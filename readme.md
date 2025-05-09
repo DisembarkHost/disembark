@@ -37,4 +37,4 @@ Connector plugin for [Disembark](https://disembark.host).
 - One click connection string to [Disembark](https://disembark.host)
 
 **v1.0.0** - June 5th 2024
-- Intial release of Disembark. Allows for full site WordPress backups to be made from [Disembark.host](Disembark.host)
+- Initial release of Disembark. Allows for full site WordPress backups to be made from [Disembark.host](Disembark.host)
