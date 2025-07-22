@@ -210,7 +210,7 @@ class Run {
                 continue;
             }
             // Exclude directories
-            if ( str_contains( $relativePath, "uploads/disembark" ) || str_contains( $relativePath, "wp-content/updraft" ) || str_contains( $relativePath, "wp-content/ai1wm-backups" ) ) {
+            if ( str_contains( $relativePath, "uploads/disembark" ) || str_contains( $relativePath, "wp-content/updraft" ) || str_contains( $relativePath, "wp-content/ai1wm-backups" ) || $relativePath === 'wp-content/mysql.sql' ) {
                 continue;
             }
             if ( ! empty( $include_files ) ) {
