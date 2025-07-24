@@ -10,6 +10,10 @@ Connector plugin for [Disembark](https://disembark.host).
 
 ### Changelog
 
+**v1.0.6** - July 25th 2025
+- WordPress version bump
+- Exclude WP Engine protected file "wp-content/mysql.sql"
+
 **v1.0.5** - January 18th 2025
 - New WP-CLI commands: `wp disembark backup-url`, `wp disembark cli-info` and `wp disembark token [--generate]`
 - Tweaked plugin updater priority
