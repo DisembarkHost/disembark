@@ -135,6 +135,7 @@ class Updater {
             $response->package     = $remote->download_url;
             $transient->response[ $response->plugin ] = $response;
         } else {
+            $response->new_version = $this->version;
             $transient->no_update[ $response->plugin ] = $response;
         }
 
