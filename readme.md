@@ -10,6 +10,9 @@ Connector plugin for [Disembark](https://disembark.host).
 
 ### Changelog
 
+**v1.0.7** - September 12th 2025
+- Fallback for `view details` link on bad response
+
 **v1.0.6** - July 24th 2025
 - WordPress version bump
 - Exclude WP Engine protected file `wp-content/mysql.sql`.
