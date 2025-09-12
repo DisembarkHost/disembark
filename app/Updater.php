@@ -17,7 +17,7 @@ class Updater {
         }
 
         $this->plugin_slug   = dirname ( plugin_basename( __DIR__ ) );
-        $this->version       = '1.0.6';
+        $this->version       = '1.0.7';
         $this->cache_key     = 'disembark_connect_updater';
         $this->cache_allowed = false;
 
@@ -56,6 +56,11 @@ class Updater {
             }
 
             $remote   = json_decode( wp_remote_retrieve_body( $remote ) );
+
+            if ( null === $remote || ! isset( $remote->version ) || ! isset( $remote->slug ) ) {
+                return $local; // The data is invalid or incomplete, so fallback.
+            }
+
             $token    = Token::get();
             $home_url = home_url();
             $remote->sections->description = "{$remote->sections->description}<br /><br />Your Disembark Connector Token for $home_url<br /><code>$token</code><ul><li><strong><a href=\"https://disembark.host/?disembark_site_url=$home_url&disembark_token=$token\" target=\"_blank\">Launch Disembark with your token</a></strong></li></ul><p>Or over command line with <a href=\"https://github.com/DisembarkHost/disembark-cli\">Disembark CLI</a></p><p><ul><li><code>disembark connect $home_url $token</code></li><li><code>disembark backup $home_url</code></li></ul></p>";
