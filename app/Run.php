@@ -109,12 +109,24 @@ class Run {
         if ( ! empty( $request['backup_token'] ) ) {
             $this->token = $request['backup_token'];
         }
+
         $file         = empty( $request['file'] ) ? "" : $request['file'];
         $include_file = empty( $request['include_file'] ) ? "" : $request['include_file'];
+
+        // Get `exclude_files` string from the request, defaulting to an empty string.
+        $exclude_files_string = $request['exclude_files'] ?? '';
+        
+        // Convert the newline-separated string into an array of paths.
+        $exclude_files_array = !empty($exclude_files_string) ? explode( "\n", $exclude_files_string ) : [];
+
         if ( ! empty( $include_file ) ) {
+            // This is a secondary logic path. For full compatibility, the match_and_zip_files
+            // function would also need to be updated to accept the exclusion array.
             return ( new Backup( $this->token ) )->match_and_zip_files( $include_file );
         }
-        return ( new Backup( $this->token ) )->zip_files( $file );
+        
+        // Pass the manifest file path and the array of excluded paths to the Backup class.
+        return ( new Backup( $this->token ) )->zip_files( $file, $exclude_files_array );
     }
 
     function zip_database ( $request ) {
