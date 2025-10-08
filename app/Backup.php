@@ -129,7 +129,7 @@ class Backup {
         return $backup_url;
     }
 
-    function zip_files( $file_manifest = "" ) {
+    function zip_files( $file_manifest = "", $exclude_paths = [] ) {
         if ( empty( $file_manifest ) ) {
             return;
         }
@@ -137,9 +137,31 @@ class Backup {
         $files     = json_decode( file_get_contents( $file_manifest ) );
         $zip_name  = "{$this->backup_path}/{$file_name}.zip";
         $directory = get_home_path();
+
+        // Ensure exclude paths are clean (no whitespace).
+        $exclude_paths = array_filter( array_map( 'trim', $exclude_paths ) );
+
         if ( $this->zip->open ( $zip_name, \ZipArchive::CREATE ) === TRUE) {
             foreach( $files as $file ) {
-                $this->zip->addFile( "{$directory}/{$file->name}", $file->name );
+                
+                $should_exclude = false;
+                foreach ( $exclude_paths as $exclude_path ) {
+                    // Check for an exact match (for excluding a specific file).
+                    if ( $file->name === $exclude_path ) {
+                        $should_exclude = true;
+                        break;
+                    }
+                    // Check if the file is within an excluded directory.
+                    if ( str_starts_with( $file->name, $exclude_path . '/' ) ) {
+                        $should_exclude = true;
+                        break; 
+                    }
+                }
+
+                // Add the file to the zip only if it's not marked for exclusion.
+                if ( ! $should_exclude ) {
+                     $this->zip->addFile( "{$directory}/{$file->name}", $file->name );
+                }
             }
             $this->zip->close();
         }
