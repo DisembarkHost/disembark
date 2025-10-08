@@ -37,35 +37,36 @@ class Run {
                 'callback' => [ $this, 'database' ]
             ]
         );
-
         register_rest_route(
             'disembark/v1', '/files', [
                 'methods'  => 'GET',
                 'callback' => [ $this, 'files' ]
             ]
         );
-
+        register_rest_route(
+            'disembark/v1', '/full-manifest', [
+                'methods'  => 'GET',
+                'callback' => [ $this, 'get_full_manifest' ]
+            ]
+        );
         register_rest_route(
             'disembark/v1', '/backup/(?P<selection>[a-zA-Z0-9-]+)', [
                 'methods'  => 'GET',
                 'callback' => [ $this, 'backup' ]
             ]
         );
-
         register_rest_route(
             'disembark/v1', '/export/database/(?P<table>[a-zA-Z0-9-_]+)', [
                 'methods'  => 'POST',
                 'callback' => [ $this, 'export_database' ]
             ]
         );
-
         register_rest_route(
             'disembark/v1', '/zip-files', [
                 'methods'  => 'POST',
                 'callback' => [ $this, 'zip_files' ]
             ]
         );
-
         register_rest_route(
             'disembark/v1', '/zip-database', [
                 'methods'  => 'POST',
@@ -79,7 +80,6 @@ class Run {
                 'callback' => [ $this, 'download' ]
             ]
         );
-
         register_rest_route(
             'disembark/v1', '/cleanup', [
                 'methods'  => 'GET',
@@ -188,12 +188,22 @@ class Run {
         if ( ! empty( $request['backup_token'] ) ) {
             $this->token = $request['backup_token'];
         }
-        self::list_files( $directory );
+        $this->list_files( $directory, [], true );
         $manifest_files = ( new Backup( $request['backup_token'] ) )->list_manifest();
         return $manifest_files;
     }
 
-    function list_files( $directory = "", $include_files = [] ) {
+    function get_full_manifest( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $directory = \get_home_path();
+        // Call list_files without generating manifest files
+        $all_files = $this->list_files( $directory, [], false );
+        return $all_files;
+    }
+
+    function list_files( $directory = "", $include_files = [], $generate_manifest = true ) {
         if ( empty( $directory ) ) {
             $directory = \get_home_path();
         }
@@ -203,7 +213,6 @@ class Run {
         );
         $response = [];
         $seen     = [];
-
         foreach ( $files as $file ) {
             $name = $file->getPathname();
             // Skip directories
@@ -221,17 +230,29 @@ class Run {
             if (in_array($relativePath, $seen)) {
                 continue;
             }
-            // Exclude directories
-            if ( str_contains( $relativePath, "uploads/disembark" ) || str_contains( $relativePath, "wp-content/updraft" ) || str_contains( $relativePath, "wp-content/ai1wm-backups" ) || $relativePath === 'wp-content/mysql.sql' ) {
-                continue;
+            // Exclude matches
+            $excludes = [ 
+                "uploads/disembark",
+                "wp-content/updraft",
+                "wp-content/ai1wm-backups",
+                "wp-content/backups-dup-lite",
+                "wp-content/backups-dup-pro",
+                "wp-content/mysql.sql"
+            ];
+            foreach ( $excludes as $path ) {
+                if ( str_contains( $relativePath, $path ) ) {
+                    continue 2;
+                }
             }
             if ( ! empty( $include_files ) ) {
                 foreach( $include_files as $include ) {
                     if ( str_contains( $relativePath, $include ) ) {
-                        $seen[]     = $relativePath;
-                        $response[] = (object) [ 
+                     
+                       $seen[]     = $relativePath;
+                       $response[] = (object) [ 
                             "name" => $name,
-                            "size" => $file->getSize()
+                            "size" => $file->getSize(),
+                            "type" => "file"
                         ];
                         break;
                     }
@@ -241,7 +262,8 @@ class Run {
             $seen[]     = $relativePath;
             $response[] = (object) [ 
                 "name" => $name,
-                "size" => $file->getSize()
+                "size" => $file->getSize(),
+                "type" => "file"
             ];
         }
 
@@ -254,7 +276,9 @@ class Run {
             return $response;
         }
 
-        ( new Backup( $this->token ) )->generate_manifest( $response );
+        if ( $generate_manifest ) {
+            ( new Backup( $this->token ) )->generate_manifest( $response );
+        }
 
         return $response;
     }
