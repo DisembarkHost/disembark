@@ -5,7 +5,7 @@
     "author_profile": "https://profiles.wordpress.org/austinginder",
     "donate_link": "https://github.com/sponsors/austinginder",
     "version": "1.1.0",
-    "download_url": "https://github.com/DisembarkHost/disembark-connector/releases/download/1.1.0/disembark-connector.zip",
+    "download_url": "https://github.com/DisembarkHost/disembark-connector/releases/download/v1.1.0/disembark-connector.zip",
     "requires": "5.6",
     "tested": "6.8.3",
     "requires_php": "5.6",
