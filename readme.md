@@ -10,6 +10,11 @@ Connector plugin for [Disembark](https://disembark.host).
 
 ### Changelog
 
+**v1.1.0** - October 8th 2025
+- Added the ability to exclude files and folders from file backups.
+- Added a new REST endpoint to retrieve a complete file manifest without generating manifest files.
+- Refactored and expanded the default list of excluded files and backup directories.
+
 **v1.0.7** - September 12th 2025
 - Fallback for `view details` link on bad response
 
