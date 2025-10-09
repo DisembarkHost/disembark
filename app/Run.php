@@ -44,6 +44,12 @@ class Run {
             ]
         );
         register_rest_route(
+            'disembark/v1', '/regenerate-manifest', [
+                'methods'  => 'POST',
+                'callback' => [ $this, 'regenerate_manifest' ]
+            ]
+        );
+        register_rest_route(
             'disembark/v1', '/full-manifest', [
                 'methods'  => 'GET',
                 'callback' => [ $this, 'get_full_manifest' ]
@@ -191,6 +197,51 @@ class Run {
         $this->list_files( $directory, [], true );
         $manifest_files = ( new Backup( $request['backup_token'] ) )->list_manifest();
         return $manifest_files;
+    }
+
+    /**
+     * Regenerates the file manifest based on a list of excluded files/folders.
+     */
+    function regenerate_manifest( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+
+        if ( ! empty( $request['backup_token'] ) ) {
+            $this->token = $request['backup_token'];
+        }
+
+        $exclude_files_string = $request['exclude_files'] ?? '';
+        $exclude_paths = !empty($exclude_files_string) ? explode( "\n", $exclude_files_string ) : [];
+
+        // 1. Get the complete list of all files without generating a manifest yet.
+        $all_files = $this->list_files( \get_home_path(), [], false );
+
+        // 2. Filter the file list based on the exclusion paths.
+        $filtered_files = array_filter($all_files, function($file) use ($exclude_paths) {
+            if (empty($exclude_paths)) {
+                return true; // Keep all files if the exclusion list is empty.
+            }
+
+            foreach ($exclude_paths as $exclude_path) {
+                // Exclude if it's an exact file match.
+                if ($file->name === $exclude_path) {
+                    return false;
+                }
+                // Exclude if the file is inside an excluded folder.
+                if (str_starts_with($file->name, $exclude_path . '/')) {
+                    return false;
+                }
+            }
+
+            return true; // Keep the file if no exclusion rules matched.
+        });
+
+        // 3. Generate a new manifest with the filtered (smaller) list of files.
+        ( new Backup( $this->token ) )->generate_manifest( array_values($filtered_files) );
+
+        // 4. Return the new, recalculated list of manifest JSON files.
+        return ( new Backup( $this->token ) )->list_manifest();
     }
 
     function get_full_manifest( $request ) {
