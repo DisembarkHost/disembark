@@ -7,17 +7,40 @@ class Backup {
     private $backup_path      = "";
     private $backup_url       = "";
     private $token            = "";
-    private $zip              = "";
     private $rows_per_segment = 100;
+    private $archiver_type    = 'none'; // Can be 'ZipArchive', 'PclZip', or 'none'
+    private $zip_object       = null;   // Will hold the ZipArchive object if used
 
     public function __construct( $token = "" ) {
         $bytes             = random_bytes( 20 );
         $this->token       = empty( $token ) ? substr( bin2hex( $bytes ), 0, -28) : $token;
-        $this->zip         = new \ZipArchive;
         $this->backup_path = wp_upload_dir()["basedir"] . "/disembark/{$this->token}";
         $this->backup_url  = wp_upload_dir()["baseurl"] . "/disembark/{$this->token}";
         if ( ! file_exists( $this->backup_path )) {
             mkdir( $this->backup_path, 0777, true );
+        }
+        
+        // Determine which zipping method is available
+        if ( class_exists( 'ZipArchive' ) ) {
+            // The best method is available, so we'll use it
+            $this->archiver_type = 'ZipArchive';
+            $this->zip_object    = new \ZipArchive();
+        } else {
+            // ZipArchive is not found, let's try to use PclZip as a fallback
+            if ( ! class_exists( 'PclZip' ) ) {
+                $pclzip_path = ABSPATH . 'wp-admin/includes/class-pclzip.php';
+                if ( file_exists( $pclzip_path ) ) {
+                    require_once $pclzip_path;
+                }
+            }
+            
+            // Now, double-check that the class exists after our attempt to load it
+            if ( class_exists( 'PclZip' ) ) {
+                $this->archiver_type = 'PclZip';
+            } else {
+                // If we reach this point, no zipping method is available
+                $this->archiver_type = 'none';
+            }
         }
     }
 
@@ -40,26 +63,21 @@ class Backup {
         }
 
         if ( 0 == $rows_start ) {
-
             $create_table = $wpdb->get_results( "SHOW CREATE TABLE `{$table}`", ARRAY_N );
             if ( false === $create_table ) {
                 echo 'Error: Unable to access and dump database table `' . $table . '`. Table may not exist. Skipping table.';
                 return;
             }
-            // Table creation text.
             if ( ! isset( $create_table[0] ) ) {
                 echo 'Error: Unable to get table creation SQL for table `' . $table . '`. Result: `' . print_r( $create_table ) . '`. Skipping table.';
                 return false;
             }
             $create_table_array = $create_table[0];
             unset( $create_table );
-            $insert_sql .= str_replace( "\n", '', $create_table_array[1] ) . ";\n"; // Remove internal linebreaks; only put one at end.
+            $insert_sql .= str_replace( "\n", '', $create_table_array[1] ) . ";\n";
             unset( $create_table_array );
 
-            // Disable keys for this table.
             $insert_sql .= "/*!40000 ALTER TABLE `{$table}` DISABLE KEYS */;\n";
-
-            // Disable foreign key and unique checks temporarily to help avoid errors.
             $insert_sql .= "SET FOREIGN_KEY_CHECKS = 0;\n";
             $insert_sql .= "SET UNIQUE_CHECKS = 0;\n";
         }
@@ -67,15 +85,13 @@ class Backup {
         $query_count = 0;
         $rows_remain = true;
         while ( true === $rows_remain ) {
-            // End early and limit select if we've reached the limit.
             if ( $rows_per_part > 0 && ( $query_count + $select_row_limit ) >= $rows_per_part ) {
                 $select_row_limit = $rows_per_part - $query_count;
                 $rows_remain = false;
             }
-            // Row creation text for all rows within this table.
             $query       = "SELECT * FROM `$table` LIMIT " . $rows_start . ',' . $select_row_limit;
             $table_query = $wpdb->get_results( $query, ARRAY_N );
-            $rows_start += $select_row_limit; // Next loop we will begin at this offset.
+            $rows_start += $select_row_limit;
             if ( false === $table_query ) {
                 echo 'Error: Unable to retrieve data from table `' . $table . '`. This table may be corrupt (try repairing the database) or too large to hold in memory (increase mysql and/or PHP memory). Skipping table.';
                 return false;
@@ -91,7 +107,6 @@ class Backup {
                 $insert_sql .= "INSERT INTO `$table` VALUES(";
                 for ( $n = 1; $n <= $num_fields; $n++ ) {
                     $m = $n - 1;
-
                     if ( null === $fetch_row[ $m ] ) {
                         $insert_sql .= 'NULL, ';
                     } else {
@@ -100,7 +115,6 @@ class Backup {
                 }
                 $insert_sql  = substr( $insert_sql, 0, -2 );
                 $insert_sql .= ");\n";
-
                 $write_return = fwrite( $file_handle, $insert_sql );
                 if ( false === $write_return || 0 == $write_return ) {
                     echo 'Error: Unable to write to SQL file. Return error/bytes written: `' . $write_return . '`. Skipping table.';
@@ -111,7 +125,6 @@ class Backup {
             }
         }
 
-        // Re-enable keys for this table.
         $insert_sql  .= "/*!40000 ALTER TABLE `{$table}` ENABLE KEYS */;\n";
         $insert_sql  .= "SET FOREIGN_KEY_CHECKS = 1;\n";
         $insert_sql  .= "SET UNIQUE_CHECKS = 1;\n";
@@ -122,10 +135,8 @@ class Backup {
             return false;
         }
         $insert_sql = "";
-
         @fclose( $file_handle );
         unset( $file_handle );
-
         return $backup_url;
     }
 
@@ -137,33 +148,47 @@ class Backup {
         $files     = json_decode( file_get_contents( $file_manifest ) );
         $zip_name  = "{$this->backup_path}/{$file_name}.zip";
         $directory = get_home_path();
-
-        // Ensure exclude paths are clean (no whitespace).
         $exclude_paths = array_filter( array_map( 'trim', $exclude_paths ) );
 
-        if ( $this->zip->open ( $zip_name, \ZipArchive::CREATE ) === TRUE) {
+        if ( $this->archiver_type === 'ZipArchive' ) {
+            if ( $this->zip_object->open( $zip_name, \ZipArchive::CREATE ) === TRUE ) {
+                foreach( $files as $file ) {
+                    $should_exclude = false;
+                    foreach ( $exclude_paths as $exclude_path ) {
+                        if ( $file->name === $exclude_path || str_starts_with( $file->name, $exclude_path . '/' ) ) {
+                            $should_exclude = true;
+                            break;
+                        }
+                    }
+                    if ( ! $should_exclude ) {
+                         $this->zip_object->addFile( "{$directory}/{$file->name}", $file->name );
+                    }
+                }
+                $this->zip_object->close();
+            } else {
+                 return new \WP_Error('zip_open_failed', 'Could not create the zip file using ZipArchive.');
+            }
+        } elseif ( $this->archiver_type === 'PclZip' ) {
+            $zip = new \PclZip( $zip_name );
+            $files_to_add = [];
             foreach( $files as $file ) {
-                
                 $should_exclude = false;
                 foreach ( $exclude_paths as $exclude_path ) {
-                    // Check for an exact match (for excluding a specific file).
-                    if ( $file->name === $exclude_path ) {
+                    if ( $file->name === $exclude_path || str_starts_with( $file->name, $exclude_path . '/' ) ) {
                         $should_exclude = true;
                         break;
                     }
-                    // Check if the file is within an excluded directory.
-                    if ( str_starts_with( $file->name, $exclude_path . '/' ) ) {
-                        $should_exclude = true;
-                        break; 
-                    }
                 }
-
-                // Add the file to the zip only if it's not marked for exclusion.
                 if ( ! $should_exclude ) {
-                     $this->zip->addFile( "{$directory}/{$file->name}", $file->name );
+                    $files_to_add[] = "{$directory}/{$file->name}";
                 }
             }
-            $this->zip->close();
+            $result = $zip->create( $files_to_add, PCLZIP_OPT_REMOVE_PATH, $directory );
+            if ( $result == 0 ) {
+                return new \WP_Error('pclzip_failed', 'Could not create the zip file using PclZip: ' . $zip->errorInfo(true));
+            }
+        } else {
+            return new \WP_Error('no_zip_method', 'The server does not have a supported zipping library (ZipArchive or PclZip).');
         }
         return "{$this->backup_url}/{$file_name}.zip";
     }
@@ -173,11 +198,26 @@ class Backup {
         $file_name = sanitize_title( $file_or_path );
         $zip_name  = "{$this->backup_path}/files-{$file_name}.zip";
         $directory = get_home_path();
-        if ( $this->zip->open ( $zip_name, \ZipArchive::CREATE ) === TRUE) {
-            foreach( $files as $file ) {
-                $this->zip->addFile( "{$directory}/{$file->name}", $file->name );
+
+        if ( $this->archiver_type === 'ZipArchive' ) {
+            if ( $this->zip_object->open ( $zip_name, \ZipArchive::CREATE ) === TRUE) {
+                foreach( $files as $file ) {
+                    $this->zip_object->addFile( "{$directory}/{$file->name}", $file->name );
+                }
+                $this->zip_object->close();
             }
-            $this->zip->close();
+        } elseif ( $this->archiver_type === 'PclZip' ) {
+            $zip = new \PclZip($zip_name);
+            $files_to_add = [];
+            foreach( $files as $file ) {
+                $files_to_add[] = "{$directory}/{$file->name}";
+            }
+            $result = $zip->create( $files_to_add, PCLZIP_OPT_REMOVE_PATH, $directory );
+            if ( $result == 0 ) {
+                return new \WP_Error('pclzip_failed', 'Could not create the zip file using PclZip: ' . $zip->errorInfo(true));
+            }
+        } else {
+            return new \WP_Error('no_zip_method', 'The server does not have a supported zipping library (ZipArchive or PclZip).');
         }
         return "{$this->backup_url}/files-{$file_name}.zip";
     }
@@ -186,22 +226,43 @@ class Backup {
         if ( ! empty( $table ) ) {
             $zip_name = "{$this->backup_path}/database-{$table}.zip";
             $file     = "{$this->backup_path}/{$table}.sql";
-            if ( $this->zip->open ( $zip_name, \ZipArchive::CREATE ) === TRUE) {
-                $this->zip->addFile( $file, basename( $file ) );
-                $this->zip->close();
+            if ( $this->archiver_type === 'ZipArchive' ) {
+                if ( $this->zip_object->open ( $zip_name, \ZipArchive::CREATE ) === TRUE) {
+                    $this->zip_object->addFile( $file, basename( $file ) );
+                    $this->zip_object->close();
+                }
+            } elseif ( $this->archiver_type === 'PclZip' ) {
+                 $zip = new \PclZip($zip_name);
+                 $result = $zip->create($file, PCLZIP_OPT_REMOVE_PATH, $this->backup_path);
+                 if ($result == 0) {
+                     return new \WP_Error('pclzip_failed', 'Could not create the zip file using PclZip: ' . $zip->errorInfo(true));
+                 }
+            } else {
+                return new \WP_Error('no_zip_method', 'The server does not have a supported zipping library.');
             }
             unlink( $file );
             return "{$this->backup_url}/database-{$table}.zip";
         }
+
         $database_files = glob( "{$this->backup_path}/*.sql" );
         $zip_name       = "{$this->backup_path}/database.zip";
-        if ( $this->zip->open ( $zip_name, \ZipArchive::CREATE ) === TRUE) {
-            foreach( $database_files as $file ) {
-                $this->zip->addFile( $file, basename( $file ) );
+        if ( $this->archiver_type === 'ZipArchive' ) {
+            if ( $this->zip_object->open ( $zip_name, \ZipArchive::CREATE ) === TRUE) {
+                foreach( $database_files as $file ) {
+                    $this->zip_object->addFile( $file, basename( $file ) );
+                }
+                $this->zip_object->close();
             }
-            $this->zip->close();
+        } elseif ( $this->archiver_type === 'PclZip' ) {
+            $zip = new \PclZip($zip_name);
+            $result = $zip->create($database_files, PCLZIP_OPT_REMOVE_PATH, $this->backup_path);
+            if ($result == 0) {
+                return new \WP_Error('pclzip_failed', 'Could not create the zip file using PclZip: ' . $zip->errorInfo(true));
+            }
+        } else {
+            return new \WP_Error('no_zip_method', 'The server does not have a supported zipping library.');
         }
-        // Delete all SQL files
+
         foreach( $database_files as $file ) {
             unlink( $file );
         }
@@ -232,7 +293,6 @@ class Backup {
         $total_files      = count( $files );
         $manifest         = [];
         $response         = [];
-
         do {
             foreach ( $files as $key => $file ) {
                 $manifest[] = $file;
@@ -264,5 +324,4 @@ class Backup {
     function list_manifest() {
         return json_decode( file_get_contents( "{$this->backup_path}/manifest.json" ) );
     }
-
 }
