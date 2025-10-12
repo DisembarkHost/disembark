@@ -79,7 +79,12 @@ class Run {
                 'callback' => [ $this, 'zip_database' ]
             ]
         );
-
+        register_rest_route(
+            'disembark/v1', '/stream-file', [
+                'methods'  => 'GET',
+                'callback' => [ $this, 'stream_file' ]
+            ]
+        );
         register_rest_route(
             'disembark/v1', '/download', [
                 'methods'  => 'GET',
@@ -143,6 +148,47 @@ class Run {
             $this->token = $request['backup_token'];
         }
         return ( new Backup( $this->token ) )->zip_database();
+    }
+
+    function stream_file( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            // Not using WP_Error to avoid JSON formatting
+            header("HTTP/1.1 403 Forbidden");
+            die('403 Forbidden: Invalid token.');
+        }
+
+        $file_path = $request->get_param('file');
+        if ( empty( $file_path ) ) {
+            header("HTTP/1.1 400 Bad Request");
+            die('400 Bad Request: File parameter is missing.');
+        }
+
+        $base_dir = realpath(ABSPATH);
+        $full_path = realpath($base_dir . '/' . $file_path);
+
+        // Security check: Ensure the requested file is within the WordPress directory
+        if ( !$full_path || strpos($full_path, $base_dir) !== 0 ) {
+            header("HTTP/1.1 400 Bad Request");
+            die('400 Bad Request: Invalid file path.');
+        }
+
+        if ( !file_exists($full_path) || !is_readable($full_path) ) {
+            header("HTTP/1.1 404 Not Found");
+            die('404 Not Found: File does not exist or is not readable.');
+        }
+
+        // Stream the file
+        header('Content-Description: File Transfer');
+        header('Content-Type: application/octet-stream');
+        header('Content-Disposition: attachment; filename="' . basename($full_path) . '"');
+        header('Expires: 0');
+        header('Cache-Control: must-revalidate');
+        header('Pragma: public');
+        header('Content-Length: ' . filesize($full_path));
+        flush();
+        // Flush system output buffer
+        readfile($full_path);
+        exit;
     }
 
     function backup ( $request ) {
