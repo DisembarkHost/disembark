@@ -257,37 +257,39 @@ class Run {
             $this->token = $request['backup_token'];
         }
 
-        $exclude_files_string = $request['exclude_files'] ?? '';
-        $exclude_paths = !empty($exclude_files_string) ? explode( "\n", $exclude_files_string ) : [];
+        $backup_manager = new Backup( $this->token );
+        $step           = $request['step'] ?? 'initiate';
+        $chunk_size     = 20000; // Files per manifest chunk
 
-        // 1. Get the complete list of all files without generating a manifest yet.
-        $all_files = $this->list_files( \get_home_path(), [], false );
+        switch ( $step ) {
+            case 'initiate':
+                // Fast: Just set up the initial state for scanning.
+                $backup_manager->initiate_scan_state();
+                return [ 'status' => 'ready' ];
 
-        // 2. Filter the file list based on the exclusion paths.
-        $filtered_files = array_filter($all_files, function($file) use ($exclude_paths) {
-            if (empty($exclude_paths)) {
-                return true; // Keep all files if the exclusion list is empty.
-            }
+            case 'scan':
+                // Scan a small portion of the filesystem. Called in a loop.
+                $exclude_files_string = $request['exclude_files'] ?? '';
+                $exclude_paths = !empty($exclude_files_string) ? explode( "\n", $exclude_files_string ) : [];
+                return $backup_manager->process_scan_step( $exclude_paths );
 
-            foreach ($exclude_paths as $exclude_path) {
-                // Exclude if it's an exact file match.
-                if ($file->name === $exclude_path) {
-                    return false;
-                }
-                // Exclude if the file is inside an excluded folder.
-                if (str_starts_with($file->name, $exclude_path . '/')) {
-                    return false;
-                }
-            }
+            case 'chunkify':
+                // Read the full file list and calculate how many chunks are needed.
+                return $backup_manager->chunkify_manifest( $chunk_size );
 
-            return true; // Keep the file if no exclusion rules matched.
-        });
+            case 'process_chunk':
+                // Create a single files-n.json chunk. Called in a loop.
+                $chunk_number = $request['chunk'] ?? 1;
+                return $backup_manager->process_manifest_chunk( $chunk_number, $chunk_size );
 
-        // 3. Generate a new manifest with the filtered (smaller) list of files.
-        ( new Backup( $this->token ) )->generate_manifest( array_values($filtered_files) );
+            case 'finalize':
+                // Generate the final manifest.json from all the chunk files.
+                $manifest_files = $backup_manager->finalize_manifest();
+                $backup_manager->cleanup_temp_files();
+                return $manifest_files;
+        }
 
-        // 4. Return the new, recalculated list of manifest JSON files.
-        return ( new Backup( $this->token ) )->list_manifest();
+        return new \WP_Error( 'invalid_step', 'The provided step is not valid.', [ 'status' => 400 ] );
     }
 
     function get_full_manifest( $request ) {
