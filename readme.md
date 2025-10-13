@@ -10,6 +10,11 @@ Connector plugin for [Disembark](https://disembark.host).
 
 ### Changelog
 
+**v1.2.0** - October 12th 2025
+* Refactored the file scanning and manifest generation into a step-by-step process that uses significantly less memory, improving support for very large websites.
+* Added `PclZip` as a fallback for creating zip archives, increasing compatibility with hosting environments where the `ZipArchive` PHP extension is not enabled.
+* Introduced a new REST endpoint for securely streaming individual files directly from the server.
+
 **v1.1.0** - October 8th 2025
 - Added the ability to exclude files and folders from file backups.
 - Added a new REST endpoint to retrieve a complete file manifest without generating manifest files.
