@@ -259,7 +259,7 @@ class Run {
 
         $backup_manager = new Backup( $this->token );
         $step           = $request['step'] ?? 'initiate';
-        $chunk_size     = 20000; // Files per manifest chunk
+        $chunk_size_mb  = 150; // Set the size limit to 150 MB per chunk
 
         switch ( $step ) {
             case 'initiate':
@@ -274,13 +274,13 @@ class Run {
                 return $backup_manager->process_scan_step( $exclude_paths );
 
             case 'chunkify':
-                // Read the full file list and calculate how many chunks are needed.
-                return $backup_manager->chunkify_manifest( $chunk_size );
+                // Read the full file list and calculate how many chunks are needed based on size.
+                return $backup_manager->chunkify_manifest( $chunk_size_mb );
 
             case 'process_chunk':
-                // Create a single files-n.json chunk. Called in a loop.
+                // Create a single files-n.json chunk based on size. Called in a loop.
                 $chunk_number = $request['chunk'] ?? 1;
-                return $backup_manager->process_manifest_chunk( $chunk_number, $chunk_size );
+                return $backup_manager->process_manifest_chunk( $chunk_number, $chunk_size_mb );
 
             case 'finalize':
                 // Generate the final manifest.json from all the chunk files.
