@@ -322,8 +322,23 @@ class Backup {
         if ( empty( $file_manifest ) ) {
             return;
         }
+
+        // Construct the full path to the manifest file inside the backup directory.
+        $manifest_full_path = "{$this->backup_path}/" . basename( $file_manifest );
+        
+        // Verify the manifest chunk file exists and is readable.
+        if ( ! is_readable( $manifest_full_path ) ) {
+            return new \WP_Error( 'manifest_not_readable', 'Manifest chunk file not found or is not readable.' );
+        }
+
         $file_name = str_replace( ".json", "", basename( $file_manifest ) );
-        $files     = json_decode( file_get_contents( $file_manifest ) );
+        $files     = json_decode( file_get_contents( $manifest_full_path ) );
+
+        // If the manifest is empty or invalid, ensure $files is an array to avoid errors.
+        if ( ! is_array( $files ) ) {
+            $files = [];
+        }
+
         $zip_name  = "{$this->backup_path}/{$file_name}.zip";
         $directory = get_home_path();
         $exclude_paths = array_filter( array_map( 'trim', $exclude_paths ) );
