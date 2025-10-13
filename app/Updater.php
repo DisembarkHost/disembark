@@ -17,7 +17,7 @@ class Updater {
         }
 
         $this->plugin_slug   = dirname ( plugin_basename( __DIR__ ) );
-        $this->version       = '1.1.0';
+        $this->version       = '1.2.0';
         $this->cache_key     = 'disembark_connect_updater';
         $this->cache_allowed = false;
 
