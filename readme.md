@@ -10,6 +10,11 @@ Connector plugin for [Disembark](https://disembark.host).
 
 ### Changelog
 
+**v1.2.1** - October 13th 2025
+* Fixed bug with file section introduced with v1.2.0
+* Changed directory scan limit from 25 to 75
+* Changed file chuck limit from 100mb to 150mb
+
 **v1.2.0** - October 12th 2025
 * Refactored the file scanning and manifest generation into a step-by-step process that uses significantly less memory, improving support for very large websites.
 * Added `PclZip` as a fallback for creating zip archives, increasing compatibility with hosting environments where the `ZipArchive` PHP extension is not enabled.
