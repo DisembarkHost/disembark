@@ -60,7 +60,7 @@ class Backup {
         $state = json_decode( file_get_contents( $state_file ), true );
 
         // Define how many directories to scan in a single request.
-        $batch_size = 25;
+        $batch_size = 75;
 
         if ( empty( $state['directories_to_scan'] ) ) {
             $state['status'] = 'scan_complete';
@@ -149,64 +149,99 @@ class Backup {
         return $this->list_manifest();
     }
 
-    public function chunkify_manifest( $chunk_size ) {
+    public function chunkify_manifest( $chunk_size_mb = 100 ) {
         $filtered_list_path = "{$this->backup_path}/_filtered_file_list.json";
         if ( ! file_exists( $filtered_list_path ) ) {
             return ['total_chunks' => 0];
         }
-
-        $line_count = 0;
+        
+        $storage_limit = $chunk_size_mb * 1024 * 1024;
+        $chunk_offsets = [1]; // First chunk always starts at line 1
+        $current_chunk_size = 0;
+        $line_number = 1;
+    
         $handle = fopen($filtered_list_path, "r");
         if ($handle) {
-            // This loop reads the file one line at a time, using very little memory.
-            while(!feof($handle)){
-                if (fgets($handle) !== false) {
-                    $line_count++;
+            while (($line = fgets($handle)) !== false) {
+                $file = json_decode($line);
+                if (!$file || !isset($file->size)) {
+                    $line_number++;
+                    continue;
                 }
+    
+                // If current chunk has content and this file will exceed the limit, start a new chunk.
+                if ( ($current_chunk_size + $file->size) > $storage_limit && $current_chunk_size > 0) {
+                    $chunk_offsets[] = $line_number;
+                    $current_chunk_size = 0; // Reset size for the new chunk
+                }
+                $current_chunk_size += $file->size;
+                $line_number++;
             }
             fclose($handle);
         }
-
+        
+        // Save the calculated starting lines for each chunk to the state file.
+        $state_file = "{$this->backup_path}/_scan_state.json";
+        $state = json_decode( file_get_contents( $state_file ), true );
+        $state['chunk_offsets'] = $chunk_offsets;
+        file_put_contents( $state_file, json_encode( $state ) );
+    
         return [
-            'total_chunks' => ceil( $line_count / $chunk_size )
+            'total_chunks' => count( $chunk_offsets )
         ];
     }
 
-    public function process_manifest_chunk( $chunk_number, $chunk_size ) {
+    public function process_manifest_chunk( $chunk_number, $chunk_size_mb = 100 ) {
         $filtered_list_path = "{$this->backup_path}/_filtered_file_list.json";
-        if ( ! file_exists( $filtered_list_path ) ) {
-            return new \WP_Error('no_list', 'Filtered file list not found.');
+        $state_file = "{$this->backup_path}/_scan_state.json";
+    
+        if ( ! file_exists( $filtered_list_path ) || ! file_exists( $state_file ) ) {
+            return new \WP_Error('missing_files', 'Required files for chunk processing are missing.');
         }
-
+        
+        $state = json_decode( file_get_contents( $state_file ), true );
+        if ( !isset($state['chunk_offsets']) || !isset($state['chunk_offsets'][$chunk_number - 1]) ) {
+            return new \WP_Error('no_offset', 'Chunk offset not found in state file.');
+        }
+        
+        $storage_limit = $chunk_size_mb * 1024 * 1024;
+        $start_line = $state['chunk_offsets'][$chunk_number - 1];
+        $current_line = 1;
+        $chunk_objects = [];
+        $current_chunk_size = 0;
+        
         $handle = fopen($filtered_list_path, "r");
         if (!$handle) {
             return new \WP_Error('file_open_error', 'Could not open the file list.');
         }
-
-        $offset = ( $chunk_number - 1 ) * $chunk_size;
-        $current_line = 0;
-        $chunk_objects = [];
-
-        // This loop efficiently skips to the starting line of the required chunk.
-        while ($current_line < $offset && !feof($handle)) {
+    
+        // Efficiently skip to the starting line of the required chunk.
+        while ($current_line < $start_line && !feof($handle)) {
             fgets($handle);
             $current_line++;
         }
-
-        // This loop reads only the lines needed for the current chunk.
-        $lines_in_chunk = 0;
-        while ($lines_in_chunk < $chunk_size && !feof($handle)) {
+    
+        // Read lines for the current chunk until the size limit is reached or the file ends.
+        while (!feof($handle)) {
             $line = fgets($handle);
-            if ($line !== false && trim($line) !== '') {
-                $chunk_objects[] = json_decode($line);
-                $lines_in_chunk++;
+            if ($line === false || trim($line) === '') continue;
+    
+            $file = json_decode($line);
+            if (!$file || !isset($file->size)) continue;
+    
+            // If the chunk has files and adding the next one exceeds the limit, stop reading.
+            if ( ($current_chunk_size + $file->size) > $storage_limit && !empty($chunk_objects) ) {
+                break; 
             }
+    
+            $chunk_objects[] = $file;
+            $current_chunk_size += $file->size;
         }
         fclose($handle);
-
+    
         $chunk_manifest_path = "{$this->backup_path}/files-{$chunk_number}.json";
         file_put_contents( $chunk_manifest_path, json_encode( $chunk_objects, JSON_PRETTY_PRINT ) );
-
+        
         return [ 'success' => true, 'chunk' => $chunk_number, 'file_count' => count($chunk_objects) ];
     }
     
