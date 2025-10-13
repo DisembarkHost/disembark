@@ -1,7 +1,6 @@
 <?php
 
 namespace DisembarkConnector;
-
 class Backup {
 
     private $backup_path      = "";
@@ -40,6 +39,185 @@ class Backup {
             } else {
                 // If we reach this point, no zipping method is available
                 $this->archiver_type = 'none';
+            }
+        }
+    }
+
+    public function initiate_scan_state() {
+        $state_file = "{$this->backup_path}/_scan_state.json";
+        $initial_state = [
+            'status' => 'scanning',
+            'directories_to_scan' => [ \get_home_path() ],
+            'total_dirs' => 1,
+            'scanned_dirs' => 0
+        ];
+        file_put_contents( $state_file, json_encode( $initial_state ) );
+    }
+
+    public function process_scan_step( $exclude_paths ) {
+        $state_file = "{$this->backup_path}/_scan_state.json";
+        $filtered_list_path = "{$this->backup_path}/_filtered_file_list.json";
+        $state = json_decode( file_get_contents( $state_file ), true );
+
+        // Define how many directories to scan in a single request.
+        $batch_size = 25;
+
+        if ( empty( $state['directories_to_scan'] ) ) {
+            $state['status'] = 'scan_complete';
+            file_put_contents( $state_file, json_encode( $state ) );
+            return $state;
+        }
+
+        // Process a batch of directories from the list.
+        $directories_in_batch = array_splice( $state['directories_to_scan'], 0, $batch_size );
+        $state['scanned_dirs'] += count( $directories_in_batch );
+
+        $file_handle = fopen( $filtered_list_path, 'a' );
+        $home_path = \get_home_path();
+
+        // Loop through the batch and process each directory.
+        foreach ( $directories_in_batch as $directory_to_scan ) {
+            $items = @scandir( $directory_to_scan );
+            if ($items === false) {
+                continue; // Skip directories that can't be read.
+            }
+
+            foreach ( $items as $item ) {
+                if ( $item === '.' || $item === '..' ) continue;
+
+                $full_path = $directory_to_scan . '/' . $item;
+                $relative_path = ltrim( str_replace( $home_path, '', $full_path ), '/' );
+
+                // Check against exclusion list
+                $is_excluded = false;
+                foreach ($exclude_paths as $exclude_path) {
+                    if ($relative_path === $exclude_path || str_starts_with($relative_path, $exclude_path . '/')) {
+                        $is_excluded = true;
+                        break;
+                    }
+                }
+                if ($is_excluded) continue;
+
+                if ( is_dir( $full_path ) ) {
+                    if (is_readable($full_path)) {
+                        $state['directories_to_scan'][] = $full_path;
+                        $state['total_dirs']++;
+                    }
+                } elseif ( is_file( $full_path ) ) {
+                    $file_info = [
+                        'name' => $relative_path,
+                        'size' => filesize( $full_path ),
+                        'type' => 'file'
+                    ];
+                    fwrite( $file_handle, json_encode($file_info) . "\n" );
+                }
+            }
+        }
+
+        fclose( $file_handle );
+        file_put_contents( $state_file, json_encode( $state ) );
+        return $state;
+    }
+
+    public function save_filtered_list( $files ) {
+        $path = "{$this->backup_path}/_filtered_file_list.json";
+        file_put_contents( $path, json_encode( $files ) );
+    }
+
+    public function finalize_manifest() {
+        $manifest_chunks = glob( "{$this->backup_path}/files-*.json" );
+        $response = [];
+        
+        // Sort the manifest chunk filenames naturally before processing them.
+        natsort( $manifest_chunks );
+        
+        foreach ( $manifest_chunks as $chunk_file ) {
+            $content = json_decode( file_get_contents( $chunk_file ) );
+            $file_count = count( $content );
+            $total_size = array_sum( array_column( $content, 'size' ) );
+
+            $response[] = (object) [
+                "name"  => basename( $chunk_file ),
+                "url"   => "{$this->backup_url}/" . basename( $chunk_file ),
+                "size"  => $total_size,
+                "count" => $file_count
+            ];
+        }
+
+        // The $response array is now built in the correct order, so the problematic sort is no longer needed.
+        file_put_contents( "{$this->backup_path}/manifest.json", json_encode( array_values( $response ), JSON_PRETTY_PRINT ) );
+        return $this->list_manifest();
+    }
+
+    public function chunkify_manifest( $chunk_size ) {
+        $filtered_list_path = "{$this->backup_path}/_filtered_file_list.json";
+        if ( ! file_exists( $filtered_list_path ) ) {
+            return ['total_chunks' => 0];
+        }
+
+        $line_count = 0;
+        $handle = fopen($filtered_list_path, "r");
+        if ($handle) {
+            // This loop reads the file one line at a time, using very little memory.
+            while(!feof($handle)){
+                if (fgets($handle) !== false) {
+                    $line_count++;
+                }
+            }
+            fclose($handle);
+        }
+
+        return [
+            'total_chunks' => ceil( $line_count / $chunk_size )
+        ];
+    }
+
+    public function process_manifest_chunk( $chunk_number, $chunk_size ) {
+        $filtered_list_path = "{$this->backup_path}/_filtered_file_list.json";
+        if ( ! file_exists( $filtered_list_path ) ) {
+            return new \WP_Error('no_list', 'Filtered file list not found.');
+        }
+
+        $handle = fopen($filtered_list_path, "r");
+        if (!$handle) {
+            return new \WP_Error('file_open_error', 'Could not open the file list.');
+        }
+
+        $offset = ( $chunk_number - 1 ) * $chunk_size;
+        $current_line = 0;
+        $chunk_objects = [];
+
+        // This loop efficiently skips to the starting line of the required chunk.
+        while ($current_line < $offset && !feof($handle)) {
+            fgets($handle);
+            $current_line++;
+        }
+
+        // This loop reads only the lines needed for the current chunk.
+        $lines_in_chunk = 0;
+        while ($lines_in_chunk < $chunk_size && !feof($handle)) {
+            $line = fgets($handle);
+            if ($line !== false && trim($line) !== '') {
+                $chunk_objects[] = json_decode($line);
+                $lines_in_chunk++;
+            }
+        }
+        fclose($handle);
+
+        $chunk_manifest_path = "{$this->backup_path}/files-{$chunk_number}.json";
+        file_put_contents( $chunk_manifest_path, json_encode( $chunk_objects, JSON_PRETTY_PRINT ) );
+
+        return [ 'success' => true, 'chunk' => $chunk_number, 'file_count' => count($chunk_objects) ];
+    }
+    
+    public function cleanup_temp_files() {
+        $files_to_delete = [
+            "{$this->backup_path}/_filtered_file_list.json",
+            "{$this->backup_path}/_scan_state.json"
+        ];
+        foreach ($files_to_delete as $file) {
+            if ( file_exists( $file ) ) {
+                unlink( $file );
             }
         }
     }
@@ -303,8 +481,9 @@ class Backup {
                     break;
                 }
             }
-            $response[] = (object) [ 
-                "name"  => "{$this->backup_path}/files-{$manifest_count}.json",
+            $response[] = (object) [
+                "name"  => "files-{$manifest_count}.json",
+                "url"   => "{$this->backup_url}/files-{$manifest_count}.json",
                 "size"  => $manifest_storage,
                 "count" => $file_count
             ];
