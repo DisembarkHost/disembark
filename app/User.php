@@ -1,11 +1,11 @@
 <?php
 
-namespace DisembarkConnector;
+namespace Disembark;
 
 class User {
 
     public static function allowed( $request ) {
-        if ( $request['token'] == Token::get() ) {
+        if ( isset($request['token']) && $request['token'] == Token::get() ) {
             return true;
         }
         return false;

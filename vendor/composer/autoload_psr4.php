@@ -6,5 +6,5 @@ $vendorDir = dirname(__DIR__);
 $baseDir = dirname($vendorDir);
 
 return array(
-    'DisembarkConnector\\' => array($baseDir . '/app'),
+    'Disembark\\' => array($baseDir . '/app'),
 );

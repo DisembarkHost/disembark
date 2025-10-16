@@ -1,6 +1,6 @@
 <?php
 
-namespace DisembarkConnector;
+namespace Disembark;
 
 class Token {
 

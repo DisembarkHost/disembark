@@ -1,62 +1,22 @@
-# Disembark Connector
+# Disembark
 
-Connector plugin for [Disembark](https://disembark.host).
+A WordPress plugin to create backups of your WordPress site.
 
-## Usage
+## Description
 
-- Download and install [latest version of Disembark Connector](https://github.com/DisembarkHost/disembark-connector/releases) on any WordPress site.
-- From `wp-admin/plugins.php` select "View details" next to Disembark Connector and select "Launch Disembark with your token"
-- After backup completed, copy command into terminal or over SSH to generate the backup zip.
+Disembark provides a user-friendly interface within your WordPress admin area to perform comprehensive backups of your site's files and database. It's designed to be efficient, even on very large websites, by using a step-by-step process to scan files and generate backups without overwhelming the server.
 
-### Changelog
+Features include:
+- A modern interface built with Vue.js.
+- A file explorer to browse your site's structure, preview images and code, and download individual files.
+- The ability to selectively exclude files, folders, and database tables from your backup.
+- A multi-step analysis process to handle very large sites without timeouts.
+- Dark mode support.
+- WP-CLI commands for easy token management.
 
-**v1.2.1** - October 13th 2025
-* Fixed bug with file section introduced with v1.2.0
-* Changed directory scan limit from 25 to 75
-* Changed file chuck limit from 100mb to 150mb
+## Installation
 
-**v1.2.0** - October 12th 2025
-* Refactored the file scanning and manifest generation into a step-by-step process that uses significantly less memory, improving support for very large websites.
-* Added `PclZip` as a fallback for creating zip archives, increasing compatibility with hosting environments where the `ZipArchive` PHP extension is not enabled.
-* Introduced a new REST endpoint for securely streaming individual files directly from the server.
-
-**v1.1.0** - October 8th 2025
-- Added the ability to exclude files and folders from file backups.
-- Added a new REST endpoint to retrieve a complete file manifest without generating manifest files.
-- Refactored and expanded the default list of excluded files and backup directories.
-
-**v1.0.7** - September 12th 2025
-- Fallback for `view details` link on bad response
-
-**v1.0.6** - July 24th 2025
-- WordPress version bump
-- Exclude WP Engine protected file `wp-content/mysql.sql`.
-
-**v1.0.5** - January 18th 2025
-- New WP-CLI commands: `wp disembark backup-url`, `wp disembark cli-info` and `wp disembark token [--generate]`
-- Tweaked plugin updater priority
-
-**v1.0.4** - January 17th 2025
-- WordPress version bump
-- If updater check fails use local plugin manifest
-
-**v1.0.3** - June 27th 2024
-- Exclude Disembark directory and others from backup zip
-- Zip large database tables individually
-
-**v1.0.2** - June 11th 2024
-- New advanced options. Ability to backup only files or database. Ability to include certain database tables or certain files or paths.
-- New instructions for Disembark CLI
-- Analyze site when pasting site URL and token
-- Improve backup progress
-- Split large database tables into smaller exports
-- Fix endpoints `cleanup` and `download` to only respond with plain text
-- Cleanup unused backup code
-
-**v1.0.1** - June 7th 2024
-- Improved database exports for [Local](https://localwp.com)
-- Cleanup endpoint to purge `uploads/disembark` folder after successful download.
-- One click connection string to [Disembark](https://disembark.host)
-
-**v1.0.0** - June 5th 2024
-- Initial release of Disembark. Allows for full site WordPress backups to be made from [Disembark.host](Disembark.host)
+1. Download the latest release `.zip` file from the repository.
+2. In your WordPress admin, go to **Plugins > Add New > Upload Plugin**.
+3. Upload the `.zip` file and activate the plugin.
+4. Access the Disembark interface by going to **Tools > Disembark**.
