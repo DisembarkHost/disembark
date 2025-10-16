@@ -7,10 +7,10 @@ $baseDir = dirname($vendorDir);
 
 return array(
     'Composer\\InstalledVersions' => $vendorDir . '/composer/InstalledVersions.php',
-    'DisembarkConnector\\Backup' => $baseDir . '/app/Backup.php',
-    'DisembarkConnector\\Command' => $baseDir . '/app/Command.php',
-    'DisembarkConnector\\Run' => $baseDir . '/app/Run.php',
-    'DisembarkConnector\\Token' => $baseDir . '/app/Token.php',
-    'DisembarkConnector\\Updater' => $baseDir . '/app/Updater.php',
-    'DisembarkConnector\\User' => $baseDir . '/app/User.php',
+    'Disembark\\Backup' => $baseDir . '/app/Backup.php',
+    'Disembark\\Command' => $baseDir . '/app/Command.php',
+    'Disembark\\Run' => $baseDir . '/app/Run.php',
+    'Disembark\\Token' => $baseDir . '/app/Token.php',
+    'Disembark\\Updater' => $baseDir . '/app/Updater.php',
+    'Disembark\\User' => $baseDir . '/app/User.php',
 );
