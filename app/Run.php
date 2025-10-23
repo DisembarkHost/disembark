@@ -116,7 +116,7 @@ class Run {
             'callback' => [ $this, 'export_database' ]
         ]);
         register_rest_route('disembark/v1', '/stream-file', [
-            'methods'  => 'GET',
+            'methods'  => 'POST',
             'callback' => [ $this, 'stream_file' ]
         ]);
         register_rest_route('disembark/v1', '/cleanup', [
@@ -255,17 +255,28 @@ class Run {
     }
 
     function stream_file( $request ) {
-        if ( ! User::allowed( $request ) ) {
+        // Get params from the JSON body
+        $params = $request->get_json_params();
+        $token = $params['token'] ?? null;
+        $file_path = $params['file'] ?? null;
+
+        // Manually create a new request object for User::allowed()
+        $auth_request = new \WP_REST_Request();
+        $auth_request->set_param('token', $token);
+
+        if ( ! User::allowed( $auth_request ) ) {
             header("HTTP/1.1 403 Forbidden");
             die('403 Forbidden: Invalid token.');
         }
-        $file_path = $request->get_param('file');
+
         if ( empty( $file_path ) ) {
             header("HTTP/1.1 400 Bad Request");
             die('400 Bad Request: File parameter is missing.');
         }
+
         $base_dir = realpath(ABSPATH);
         $full_path = realpath($base_dir . '/' . $file_path);
+        
         if ( !$full_path || strpos($full_path, $base_dir) !== 0 ) {
             header("HTTP/1.1 400 Bad Request");
             die('400 Bad Request: Invalid file path.');
@@ -274,6 +285,7 @@ class Run {
             header("HTTP/1.1 404 Not Found");
             die('404 Not Found: File does not exist or is not readable.');
         }
+        
         header('Content-Description: File Transfer');
         header('Content-Type: application/octet-stream');
         header('Content-Disposition: attachment; filename="' . basename($full_path) . '"');
