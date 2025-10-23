@@ -1,7 +1,6 @@
 <?php
 
 namespace Disembark;
-
 class Backup {
 
     private $backup_path      = "";
@@ -10,7 +9,6 @@ class Backup {
     private $rows_per_segment = 100;
     private $archiver_type    = 'none'; // Can be 'ZipArchive', 'PclZip', or 'none'
     private $zip_object       = null;
-
     public function __construct( $token = "" ) {
         $bytes             = random_bytes( 20 );
         $this->token       = empty( $token ) ? substr( bin2hex( $bytes ), 0, -28) : $token;
@@ -54,7 +52,6 @@ class Backup {
         $filtered_list_path = "{$this->backup_path}/_filtered_file_list.json";
         $state = json_decode( file_get_contents( $state_file ), true );
         $batch_size = 75;
-
         if ( empty( $state['directories_to_scan'] ) ) {
             $state['status'] = 'scan_complete';
             file_put_contents( $state_file, json_encode( $state ) );
@@ -66,7 +63,6 @@ class Backup {
 
         $file_handle = fopen( $filtered_list_path, 'a' );
         $home_path = \get_home_path();
-
         foreach ( $directories_in_batch as $directory_to_scan ) {
             $items = @scandir( $directory_to_scan );
             if ($items === false) {
@@ -86,7 +82,6 @@ class Backup {
                     }
                 }
                 if ($is_excluded) continue;
-
                 if ( is_dir( $full_path ) ) {
                     if (is_readable($full_path)) {
                         $state['directories_to_scan'][] = $full_path;
@@ -141,7 +136,6 @@ class Backup {
         $state = json_decode( file_get_contents( $state_file ), true );
         $state['chunk_offsets'] = $chunk_offsets;
         file_put_contents( $state_file, json_encode( $state ) );
-        
         return [ 'total_chunks' => count( $chunk_offsets ) ];
     }
 
@@ -180,7 +174,6 @@ class Backup {
     
             $file = json_decode($line);
             if (!$file || !isset($file->size)) continue;
-
             if ( ($current_chunk_size + $file->size) > $storage_limit && !empty($chunk_objects) ) {
                 break;
             }
@@ -205,9 +198,19 @@ class Backup {
             $content = json_decode( file_get_contents( $chunk_file ) );
             $file_count = count( $content );
             $total_size = array_sum( array_column( $content, 'size' ) );
+
+            // Add back the URL for direct download
+            $file_name = basename( $chunk_file );
+            $url = "{$this->backup_url}/{$file_name}";
+
+            // Keep relative path just in case
+            $relative_path = str_replace( rtrim( ABSPATH, '/' ), '', $chunk_file );
+            $relative_path = ltrim( $relative_path, '/' );
+
             $response[] = (object) [
-                "name"  => basename( $chunk_file ),
-                "url"   => "{$this->backup_url}/" . basename( $chunk_file ),
+                "name"  => $file_name,
+                "url"   => $url,
+                "path"  => $relative_path, 
                 "size"  => $total_size,
                 "count" => $file_count
             ];
@@ -270,7 +273,6 @@ class Backup {
             $query       = "SELECT * FROM `$table` LIMIT " . $rows_start . ',' . $select_row_limit;
             $table_query = $wpdb->get_results( $query, ARRAY_N );
             $rows_start += $select_row_limit;
-
             if ( false === $table_query ) {
                 return false;
             }
@@ -281,7 +283,6 @@ class Backup {
             $query_count += $table_count;
             $columns    = $wpdb->get_col_info();
             $num_fields = count( $columns );
-
             foreach ( $table_query as $fetch_row ) {
                 $insert_sql .= "INSERT INTO `$table` VALUES(";
                 for ( $n = 1; $n <= $num_fields; $n++ ) {
@@ -312,6 +313,8 @@ class Backup {
             return false;
         }
         @fclose( $file_handle );
+
+        // Return the public URL
         return $backup_url;
     }
 
@@ -371,6 +374,8 @@ class Backup {
         } else {
             return new \WP_Error('no_zip_method', 'No supported zipping library found.');
         }
+
+        // Return the public URL
         return "{$this->backup_url}/{$file_name}.zip";
     }
     
@@ -398,6 +403,8 @@ class Backup {
         foreach( $database_files as $file ) {
             unlink( $file );
         }
+
+        // Return the public URL
         return "{$this->backup_url}/database.zip";
     }
 
@@ -427,5 +434,25 @@ class Backup {
             return json_decode( file_get_contents( $manifest_path ) );
         }
         return [];
+    }
+
+    public function delete_backup_file( $file_name ) {
+        $safe_file_name = basename( $file_name );
+        // Prevent deleting files outside the backup directory
+        if ( empty( $safe_file_name ) || strpos( $safe_file_name, '..' ) !== false ) {
+            return new \WP_Error( 'invalid_file', 'Invalid file name provided.' );
+        }
+
+        $file_path = "{$this->backup_path}/{$safe_file_name}";
+
+        if ( file_exists( $file_path ) ) {
+            if ( is_writable( $file_path ) && unlink( $file_path ) ) {
+                return [ 'success' => true, 'message' => "Deleted {$safe_file_name}." ];
+            } else {
+                return new \WP_Error( 'delete_failed', "Could not delete {$safe_file_name}. Check permissions." );
+            }
+        }
+        // Return success even if file not found, as the goal is for it to be gone
+        return [ 'success' => true, 'message' => "File {$safe_file_name} not found or already deleted." ];
     }
 }
