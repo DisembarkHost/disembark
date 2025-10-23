@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.1.0 - October 22nd 2025
+## v2.1.0 - October 23rd 2025
 
 * **New Feature:** Added a "CLI Commands" panel to the main interface. The `disembark backup` command shown in this panel now dynamically updates to include all file (`-x "path"`) and database table (`--exclude-tables=...`) exclusions selected in the UI.
 * **Security/Improvement:** Changed the `/stream-file` REST endpoint from `GET` to `POST`. The file path and token are now sent in the request body instead of query parameters, improving security.
