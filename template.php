@@ -1,29 +1,19 @@
 <div id="app" v-cloak>
 <v-app>
     <div style="position: absolute; top: 10px; right: 10px; z-index: 10; display: flex; gap: 4px;">
-        <v-menu location="bottom end">
-            <template v-slot:activator="{ props }">
-                <v-btn icon variant="text" v-bind="props">
-                    <v-icon>mdi-information-outline</v-icon>
-                    <v-tooltip location="left" activator="parent" text="Connection Info"></v-tooltip>
-                </v-btn>
-            </template>
-            <v-card max-width="650" class="pa-3">
+        <v-menu location="bottom end" :close-on-content-click="false">
+             <template v-slot:activator="{ props }">
+                 <v-btn icon variant="text" v-bind="props">
+                     <v-icon>mdi-tools</v-icon>
+                     <v-tooltip location="left" activator="parent" text="Cleanup & Settings"></v-tooltip>
+                 </v-btn>
+             </template>
+             <v-card max-width="650" class="pa-3">
                 <v-card-text class="text-body-2">
-                    <p class="mb-2">Your Disembark Connector Token for <strong>{{ home_url }}</strong></p>
+                    <p class="mb-2">In order to generate a zip file locally you'll need to have Disembark CLI.</p>
                     <div style="position: relative;margin-bottom: 14px;padding-right: 42px;background: #2d2d2d; border-radius: 4px;">
-                        <pre style="font-size: 11px;color: #f8f8f2;background: #2d2d2d;padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ api_token }}</pre>
-                        <v-btn variant="text" icon="mdi-content-copy" @click="copyText( api_token )" style="color: #f8f8f2;caret-color: #f8f8f2;position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
-                    </div>
-                    <v-divider class="my-3"></v-divider>
-                    <a :href="`https://disembark.host/?disembark_site_url=${home_url}&disembark_token=${api_token}`" target="_blank" class="text-primary d-block mb-4" style="text-decoration: none;">
-                        <v-icon small class="mr-1">mdi-rocket-launch-outline</v-icon>
-                        Launch Disembark with your token
-                    </a>
-                    <p class="mb-2">Or over command line with Disembark CLI</p>
-                    <div style="position: relative;margin-bottom: 14px;padding-right: 42px;background: #2d2d2d; border-radius: 4px;">
-                        <pre style="font-size: 11px;color: #f8f8f2;background: #2d2d2d;padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliCommands }}</pre>
-                        <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliCommands )" style="color: #f8f8f2;caret-color: #f8f8f2;position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
+                        <pre style="font-size: 11px;color: #f8f8f2;background: #2d2d2d;padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliInstall }}</pre>
+                        <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliInstall )" style="color: #f8f8f2;caret-color: #f8f8f2;position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
                     </div>
                     <v-divider class="my-3"></v-divider>
                     <div v-if="backup_disk_size > 0">
@@ -55,7 +45,7 @@
         <v-card-text>
         <v-row v-if="ui_state === 'initial'">
             <v-col cols="12">
-                <v-btn block color="primary" @click="handleMainAction" :loading="analyzing">
+                <v-btn block color="primary" @click="handleMainAction">
                     Analyze Site & Prepare Backup
                     <v-icon class="ml-2">mdi-magnify-scan</v-icon>
                 </v-btn>
@@ -77,7 +67,7 @@
         </v-row>
     </v-card-text>
     </v-card>
-    <v-overlay v-model="loading" contained attach="#app" opacity="0.7" class="align-center justify-center">
+    <v-overlay v-model="loading" contained persistent attach="#app" opacity="0.7" class="align-center justify-center">
         <div class="text-center text-white text-body-1 disembark-overlay-content" style="width: 500px; max-width: 90vw;">
             <div class="mb-5"><strong>Backup in progress...</strong></div>
 
@@ -98,7 +88,7 @@
             <div class="mt-5 text-caption">Refreshing this page will cancel the current backup.</div>
         </div>
     </v-overlay>
-    <v-overlay v-model="analyzing" contained attach="#app" opacity="0.7" class="align-center justify-center">
+    <v-overlay v-model="analyzing" contained persistent attach="#app" opacity="0.7" class="align-center justify-center">
         <div class="text-center text-white text-body-1 disembark-overlay-content">
             <div v-if="scan_progress.status === 'scanning'">
                 <div><strong>Scanning file structure...</strong></div>
@@ -133,7 +123,6 @@
                 <v-spacer></v-spacer>
                 <v-btn
                     variant="text"
-                    size="small"
                     class="mr-2"
                     @click="toggleDatabaseSort"
                 >
@@ -259,6 +248,15 @@
             </v-treeview>
         </v-col>
     </v-row>
+    <v-card v-if="ui_state === 'backing_up' || ui_state === 'connected'" class="mt-6" flat rounded="0" density="compact">
+        <v-toolbar flat density="compact" class="text-body-2" color="primary"><v-icon icon="mdi-console" class="mr-2 ml-4"></v-icon>For limited space, you can run the backup over CLI. Use the commands below after configuring your exclusions.</v-toolbar>
+        <v-card-text>
+        <div style="position: relative;padding-right: 42px; border-radius: 4px;" :class="isDarkMode ? 'bg-grey-darken-4' : 'bg-grey-lighten-4'">
+            <pre style="font-size: 11px;padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliCommands }}</pre>
+            <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliCommands )" color="primary" style="position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
+        </div>
+        </v-card-text>
+    </v-card>
     </div>  
     </v-container>
     <v-dialog v-model="explorer.show" fullscreen :scrim="false" transition="none">
@@ -296,7 +294,7 @@
                             <v-card-title>{{ explorer.selected_node.name }}</v-card-title>
                              <v-card-subtitle>Size: {{ formatSize(explorer.selected_node.size) }}</v-card-subtitle>
                             <v-card-actions>
-                                <v-btn :href="downloadUrl" :download="explorer.selected_node.name" color="primary">Download</v-btn>
+                                <v-btn @click="downloadFile(explorer.selected_node)" color="primary">Download</v-btn>
                             </v-card-actions>
                              <v-divider class="my-4"></v-divider>
                             <v-card-text :class="{ 'pa-0': explorer.preview_type === 'code' }">
@@ -476,7 +474,6 @@ createApp({
 
             const item = findNode(this.explorer.items, itemPath);
             if (!item) { return };
-            
             if (item.children) { // It's a directory
                 item.stats = this.calculateFolderStats(item);
                 this.explorer.selected_node = item;
@@ -491,12 +488,15 @@ createApp({
 
             const extension = (item.name.split('.').pop() || '').toLowerCase();
             const imageExtensions = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'];
-            const fileUrl = this.downloadUrl;
+
+            // Define the POST data
+            const postData = { token: this.api_token, file: item.id};
 
             if (imageExtensions.includes(extension)) {
                 this.explorer.preview_type = 'image';
                 try {
-                    const response = await axios.get(fileUrl, { responseType: 'blob' });
+                    // Use axios.post
+                    const response = await axios.post( '/wp-json/disembark/v1/stream-file', postData, { responseType: 'blob' });
                     this.explorer.preview_content = URL.createObjectURL(response.data);
                 } catch (error) {
                     this.explorer.preview_content = 'Error loading image.';
@@ -510,10 +510,10 @@ createApp({
                     if (item.size > 1024 * 500) { // 500KB limit
                         throw new Error('File is too large to preview.');
                     }
-                    const response = await axios.get(fileUrl);
+                    // Use axios.post
+                    const response = await axios.post('/wp-json/disembark/v1/stream-file', postData );
                     let content = (typeof response.data === 'object' && response.data !== null) ? JSON.stringify(response.data, null, 2) : response.data;
                     let language = (extension === 'js') ? 'javascript' : extension;
-
                     if (Prism.languages[language]) {
                          this.explorer.preview_content = Prism.highlight(content, Prism.languages[language], language);
                     } else {
@@ -527,6 +527,45 @@ createApp({
                 } finally {
                     this.explorer.loading_preview = false;
                 }
+            }
+        },
+        async downloadFile(node) {
+            if (!node) return;
+
+            this.snackbar.message = `Preparing download for ${node.name}...`;
+            this.snackbar.show = true;
+
+            const postData = {
+                token: this.api_token,
+                file: node.id
+            };
+
+            try {
+                const response = await axios.post(
+                    '/wp-json/disembark/v1/stream-file',
+                    postData,
+                    { responseType: 'blob' }
+                );
+
+                // Create a new Blob object using the response data
+                const blob = new Blob([response.data], { type: response.headers['content-type'] });
+                const url = window.URL.createObjectURL(blob);
+
+                // Create a temporary link element to trigger the download
+                const link = document.createElement('a');
+                link.href = url;
+                link.setAttribute('download', node.name); // Set the download filename
+                document.body.appendChild(link);
+                link.click();
+
+                // Clean up by removing the link and revoking the blob URL
+                link.parentNode.removeChild(link);
+                window.URL.revokeObjectURL(url);
+
+            } catch (error) {
+                console.error("Download failed:", error);
+                this.snackbar.message = `Could not download ${node.name}. An error occurred.`;
+                this.snackbar.show = true;
             }
         },
         calculateFolderStats(folderNode) {
@@ -1036,7 +1075,46 @@ createApp({
     computed: {
         cliCommands() {
             if (!this.home_url || !this.api_token) return '';
-            return `disembark connect ${this.home_url} ${this.api_token}\ndisembark backup ${this.home_url}`;
+
+            // Base Commands
+            const connectCommand = `disembark connect ${this.home_url} ${this.api_token}`;
+            let backupCommand = `disembark backup ${this.home_url}`;
+
+            // Add File Exclusions
+            const selectedPaths = new Set(this.excluded_nodes.map(node => node.id));
+            const minimalExclusionPaths = this.excluded_nodes
+                .map(node => node.id)
+                .filter(path => {
+                    let parent = path.substring(0, path.lastIndexOf('/'));
+                    while (parent) {
+                        if (selectedPaths.has(parent)) {
+                            return false;
+                        }
+                        parent = parent.substring(0, parent.lastIndexOf('/'));
+                    }
+                    return true;
+                });
+
+            if (minimalExclusionPaths.length > 0) {
+                const fileExcludes = minimalExclusionPaths.map(path => `-x "${path}"`).join(' ');
+                backupCommand += ` ${fileExcludes}`;
+            }
+
+            // Add Database Exclusions
+            const includedTableNames = new Set(this.included_tables.map(t => t.table));
+            const excludedTableNames = this.database
+                .filter(table => !includedTableNames.has(table.table))
+                .map(table => table.table);
+
+            if (excludedTableNames.length > 0) {
+                backupCommand += ` --exclude-tables=${excludedTableNames.join(',')}`;
+            }
+
+            // Return both commands
+            return `${connectCommand}\n${backupCommand}`;
+        },
+        cliInstall() {
+            return `wget https://github.com/DisembarkHost/disembark-cli/releases/latest/download/disembark.phar\nchmod +x disembark.phar\nsudo mv disembark.phar /usr/local/bin/disembark`;
         },
         downloadUrl() {
             if (!this.explorer.selected_node) return '#';
