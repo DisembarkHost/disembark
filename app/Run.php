@@ -127,6 +127,10 @@ class Run {
             'methods'  => 'GET',
             'callback' => [ $this, 'download' ]
         ]);
+        register_rest_route('disembark/v1', '/cleanup-file', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'cleanup_file' ]
+        ]);
     }
 
     public function get_backup_size( $request ) {
@@ -151,6 +155,20 @@ class Run {
         }
 
         return [ 'size' => $size ];
+    }
+
+    function cleanup_file( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $backup_token = $request['backup_token'];
+        $file_name    = $request['file_name'];
+
+        if ( empty( $backup_token ) || empty( $file_name ) ) {
+            return new \WP_Error( 'missing_params', 'Missing backup_token or file_name.', [ 'status' => 400 ] );
+        }
+
+        return ( new Backup( $backup_token ) )->delete_backup_file( $file_name );
     }
 
     public static function database( $request ) {
