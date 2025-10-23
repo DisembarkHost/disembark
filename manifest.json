@@ -4,13 +4,13 @@
     "author": "<a href=\"https://austinginder.com\">Austin Ginder</a>",
     "author_profile": "https://profiles.wordpress.org/austinginder",
     "donate_link": "https://github.com/sponsors/austinginder",
-    "version": "2.0.0",
-    "download_url": "https://github.com/DisembarkHost/disembark/releases/download/v2.0.0/disembark.zip",
+    "version": "2.1.0",
+    "download_url": "https://github.com/DisembarkHost/disembark/releases/download/v2.1.0/disembark.zip",
     "requires": "5.6",
     "tested": "6.8.3",
     "requires_php": "5.6",
-    "added": "2025-10-13 20:00:00",
-    "last_updated": "2025-10-16 16:00:00",
+    "added": "2024-06-05 16:00:00",
+    "last_updated": "2025-10-22 16:00:00",
     "homepage": "https://disembark.host",
     "sections": {
         "description": "Safe journeys as you travel to your next WordPress host."
