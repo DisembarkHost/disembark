@@ -59,7 +59,7 @@ class Backup {
         file_put_contents( $state_file, json_encode( $initial_state ) );
     }
 
-    public function process_scan_step( $exclude_paths ) {
+    public function process_scan_step( $exclude_paths, $include_checksums = false ) {
         $state_file = "{$this->backup_path}/_scan_state.json";
         $filtered_list_path = "{$this->backup_path}/_filtered_file_list.json";
         $state = json_decode( file_get_contents( $state_file ), true );
@@ -117,6 +117,9 @@ class Backup {
                         'size' => filesize( $full_path ),
                         'type' => 'file'
                     ];
+                    if ( $include_checksums ) {
+                        $file_info['checksum'] = md5_file( $full_path );
+                    }
                     fwrite( $file_handle, json_encode($file_info) . "\n" );
                     $state['seen_files'][$relative_path] = true;
                 }

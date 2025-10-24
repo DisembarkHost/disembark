@@ -209,7 +209,8 @@ class Run {
                 $user_exclude_paths = !empty($exclude_files_string) ? explode( "\n", $exclude_files_string ) : [];
                 // Merge default and user-defined exclusions
                 $exclude_paths = array_unique( array_merge( $default_excludes, $user_exclude_paths ) );
-                return $backup_manager->process_scan_step( $exclude_paths );
+                $include_checksums = isset( $request['include_checksums'] ) ? true : false;
+                return $backup_manager->process_scan_step( $exclude_paths, $include_checksums );
             case 'chunkify':
                 return $backup_manager->chunkify_manifest( $chunk_size_mb );
             case 'process_chunk':
