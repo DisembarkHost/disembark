@@ -1,6 +1,7 @@
 <?php
 
 namespace Disembark;
+
 class Backup {
 
     private $backup_path      = "";
@@ -38,11 +39,22 @@ class Backup {
 
     public function initiate_scan_state() {
         $state_file = "{$this->backup_path}/_scan_state.json";
+        
+        $web_root = dirname( WP_CONTENT_DIR );
+        $core_root = rtrim( ABSPATH, '/' );
+        $dirs_to_scan = [ $web_root ];
+        
+        // Add core root only if it's not the same as or inside the web root
+        if ( $web_root !== $core_root && !str_starts_with( $core_root, $web_root . '/' ) ) {
+            $dirs_to_scan[] = $core_root;
+        }
+
         $initial_state = [
             'status' => 'scanning',
-            'directories_to_scan' => [ \get_home_path() ],
-            'total_dirs' => 1,
-            'scanned_dirs' => 0
+            'directories_to_scan' => $dirs_to_scan,
+            'total_dirs' => count( $dirs_to_scan ),
+            'scanned_dirs' => 0,
+            'seen_files' => []
         ];
         file_put_contents( $state_file, json_encode( $initial_state ) );
     }
@@ -62,8 +74,16 @@ class Backup {
         $state['scanned_dirs'] += count( $directories_in_batch );
 
         $file_handle = fopen( $filtered_list_path, 'a' );
-        $home_path = \get_home_path();
+        $web_root = dirname( WP_CONTENT_DIR );
+        $core_root = rtrim( ABSPATH, '/' );
+        
         foreach ( $directories_in_batch as $directory_to_scan ) {
+            // Determine the correct base path for this directory
+            $home_path = $web_root;
+            if ( $web_root !== $core_root && str_starts_with( $directory_to_scan, $core_root ) ) {
+                $home_path = $core_root;
+            }
+
             $items = @scandir( $directory_to_scan );
             if ($items === false) {
                 continue;
@@ -73,6 +93,10 @@ class Backup {
                 if ( $item === '.' || $item === '..' ) continue;
                 $full_path = $directory_to_scan . '/' . $item;
                 $relative_path = ltrim( str_replace( $home_path, '', $full_path ), '/' );
+
+                if ( isset( $state['seen_files'][$relative_path] ) ) {
+                    continue; // Already processed this file from a higher-priority root
+                }
 
                 $is_excluded = false;
                 foreach ($exclude_paths as $exclude_path) {
@@ -94,6 +118,7 @@ class Backup {
                         'type' => 'file'
                     ];
                     fwrite( $file_handle, json_encode($file_info) . "\n" );
+                    $state['seen_files'][$relative_path] = true;
                 }
             }
         }
@@ -198,7 +223,6 @@ class Backup {
             $content = json_decode( file_get_contents( $chunk_file ) );
             $file_count = count( $content );
             $total_size = array_sum( array_column( $content, 'size' ) );
-
             // Add back the URL for direct download
             $file_name = basename( $chunk_file );
             $url = "{$this->backup_url}/{$file_name}";
@@ -313,7 +337,6 @@ class Backup {
             return false;
         }
         @fclose( $file_handle );
-
         // Return the public URL
         return $backup_url;
     }
@@ -331,7 +354,9 @@ class Backup {
         if ( ! is_array( $files ) ) { $files = []; }
 
         $zip_name  = "{$this->backup_path}/{$file_name}.zip";
-        $directory = get_home_path();
+        $web_root = dirname( WP_CONTENT_DIR );
+        $core_root = rtrim( ABSPATH, '/' );
+        
         $exclude_paths = array_filter( array_map( 'trim', $exclude_paths ) );
 
         if ( $this->archiver_type === 'ZipArchive' ) {
@@ -345,7 +370,12 @@ class Backup {
                         }
                     }
                     if ( ! $should_exclude ) {
-                         $this->zip_object->addFile( "{$directory}/{$file->name}", $file->name );
+                        // Determine the correct full path
+                        $full_file_path = "{$web_root}/{$file->name}";
+                        if ( $web_root !== $core_root && ! file_exists( $full_file_path ) && file_exists( "{$core_root}/{$file->name}" ) ) {
+                            $full_file_path = "{$core_root}/{$file->name}";
+                        }
+                        $this->zip_object->addFile( $full_file_path, $file->name );
                     }
                 }
                 $this->zip_object->close();
@@ -354,7 +384,8 @@ class Backup {
             }
         } elseif ( $this->archiver_type === 'PclZip' ) {
             $zip = new \PclZip( $zip_name );
-            $files_to_add = [];
+            $www_files = [];
+            $core_files = [];
             foreach( $files as $file ) {
                 $should_exclude = false;
                 foreach ( $exclude_paths as $exclude_path ) {
@@ -364,10 +395,28 @@ class Backup {
                     }
                 }
                 if ( ! $should_exclude ) {
-                    $files_to_add[] = "{$directory}/{$file->name}";
+                    $web_path = "{$web_root}/{$file->name}";
+                    if ( $web_root !== $core_root && ! file_exists( $web_path ) && file_exists( "{$core_root}/{$file->name}" ) ) {
+                         $core_files[] = "{$core_root}/{$file->name}";
+                    } else {
+                         $www_files[] = $web_path;
+                    }
                 }
             }
-            $result = $zip->create( $files_to_add, PCLZIP_OPT_REMOVE_PATH, $directory );
+            
+            $result = 0;
+            if ( !empty($www_files) ) {
+                // Create zip with web root files
+                $result = $zip->create( $www_files, PCLZIP_OPT_REMOVE_PATH, $web_root );
+                if ( $result != 0 && !empty($core_files) ) {
+                    // Add core root files to existing zip
+                    $result = $zip->add( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
+                }
+            } elseif ( !empty($core_files) ) {
+                 // Create zip with core root files if no web root files
+                 $result = $zip->create( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
+            }
+
             if ( $result == 0 ) {
                 return new \WP_Error('pclzip_failed', 'Could not create zip: ' . $zip->errorInfo(true));
             }
@@ -444,7 +493,6 @@ class Backup {
         }
 
         $file_path = "{$this->backup_path}/{$safe_file_name}";
-
         if ( file_exists( $file_path ) ) {
             if ( is_writable( $file_path ) && unlink( $file_path ) ) {
                 return [ 'success' => true, 'message' => "Deleted {$safe_file_name}." ];
