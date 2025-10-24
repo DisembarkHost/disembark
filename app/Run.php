@@ -274,10 +274,21 @@ class Run {
             die('400 Bad Request: File parameter is missing.');
         }
 
-        $base_dir = realpath(ABSPATH);
+        $base_dir = realpath( dirname( WP_CONTENT_DIR ) );
+        $core_dir = realpath( ABSPATH );
+        
+        // Try to resolve the path from the web root first
         $full_path = realpath($base_dir . '/' . $file_path);
         
-        if ( !$full_path || strpos($full_path, $base_dir) !== 0 ) {
+        // If not found, and roots are different, try resolving from the core root
+        if ( !$full_path && $base_dir !== $core_dir ) {
+            $full_path = realpath($core_dir . '/' . $file_path);
+        }
+
+        $is_in_base_dir = $full_path && strpos( $full_path, $base_dir ) === 0;
+        $is_in_core_dir = $full_path && $core_dir !== $base_dir && strpos( $full_path, $core_dir ) === 0;
+
+        if ( !$full_path || ( !$is_in_base_dir && !$is_in_core_dir ) ) {
             header("HTTP/1.1 400 Bad Request");
             die('400 Bad Request: Invalid file path.');
         }
