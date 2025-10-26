@@ -63,39 +63,81 @@ class Backup {
         $state_file = "{$this->backup_path}/_scan_state.json";
         $filtered_list_path = "{$this->backup_path}/_filtered_file_list.json";
         $state = json_decode( file_get_contents( $state_file ), true );
-        $batch_size = 75;
-        if ( empty( $state['directories_to_scan'] ) ) {
-            $state['status'] = 'scan_complete';
-            file_put_contents( $state_file, json_encode( $state ) );
-            return $state;
+
+        $operation_limit = 5000;
+        // Max files/folders to process per request
+        $operations_this_batch = 0;
+        
+        // --- Open file handle *once* outside the loop ---
+        $file_handle = fopen( $filtered_list_path, 'a' );
+        if (!$file_handle) {
+            return new \WP_Error('file_open_error', 'Could not open the filtered file list for writing.');
         }
 
-        $directories_in_batch = array_splice( $state['directories_to_scan'], 0, $batch_size );
-        $state['scanned_dirs'] += count( $directories_in_batch );
+        while ( $operations_this_batch < $operation_limit ) {
+            // Check if we are already processing items in a directory
+            if ( empty( $state['current_directory_items'] ) ) {
+                // No directory is being processed, let's get a new one.
+                if ( empty( $state['directories_to_scan'] ) ) {
+                    // No new directories left, scan is complete.
+                    $state['status'] = 'scan_complete';
+                    unset($state['current_directory_path']); // Clean up
+                    unset($state['current_directory_items']);
+                    // Clean up
+                    file_put_contents( $state_file, json_encode( $state ) );
+                    
+                    // --- FIX: Change 'break 2;' to just 'break;' ---
+                    break; // Exit the master 'while' loop
+                }
 
-        $file_handle = fopen( $filtered_list_path, 'a' );
-        $web_root = dirname( WP_CONTENT_DIR );
-        $core_root = rtrim( ABSPATH, '/' );
-        
-        foreach ( $directories_in_batch as $directory_to_scan ) {
-            // Determine the correct base path for this directory
+                // Get the next directory and save its contents to the state
+                $directory_to_scan = array_shift( $state['directories_to_scan'] );
+                $state['current_directory_path'] = $directory_to_scan;
+                
+                $items = @scandir( $directory_to_scan );
+                if ($items === false) {
+                    // Directory not readable, skip it
+                    unset($state['current_directory_path']);
+                    $state['scanned_dirs']++; // Still counts as "scanned"
+                    file_put_contents( $state_file, json_encode( $state ) );
+                    continue; // Skip to the next iteration of the master 'while' loop
+                }
+                
+                // Remove '.' and '..'
+                $state['current_directory_items'] = array_diff($items, ['.', '..']);
+                $state['scanned_dirs']++;
+            }
+
+            // We have items to process (either new or from a previous run)
+            // --- This logic was moved outside the loop ---
+            $web_root = dirname( WP_CONTENT_DIR );
+            $core_root = rtrim( ABSPATH, '/' );
+            // Determine the home_path for the *current* directory
             $home_path = $web_root;
-            if ( $web_root !== $core_root && str_starts_with( $directory_to_scan, $core_root ) ) {
+            if ( !empty($state['current_directory_path']) && $web_root !== $core_root && str_starts_with( $state['current_directory_path'], $core_root ) ) {
                 $home_path = $core_root;
             }
 
-            $items = @scandir( $directory_to_scan );
-            if ($items === false) {
-                continue;
-            }
+            while ( $item = array_shift( $state['current_directory_items'] ) ) {
+                
+                $operations_this_batch++;
+                if ( $operations_this_batch >= $operation_limit ) {
+                    // Hit the limit.
+                    // Put the item we just pulled *back* on the list.
+                    array_unshift( $state['current_directory_items'], $item );
 
-            foreach ( $items as $item ) {
-                if ( $item === '.' || $item === '..' ) continue;
-                $full_path = $directory_to_scan . '/' . $item;
+                    // Save state and exit.
+                    // Next request will resume this 'while' loop.
+                    // --- We don't close the file handle here ---
+                    file_put_contents( $state_file, json_encode( $state ) );
+                    
+                    break 2; // Exit both the 'while ( $item = ... )' and the new master 'while' loop
+                }
+
+                $full_path = $state['current_directory_path'] . '/' . $item;
                 $relative_path = ltrim( str_replace( $home_path, '', $full_path ), '/' );
-
                 if ( isset( $state['seen_files'][$relative_path] ) ) {
-                    continue; // Already processed this file from a higher-priority root
+                    continue; // Already processed
                 }
 
                 $is_excluded = false;
@@ -108,6 +150,7 @@ class Backup {
                 if ($is_excluded) continue;
                 if ( is_dir( $full_path ) ) {
                     if (is_readable($full_path)) {
+                        // Add new directory to the *main* list, not the current batch
                         $state['directories_to_scan'][] = $full_path;
                         $state['total_dirs']++;
                     }
@@ -115,6 +158,7 @@ class Backup {
                     $file_info = [
                         'name' => $relative_path,
                         'size' => filesize( $full_path ),
+                    
                         'type' => 'file'
                     ];
                     if ( $include_checksums ) {
@@ -123,11 +167,24 @@ class Backup {
                     fwrite( $file_handle, json_encode($file_info) . "\n" );
                     $state['seen_files'][$relative_path] = true;
                 }
-            }
-        }
+            } // end while (item processing loop)
 
+            // If we are here, we finished processing $state['current_directory_items']
+            unset($state['current_directory_path']);
+            unset($state['current_directory_items']);
+
+        } // End of the new master 'while' loop
+
+        // --- Close the file handle *once* here ---
         fclose( $file_handle );
         file_put_contents( $state_file, json_encode( $state ) );
+        
+        // Check if we're all done
+        if ( empty( $state['directories_to_scan'] ) ) {
+            $state['status'] = 'scan_complete';
+            file_put_contents( $state_file, json_encode( $state ) );
+        }
+        
         return $state;
     }
 
