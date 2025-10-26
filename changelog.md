@@ -1,5 +1,26 @@
 # Changelog
 
+## v2.2.0 - October 26, 2025
+
+* **New Feature: Decoupled Filesystem Support (e.g., Flywheel)**
+    * Reworked the file scanning, zipping, and streaming logic to fully support hosting environments where the WordPress core (`ABSPATH`) and the web root (`dirname(WP_CONTENT_DIR)`) are in separate locations.
+    * The file scanner now identifies and scans both the web root and core root if they are different, using a `seen_files` log to prevent duplicates.
+    * The zipping process now correctly locates files in either the web root or core root before adding them to the archive.
+    * The File Explorer's streaming endpoint has been updated to find and stream files from a separate core directory, ensuring previews and downloads work correctly on decoupled sites.
+
+* **Improvement: Database Export Compatibility**
+    * Database export files are now saved with a `.sql.txt` extension instead of `.sql`.
+    * This bypasses security rules on certain managed hosts that block the direct download of `.sql` files.
+
+* **Improvement: Added Checksum Generation Support**
+    * The `Backup` class can now optionally generate and include `md5_file` checksums in the file manifest during the scan step.
+    * The `/regenerate-manifest` REST endpoint was updated to accept an `include_checksums` parameter to trigger this behavior, which is useful for external CLI validation.
+
+* **Dev: New API Endpoints & UI Functionality**
+    * Added a `/zip-sync-files` endpoint to create a zip archive from an arbitrary list of files sent from a client.
+    * Added a `/regenerate-token` endpoint and a corresponding "Regenerate Token" button in the UI's Tools menu.
+    * Added a "Regenerate Session" button in the UI to allow re-running the file manifest generation with the current exclusions without starting a new session.
+
 ## v2.1.0 - October 23rd 2025
 
 * **New Feature:** Added a "CLI Commands" panel to the main interface. The `disembark backup` command shown in this panel now dynamically updates to include all file (`-x "path"`) and database table (`--exclude-tables=...`) exclusions selected in the UI.
