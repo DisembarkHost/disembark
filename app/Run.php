@@ -111,6 +111,10 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'zip_database' ]
         ]);
+        register_rest_route('disembark/v1', '/regenerate-token', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'regenerate_token' ]
+        ]);
         register_rest_route('disembark/v1', '/export/database/(?P<table>[a-zA-Z0-9-_]+)', [
             'methods'  => 'POST',
             'callback' => [ $this, 'export_database' ]
@@ -241,6 +245,17 @@ class Run {
         }
         $backup_token = $request['backup_token'];
         return ( new Backup( $backup_token ) )->zip_database();
+    }
+
+    function regenerate_token( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+
+        $token = wp_generate_password( 42, false );
+        update_option( "disembark_token", $token );
+
+        return [ 'token' => $token ];
     }
 
     function export_database ( $request ) {
