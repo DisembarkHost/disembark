@@ -268,6 +268,9 @@
             <pre style="font-size: 11px;padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliCommands }}</pre>
             <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliCommands )" color="primary" style="position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
         </div>
+        <div v-if="backup_token" class="px-2 py-2 text-caption">
+            Your current Backup Session ID is: <code class="text-caption" @click="copyText( backup_token )" style="cursor: pointer;">{{ backup_token }}</code>. You can use this ID with the CLI to reuse the generated file list <code class="text-caption" @click="copyText( '--session-id=' + backup_token )" style="cursor: pointer;">--session-id={{ backup_token }}</code>.
+        </div>
         </v-card-text>
     </v-card>
     </div>  

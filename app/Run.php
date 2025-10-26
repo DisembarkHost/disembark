@@ -115,6 +115,10 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'regenerate_token' ]
         ]);
+        register_rest_route('disembark/v1', '/manifest', [
+            'methods'  => 'GET',
+            'callback' => [ $this, 'get_manifest' ]
+        ]);
         register_rest_route('disembark/v1', '/export/database/(?P<table>[a-zA-Z0-9-_]+)', [
             'methods'  => 'POST',
             'callback' => [ $this, 'export_database' ]
@@ -270,12 +274,26 @@ class Run {
         return ( new Backup( $backup_token ) )->database_export( $table );
     }
 
+    function get_manifest( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $backup_token = $request['backup_token'];
+        if ( empty( $backup_token ) ) {
+            return new \WP_Error( 'missing_params', 'Missing backup_token.', [ 'status' => 400 ] );
+        }
+        $manifest = ( new Backup( $backup_token ) )->list_manifest();
+        if ( empty( $manifest ) ) {
+            return new \WP_Error( 'not_found', 'Manifest not found. It may not be generated yet or the session ID is invalid.', [ 'status' => 404 ] );
+        }
+        return $manifest;
+    }
+
     function stream_file( $request ) {
         // Get params from the JSON body
         $params = $request->get_json_params();
         $token = $params['token'] ?? null;
         $file_path = $params['file'] ?? null;
-
         // Manually create a new request object for User::allowed()
         $auth_request = new \WP_REST_Request();
         $auth_request->set_param('token', $token);
