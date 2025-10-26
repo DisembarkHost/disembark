@@ -490,6 +490,94 @@ class Backup {
         // Return the public URL
         return "{$this->backup_url}/{$file_name}.zip";
     }
+
+    function zip_file_list( $files = [] ) {
+        if ( empty( $files ) ) {
+            return new \WP_Error( 'no_files', 'No files provided to zip.' );
+        }
+        // Use a unique name for this sync zip
+        $file_name = "sync-files-" . time();
+        $zip_name  = "{$this->backup_path}/{$file_name}.zip";
+        $web_root  = dirname( WP_CONTENT_DIR );
+        $core_root = rtrim( ABSPATH, '/' );
+        $files_added = 0; // Add a counter
+
+        // We don't need to check $exclude_paths, the client already filtered.
+
+        if ( $this->archiver_type === 'ZipArchive' ) {
+            if ( $this->zip_object->open( $zip_name, \ZipArchive::CREATE ) === TRUE ) {
+                foreach( $files as $file_obj ) {
+                    // $file_obj is an associative array from the client
+                    if ( !is_array($file_obj) || empty($file_obj['name']) ) continue;
+                    $file_relative_path = $file_obj['name'];
+
+                    $full_file_path = "{$web_root}/{$file_relative_path}";
+                    if ( $web_root !== $core_root && ! file_exists( $full_file_path ) && file_exists( "{$core_root}/{$file_relative_path}" ) ) {
+                        $full_file_path = "{$core_root}/{$file_relative_path}";
+                    }
+                    // Only add if it exists, otherwise zip fails
+                    if ( file_exists( $full_file_path ) && is_readable( $full_file_path ) ) {
+                        if ( $this->zip_object->addFile( $full_file_path, $file_relative_path ) ) {
+                            $files_added++; // Increment counter
+                        }
+                    }
+                }
+                $this->zip_object->close();
+            } else {
+                 return new \WP_Error('zip_open_failed', 'Could not create the zip file using ZipArchive.');
+            }
+        } elseif ( $this->archiver_type === 'PclZip' ) {
+            $zip = new \PclZip( $zip_name );
+            $www_files = [];
+            $core_files = [];
+            foreach( $files as $file_obj ) {
+                // $file_obj is an associative array from the client
+                if ( !is_array($file_obj) || empty($file_obj['name']) ) continue;
+                $file_relative_path = $file_obj['name'];
+                
+                $web_path = "{$web_root}/{$file_relative_path}";
+                $core_path = "{$core_root}/{$file_relative_path}";
+
+                if ( $web_root !== $core_root && ! file_exists( $web_path ) && file_exists( $core_path ) ) {
+                     if ( is_readable( $core_path ) ) $core_files[] = $core_path;
+                } else {
+                     if ( file_exists( $web_path ) && is_readable( $web_path ) ) $www_files[] = $web_path;
+                }
+            }
+            
+            $files_added = count($www_files) + count($core_files); // Set counter
+            
+            $result = 0;
+            if ( !empty($www_files) ) {
+                $result = $zip->create( $www_files, PCLZIP_OPT_REMOVE_PATH, $web_root );
+                if ( $result != 0 && !empty($core_files) ) {
+                    $result = $zip->add( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
+                }
+            } elseif ( !empty($core_files) ) {
+                 $result = $zip->create( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
+            }
+
+            // Only error if PclZip failed AND we actually had files to add
+            if ( $result == 0 && $files_added > 0 ) {
+                return new \WP_Error('pclzip_failed', 'Could not create zip: ' . $zip->errorInfo(true));
+            }
+        } else {
+            return new \WP_Error('no_zip_method', 'No supported zipping library found.');
+        }
+
+        // Check if we successfully added any files
+        if ( $files_added === 0 ) {
+            // We successfully "created" an empty zip or no zip at all because no files were found/readable.
+            // Delete the empty zip if it exists and return an error.
+            if ( file_exists( $zip_name ) ) {
+                unlink( $zip_name );
+            }
+            return new \WP_Error('zip_failed_no_files', 'Zip creation failed. None of the requested ' . count($files) . ' files could be found or read on the server.');
+        }
+
+        // Return the public URL
+        return "{$this->backup_url}/{$file_name}.zip";
+    }
     
     function zip_database() {
         $database_files = glob( "{$this->backup_path}/*.sql" );
