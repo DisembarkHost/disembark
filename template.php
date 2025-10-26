@@ -268,8 +268,23 @@
             <pre style="font-size: 11px;padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliCommands }}</pre>
             <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliCommands )" color="primary" style="position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
         </div>
-        <div v-if="backup_token" class="px-2 py-2 text-caption">
-            Your current Backup Session ID is: <code class="text-caption" @click="copyText( backup_token )" style="cursor: pointer;">{{ backup_token }}</code>. You can use this ID with the CLI to reuse the generated file list <code class="text-caption" @click="copyText( '--session-id=' + backup_token )" style="cursor: pointer;">--session-id={{ backup_token }}</code>.
+        <div v-if="backup_token" class="px-2 py-2 text-caption d-flex align-center flex-wrap" style="gap: 4px;">
+            <span class="mr-1">
+                Your current Backup Session ID is: <code class="text-caption" @click="copyText( backup_token )" style="cursor: pointer;">{{ backup_token }}</code>. You can use this ID with the CLI to reuse the generated file list <code class="text-caption" @click="copyText( '--session-id=' + backup_token )" style="cursor: pointer;">--session-id={{ backup_token }}</code>.
+            </span>
+            <v-btn
+                color="primary"
+                variant="text"
+                size="small"
+                @click="regenerateSessionManifest"
+                :loading="regenerating_manifest"
+                class="pa-1"
+                style="min-width: 0;"
+                icon
+            >
+                <v-icon>mdi-refresh</v-icon>
+                <v-tooltip location="top" activator="parent">Regenerate session with current file exclusions</v-tooltip>
+            </v-btn>
         </div>
         </v-card-text>
     </v-card>
@@ -416,6 +431,7 @@ createApp({
             backup_disk_size: 0,
             cleaning_up: false,
             regenerating_token: false,
+            regenerating_manifest: false,
         }
     },
     watch: {
@@ -475,6 +491,56 @@ createApp({
                 console.error("Token regeneration failed:", error);
             } finally {
                 this.regenerating_token = false;
+            }
+        },
+        async regenerateSessionManifest() {
+            if (!this.backup_token) {
+                this.snackbar.message = "No active session to regenerate.";
+                this.snackbar.show = true;
+                return;
+            }
+
+            this.regenerating_manifest = true;
+            this.analyzing = true; // Show the "Scanning..." overlay
+            this.tree_loading = true; // Show tree loader
+
+            try {
+                // 1. Calculate current exclusions, just like startBackup() does
+                const selectedPaths = new Set(this.excluded_nodes.map(node => node.id));
+                const minimalExclusionPaths = this.excluded_nodes
+                    .map(node => node.id)
+                    .filter(path => {
+                        let parent = path.substring(0, path.lastIndexOf('/'));
+                        while (parent) {
+                            if (selectedPaths.has(parent)) {
+                                return false;
+                            }
+                            parent = parent.substring(0, parent.lastIndexOf('/'));
+                        }
+                        return true;
+                    });
+                this.options.exclude_files = minimalExclusionPaths.join("\n");
+
+                // 2. Re-run the manifest generation using the *existing* backup_token
+                this.files = await this.runManifestGeneration();
+                
+                // 3. Re-fetch and process the new manifest files
+                await this.fetchAndProcessManifests(this.files);
+
+                // 4. Re-build the file tree in the UI
+                this.explorer.items = this.buildInitialTree(this.explorer.raw_file_list);
+                
+                this.snackbar.message = "Session manifest updated with current exclusions.";
+                this.snackbar.show = true;
+
+            } catch (error) {
+                this.snackbar.message = "Failed to regenerate manifest: " + error.message;
+                this.snackbar.show = true;
+                console.error("Manifest regeneration failed:", error);
+            } finally {
+                this.regenerating_manifest = false;
+                this.analyzing = false;
+                this.tree_loading = false;
             }
         },
         toggleTheme() {
