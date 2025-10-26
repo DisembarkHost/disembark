@@ -107,6 +107,10 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'zip_files' ]
         ]);
+        register_rest_route('disembark/v1', '/zip-sync-files', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'zip_sync_files' ]
+        ]);
         register_rest_route('disembark/v1', '/zip-database', [
             'methods'  => 'POST',
             'callback' => [ $this, 'zip_database' ]
@@ -241,6 +245,19 @@ class Run {
         $exclude_files_string = $request['exclude_files'] ?? '';
         $exclude_files_array = !empty($exclude_files_string) ? explode( "\n", $exclude_files_string ) : [];
         return ( new Backup( $backup_token ) )->zip_files( $file, $exclude_files_array );
+    }
+
+    function zip_sync_files( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $backup_token = $request['backup_token'];
+        $files_list   = $request['files']; // This will be an array of file objects
+        if ( empty( $backup_token ) || ! is_array( $files_list ) ) {
+            return new \WP_Error( 'missing_params', 'Missing backup_token or files list.', [ 'status' => 400 ] );
+        }
+        // We need a new method in Backup.php to handle this
+        return ( new Backup( $backup_token ) )->zip_file_list( $files_list );
     }
 
     function zip_database ( $request ) {
