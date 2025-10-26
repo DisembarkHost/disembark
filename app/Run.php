@@ -330,7 +330,6 @@ class Run {
         
         // Try to resolve the path from the web root first
         $full_path = realpath($base_dir . '/' . $file_path);
-        
         // If not found, and roots are different, try resolving from the core root
         if ( !$full_path && $base_dir !== $core_dir ) {
             $full_path = realpath($core_dir . '/' . $file_path);
@@ -338,7 +337,6 @@ class Run {
 
         $is_in_base_dir = $full_path && strpos( $full_path, $base_dir ) === 0;
         $is_in_core_dir = $full_path && $core_dir !== $base_dir && strpos( $full_path, $core_dir ) === 0;
-
         if ( !$full_path || ( !$is_in_base_dir && !$is_in_core_dir ) ) {
             header("HTTP/1.1 400 Bad Request");
             die('400 Bad Request: Invalid file path.');
@@ -356,7 +354,24 @@ class Run {
         header('Pragma: public');
         header('Content-Length: ' . filesize($full_path));
         flush();
-        readfile($full_path);
+        
+        // Use a chunked readfile to support large files
+        $file = @fopen($full_path, 'rb');
+        if ($file) {
+            while (!feof($file)) {
+                echo @fread($file, 8192); // Read and echo 8KB chunks
+                flush(); // Flush PHP's output buffer
+                if (connection_status() != 0) {
+                    @fclose($file);
+                    die(); // Stop if client disconnects
+                }
+            }
+            @fclose($file);
+        } else {
+            header("HTTP/1.1 500 Internal Server Error");
+            die('500 Internal Server Error: Could not open file for reading.');
+        }
+        
         exit;
     }
 
