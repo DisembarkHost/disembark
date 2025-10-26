@@ -30,6 +30,19 @@
                     <div v-else>
                         <p class="text-body-2">No temporary backup files to clean up.</p>
                     </div>
+                    <v-divider class="my-3"></v-divider>
+                    <div>
+                        <p class="mb-2 text-body-2">Regenerate the site token. This will invalidate any existing CLI connections or commands.</p>
+                        <v-btn
+                            block
+                            color="error"
+                            @click="regenerateToken"
+                            :loading="regenerating_token"
+                        >
+                            Regenerate Token
+                            <v-icon end>mdi-refresh</v-icon>
+                        </v-btn>
+                    </div>
                 </v-card-text>
             </v-card>
         </v-menu>
@@ -399,6 +412,7 @@ createApp({
             database_backup_queue: [],
             backup_disk_size: 0,
             cleaning_up: false,
+            regenerating_token: false,
         }
     },
     watch: {
@@ -439,6 +453,25 @@ createApp({
                 console.error("Cleanup failed:", error);
             } finally {
                 this.cleaning_up = false;
+            }
+        },
+        async regenerateToken() {
+            if (!confirm("Are you sure you want to regenerate the token? This will invalidate any existing CLI connections.")) {
+                return;
+            }
+            this.regenerating_token = true;
+            try {
+                // Pass the current token in the POST body for authorization
+                const response = await axios.post(`/wp-json/disembark/v1/regenerate-token`, { token: this.api_token });
+                this.api_token = response.data.token; // Update the app's token
+                this.snackbar.message = "New token successfully generated.";
+                this.snackbar.show = true;
+            } catch (error) {
+                this.snackbar.message = "An error occurred while regenerating the token.";
+                this.snackbar.show = true;
+                console.error("Token regeneration failed:", error);
+            } finally {
+                this.regenerating_token = false;
             }
         },
         toggleTheme() {
