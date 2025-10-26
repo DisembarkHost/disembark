@@ -264,11 +264,14 @@ class Backup {
         $select_row_limit = 1000;
         $rows_start       = 0;
         $insert_sql       = "";
-        $backup_file      = "{$this->backup_path}/{$table}.sql";
-        $backup_url       = "{$this->backup_url}/{$table}.sql";
+        
+        // Use a .txt extension to avoid server-side .sql file download blocks
+        $file_ext         = ".sql.txt";
+        $backup_file      = "{$this->backup_path}/{$table}{$file_ext}";
+        $backup_url       = "{$this->backup_url}/{$table}{$file_ext}";
         if ( ! empty( $parts ) ) {
-            $backup_file  = "{$this->backup_path}/{$table}-{$parts}.sql";
-            $backup_url   = "{$this->backup_url}/{$table}-{$parts}.sql";
+            $backup_file  = "{$this->backup_path}/{$table}-{$parts}{$file_ext}";
+            $backup_url   = "{$this->backup_url}/{$table}-{$parts}{$file_ext}";
             $rows_start   = ( $parts - 1 ) * $rows_per_part;
         }
 
