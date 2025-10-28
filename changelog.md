@@ -1,5 +1,8 @@
 # Changelog
 
+## v2.2.1 - October 27, 2025
+* **Fix:** Database listings for new `.sql.txt` extension
+
 ## v2.2.0 - October 26, 2025
 
 * **New Feature: Decoupled Filesystem Support (e.g., Flywheel)**
