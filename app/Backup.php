@@ -158,7 +158,6 @@ class Backup {
                     $file_info = [
                         'name' => $relative_path,
                         'size' => filesize( $full_path ),
-                    
                         'type' => 'file'
                     ];
                     if ( $include_checksums ) {
@@ -580,8 +579,10 @@ class Backup {
     }
     
     function zip_database() {
-        $database_files = glob( "{$this->backup_path}/*.sql" );
-        $zip_name       = "{$this->backup_path}/database.zip";
+        $sql_files = glob( "{$this->backup_path}/*.sql" );
+        $sql_txt_files = glob( "{$this->backup_path}/*.sql.txt" );
+        $sql_files = array_merge( $sql_files, $sql_txt_files );
+        $zip_name = "{$this->backup_path}/database.zip";
         
         if ( $this->archiver_type === 'ZipArchive' ) {
             if ( $this->zip_object->open ( $zip_name, \ZipArchive::CREATE ) === TRUE) {
@@ -610,6 +611,8 @@ class Backup {
 
     function list_downloads() {
         $sql_files = glob( "{$this->backup_path}/*.sql" );
+        $sql_txt_files = glob( "{$this->backup_path}/*.sql.txt" );
+        $sql_files = array_merge( $sql_files, $sql_txt_files );
         $zip_files = glob( "{$this->backup_path}/*.zip" );
         $files     = [];
         natsort($sql_files);
