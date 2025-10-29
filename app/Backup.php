@@ -403,6 +403,117 @@ class Backup {
         return $backup_url;
     }
 
+    public function database_export_batch( $tables = [] ) {
+        global $wpdb;
+
+        if ( empty( $tables ) ) {
+            return false;
+        }
+
+        // Create a unique-ish name for the batch file
+        $batch_hash = md5( implode( ',', $tables ) );
+        $file_ext    = ".sql.txt";
+        $backup_file = "{$this->backup_path}/batch-{$batch_hash}{$file_ext}";
+        $backup_url  = "{$this->backup_url}/batch-{$batch_hash}{$file_ext}";
+
+        if ( false === ( $file_handle = fopen( $backup_file, 'w' ) ) ) { // Use 'w' to create a new file
+            return false;
+        }
+
+        // Write headers once
+        fwrite( $file_handle, "SET FOREIGN_KEY_CHECKS = 0;\nSET UNIQUE_CHECKS = 0;\n" );
+
+        // Add paging
+        $select_row_limit = 1000; // Use the same paging as the single export
+
+        foreach ( $tables as $table ) {
+            $insert_sql = '';
+            // 1. Get CREATE TABLE statement
+            $create_table = $wpdb->get_results( "SHOW CREATE TABLE `{$table}`", ARRAY_N );
+            if ( false === $create_table || ! isset( $create_table[0] ) ) {
+                continue; // Skip this table on error
+            }
+            $create_table_array = $create_table[0];
+            unset( $create_table );
+            $insert_sql .= str_replace( "\n", '', $create_table_array[1] ) . ";\n";
+            unset( $create_table_array );
+
+            // 2. Add DISABLE KEYS
+            $insert_sql .= "/*!40000 ALTER TABLE `{$table}` DISABLE KEYS */;\n";
+            if ( false === fwrite( $file_handle, $insert_sql ) ) {
+                continue; // Error writing
+            }
+            $insert_sql = ''; // Reset for rows
+
+            // 3. Get rows WITH PAGING
+            $rows_start = 0;
+            $rows_remain = true;
+            $num_fields = 0; // Initialize
+            $first_run = true;
+
+            while ( true === $rows_remain ) {
+                $query       = "SELECT * FROM `$table` LIMIT " . $rows_start . ',' . $select_row_limit;
+                $table_query = $wpdb->get_results( $query, ARRAY_N );
+                $rows_start += $select_row_limit;
+
+                if ( false === $table_query ) {
+                    $rows_remain = false; // Error, stop processing this table
+                    break; 
+                }
+
+                if ( $first_run ) {
+                    $columns = $wpdb->get_col_info(); // Get info from the first query
+                    $num_fields = count( $columns );
+                    $first_run = false;
+                }
+                
+                $table_count = count( $table_query );
+                if ( 0 == $table_count || $table_count < $select_row_limit ) {
+                    $rows_remain = false;
+                }
+                
+                if ( $num_fields == 0 ) {
+                    // No columns found, or table is empty. In either case, we're done.
+                    $rows_remain = false;
+                    continue;
+                }
+
+                // 4. Loop through rows and build INSERT statements
+                foreach ( $table_query as $fetch_row ) {
+                    $insert_sql .= "INSERT INTO `$table` VALUES(";
+                    for ( $n = 1; $n <= $num_fields; $n++ ) {
+                        $m = $n - 1;
+                        if ( null === $fetch_row[ $m ] ) {
+                            $insert_sql .= 'NULL, ';
+                        } else {
+                            $insert_sql .= "'" . self::db_escape( $fetch_row[ $m ] ) . "', ";
+                        }
+                    }
+                    $insert_sql  = substr( $insert_sql, 0, -2 );
+                    $insert_sql .= ");\n";
+                    
+                    // Write to file
+                    if ( false === fwrite( $file_handle, $insert_sql ) ) {
+                        $rows_remain = false; // Stop processing this table if write fails
+                        break; 
+                    }
+                    $insert_sql = '';
+                }
+            } // end while $rows_remain
+            
+            // 5. Add ENABLE KEYS
+            $insert_sql = "/*!40000 ALTER TABLE `{$table}` ENABLE KEYS */;\n";
+            fwrite( $file_handle, $insert_sql );
+        } // end foreach $tables
+
+        // Write footers once
+        fwrite( $file_handle, "SET FOREIGN_KEY_CHECKS = 1;\nSET UNIQUE_CHECKS = 1;\n" );
+        
+        @fclose( $file_handle );
+        // Return the public URL
+        return $backup_url;
+    }
+
     function zip_files( $file_manifest = "", $exclude_paths = [] ) {
         if ( empty( $file_manifest ) ) { return; }
 

@@ -127,6 +127,10 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'export_database' ]
         ]);
+        register_rest_route('disembark/v1', '/export-database-batch', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'export_database_batch' ]
+        ]);
         register_rest_route('disembark/v1', '/stream-file', [
             'methods'  => 'POST',
             'callback' => [ $this, 'stream_file' ]
@@ -289,6 +293,20 @@ class Run {
             return ( new Backup( $backup_token ) )->database_export( $table, $request['parts'], $request['rows_per_part'] );
         }
         return ( new Backup( $backup_token ) )->database_export( $table );
+    }
+
+    function export_database_batch( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $backup_token = $request['backup_token'];
+        $tables       = $request['tables'];
+
+        if ( empty( $backup_token ) || ! is_array( $tables ) || empty( $tables ) ) {
+            return new \WP_Error( 'missing_params', 'Missing backup_token or tables array.', [ 'status' => 400 ] );
+        }
+
+        return ( new Backup( $backup_token ) )->database_export_batch( $tables );
     }
 
     function get_manifest( $request ) {

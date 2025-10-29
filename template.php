@@ -907,56 +907,100 @@ createApp({
                     this.backup_ready = true;
                     this.ui_state = 'initial';
                 }
-                const hasNonPartTables = this.database_backup_queue.some(table => !table.parts);
-                if (hasNonPartTables) {
+                // Check if any batches or single-part tables were processed
+                const hasBatchesOrSinglePartTables = this.database_backup_queue.some(item => item.type === 'batch' || (item.type === 'table' && !item.table.parts));
+                if (hasBatchesOrSinglePartTables) {
                     this.zipDatabase();
                 }
                 return;
             }
 
-            let table = this.database_backup_queue[this.database_progress.copied];
-    
-            table.running = true;
+            let item = this.database_backup_queue[this.database_progress.copied];
             let data = {
                 token: this.api_token,
                 backup_token: this.backup_token,
-                table: table.table
             };
-            if (table.parts) {
-                table.current = (table.current || 0) + 1;
-                data.parts = table.current;
-                data.rows_per_part = table.rows_per_part;
-            }
 
-            axios.post(`/wp-json/disembark/v1/export/database/${table.table}`, data).then(response => {
-                if (response.data == "") {
-                    this.snackbar.message = `Could not backup table ${table.table}.`;
-                    this.snackbar.show = true;
-                    this.loading = false;
-                    table.running = false;
-                    return;
-                }
+            if (item.type === 'batch') {
+                // --- Handle Batch ---
+                const tableNames = item.tables.map(t => t.table);
+                data.tables = tableNames;
+                // Set all tables in this batch to running
+                item.tables.forEach(t => t.running = true);
 
-                if (table.parts && table.current !== table.parts) {
-                     axios.post('/wp-json/disembark/v1/zip-database', data).then(() => {
-                        table.running = false;
-                        this.backupDatabase();
+                axios.post(`/wp-json/disembark/v1/export-database-batch`, data).then(response => {
+                    if (response.data == "") {
+                        this.snackbar.message = `Could not backup batch ${this.database_progress.copied + 1}.`;
+                        this.snackbar.show = true;
+                        this.loading = false;
+                        item.tables.forEach(t => t.running = false); // Reset on failure
+                        return;
+                    }
+
+                    this.database_progress.copied = this.database_progress.copied + 1;
+                    // Set all tables in this batch to done
+                    item.tables.forEach(t => {
+                        t.running = false;
+                        t.done = true;
+                        t.completion_time = new Date().getTime();
                     });
-                     return;
-                }
-                this.database_progress.copied = this.database_progress.copied + 1;
-                table.running = false;
-                table.done = true;
-                table.completion_time = new Date().getTime();
-                this.backupDatabase();
-            }).catch(error => {
-                this.snackbar.message = `Could not backup table ${table.table}. Retrying...`;
+                    this.backupDatabase(); // Process next item
+
+                }).catch(error => {
+                    this.snackbar.message = `Could not backup batch. Retrying...`;
+                    this.snackbar.show = true;
+                    item.tables.forEach(t => t.running = false); // Reset on failure
+                    this.backupDatabase(); // Retry
+                });
+
+            } else if (item.type === 'table') {
+                // --- Handle Single Large Table (with or without parts) ---
+                let table = item.table;
+                data.table = table.table;
+                table.running = true;
+
                 if (table.parts) {
-                    table.current = table.current - 1;
+                    table.current = (table.current || 0) + 1;
+                    data.parts = table.current;
+                    data.rows_per_part = table.rows_per_part;
                 }
-                this.snackbar.show = true;
-                this.backupDatabase();
-            });
+
+                axios.post(`/wp-json/disembark/v1/export/database/${table.table}`, data).then(response => {
+                    if (response.data == "") {
+                        this.snackbar.message = `Could not backup table ${table.table}.`;
+                        this.snackbar.show = true;
+                        this.loading = false;
+                        table.running = false;
+                        return;
+                    }
+
+                    if (table.parts && table.current !== table.parts) {
+                        // This is a multi-part table, but not the last part.
+                        // Zip the part we just got.
+                        axios.post('/wp-json/disembark/v1/zip-database', data).then(() => {
+                            // Don't mark as "running = false", the table is still processing.
+                            this.backupDatabase(); // Call for the next part
+                        });
+                        return;
+                    }
+
+                    // This is the last part of a multi-part table, or a single-part table
+                    this.database_progress.copied = this.database_progress.copied + 1;
+                    table.running = false;
+                    table.done = true;
+                    table.completion_time = new Date().getTime();
+                    this.backupDatabase(); // Call for next item in queue
+
+                }).catch(error => {
+                    this.snackbar.message = `Could not backup table ${table.table}. Retrying...`;
+                    if (table.parts) {
+                        table.current = table.current - 1; // Decrement part counter
+                    }
+                    this.snackbar.show = true;
+                    table.running = false; // Reset running on failure
+                    this.backupDatabase(); // Retry
+                });
+            }
         },
         zipDatabase() {
             axios.post( '/wp-json/disembark/v1/zip-database', {
