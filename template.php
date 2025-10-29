@@ -264,15 +264,17 @@
     <v-card v-if="ui_state === 'backing_up' || ui_state === 'connected'" class="mt-6" flat rounded="0" density="compact">
         <v-toolbar flat density="compact" class="text-body-2" color="primary"><v-icon icon="mdi-console" class="mr-2 ml-4"></v-icon>For limited space, you can run the backup over CLI. Use the commands below after configuring your exclusions.</v-toolbar>
         <v-card-text>
-        <div style="position: relative;padding-right: 42px; border-radius: 4px;" :class="isDarkMode ? 'bg-grey-darken-4' : 'bg-grey-lighten-4'">
-            <pre style="font-size: 11px;padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliCommands }}</pre>
-            <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliCommands )" color="primary" style="position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
+        <div style="position: relative;padding-right: 42px; border-radius: 4px;">
+            <p><code @click="copyText( cliCommands.connect )" style="cursor: pointer;">{{ cliCommands.connect }}</code></p>
+            <p><code @click="copyText( cliCommands.backup )" style="cursor: pointer;">{{ cliCommands.backup }}</code></p>
+            <p><code @click="copyText( cliCommands.sync )" style="cursor: pointer;">{{ cliCommands.sync }}</code></p>
         </div>
         <div v-if="backup_token" class="px-2 py-2 text-caption d-flex align-center flex-wrap" style="gap: 4px;">
-            <span class="mr-1">
+            <span>
                 Your current Backup Session ID is: <code class="text-caption" @click="copyText( backup_token )" style="cursor: pointer;">{{ backup_token }}</code>. You can use this ID with the CLI to reuse the generated file list <code class="text-caption" @click="copyText( '--session-id=' + backup_token )" style="cursor: pointer;">--session-id={{ backup_token }}</code>.
             </span>
             <v-btn
+                v-if="!manifest_is_synced"
                 color="primary"
                 variant="text"
                 size="small"
@@ -432,6 +434,7 @@ createApp({
             cleaning_up: false,
             regenerating_token: false,
             regenerating_manifest: false,
+            manifest_is_synced: false,
         }
     },
     watch: {
@@ -503,7 +506,6 @@ createApp({
             this.regenerating_manifest = true;
             this.analyzing = true; // Show the "Scanning..." overlay
             this.tree_loading = true; // Show tree loader
-
             try {
                 // 1. Calculate current exclusions, just like startBackup() does
                 const selectedPaths = new Set(this.excluded_nodes.map(node => node.id));
@@ -523,16 +525,13 @@ createApp({
 
                 // 2. Re-run the manifest generation using the *existing* backup_token
                 this.files = await this.runManifestGeneration();
-                
                 // 3. Re-fetch and process the new manifest files
                 await this.fetchAndProcessManifests(this.files);
-
                 // 4. Re-build the file tree in the UI
                 this.explorer.items = this.buildInitialTree(this.explorer.raw_file_list);
-                
                 this.snackbar.message = "Session manifest updated with current exclusions.";
                 this.snackbar.show = true;
-
+                this.manifest_is_synced = true;
             } catch (error) {
                 this.snackbar.message = "Failed to regenerate manifest: " + error.message;
                 this.snackbar.show = true;
@@ -697,6 +696,7 @@ createApp({
                     this.included_tables.push(originalTable);
                 }
             }
+            this.manifest_is_synced = false;
         },
         isNodeExcluded(node) {
             const excludedPaths = new Set(this.excluded_nodes.map(n => n.id));
@@ -719,6 +719,7 @@ createApp({
             } else {
                 this.excluded_nodes.push(node);
             }
+            this.manifest_is_synced = false;
         },
         buildInitialTree(files) {
             const tree = [];
@@ -811,6 +812,7 @@ createApp({
                 });
                 this.excluded_nodes = combinedNodes;
                 this.range_start = null;
+                this.manifest_is_synced = false;
 
             } else {
                 this.range_start = item;
@@ -829,7 +831,6 @@ createApp({
                 
                 // Determine if we are including or excluding based on the clicked item's state
                 const isIncluding = !this.isTableIncluded(clickedTable);
-                
                 tablesInRange.forEach(tableInRange => {
                     const isCurrentlyIncluded = this.isTableIncluded(tableInRange);
                     if (isIncluding && !isCurrentlyIncluded) {
@@ -838,7 +839,7 @@ createApp({
                         this.toggleTableExclusion(tableInRange);
                     }
                 });
-
+                this.manifest_is_synced = false;
             } else {
                 this.db_range_start = clickedTable;
                 // The single click action is now handled by the button, so we can leave this empty
@@ -1090,10 +1091,8 @@ createApp({
                 const bytes = new Uint8Array(20);
                 window.crypto.getRandomValues(bytes);
                 this.backup_token = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('').substring(0, 12);
-                
                 this.tree_loading = true; // Show loader for tree
                 this.files = await this.runManifestGeneration();
-                
                 this.scan_progress.status = 'loading';
                 this.manifest_progress.fetched = 0; 
                 this.manifest_progress.total = this.files.length;
@@ -1102,7 +1101,7 @@ createApp({
                 this.explorer.items = this.buildInitialTree(this.explorer.raw_file_list);
                 this.tree_loading = false; // Hide loader for tree
                 this.ui_state = 'connected';
-
+                this.manifest_is_synced = true;
             } catch (error) {
                 this.snackbar.message = `Could not analyze site. ${error.message}`;
                 this.snackbar.show = true;
@@ -1114,9 +1113,8 @@ createApp({
         },
         async startBackup() {
             this.resetBackupState();
-            this.analyzing = true; // Show the analysis overlay first
+            this.analyzing = true; 
             
-            // Create a stable queue from the currently included tables
             this.database_backup_queue = [...this.included_tables];
             this.database_progress.total = this.database_backup_queue.length;
 
@@ -1137,12 +1135,14 @@ createApp({
             this.options.exclude_files = minimalExclusionPaths.join("\n");
 
             try {
-                // Regenerate the manifest with the latest exclusions just before backup
-                this.files = await this.runManifestGeneration();
-                await this.fetchAndProcessManifests(this.files);
+                if (!this.manifest_is_synced) {
+                    this.files = await this.runManifestGeneration();
+                    await this.fetchAndProcessManifests(this.files);
+                    this.manifest_is_synced = true; 
+                }
 
-                this.analyzing = false; // Hide analysis overlay
-                this.loading = true; // Show backup progress overlay
+                this.analyzing = false;
+                this.loading = true;
 
                 if (this.included_tables.length > 0) {
                     this.backupDatabase();
@@ -1157,7 +1157,7 @@ createApp({
                 this.snackbar.message = "Could not start backup. Failed to generate file list.";
                 this.snackbar.show = true;
                 console.error("Backup failed during manifest generation:", error);
-                this.analyzing = false; // Ensure overlay is hidden on error
+                this.analyzing = false;
             }
         },
         async runManifestGeneration() {
@@ -1220,11 +1220,12 @@ createApp({
     },
     computed: {
         cliCommands() {
-            if (!this.home_url || !this.api_token) return '';
-
+            if (!this.home_url || !this.api_token) return {}; // Return empty object
+            
             // Base Commands
             const connectCommand = `disembark connect ${this.home_url} ${this.api_token}`;
             let backupCommand = `disembark backup ${this.home_url}`;
+            let syncCommand = `disembark sync ${this.home_url}`;
 
             // Add File Exclusions
             const selectedPaths = new Set(this.excluded_nodes.map(node => node.id));
@@ -1244,6 +1245,7 @@ createApp({
             if (minimalExclusionPaths.length > 0) {
                 const fileExcludes = minimalExclusionPaths.map(path => `-x "${path}"`).join(' ');
                 backupCommand += ` ${fileExcludes}`;
+                syncCommand += ` ${fileExcludes}`;
             }
 
             // Add Database Exclusions
@@ -1253,11 +1255,23 @@ createApp({
                 .map(table => table.table);
 
             if (excludedTableNames.length > 0) {
-                backupCommand += ` --exclude-tables=${excludedTableNames.join(',')}`;
+                const tableExcludes = `--exclude-tables=${excludedTableNames.join(',')}`;
+                backupCommand += ` ${tableExcludes}`;
+                syncCommand += ` ${tableExcludes}`;
             }
 
-            // Return both commands
-            return `${connectCommand}\n${backupCommand}`;
+            // Only add the session ID if the manifest is synced
+            let sessionIdFlag = '';
+            if (this.backup_token && this.manifest_is_synced) {
+                sessionIdFlag = ` --session-id=${this.backup_token}`;
+            }
+
+            // Return an object with each command
+            return {
+                connect: connectCommand,
+                backup: backupCommand + sessionIdFlag,
+                sync: syncCommand + sessionIdFlag
+            };
         },
         cliInstall() {
             return `wget https://github.com/DisembarkHost/disembark-cli/releases/latest/download/disembark.phar\nchmod +x disembark.phar\nsudo mv disembark.phar /usr/local/bin/disembark`;
