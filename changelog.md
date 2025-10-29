@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.3.0 - 2025-10-28
+
+### Added
+* **Database Batch Export:** Implemented a new batching system for database exports. The plugin now intelligently groups small tables (under 200MB and 1 million rows) into combined `.sql.txt` files. This dramatically reduces the number of API requests and zip operations, resulting in a much faster database backup.
+* **Session ID & Manifest Regeneration:** The UI now displays a **Backup Session ID** after the initial analysis.
+    * A new "Regenerate Session" refresh icon allows you to update the file manifest with new exclusions *without* re-scanning the entire file system.
+    * This session ID can be used with the CLI (`--session-id=...`) to reuse the generated manifest.
+* **New `sync` CLI Command:** Added the `disembark sync` command to the CLI instructions display, which works with the new session ID feature.
+* **Database Row Count:** The database table list now fetches and displays the row count for each table, helping to identify large tables more easily.
+
+### Changed
+* **Smarter Backup Start:** The "Start Backup" button will now only regenerate the file manifest if you have changed your file/folder exclusions. If no exclusions have changed, it reuses the existing manifest, making the backup start almost instant.
+* **UI Reset on Cleanup:** Clicking the "Cleanup Temporary Files" button now fully resets the plugin's UI to the initial "Analyze Site" screen. This prevents errors from trying to use a stale session after its files have been deleted.
+* **Checksums Enabled by Default:** The file scanning process now generates MD5 checksums by default.
+* **Improved CLI Copying:** The CLI commands in the UI are now on separate lines, making it easier to copy a single command at a time.
+
 ## v2.2.1 - October 27, 2025
 * **Fix:** Database listings for new `.sql.txt` extension
 
