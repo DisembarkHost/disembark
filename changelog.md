@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.3.0 - 2025-10-28
+## 2.3.0 - October 28, 2025
 
 ### Added
 * **Database Batch Export:** Implemented a new batching system for database exports. The plugin now intelligently groups small tables (under 200MB and 1 million rows) into combined `.sql.txt` files. This dramatically reduces the number of API requests and zip operations, resulting in a much faster database backup.
