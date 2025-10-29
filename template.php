@@ -87,7 +87,7 @@
             <div v-if="included_tables.length > 0" class="mb-4">
                 <div class="text-left text-body-2 mb-1">Database</div>
                 <v-progress-linear v-model="databaseProgress" color="amber" height="25">
-                    Copied {{ database_progress.copied }} of {{ included_tables.length }} tables
+                    Copied {{ database_progress.copied }} of {{ database_backup_queue.length }} items
                 </v-progress-linear>
             </div>
 
@@ -469,6 +469,21 @@ createApp({
                 this.snackbar.message = "Temporary files have been cleaned up.";
                 this.snackbar.show = true;
                 await this.fetchBackupSize(); // Refresh size
+
+                // Reset UI to the initial state
+                this.ui_state = 'initial';
+                this.backup_token = "";
+                this.database = [];
+                this.files = [];
+                this.files_total = 0;
+                this.excluded_nodes = [];
+                this.explorer.raw_file_list = [];
+                this.explorer.items = [];
+                this.included_tables = [];
+                this.manifest_progress = { fetched: 0, total: 0 };
+                this.scan_progress = { total: 1, scanned: 0, status: 'initializing' };
+                this.manifest_is_synced = false;
+
             } catch (error) {
                 this.snackbar.message = "An error occurred during cleanup.";
                 this.snackbar.show = true;
@@ -540,6 +555,7 @@ createApp({
                 this.regenerating_manifest = false;
                 this.analyzing = false;
                 this.tree_loading = false;
+                this.fetchBackupSize();
             }
         },
         toggleTheme() {
@@ -1109,6 +1125,7 @@ createApp({
                 this.tree_loading = false;
             } finally {
                 this.analyzing = false;
+                this.fetchBackupSize();
             }
         },
         async startBackup() {
@@ -1116,9 +1133,64 @@ createApp({
             this.analyzing = true; 
             
             this.database_backup_queue = [...this.included_tables];
-            this.database_progress.total = this.database_backup_queue.length;
+            
+            // --- Start: Hybrid Batching Logic ---
+            this.database_backup_queue = [];
+            const large_tables = [];
+            const small_tables = [];
+            const max_size = 209715200; // 200 MB
+            const max_rows = 1000000;   // 1 million rows
 
-            // Generate the final exclusion string from the excluded_nodes array
+            this.included_tables.forEach(table => {
+                const table_size = parseFloat(table.size) || 0;
+                const row_count = parseInt(table.row_count) || 0;
+                const originalTable = this.database.find(t => t.table === table.table);
+
+                // Check if EITHER size OR row count exceeds the limit
+                if ((table_size > max_size || row_count > max_rows) && row_count > 0) {
+                    // This is a "large table"
+                    const parts_by_size = Math.ceil(table_size / max_size);
+                    const parts_by_rows = Math.ceil(row_count / max_rows);
+                    
+                    // Use the larger number of parts to be safe
+                    const parts = Math.max(parts_by_size, parts_by_rows);
+                    
+                    originalTable.parts = parts;
+                    originalTable.current = 0;
+                    originalTable.rows_per_part = Math.ceil(row_count / parts);
+                    
+                    large_tables.push({ type: 'table', table: originalTable });
+                } else {
+                    // This is a "small table"
+                    if (originalTable) originalTable.parts = 0;
+                    small_tables.push(originalTable);
+                }
+            });
+            
+            const small_table_batches = [];
+            let current_batch = [];
+            let current_batch_size = 0;
+            
+            small_tables.forEach(table => {
+                const table_size = parseFloat(table.size) || 0;
+                if (current_batch_size + table_size > max_size && current_batch.length > 0) {
+                    small_table_batches.push({ type: 'batch', tables: current_batch, size: current_batch_size });
+                    current_batch = [];
+                    current_batch_size = 0;
+                }
+                current_batch.push(table);
+                current_batch_size += table_size;
+            });
+            
+            if (current_batch.length > 0) {
+                small_table_batches.push({ type: 'batch', tables: current_batch, size: current_batch_size });
+            }
+
+            this.database_backup_queue = [...small_table_batches, ...large_tables];
+            // --- End: Hybrid Batching Logic ---
+
+            this.database_progress.total = this.database_backup_queue.length;
+            
             const selectedPaths = new Set(this.excluded_nodes.map(node => node.id));
             const minimalExclusionPaths = this.excluded_nodes
                 .map(node => node.id)
@@ -1285,12 +1357,14 @@ createApp({
             return this.$vuetify.theme.global.current.dark;
         },
         filesProgress() {
-            if (this.exclusionReport.remainingFiles === 0) { return 0; }
+            if (this.exclusionReport.remainingFiles === 0) {
+                return 0;
+            }
             return (this.files_progress.copied / this.exclusionReport.remainingFiles) * 100;
         },
         databaseProgress() {
-            if (!this.included_tables.length) return 0;
-            return this.database_progress.copied / this.included_tables.length * 100;
+            if (!this.database_backup_queue.length) return 0;
+            return this.database_progress.copied / this.database_backup_queue.length * 100;
         },
         totalDatabaseSize() {
             if (!this.included_tables || this.included_tables.length === 0) return 0;
