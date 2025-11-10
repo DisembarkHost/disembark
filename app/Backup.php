@@ -64,7 +64,7 @@ class Backup {
         $filtered_list_path = "{$this->backup_path}/_filtered_file_list.json";
         $state = json_decode( file_get_contents( $state_file ), true );
 
-        $operation_limit = 5000;
+        $operation_limit = $include_checksums ? 200 : 5000;
         // Max files/folders to process per request
         $operations_this_batch = 0;
         
