@@ -84,7 +84,7 @@
         <div class="text-center text-white text-body-1 disembark-overlay-content" style="width: 500px; max-width: 90vw;">
             <div class="mb-5"><strong>Backup in progress...</strong></div>
 
-            <div v-if="included_tables.length > 0" class="mb-4">
+            <div v-if="included_tables.length > 0 && this.options.include_database" class="mb-4">
                 <div class="text-left text-body-2 mb-1">Database</div>
                 <v-progress-linear v-model="databaseProgress" color="amber" height="25">
                     Copied {{ database_progress.copied }} of {{ database_backup_queue.length }} items
@@ -132,8 +132,22 @@
     <v-row v-if="ui_state === 'backing_up' || ui_state === 'connected'">
         <v-col cols="12" sm="12" md="6" v-if="database.length > 0">
             <v-toolbar flat dark density="compact" color="primary" class="text-white pr-5">
-                <v-toolbar-title>Database</v-toolbar-title>
-                <v-spacer></v-spacer>
+                <div class="ml-5 pr-3" style="font-size:18px">Database</div>
+                <v-tooltip location="bottom">
+                    <template v-slot:activator="{ props }">
+                        <div v-bind="props" class="ml-2"> 
+                            <v-switch
+                                v-model="options.include_database"
+                                density="compact"
+                                hide-details
+                                color="success"
+                                @change="manifest_is_synced = false"
+                            ></v-switch>
+                        </div>
+                    </template>
+                    <span>Backup Database</span>
+                </v-tooltip>
+                <v-spacer></v-spacer> 
                 <v-btn
                     variant="text"
                     class="mr-2"
@@ -146,7 +160,7 @@
                 </v-btn>
                 {{ formatSize(totalDatabaseSize) }}
             </v-toolbar>
-            <v-toolbar density="compact" flat color="white" class="px-4">
+            <v-toolbar v-show="options.include_database" density="compact" flat color="white" class="px-4">
                 <v-text-field
                     v-model="database_search"
                     label="Search Tables"
@@ -158,7 +172,7 @@
                     class="w-100"
                 ></v-text-field>
             </v-toolbar>
-            <v-list density="compact" style="max-height: 436px; overflow-y: auto;" class="no-select">
+            <v-list v-show="options.include_database" density="compact" style="max-height: 436px; overflow-y: auto;" class="no-select">
                 <v-hover v-for="item in filteredDatabase" v-slot="{ isHovering, props }">
                     <v-list-item
                         v-bind="props"
@@ -210,11 +224,26 @@
         </v-col>
         <v-col cols="12" sm="12" md="6" v-if="files.length > 0">
             <v-toolbar flat dark density="compact" color="primary" class="text-white pr-5">
-                <v-toolbar-title>Files</v-toolbar-title>
+                <div class="mx-5" style="font-size:18px">Files</div>
+                <v-tooltip location="bottom">
+                    <template v-slot:activator="{ props }">
+                        <div v-bind="props" class="mr-2">
+                             <v-switch
+                                v-model="options.include_files"
+                                density="compact"
+                                hide-details
+                                color="success"
+                                @change="manifest_is_synced = false"
+                                class="mr-3"
+                            ></v-switch>
+                        </div>
+                    </template>
+                    <span>Backup Files</span>
+                </v-tooltip>
                 <v-spacer></v-spacer>
                 {{ formatSize( exclusionReport.remainingSize ) }}
             </v-toolbar>
-            <v-card flat rounded="0">
+            <v-card flat rounded="0" v-show="options.include_files">
             <v-card v-if="!tree_loading" variant="tonal" class="mx-2 mt-2 pa-2 text-caption">
                 <div><b>To select a range:</b></div>
                 1. Click a start file/folder.<br>
@@ -234,6 +263,7 @@
                 density="compact"
                 style="max-height: 400px; overflow-y: auto;"
                 class="no-select"
+                v-show="options.include_files"
             >
                 <template v-slot:title="{ item }">
                     <v-hover v-slot="{ isHovering, props }">
@@ -405,7 +435,9 @@ createApp({
             options: {
                 database: true,
                 files: true,
-                exclude_files: ""
+                exclude_files: "",
+                include_database: true,
+                include_files: true
             },
             database_progress: { copied: 0, total: 0 },
             files_progress: { copied: 0, total: 0 },
@@ -565,6 +597,11 @@ createApp({
             document.body.classList.toggle('disembark-dark-mode', newTheme === 'dark');
         },
         startBackupUI() {
+            if (!this.options.include_database && !this.options.include_files) {
+                this.snackbar.message = "Nothing to back up. Please toggle on either files or database.";
+                this.snackbar.show = true;
+                return;
+            }
             this.ui_state = 'backing_up';
             this.startBackup();
         },
@@ -917,7 +954,7 @@ createApp({
         },
         backupDatabase() {
             if (this.database_progress.copied == this.database_backup_queue.length) {
-                if (this.options.files) {
+                if (this.options.include_files) {
                     this.backupFiles();
                 } else {
                     this.loading = false;
@@ -1089,7 +1126,7 @@ createApp({
             this.backup_ready = false;
             this.backup_token = "";
             this.database = [];
-            this.options = { database: true, files: true, exclude_files: "" };
+            this.options = { database: true, files: true, exclude_files: "", include_database: true, include_files: true };
             this.files = [];
             this.files_total = 0;
             this.excluded_nodes = [];
@@ -1216,9 +1253,9 @@ createApp({
                 this.analyzing = false;
                 this.loading = true;
 
-                if (this.included_tables.length > 0) {
+                if (this.options.include_database && this.included_tables.length > 0) {
                     this.backupDatabase();
-                } else if (this.files.length > 0) {
+                } else if (this.options.include_files && this.files.length > 0) {
                     this.backupFiles();
                 } else {
                     this.loading = false;
@@ -1330,6 +1367,18 @@ createApp({
                 const tableExcludes = `--exclude-tables=${excludedTableNames.join(',')}`;
                 backupCommand += ` ${tableExcludes}`;
                 syncCommand += ` ${tableExcludes}`;
+            }
+
+            // Add Skip DB flag
+            if (!this.options.include_database) {
+                backupCommand += ` --skip-db`;
+                syncCommand += ` --skip-db`;
+            }
+
+            // Add Skip Files flag (Add this block)
+            if (!this.options.include_files) {
+                backupCommand += ` --skip-files`;
+                syncCommand += ` --skip-files`;
             }
 
             // Only add the session ID if the manifest is synced
