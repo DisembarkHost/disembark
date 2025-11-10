@@ -261,7 +261,7 @@
             </v-treeview>
         </v-col>
     </v-row>
-    <v-card v-if="ui_state === 'backing_up' || ui_state === 'connected'" class="mt-6" flat rounded="0" density="compact">
+    <v-card class="mt-6" flat rounded="0" density="compact">
         <v-toolbar flat density="compact" class="text-body-2" color="primary"><v-icon icon="mdi-console" class="mr-2 ml-4"></v-icon>For limited space, you can run the backup over CLI. Use the commands below after configuring your exclusions.</v-toolbar>
         <v-card-text>
         <div style="position: relative;padding-right: 42px; border-radius: 4px;">
