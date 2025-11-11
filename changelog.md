@@ -1,5 +1,11 @@
 # Changelog
 
+## **v2.4.1** - November 11, 2025
+
+### Changed
+
+* **Analysis Performance:** The file analysis process ("Analyze Site") no longer generates MD5 checksums by default. This significantly improves scanning speed on large sites. Checksums are now only generated when explicitly requested by a client, such as for a `disembark sync` CLI command.
+
 ## **v2.4.0** - November 10, 2025
 
 ### Added
