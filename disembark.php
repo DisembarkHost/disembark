@@ -9,7 +9,7 @@
  * Plugin Name:       Disembark
  * Plugin URI:        https://disembark.host
  * Description:       Safe journeys as you travel to your next WordPress host.
- * Version:           2.3.0
+ * Version:           2.4.0
  * Author:            Austin Ginder
  * Author URI:        https://austinginder.com
  * License:           MIT

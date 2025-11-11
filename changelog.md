@@ -1,12 +1,27 @@
 # Changelog
 
+## **v2.4.0** - November 10, 2025
+
+### Added
+* **Backup Toggles:** Added "Backup Database" and "Backup Files" switches to the main interface, allowing you to easily skip an entire section of the backup.
+* **CLI Command Update:** The generated CLI commands in the UI now dynamically add the `--skip-db` and `--skip-files` flags to match the new UI toggles.
+* **UI Validation:** Added a check to prevent starting a backup if both the file and database sections are disabled.
+
+### Changed
+* **Smarter UI File Zipping:** The "Start Backup" process now filters the file list based on UI exclusions *in the browser* and sends batches of files to be zipped. This correctly respects all UI exclusions and is significantly more efficient than the previous method of re-zipping manifest chunks.
+* **UI Polish:** The file and database exclusion lists are now hidden when their respective "Backup" toggles are switched off.
+
+### Fixed
+* **Filescan Performance:** Optimized the file scanning step by lowering the operation limit when checksums are enabled, preventing potential timeouts on slower hosts during the analysis phase.
+* **UI Polish:** The database backup progress bar is now correctly hidden during a backup if the "Backup Database" option is disabled.
+
 ## **v2.3.0** - October 28, 2025
 
 ### Added
 * **Database Batch Export:** Implemented a new batching system for database exports. The plugin now intelligently groups small tables (under 200MB and 1 million rows) into combined `.sql.txt` files. This dramatically reduces the number of API requests and zip operations, resulting in a much faster database backup.
 * **Session ID & Manifest Regeneration:** The UI now displays a **Backup Session ID** after the initial analysis.
-    * A new "Regenerate Session" refresh icon allows you to update the file manifest with new exclusions *without* re-scanning the entire file system.
-    * This session ID can be used with the CLI (`--session-id=...`) to reuse the generated manifest.
+* A new "Regenerate Session" refresh icon allows you to update the file manifest with new exclusions *without* re-scanning the entire file system.
+* This session ID can be used with the CLI (`--session-id=...`) to reuse the generated manifest.
 * **New `sync` CLI Command:** Added the `disembark sync` command to the CLI instructions display, which works with the new session ID feature.
 * **Database Row Count:** The database table list now fetches and displays the row count for each table, helping to identify large tables more easily.
 
@@ -26,15 +41,12 @@
     * The file scanner now identifies and scans both the web root and core root if they are different, using a `seen_files` log to prevent duplicates.
     * The zipping process now correctly locates files in either the web root or core root before adding them to the archive.
     * The File Explorer's streaming endpoint has been updated to find and stream files from a separate core directory, ensuring previews and downloads work correctly on decoupled sites.
-
 * **Improvement: Database Export Compatibility**
     * Database export files are now saved with a `.sql.txt` extension instead of `.sql`.
     * This bypasses security rules on certain managed hosts that block the direct download of `.sql` files.
-
 * **Improvement: Added Checksum Generation Support**
     * The `Backup` class can now optionally generate and include `md5_file` checksums in the file manifest during the scan step.
     * The `/regenerate-manifest` REST endpoint was updated to accept an `include_checksums` parameter to trigger this behavior, which is useful for external CLI validation.
-
 * **Dev: New API Endpoints & UI Functionality**
     * Added a `/zip-sync-files` endpoint to create a zip archive from an arbitrary list of files sent from a client.
     * Added a `/regenerate-token` endpoint and a corresponding "Regenerate Token" button in the UI's Tools menu.
