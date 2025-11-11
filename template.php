@@ -463,6 +463,7 @@ createApp({
             db_range_start: null,
             database_backup_queue: [],
             backup_disk_size: 0,
+            file_backup_queue: [],
             cleaning_up: false,
             regenerating_token: false,
             regenerating_manifest: false,
@@ -749,7 +750,6 @@ createApp({
                     this.included_tables.push(originalTable);
                 }
             }
-            this.manifest_is_synced = false;
         },
         isNodeExcluded(node) {
             const excludedPaths = new Set(this.excluded_nodes.map(n => n.id));
@@ -772,7 +772,6 @@ createApp({
             } else {
                 this.excluded_nodes.push(node);
             }
-            this.manifest_is_synced = false;
         },
         buildInitialTree(files) {
             const tree = [];
@@ -865,7 +864,6 @@ createApp({
                 });
                 this.excluded_nodes = combinedNodes;
                 this.range_start = null;
-                this.manifest_is_synced = false;
 
             } else {
                 this.range_start = item;
@@ -892,7 +890,6 @@ createApp({
                         this.toggleTableExclusion(tableInRange);
                     }
                 });
-                this.manifest_is_synced = false;
             } else {
                 this.db_range_start = clickedTable;
                 // The single click action is now handled by the button, so we can leave this empty
@@ -920,37 +917,48 @@ createApp({
             });
             return files;
         },
-        backupFiles() {
+        async backupFiles() {
             if ( this.backup_progress.copied == this.backup_progress.total ) {
                 this.loading = false
                 this.backup_ready = true
                 this.ui_state = 'initial';
+                this.fetchBackupSize(); // Refresh disk size
                 return
             }
-            file = this.files[ this.backup_progress.copied ]
-            data = {
+
+            let chunk = this.file_backup_queue[ this.backup_progress.copied ];
+            let data = {
                 token: this.api_token,
                 backup_token: this.backup_token,
-                file: file.name,
-                exclude_files: this.options.exclude_files
+                files: chunk
             }
-            axios.post( '/wp-json/disembark/v1/zip-files', data).then( response => {
-                if ( response.data == "" ) {
-                    this.snackbar.message = `Could not zip ${file.name}.`
-                    this.snackbar.show = true
-                    this.loading = false
-                    return
+
+            try {
+                const response = await axios.post( '/wp-json/disembark/v1/zip-sync-files', data)
+                
+                if ( !response.data || typeof response.data !== 'string' || !response.data.startsWith('http') ) {
+                    let errorMsg = 'Did not receive a valid zip URL.';
+                    if (response.data && response.data.message) {
+                        errorMsg = response.data.message;
+                    }
+                    throw new Error(errorMsg);
                 }
-                if ( this.options.files ) {
-                    this.files_progress.copied = this.files_progress.copied + file.count
+                
+                if ( this.options.include_files ) {
+                     this.files_progress.copied += chunk.length
                 }
-                this.backup_progress.copied = this.backup_progress.copied + 1
-                this.backupFiles()
-            }).catch(error => {
-                 this.snackbar.message = `Could not zip ${file.name}. Retrying...`
-                this.snackbar.show = true
-                this.backupFiles()
-            })
+                this.backup_progress.copied++;
+                this.backupFiles();
+
+            } catch(error) {
+                 let chunk_name = `chunk ${this.backup_progress.copied + 1}`;
+                 this.snackbar.message = `Could not zip ${chunk_name}: ${error.message}. Retrying...`
+                 this.snackbar.show = true
+                 
+                 setTimeout(() => {
+                    this.backupFiles()
+                 }, 3000);
+            }
         },
         backupDatabase() {
             if (this.database_progress.copied == this.database_backup_queue.length) {
@@ -1070,9 +1078,10 @@ createApp({
         resetBackupState() {
             this.backup_ready = false;
             this.database_backup_queue = [];
-            this.database_progress = { copied: 0, total: this.included_tables.length };
+            this.file_backup_queue = [];
+            this.database_progress = { copied: 0, total: 0 };
             this.files_progress = { copied: 0, total: 0 };
-            this.backup_progress = { copied: 0, total: this.files.length };
+            this.backup_progress = { copied: 0, total: 0 };
             this.database.forEach(table => {
                 table.running = false;
                 table.done = false;
@@ -1166,39 +1175,30 @@ createApp({
             }
         },
         async startBackup() {
-            this.resetBackupState();
-            this.analyzing = true; 
+            this.resetBackupState(); 
             
-            this.database_backup_queue = [...this.included_tables];
-            
-            // --- Start: Hybrid Batching Logic ---
+            // --- 1. Database Queue (Unchanged) ---
             this.database_backup_queue = [];
             const large_tables = [];
             const small_tables = [];
             const max_size = 209715200; // 200 MB
-            const max_rows = 1000000;   // 1 million rows
+            const max_rows = 1000000; // 1 million rows
 
             this.included_tables.forEach(table => {
                 const table_size = parseFloat(table.size) || 0;
                 const row_count = parseInt(table.row_count) || 0;
                 const originalTable = this.database.find(t => t.table === table.table);
 
-                // Check if EITHER size OR row count exceeds the limit
                 if ((table_size > max_size || row_count > max_rows) && row_count > 0) {
-                    // This is a "large table"
                     const parts_by_size = Math.ceil(table_size / max_size);
                     const parts_by_rows = Math.ceil(row_count / max_rows);
-                    
-                    // Use the larger number of parts to be safe
                     const parts = Math.max(parts_by_size, parts_by_rows);
-                    
+                
                     originalTable.parts = parts;
                     originalTable.current = 0;
                     originalTable.rows_per_part = Math.ceil(row_count / parts);
-                    
                     large_tables.push({ type: 'table', table: originalTable });
                 } else {
-                    // This is a "small table"
                     if (originalTable) originalTable.parts = 0;
                     small_tables.push(originalTable);
                 }
@@ -1218,16 +1218,14 @@ createApp({
                 current_batch.push(table);
                 current_batch_size += table_size;
             });
-            
             if (current_batch.length > 0) {
                 small_table_batches.push({ type: 'batch', tables: current_batch, size: current_batch_size });
             }
 
             this.database_backup_queue = [...small_table_batches, ...large_tables];
-            // --- End: Hybrid Batching Logic ---
-
             this.database_progress.total = this.database_backup_queue.length;
             
+            // --- 2. File Filtering & Chunking (New Logic) ---
             const selectedPaths = new Set(this.excluded_nodes.map(node => node.id));
             const minimalExclusionPaths = this.excluded_nodes
                 .map(node => node.id)
@@ -1241,32 +1239,65 @@ createApp({
                     }
                     return true;
                 });
-            this.options.exclude_files = minimalExclusionPaths.join("\n");
 
-            try {
-                if (!this.manifest_is_synced) {
-                    this.files = await this.runManifestGeneration();
-                    await this.fetchAndProcessManifests(this.files);
-                    this.manifest_is_synced = true; 
+            // Filter the raw list
+            const files_to_zip = this.explorer.raw_file_list.filter(file => {
+                if (!file.type || file.type !== 'file') return false;
+                for (const exclude_path of minimalExclusionPaths) {
+                    if (file.name === exclude_path || file.name.startsWith(exclude_path + '/')) {
+                        return false;
+                    }
                 }
+                return true;
+            });
 
-                this.analyzing = false;
-                this.loading = true;
+            // Chunk the filtered list
+            const file_chunks = [];
+            let chunk_current = [];
+            let chunk_current_size = 0;
+            const file_chunk_size = 2500; // 2500 files default (like CLI)
+            const file_chunk_max_size = 524288000; // 500MB default (like CLI)
 
-                if (this.options.include_database && this.included_tables.length > 0) {
-                    this.backupDatabase();
-                } else if (this.options.include_files && this.files.length > 0) {
-                    this.backupFiles();
+            for (const file of files_to_zip) {
+                const file_size = file.size || 0;
+
+                if (file_size > file_chunk_max_size) {
+                    if (chunk_current.length > 0) file_chunks.push(chunk_current);
+                    file_chunks.push([file]);
+                    chunk_current = [];
+                    chunk_current_size = 0;
+                    continue;
+                }
+                if ( (chunk_current.length > 0 && chunk_current_size + file_size > file_chunk_max_size) || 
+                     (chunk_current.length >= file_chunk_size) ) {
+                    file_chunks.push(chunk_current);
+                    chunk_current = [file];
+                    chunk_current_size = file_size;
                 } else {
-                    this.loading = false;
-                    this.snackbar.message = "Nothing to back up. Please include either files or database tables.";
-                    this.snackbar.show = true;
+                    chunk_current.push(file);
+                    chunk_current_size += file_size;
                 }
-            } catch (error) {
-                this.snackbar.message = "Could not start backup. Failed to generate file list.";
+            }
+            if (chunk_current.length > 0) {
+                file_chunks.push(chunk_current);
+            }
+            
+            this.file_backup_queue = file_chunks; 
+            this.backup_progress.total = this.file_backup_queue.length; // Total *chunks*
+            
+            // --- 3. Start Backup ---
+            this.analyzing = false;
+            this.loading = true;
+
+            if (this.options.include_database && this.included_tables.length > 0) {
+                this.backupDatabase();
+            } else if (this.options.include_files && this.file_backup_queue.length > 0) {
+                this.backupFiles();
+            } else {
+                this.loading = false;
+                this.snackbar.message = "Nothing to back up. Please include either files or database tables.";
                 this.snackbar.show = true;
-                console.error("Backup failed during manifest generation:", error);
-                this.analyzing = false;
+                this.ui_state = 'connected'; // Go back to connected state
             }
         },
         async runManifestGeneration() {
