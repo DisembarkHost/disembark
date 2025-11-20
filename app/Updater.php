@@ -108,6 +108,8 @@ class Updater {
             $response->plugin = "{$this->plugin_slug}/{$this->plugin_slug}.php";
             $response->new_version = $remote->version;
             $response->package = $remote->download_url;
+            $response->tested = $remote->tested;
+            $response->requires_php = $remote->requires_php;
             $transient->response[ $response->plugin ] = $response;
         }
         return $transient;
