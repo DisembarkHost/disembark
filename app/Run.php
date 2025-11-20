@@ -329,6 +329,11 @@ class Run {
         $params = $request->get_json_params();
         $token = $params['token'] ?? null;
         $file_path = $params['file'] ?? null;
+        
+        // New params for chunking
+        $offset = isset($params['offset']) ? (int)$params['offset'] : 0;
+        $length = isset($params['length']) ? (int)$params['length'] : null;
+
         // Manually create a new request object for User::allowed()
         $auth_request = new \WP_REST_Request();
         $auth_request->set_param('token', $token);
@@ -364,24 +369,55 @@ class Run {
             die('404 Not Found: File does not exist or is not readable.');
         }
         
+        // Prepare headers
         header('Content-Description: File Transfer');
         header('Content-Type: application/octet-stream');
         header('Content-Disposition: attachment; filename="' . basename($full_path) . '"');
         header('Expires: 0');
         header('Cache-Control: must-revalidate');
         header('Pragma: public');
-        header('Content-Length: ' . filesize($full_path));
+        
+        // If length is specified, we are sending a partial content
+        if ($length !== null) {
+             header('Content-Length: ' . $length);
+        } else {
+             header('Content-Length: ' . filesize($full_path));
+        }
+        
         flush();
         
         // Use a chunked readfile to support large files
         $file = @fopen($full_path, 'rb');
         if ($file) {
+            // Move to offset
+            if ($offset > 0) {
+                fseek($file, $offset);
+            }
+
+            $bytes_sent = 0;
             while (!feof($file)) {
-                echo @fread($file, 8192); // Read and echo 8KB chunks
-                flush(); // Flush PHP's output buffer
+                // If we have a limit, check if we reached it
+                if ($length !== null && $bytes_sent >= $length) {
+                    break;
+                }
+
+                // Calculate how much to read in this buffer
+                $read_size = 8192;
+                if ($length !== null) {
+                    $remaining = $length - $bytes_sent;
+                    if ($remaining < $read_size) {
+                        $read_size = $remaining;
+                    }
+                }
+
+                echo @fread($file, $read_size);
+                $bytes_sent += $read_size;
+
+                flush();
+                
                 if (connection_status() != 0) {
                     @fclose($file);
-                    die(); // Stop if client disconnects
+                    die(); 
                 }
             }
             @fclose($file);
