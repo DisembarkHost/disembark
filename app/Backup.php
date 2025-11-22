@@ -448,7 +448,7 @@ class Backup {
             // 3. Get rows WITH PAGING
             $rows_start = 0;
             $rows_remain = true;
-            $num_fields = 0; // Initialize
+            $num_fields = 0;
             $first_run = true;
 
             while ( true === $rows_remain ) {
@@ -718,23 +718,6 @@ class Backup {
 
         // Return the public URL
         return "{$this->backup_url}/database.zip";
-    }
-
-    function list_downloads() {
-        $sql_files = glob( "{$this->backup_path}/*.sql" );
-        $sql_txt_files = glob( "{$this->backup_path}/*.sql.txt" );
-        $sql_files = array_merge( $sql_files, $sql_txt_files );
-        $zip_files = glob( "{$this->backup_path}/*.zip" );
-        $files     = [];
-        natsort($sql_files);
-        natsort($zip_files);
-        foreach ( $sql_files as $file ) {
-            $files[] = str_replace( $this->backup_path, $this->backup_url, $file );
-        }
-        foreach ( $zip_files as $file ) {
-            $files[] = str_replace( $this->backup_path, $this->backup_url, $file );
-        }
-        return $files;
     }
 
     public static function db_escape( $sql ) {
