@@ -1,5 +1,22 @@
 # Changelog
 
+## **v2.5.0** - November 21, 2025
+
+**Added**
+* **NCDU Command Support:** Added a new CLI command generator for `ncdu` (NCurses Disk Usage), allowing users to easily browse remote file system disk usage via the Disembark CLI.
+* **Resumable File Streaming:** Updated the `stream_file` REST API endpoint to support `offset` and `length` parameters. This allows for chunked or resumable file downloads, improving reliability for large file transfers.
+* **Updater Metadata:** The custom updater now passes `tested` (WordPress version) and `requires_php` fields to the plugin information screen.
+
+**Changed**
+* **Backup Workflow:** The "Start Backup" UI flow has been redesigned. Instead of immediately attempting a browser-based backup (which is prone to timeouts), the UI now generates a "Runner" command. This encourages users to run the migration via the terminal using a one-line `curl | bash` command for higher reliability.
+* **CLI Command Generation:** The `migrateCommand` logic now dynamically builds a full runner command that includes all selected file and table exclusions directly in the generated string.
+* **CLI Sync Command:** Updated the `sync` command format to include the domain as a second argument (`disembark sync <url> "<domain>"`).
+* **Dashboard Redesign:** The main dashboard buttons ("Explore Files", "Start Backup") have been reorganized.
+* **Tooltips:** Added tooltips to the CLI command block for better clarity on what `connect`, `backup`, `sync`, and `ncdu` commands do.
+
+**Fixed**
+* **Cleanup State:** Ensure UI state (`backup_ready`) is properly reset when running the cleanup routine.
+
 ## **v2.4.1** - November 11, 2025
 
 ### Changed
