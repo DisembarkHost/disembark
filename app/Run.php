@@ -103,10 +103,6 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'regenerate_manifest' ]
         ]);
-        register_rest_route('disembark/v1', '/zip-files', [
-            'methods'  => 'POST',
-            'callback' => [ $this, 'zip_files' ]
-        ]);
         register_rest_route('disembark/v1', '/zip-sync-files', [
             'methods'  => 'POST',
             'callback' => [ $this, 'zip_sync_files' ]
@@ -138,10 +134,6 @@ class Run {
         register_rest_route('disembark/v1', '/cleanup', [
             'methods'  => 'GET',
             'callback' => [ $this, 'cleanup' ]
-        ]);
-        register_rest_route('disembark/v1', '/download', [
-            'methods'  => 'GET',
-            'callback' => [ $this, 'download' ]
         ]);
         register_rest_route('disembark/v1', '/cleanup-file', [
             'methods'  => 'POST',
@@ -238,17 +230,6 @@ class Run {
                 return $manifest_files;
         }
         return new \WP_Error( 'invalid_step', 'The provided step is not valid.', [ 'status' => 400 ] );
-    }
-
-    function zip_files ( $request ) {
-        if ( ! User::allowed( $request ) ) {
-            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
-        }
-        $backup_token = $request['backup_token'];
-        $file = empty( $request['file'] ) ? "" : $request['file'];
-        $exclude_files_string = $request['exclude_files'] ?? '';
-        $exclude_files_array = !empty($exclude_files_string) ? explode( "\n", $exclude_files_string ) : [];
-        return ( new Backup( $backup_token ) )->zip_files( $file, $exclude_files_array );
     }
 
     function zip_sync_files( $request ) {
@@ -426,16 +407,6 @@ class Run {
             die('500 Internal Server Error: Could not open file for reading.');
         }
         
-        exit;
-    }
-
-    function download( $request ) {
-        if ( ! User::allowed( $request ) ) {
-            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
-        }
-        $files = ( new Backup( $request['backup_token'] ) )->list_downloads();
-        header('Content-Type: text/plain');
-        echo implode( "\n", $files );
         exit;
     }
 

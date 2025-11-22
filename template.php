@@ -10,7 +10,7 @@
              </template>
              <v-card max-width="650" class="pa-3">
                 <v-card-text class="text-body-2">
-                    <p class="mb-2">In order to generate a zip file locally you'll need to have Disembark CLI.</p>
+                    <p class="mb-2">For the best experience, install Disembark CLI.</p>
                     <div style="position: relative;margin-bottom: 14px;padding-right: 42px;background: #2d2d2d; border-radius: 4px;">
                         <pre style="font-size: 11px;color: #f8f8f2;background: #2d2d2d;padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliInstall }}</pre>
                         <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliInstall )" style="color: #f8f8f2;caret-color: #f8f8f2;position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
@@ -54,7 +54,7 @@
     <v-main>
     <v-container>
     <div style="position: relative;" id="disembark-app-container">
-    <v-card v-if="ui_state === 'initial' || ui_state === 'connected'" style="max-width: 600px; margin: 0px auto 20px auto;position:relative" class="pa-3">
+    <v-card v-if="ui_state === 'initial' || ui_state === 'connected'" :style="{ 'max-width': backup_ready ? '750px' : '600px', margin: '0px auto 20px auto', position: 'relative' }" class="pa-3">
         <v-card-text>
         <v-row v-if="ui_state === 'initial'">
             <v-col cols="12">
@@ -64,20 +64,41 @@
                 </v-btn>
             </v-col>
         </v-row>
-        <v-row v-if="ui_state === 'connected'">
+        <v-row v-if="ui_state === 'connected' && !backup_ready">
             <v-col cols="12" sm="6">
                 <v-btn block color="primary" @click="showExplorer">
-                    <v-icon left>mdi-folder-search-outline</v-icon>
+                    <v-icon left class="mr-1">mdi-folder-search-outline</v-icon>
                     Explore Files
                 </v-btn>
             </v-col>
             <v-col cols="12" sm="6">
-                <v-btn block color="secondary" @click="startBackupUI">
-                    <v-icon left>mdi-cloud-download</v-icon>
+                <v-btn block color="secondary" @click="this.backup_ready = true">
                     Start Backup
+                    <v-icon left class="ml-1">mdi-cloud-download</v-icon>
                 </v-btn>
             </v-col>
         </v-row>
+        <v-card v-if="backup_ready" flat>
+            <div class="d-flex align-center mb-4">
+                <v-icon color="success" class="mr-2">mdi-check-circle</v-icon>
+                <span class="text-h6">Ready to Backup</span>
+                <v-spacer></v-spacer>
+                <v-btn variant="text" icon size="small" @click="backup_ready = false">
+                    <v-icon>mdi-close</v-icon>
+                </v-btn>
+            </div>
+            
+            <p class="text-body-2 mb-3">Run this command in your terminal to process the backup locally:</p>
+            
+            <div style="position: relative; background: #2d2d2d; border-radius: 4px; padding-right: 38px;">
+                <pre style="font-size: 12px; color: #f8f8f2; background: #2d2d2d; padding: 14px; white-space: pre-wrap; word-break: break-all; border-radius: 4px;">{{ migrateCommand }}</pre>
+                <v-btn variant="text" icon="mdi-content-copy" @click="copyText( migrateCommand )" style="color: #f8f8f2; position: absolute; top: 5px; right: 5px;"></v-btn>
+            </div>
+            
+            <v-alert type="info" density="compact" variant="tonal" class="mt-4 text-caption">
+                This command uses your current settings (Session ID: {{ backup_token }}).
+            </v-alert>
+        </v-card>
     </v-card-text>
     </v-card>
     <v-overlay v-model="loading" contained persistent attach="#app" opacity="0.7" class="align-center justify-center">
@@ -122,13 +143,6 @@
         </div>
     </v-overlay>
     <div style="opacity:0;"><textarea id="clipboard" style="height:1px;width:10px;display:flex;cursor:default"></textarea></div>
-    <v-alert variant="outlined" type="success" text v-if="migrateCommand" class="mb-4">
-        Backup is ready. You can generate a zip file locally use the following commands in your terminal.
-        <div style="position: relative;margin-top: 14px;padding-right: 42px;background: #2d2d2d;">
-        <pre style="font-size: 11px;color: #f8f8f2;background: #2d2d2d;padding: 14px 50px 14px 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ migrateCommand }}</pre>
-        <v-btn variant="text" icon="mdi-content-copy" @click="copyText( migrateCommand )" style="color: #f8f8f2;caret-color: #f8f8f2;position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
-      </div>
-    </v-alert>
     <v-row v-if="ui_state === 'backing_up' || ui_state === 'connected'">
         <v-col cols="12" sm="12" md="6" v-if="database.length > 0">
             <v-toolbar flat dark density="compact" color="primary" class="text-white pr-5">
@@ -290,31 +304,32 @@
         </v-col>
     </v-row>
     <v-card class="mt-6" flat rounded="0" density="compact">
-        <v-toolbar flat density="compact" class="text-body-2" color="primary"><v-icon icon="mdi-console" class="mr-2 ml-4"></v-icon>For limited space, you can run the backup over CLI. Use the commands below after configuring your exclusions.</v-toolbar>
+        <v-toolbar flat density="compact" class="text-body-2" color="primary"><v-icon icon="mdi-console" class="mr-2 ml-4"></v-icon>For reuseable backups use the Disembark CLI. Use the commands below after configuring your exclusions.</v-toolbar>
         <v-card-text>
         <div style="position: relative;padding-right: 42px; border-radius: 4px;">
-            <p><code @click="copyText( cliCommands.connect )" style="cursor: pointer;">{{ cliCommands.connect }}</code></p>
-            <p><code @click="copyText( cliCommands.backup )" style="cursor: pointer;">{{ cliCommands.backup }}</code></p>
-            <p><code @click="copyText( cliCommands.sync )" style="cursor: pointer;">{{ cliCommands.sync }}</code></p>
-        </div>
-        <div v-if="backup_token" class="px-2 py-2 text-caption d-flex align-center flex-wrap" style="gap: 4px;">
-            <span>
-                Your current Backup Session ID is: <code class="text-caption" @click="copyText( backup_token )" style="cursor: pointer;">{{ backup_token }}</code>. You can use this ID with the CLI to reuse the generated file list <code class="text-caption" @click="copyText( '--session-id=' + backup_token )" style="cursor: pointer;">--session-id={{ backup_token }}</code>.
-            </span>
-            <v-btn
-                v-if="!manifest_is_synced"
-                color="primary"
-                variant="text"
-                size="small"
-                @click="regenerateSessionManifest"
-                :loading="regenerating_manifest"
-                class="pa-1"
-                style="min-width: 0;"
-                icon
-            >
-                <v-icon>mdi-refresh</v-icon>
-                <v-tooltip location="top" activator="parent">Regenerate session with current file exclusions</v-tooltip>
-            </v-btn>
+            <v-tooltip text="Connect to this site from the CLI." location="top">
+                <template v-slot:activator="{ props }">
+                    <p class="mb-2"><code v-bind="props" @click="copyText( cliCommands.connect )" style="cursor: pointer;">{{ cliCommands.connect }}</code></p>
+                </template>
+            </v-tooltip>
+            
+            <v-tooltip text="Run a full backup with your selected exclusions." location="top">
+                <template v-slot:activator="{ props }">
+                    <p class="mb-2"><code v-bind="props" @click="copyText( cliCommands.backup )" style="cursor: pointer;">{{ cliCommands.backup }}</code></p>
+                </template>
+            </v-tooltip>
+
+            <v-tooltip text="Create/update a local mirror with your selected exclusions." location="top">
+                <template v-slot:activator="{ props }">
+                    <p class="mb-2"><code v-bind="props" @click="copyText( cliCommands.sync )" style="cursor: pointer;">{{ cliCommands.sync }}</code></p>
+                </template>
+            </v-tooltip>
+            
+            <v-tooltip text="Browse remote file system disk usage (requires `ncdu`)." location="top">
+                <template v-slot:activator="{ props }">
+                    <p class="mb-0"><code v-bind="props" @click="copyText( cliCommands.ncdu )" style="cursor: pointer;">{{ cliCommands.ncdu }}</code></p>
+                </template>
+            </v-tooltip>
         </div>
         </v-card-text>
     </v-card>
@@ -500,6 +515,7 @@ createApp({
                 await this.fetchBackupSize(); // Refresh size
 
                 // Reset UI to the initial state
+                this.backup_ready = false;
                 this.ui_state = 'initial';
                 this.backup_token = "";
                 this.database = [];
@@ -544,15 +560,6 @@ createApp({
             this.$vuetify.theme.global.name = newTheme;
             localStorage.setItem('theme', newTheme);
             document.body.classList.toggle('disembark-dark-mode', newTheme === 'dark');
-        },
-        startBackupUI() {
-            if (!this.options.include_database && !this.options.include_files) {
-                this.snackbar.message = "Nothing to back up. Please toggle on either files or database.";
-                this.snackbar.show = true;
-                return;
-            }
-            this.ui_state = 'backing_up';
-            this.startBackup();
         },
         showExplorer() {
             this.explorer.show = true;
@@ -865,164 +872,6 @@ createApp({
             });
             return files;
         },
-        async backupFiles() {
-            if ( this.backup_progress.copied == this.backup_progress.total ) {
-                this.loading = false
-                this.backup_ready = true
-                this.ui_state = 'initial';
-                this.fetchBackupSize(); // Refresh disk size
-                return
-            }
-
-            let chunk = this.file_backup_queue[ this.backup_progress.copied ];
-            let data = {
-                token: this.api_token,
-                backup_token: this.backup_token,
-                files: chunk
-            }
-
-            try {
-                const response = await axios.post( '/wp-json/disembark/v1/zip-sync-files', data)
-                
-                if ( !response.data || typeof response.data !== 'string' || !response.data.startsWith('http') ) {
-                    let errorMsg = 'Did not receive a valid zip URL.';
-                    if (response.data && response.data.message) {
-                        errorMsg = response.data.message;
-                    }
-                    throw new Error(errorMsg);
-                }
-                
-                if ( this.options.include_files ) {
-                     this.files_progress.copied += chunk.length
-                }
-                this.backup_progress.copied++;
-                this.backupFiles();
-
-            } catch(error) {
-                 let chunk_name = `chunk ${this.backup_progress.copied + 1}`;
-                 this.snackbar.message = `Could not zip ${chunk_name}: ${error.message}. Retrying...`
-                 this.snackbar.show = true
-                 
-                 setTimeout(() => {
-                    this.backupFiles()
-                 }, 3000);
-            }
-        },
-        backupDatabase() {
-            if (this.database_progress.copied == this.database_backup_queue.length) {
-                if (this.options.include_files) {
-                    this.backupFiles();
-                } else {
-                    this.loading = false;
-                    this.backup_ready = true;
-                    this.ui_state = 'initial';
-                }
-                // Check if any batches or single-part tables were processed
-                const hasBatchesOrSinglePartTables = this.database_backup_queue.some(item => item.type === 'batch' || (item.type === 'table' && !item.table.parts));
-                if (hasBatchesOrSinglePartTables) {
-                    this.zipDatabase();
-                }
-                return;
-            }
-
-            let item = this.database_backup_queue[this.database_progress.copied];
-            let data = {
-                token: this.api_token,
-                backup_token: this.backup_token,
-            };
-
-            if (item.type === 'batch') {
-                // --- Handle Batch ---
-                const tableNames = item.tables.map(t => t.table);
-                data.tables = tableNames;
-                // Set all tables in this batch to running
-                item.tables.forEach(t => t.running = true);
-
-                axios.post(`/wp-json/disembark/v1/export-database-batch`, data).then(response => {
-                    if (response.data == "") {
-                        this.snackbar.message = `Could not backup batch ${this.database_progress.copied + 1}.`;
-                        this.snackbar.show = true;
-                        this.loading = false;
-                        item.tables.forEach(t => t.running = false); // Reset on failure
-                        return;
-                    }
-
-                    this.database_progress.copied = this.database_progress.copied + 1;
-                    // Set all tables in this batch to done
-                    item.tables.forEach(t => {
-                        t.running = false;
-                        t.done = true;
-                        t.completion_time = new Date().getTime();
-                    });
-                    this.backupDatabase(); // Process next item
-
-                }).catch(error => {
-                    this.snackbar.message = `Could not backup batch. Retrying...`;
-                    this.snackbar.show = true;
-                    item.tables.forEach(t => t.running = false); // Reset on failure
-                    this.backupDatabase(); // Retry
-                });
-
-            } else if (item.type === 'table') {
-                // --- Handle Single Large Table (with or without parts) ---
-                let table = item.table;
-                data.table = table.table;
-                table.running = true;
-
-                if (table.parts) {
-                    table.current = (table.current || 0) + 1;
-                    data.parts = table.current;
-                    data.rows_per_part = table.rows_per_part;
-                }
-
-                axios.post(`/wp-json/disembark/v1/export/database/${table.table}`, data).then(response => {
-                    if (response.data == "") {
-                        this.snackbar.message = `Could not backup table ${table.table}.`;
-                        this.snackbar.show = true;
-                        this.loading = false;
-                        table.running = false;
-                        return;
-                    }
-
-                    if (table.parts && table.current !== table.parts) {
-                        // This is a multi-part table, but not the last part.
-                        // Zip the part we just got.
-                        axios.post('/wp-json/disembark/v1/zip-database', data).then(() => {
-                            // Don't mark as "running = false", the table is still processing.
-                            this.backupDatabase(); // Call for the next part
-                        });
-                        return;
-                    }
-
-                    // This is the last part of a multi-part table, or a single-part table
-                    this.database_progress.copied = this.database_progress.copied + 1;
-                    table.running = false;
-                    table.done = true;
-                    table.completion_time = new Date().getTime();
-                    this.backupDatabase(); // Call for next item in queue
-
-                }).catch(error => {
-                    this.snackbar.message = `Could not backup table ${table.table}. Retrying...`;
-                    if (table.parts) {
-                        table.current = table.current - 1; // Decrement part counter
-                    }
-                    this.snackbar.show = true;
-                    table.running = false; // Reset running on failure
-                    this.backupDatabase(); // Retry
-                });
-            }
-        },
-        zipDatabase() {
-            axios.post( '/wp-json/disembark/v1/zip-database', {
-                token: this.api_token,
-                backup_token: this.backup_token
-            }).then( response => {
-               if ( response.data == "" ) {
-                    this.snackbar.message = `Could not zip database.`
-                    this.snackbar.show = true
-                }
-             })
-        },
         resetBackupState() {
             this.backup_ready = false;
             this.database_backup_queue = [];
@@ -1042,8 +891,6 @@ createApp({
         handleMainAction() {
             if (this.ui_state === 'initial') {
                 this.connect();
-            } else if (this.ui_state === 'connected') {
-                this.startBackupUI();
             }
         },
         async fetchAndProcessManifests(manifests) {
@@ -1119,132 +966,6 @@ createApp({
             } finally {
                 this.analyzing = false;
                 this.fetchBackupSize();
-            }
-        },
-        async startBackup() {
-            this.resetBackupState(); 
-            
-            // --- 1. Database Queue (Unchanged) ---
-            this.database_backup_queue = [];
-            const large_tables = [];
-            const small_tables = [];
-            const max_size = 209715200; // 200 MB
-            const max_rows = 1000000; // 1 million rows
-
-            this.included_tables.forEach(table => {
-                const table_size = parseFloat(table.size) || 0;
-                const row_count = parseInt(table.row_count) || 0;
-                const originalTable = this.database.find(t => t.table === table.table);
-
-                if ((table_size > max_size || row_count > max_rows) && row_count > 0) {
-                    const parts_by_size = Math.ceil(table_size / max_size);
-                    const parts_by_rows = Math.ceil(row_count / max_rows);
-                    const parts = Math.max(parts_by_size, parts_by_rows);
-                
-                    originalTable.parts = parts;
-                    originalTable.current = 0;
-                    originalTable.rows_per_part = Math.ceil(row_count / parts);
-                    large_tables.push({ type: 'table', table: originalTable });
-                } else {
-                    if (originalTable) originalTable.parts = 0;
-                    small_tables.push(originalTable);
-                }
-            });
-            
-            const small_table_batches = [];
-            let current_batch = [];
-            let current_batch_size = 0;
-            
-            small_tables.forEach(table => {
-                const table_size = parseFloat(table.size) || 0;
-                if (current_batch_size + table_size > max_size && current_batch.length > 0) {
-                    small_table_batches.push({ type: 'batch', tables: current_batch, size: current_batch_size });
-                    current_batch = [];
-                    current_batch_size = 0;
-                }
-                current_batch.push(table);
-                current_batch_size += table_size;
-            });
-            if (current_batch.length > 0) {
-                small_table_batches.push({ type: 'batch', tables: current_batch, size: current_batch_size });
-            }
-
-            this.database_backup_queue = [...small_table_batches, ...large_tables];
-            this.database_progress.total = this.database_backup_queue.length;
-            
-            // --- 2. File Filtering & Chunking (New Logic) ---
-            const selectedPaths = new Set(this.excluded_nodes.map(node => node.id));
-            const minimalExclusionPaths = this.excluded_nodes
-                .map(node => node.id)
-                .filter(path => {
-                    let parent = path.substring(0, path.lastIndexOf('/'));
-                    while (parent) {
-                        if (selectedPaths.has(parent)) {
-                            return false;
-                        }
-                        parent = parent.substring(0, parent.lastIndexOf('/'));
-                    }
-                    return true;
-                });
-
-            // Filter the raw list
-            const files_to_zip = this.explorer.raw_file_list.filter(file => {
-                if (!file.type || file.type !== 'file') return false;
-                for (const exclude_path of minimalExclusionPaths) {
-                    if (file.name === exclude_path || file.name.startsWith(exclude_path + '/')) {
-                        return false;
-                    }
-                }
-                return true;
-            });
-
-            // Chunk the filtered list
-            const file_chunks = [];
-            let chunk_current = [];
-            let chunk_current_size = 0;
-            const file_chunk_size = 2500; // 2500 files default (like CLI)
-            const file_chunk_max_size = 524288000; // 500MB default (like CLI)
-
-            for (const file of files_to_zip) {
-                const file_size = file.size || 0;
-
-                if (file_size > file_chunk_max_size) {
-                    if (chunk_current.length > 0) file_chunks.push(chunk_current);
-                    file_chunks.push([file]);
-                    chunk_current = [];
-                    chunk_current_size = 0;
-                    continue;
-                }
-                if ( (chunk_current.length > 0 && chunk_current_size + file_size > file_chunk_max_size) || 
-                     (chunk_current.length >= file_chunk_size) ) {
-                    file_chunks.push(chunk_current);
-                    chunk_current = [file];
-                    chunk_current_size = file_size;
-                } else {
-                    chunk_current.push(file);
-                    chunk_current_size += file_size;
-                }
-            }
-            if (chunk_current.length > 0) {
-                file_chunks.push(chunk_current);
-            }
-            
-            this.file_backup_queue = file_chunks; 
-            this.backup_progress.total = this.file_backup_queue.length; // Total *chunks*
-            
-            // --- 3. Start Backup ---
-            this.analyzing = false;
-            this.loading = true;
-
-            if (this.options.include_database && this.included_tables.length > 0) {
-                this.backupDatabase();
-            } else if (this.options.include_files && this.file_backup_queue.length > 0) {
-                this.backupFiles();
-            } else {
-                this.loading = false;
-                this.snackbar.message = "Nothing to back up. Please include either files or database tables.";
-                this.snackbar.show = true;
-                this.ui_state = 'connected'; // Go back to connected state
             }
         },
         async runManifestGeneration() {
@@ -1456,8 +1177,44 @@ createApp({
         },
         migrateCommand() {
             if ( this.backup_token == '' || ! this.backup_ready ) { return "" }
-            const command = `curl -sL https://disembark.host/generate-zip | bash -s -- --url="${this.home_url}" --token="${this.api_token}" --backup-token="${this.backup_token}" --cleanup`;
-            return command
+            
+            // 1. Base Runner Command
+            let cmd = `curl -sL https://disembark.host/run | bash -s -- backup "${this.home_url}" --token="${this.api_token}" --session-id="${this.backup_token}"`;
+
+            // 2. Database Exclusions
+            // Calculate tables that are NOT in the included list
+            const includedSet = new Set(this.included_tables.map(t => t.table));
+            const excludedTables = this.database
+                .filter(t => !includedSet.has(t.table))
+                .map(t => t.table);
+            
+            if (excludedTables.length > 0) {
+                cmd += ` --exclude-tables=${excludedTables.join(',')}`;
+            }
+
+            // 3. File Exclusions
+            // Filter to find minimal parent paths to keep command clean
+            const selectedPaths = new Set(this.excluded_nodes.map(node => node.id));
+            const minimalExclusions = this.excluded_nodes
+                .map(node => node.id)
+                .filter(path => {
+                    let parent = path.substring(0, path.lastIndexOf('/'));
+                    while (parent) {
+                        if (selectedPaths.has(parent)) return false;
+                        parent = parent.substring(0, parent.lastIndexOf('/'));
+                    }
+                    return true;
+                });
+            
+            if (minimalExclusions.length > 0) {
+                cmd += " " + minimalExclusions.map(path => `-x "${path}"`).join(' ');
+            }
+
+            // 4. Skip Flags
+            if (!this.options.include_database) cmd += ` --skip-db`;
+            if (!this.options.include_files) cmd += ` --skip-files`;
+
+            return cmd;
         },
         displayTables() {
             return [...this.included_tables].sort((a, b) => {
