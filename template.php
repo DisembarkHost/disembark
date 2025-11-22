@@ -1313,6 +1313,7 @@ createApp({
             const connectCommand = `disembark connect ${this.home_url} ${this.api_token}`;
             let backupCommand = `disembark backup ${this.home_url}`;
             let syncCommand = `disembark sync ${this.home_url}`;
+            let ncduCommand = `disembark ncdu ${this.home_url}`;
 
             // Add File Exclusions
             const selectedPaths = new Set(this.excluded_nodes.map(node => node.id));
@@ -1369,7 +1370,8 @@ createApp({
             return {
                 connect: connectCommand,
                 backup: backupCommand + sessionIdFlag,
-                sync: syncCommand + sessionIdFlag
+                sync: syncCommand + sessionIdFlag,
+                ncdu: ncduCommand + sessionIdFlag
             };
         },
         cliInstall() {
