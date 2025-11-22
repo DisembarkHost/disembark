@@ -1308,11 +1308,14 @@ createApp({
     computed: {
         cliCommands() {
             if (!this.home_url || !this.api_token) return {}; // Return empty object
+
+            // Extract domain for folder name (remove protocol and trailing slash)
+            const domain = this.home_url.replace(/^https?:\/\//, '').replace(/\/$/, '');
             
             // Base Commands
             const connectCommand = `disembark connect ${this.home_url} ${this.api_token}`;
             let backupCommand = `disembark backup ${this.home_url}`;
-            let syncCommand = `disembark sync ${this.home_url}`;
+            let syncCommand = `disembark sync ${this.home_url} "${domain}"`;
             let ncduCommand = `disembark ncdu ${this.home_url}`;
 
             // Add File Exclusions
