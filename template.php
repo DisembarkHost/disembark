@@ -8,14 +8,8 @@
                      <v-tooltip location="left" activator="parent" text="Cleanup & Settings"></v-tooltip>
                  </v-btn>
              </template>
-             <v-card max-width="650" class="pa-3">
+             <v-card max-width="350" class="pa-3">
                 <v-card-text class="text-body-2">
-                    <p class="mb-2">For the best experience, install Disembark CLI.</p>
-                    <div style="position: relative;margin-bottom: 14px;padding-right: 42px;background: #2d2d2d; border-radius: 4px;">
-                        <pre style="font-size: 11px;color: #f8f8f2;background: #2d2d2d;padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliInstall }}</pre>
-                        <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliInstall )" style="color: #f8f8f2;caret-color: #f8f8f2;position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
-                    </div>
-                    <v-divider class="my-3"></v-divider>
                     <div v-if="backup_disk_size > 0">
                         <p class="mb-2 text-body-2">You can free up <strong>{{ formatSize(backup_disk_size) }}</strong> of disk space by removing temporary backup files.</p>
                         <v-btn
@@ -28,7 +22,40 @@
                         </v-btn>
                     </div>
                     <div v-else>
-                        <p class="text-body-2">No temporary backup files to clean up.</p>
+                         <p class="text-body-2">No temporary backup files to clean up.</p>
+                    </div>
+
+                    <div v-if="last_scan_stats" class="my-4">
+                        <div class="bg-grey-lighten-4 pa-3 rounded border" style="border-color: rgba(0,0,0,0.08) !important;">
+                            <div class="text-subtitle-2 mb-2 font-weight-bold text-high-emphasis">
+                                <v-icon size="small" class="mr-1" color="primary">mdi-history</v-icon> 
+                                Last Scan Info
+                            </div>
+                            
+                            <div style="display: grid; grid-template-columns: 1fr auto; gap: 8px 0; align-items: start;">
+                                
+                                <div class="text-caption text-medium-emphasis">Files Found</div>
+                                <div class="text-caption font-weight-bold text-high-emphasis text-right">
+                                    {{ formatLargeNumbers(last_scan_stats.total_files) }}
+                                </div>
+
+                                <div class="text-caption text-medium-emphasis">Total Size</div>
+                                <div class="text-caption font-weight-bold text-high-emphasis text-right">
+                                    {{ formatSize(last_scan_stats.total_size) }}
+                                </div>
+
+                                <div class="text-caption text-medium-emphasis pt-1">Scanned</div>
+                                <div class="text-caption text-right">
+                                    <div class="font-weight-bold text-high-emphasis">
+                                        {{ formatTimeAgo(last_scan_stats.timestamp) }}
+                                    </div>
+                                    <div class="text-disabled" style="font-size: 10px; line-height: 1.2;">
+                                        {{ formatDate(last_scan_stats.timestamp) }}
+                                    </div>
+                                </div>
+
+                            </div>
+                        </div>
                     </div>
                     <v-divider class="my-3"></v-divider>
                     <div>
@@ -467,6 +494,7 @@ createApp({
             database: [],
             files: [],
             files_total: 0,
+            last_scan_stats: null,
             backup_ready: false,
             options: {
                 database: true,
@@ -520,13 +548,29 @@ createApp({
         toggleDatabaseSort() {
             this.database_sort_key = this.database_sort_key === 'table' ? 'size' : 'table';
         },
+        formatDate(timestamp) {
+            if (!timestamp) return '';
+            return new Date(timestamp * 1000).toLocaleString();
+        },
+        formatTimeAgo(timestamp) {
+            if (!timestamp) return '';
+            const seconds = Math.floor(Date.now() / 1000) - timestamp;
+            if (seconds < 60) return 'Just now';
+            const minutes = Math.floor(seconds / 60);
+            if (minutes < 60) return `${minutes}m ago`;
+            const hours = Math.floor(minutes / 60);
+            if (hours < 24) return `${hours}h ago`;
+            return `${Math.floor(hours / 24)}d ago`;
+        },
         async fetchBackupSize() {
             try {
                 const response = await axios.get(`/wp-json/disembark/v1/backup-size?token=${this.api_token}`);
                 this.backup_disk_size = response.data.size;
+                this.last_scan_stats = response.data.scan_stats;
             } catch (error) {
                 console.error("Could not fetch backup size:", error);
                 this.backup_disk_size = 0;
+                this.last_scan_stats = null;
             }
         },
         async cleanupBackups() {
