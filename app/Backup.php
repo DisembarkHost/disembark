@@ -622,7 +622,7 @@ class Backup {
             return new \WP_Error( 'no_files', 'No files provided to zip.' );
         }
         // Use a unique name for this sync zip
-        $file_name = "sync-files-" . time();
+        $file_name = "sync-files-" . uniqid();
         $zip_name  = "{$this->backup_path}/{$file_name}.zip";
         $web_root  = dirname( WP_CONTENT_DIR );
         $core_root = rtrim( ABSPATH, '/' );
