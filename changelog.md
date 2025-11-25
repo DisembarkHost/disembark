@@ -1,5 +1,15 @@
 # Changelog
 
+### **v2.6.0** - November 25, 2025
+
+### Added
+* **Scan History**: The settings menu now displays cached statistics from the last file analysis, including the total number of files found, total size, and the time elapsed since the scan.
+
+### Improved
+* **CLI Info Section**: Cleaned up the CLI information area by consolidating installation instructions into a hover menu and refreshing the command block styling.
+* **Security**: Hardened API authentication by implementing `hash_equals` for constant-time token comparison, protecting against timing attacks.
+* **Concurrency**: Changed the naming convention for temporary synchronization zip files to use unique IDs (`uniqid`) instead of timestamps (`time()`). This prevents filename collisions when multiple file chunks are requested simultaneously.
+
 ## **v2.5.0** - November 21, 2025
 
 **Added**
