@@ -147,22 +147,25 @@ class Run {
         }
 
         $directory = wp_upload_dir()["basedir"] . "/disembark/";
-        if ( ! is_dir( $directory ) ) {
-            return [ 'size' => 0 ];
-        }
-
         $size = 0;
-        $files = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($directory, \RecursiveDirectoryIterator::SKIP_DOTS)
-        );
 
-        foreach ( $files as $file ) {
-            if ( $file->isFile() ) {
-                $size += $file->getSize();
+        if ( is_dir( $directory ) ) {
+            $files = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($directory, \RecursiveDirectoryIterator::SKIP_DOTS)
+            );
+            foreach ( $files as $file ) {
+                if ( $file->isFile() ) {
+                    $size += $file->getSize();
+                }
             }
         }
 
-        return [ 'size' => $size ];
+        $last_scan = get_option( 'disembark_last_scan_stats', null );
+        
+        return [ 
+            'size' => $size,
+            'scan_stats' => $last_scan
+        ];
     }
 
     function cleanup_file( $request ) {
