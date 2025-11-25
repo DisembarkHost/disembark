@@ -278,10 +278,19 @@ class Backup {
         $response = [];
         natsort( $manifest_chunks );
         
+        // Initialize grand totals
+        $grand_total_size = 0;
+        $grand_total_files = 0;
+        
         foreach ( $manifest_chunks as $chunk_file ) {
             $content = json_decode( file_get_contents( $chunk_file ) );
             $file_count = count( $content );
             $total_size = array_sum( array_column( $content, 'size' ) );
+
+            // Accumulate totals
+            $grand_total_size += $total_size;
+            $grand_total_files += $file_count;
+
             // Add back the URL for direct download
             $file_name = basename( $chunk_file );
             $url = "{$this->backup_url}/{$file_name}";
@@ -298,6 +307,13 @@ class Backup {
                 "count" => $file_count
             ];
         }
+
+        // Cache the global stats for the CLI info command
+        update_option( 'disembark_last_scan_stats', [
+            'total_size'  => $grand_total_size,
+            'total_files' => $grand_total_files,
+            'timestamp'   => time()
+        ]);
 
         file_put_contents( "{$this->backup_path}/manifest.json", json_encode( array_values( $response ), JSON_PRETTY_PRINT ) );
         return $this->list_manifest();
