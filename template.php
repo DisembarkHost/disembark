@@ -304,33 +304,56 @@
         </v-col>
     </v-row>
     <v-card class="mt-6" flat rounded="0" density="compact">
-        <v-toolbar flat density="compact" class="text-body-2" color="primary"><v-icon icon="mdi-console" class="mr-2 ml-4"></v-icon>For reuseable backups use the Disembark CLI. Use the commands below after configuring your exclusions.</v-toolbar>
+        <v-toolbar flat density="compact" class="text-body-2" color="primary">
+            <v-icon icon="mdi-console" class="mr-2 ml-4"></v-icon>
+            For reuseable backups use the Disembark CLI then use the commands below after configuring your exclusions.
+        </v-toolbar>
+        
         <v-card-text>
-        <div style="position: relative;padding-right: 42px; border-radius: 4px;">
-            <v-tooltip text="Connect to this site from the CLI." location="top">
-                <template v-slot:activator="{ props }">
-                    <p class="mb-2"><code v-bind="props" @click="copyText( cliCommands.connect )" style="cursor: pointer;">{{ cliCommands.connect }}</code></p>
-                </template>
-            </v-tooltip>
-            
-            <v-tooltip text="Run a full backup with your selected exclusions." location="top">
-                <template v-slot:activator="{ props }">
-                    <p class="mb-2"><code v-bind="props" @click="copyText( cliCommands.backup )" style="cursor: pointer;">{{ cliCommands.backup }}</code></p>
-                </template>
-            </v-tooltip>
+            <div class="mt-0 mb-4 text-caption">
+                For the best experience, install 
+                <v-menu open-on-hover location="bottom start" :close-on-content-click="false">
+                    <template v-slot:activator="{ props }">
+                        <span 
+                            v-bind="props" 
+                            class="text-primary font-weight-bold" 
+                            style="cursor: help; text-decoration: underline dotted;"
+                        >
+                            Disembark CLI
+                        </span>
+                    </template>
+                    <v-sheet elevation="4" rounded min-width="450" class="pa-0">
+                        <div style="position: relative; padding-right: 42px; background: rgb(var(--v-theme-surface-light)); border-radius: 4px;">
+                            <pre style="font-size: 11px; background: transparent; padding: 14px; white-space: pre; overflow-x: auto; border-radius: 4px;">{{ cliInstall }}</pre>
+                            <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliInstall )" style="position: absolute; top: 50%; right: -4px; transform: translateY(-50%);"></v-btn>
+                        </div>
+                    </v-sheet>
+                </v-menu>.
+            </div>
 
-            <v-tooltip text="Create/update a local mirror with your selected exclusions." location="top">
-                <template v-slot:activator="{ props }">
-                    <p class="mb-2"><code v-bind="props" @click="copyText( cliCommands.sync )" style="cursor: pointer;">{{ cliCommands.sync }}</code></p>
-                </template>
-            </v-tooltip>
-            
-            <v-tooltip text="Browse remote file system disk usage (requires `ncdu`)." location="top">
-                <template v-slot:activator="{ props }">
-                    <p class="mb-0"><code v-bind="props" @click="copyText( cliCommands.ncdu )" style="cursor: pointer;">{{ cliCommands.ncdu }}</code></p>
-                </template>
-            </v-tooltip>
-        </div>
+            <div style="position: relative;margin-bottom: 14px;padding-right: 42px;background: rgb(var(--v-theme-surface-light));border-radius: 4px;">
+                <v-tooltip location="top" activator="parent" text="Connect to this site from the CLI."></v-tooltip>
+                <pre style="font-size: 11px;background: rgb(var(--v-theme-surface-light));padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliCommands.connect }}</pre>
+                <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliCommands.connect )" style="position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
+            </div>
+
+            <div style="position: relative;margin-bottom: 14px;padding-right: 42px;background: rgb(var(--v-theme-surface-light));border-radius: 4px;">
+                <v-tooltip location="top" activator="parent" text="Run a full backup with your selected exclusions."></v-tooltip>
+                <pre style="font-size: 11px;background: rgb(var(--v-theme-surface-light));padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliCommands.backup }}</pre>
+                <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliCommands.backup )" style="position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
+            </div>
+
+            <div style="position: relative;margin-bottom: 14px;padding-right: 42px;background: rgb(var(--v-theme-surface-light));border-radius: 4px;">
+                <v-tooltip location="top" activator="parent" text="Create/update a local mirror with your selected exclusions."></v-tooltip>
+                <pre style="font-size: 11px;background: rgb(var(--v-theme-surface-light));padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliCommands.sync }}</pre>
+                <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliCommands.sync )" style="position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
+            </div>
+
+            <div style="position: relative;margin-bottom: 14px;padding-right: 42px;background: rgb(var(--v-theme-surface-light));border-radius: 4px;">
+                <v-tooltip location="top" activator="parent" text="Browse remote file system disk usage (requires `ncdu`)."></v-tooltip>
+                <pre style="font-size: 11px;background: rgb(var(--v-theme-surface-light));padding: 14px;white-space: pre;overflow-x: auto;border-radius: 4px;">{{ cliCommands.ncdu }}</pre>
+                <v-btn variant="text" icon="mdi-content-copy" @click="copyText( cliCommands.ncdu )" style="position: absolute;top: 50%;right: -4px;transform: translateY(-50%);"></v-btn>
+            </div>
         </v-card-text>
     </v-card>
     </div>  
