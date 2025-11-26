@@ -26,7 +26,10 @@
                     </div>
 
                     <div v-if="last_scan_stats" class="my-4">
-                        <div class="bg-grey-lighten-4 pa-3 rounded border" style="border-color: rgba(0,0,0,0.08) !important;">
+                        <div 
+                            :class="['pa-3', 'rounded', 'border', isDarkMode ? 'bg-grey-darken-3' : 'bg-grey-lighten-4']" 
+                            :style="{ borderColor: isDarkMode ? 'rgba(255,255,255,0.12) !important' : 'rgba(0,0,0,0.08) !important' }"
+                        >
                             <div class="text-subtitle-2 mb-2 font-weight-bold text-high-emphasis">
                                 <v-icon size="small" class="mr-1" color="primary">mdi-history</v-icon> 
                                 Last Scan Info
