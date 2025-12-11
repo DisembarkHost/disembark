@@ -92,7 +92,7 @@ body.disembark-dark-mode #wpbody-content {
     color: #e0f1fa !important;
 }
 
-.v-theme--dark .text-primary {
+.v-theme--dark .text-primary, .v-theme--dark h2, .v-theme--dark h3 {
     color: #e0f1fa !important;
 }
 
@@ -136,4 +136,22 @@ body.disembark-dark-mode #wpbody-content {
 
 .v-treeview-item__level { 
     width: 28.5px; 
+}
+
+input[type=color], input[type=date], input[type=datetime-local], input[type=datetime], input[type=email], input[type=month], input[type=number], input[type=password], input[type=search], input[type=tel], input[type=text], input[type=time], input[type=url], input[type=week], select, textarea {
+    background: transparent;
+}
+
+.v-data-table-footer__items-per-page > .v-select {
+    min-width: 100px !important;
+   
+}
+
+.v-overlay.v-menu {
+    z-index: 100001 !important;
+}
+
+pre.language-css {
+    padding: 14px;
+    overflow: scroll;
 }
