@@ -148,8 +148,10 @@ class Run {
 
         $directory = wp_upload_dir()["basedir"] . "/disembark/";
         $size = 0;
+        $sessions = [];
 
         if ( is_dir( $directory ) ) {
+            // 1. Calculate Total Size (Existing Logic)
             $files = new \RecursiveIteratorIterator(
                 new \RecursiveDirectoryIterator($directory, \RecursiveDirectoryIterator::SKIP_DOTS)
             );
@@ -158,13 +160,34 @@ class Run {
                     $size += $file->getSize();
                 }
             }
+
+            // 2. Find Previous Sessions
+            $dirs = glob( $directory . '*', GLOB_ONLYDIR );
+            if ( $dirs ) {
+                foreach ( $dirs as $dir ) {
+                    $token = basename( $dir );
+                    // Only list sessions that have a manifest (completed scans)
+                    if ( file_exists( $dir . '/manifest.json' ) ) {
+                        $sessions[] = [
+                            'token'     => $token,
+                            'timestamp' => filemtime( $dir . '/manifest.json' ), // Use manifest time
+                            'count'     => count( glob( $dir . '/files-*.json' ) ) // Count chunks
+                        ];
+                    }
+                }
+                // Sort by newest first
+                usort( $sessions, function($a, $b) {
+                    return $b['timestamp'] - $a['timestamp'];
+                });
+            }
         }
 
         $last_scan = get_option( 'disembark_last_scan_stats', null );
         
         return [ 
-            'size' => $size,
-            'scan_stats' => $last_scan
+            'size'       => $size,
+            'scan_stats' => $last_scan,
+            'sessions'   => $sessions
         ];
     }
 
