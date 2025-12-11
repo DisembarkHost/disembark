@@ -88,8 +88,6 @@ class Run {
     }
 
     // --- REST API Endpoints ---
-    // The methods below are unchanged and handle the direct backup logic.
-
     function register_rest_endpoints() {
         register_rest_route('disembark/v1', '/backup-size', [
             'methods'  => 'GET',
@@ -98,6 +96,34 @@ class Run {
         register_rest_route('disembark/v1', '/database', [
             'methods'  => 'GET',
             'callback' => [ $this, 'database' ]
+        ]);
+        register_rest_route('disembark/v1', '/database/row', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'update_database_row' ]
+        ]);
+        register_rest_route('disembark/v1', '/database/row/create', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'insert_database_row' ]
+        ]);
+        register_rest_route('disembark/v1', '/database/row/delete', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'delete_database_row' ]
+        ]);
+        register_rest_route('disembark/v1', '/database/rows', [
+            'methods'  => 'GET',
+            'callback' => [ $this, 'get_table_rows' ]
+        ]);
+        register_rest_route('disembark/v1', '/database/schema', [
+            'methods'  => 'GET',
+            'callback' => [ $this, 'get_table_schema' ]
+        ]);
+        register_rest_route('disembark/v1', '/file/save', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'save_file' ]
+        ]);
+        register_rest_route('disembark/v1', '/file/rename', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'rename_file' ]
         ]);
         register_rest_route('disembark/v1', '/regenerate-manifest', [
             'methods'  => 'POST',
@@ -217,6 +243,296 @@ class Run {
         }
         return $response;
     }
+
+    public function update_database_row( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+
+        global $wpdb;
+        $params = $request->get_json_params();
+        
+        $table = $params['table'] ?? '';
+        $data  = $params['data'] ?? [];       // The new values
+        $where = $params['where'] ?? [];      // The primary keys to identify the row
+
+        // Validate Table Name
+        $valid_tables = $wpdb->get_col( "SHOW TABLES" );
+        if ( ! in_array( $table, $valid_tables ) ) {
+            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        }
+
+        if ( empty( $data ) || empty( $where ) ) {
+            return new \WP_Error( 'missing_data', 'Missing data or primary key identification.', [ 'status' => 400 ] );
+        }
+
+        // Perform the update
+        $result = $wpdb->update( $table, $data, $where );
+
+        if ( false === $result ) {
+            return new \WP_Error( 'update_failed', 'Database update failed: ' . $wpdb->last_error, [ 'status' => 500 ] );
+        }
+
+        return [ 'success' => true, 'rows_affected' => $result ];
+    }
+
+    public function insert_database_row( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+
+        global $wpdb;
+        $params = $request->get_json_params();
+        
+        $table = $params['table'] ?? '';
+        $data  = $params['data'] ?? []; 
+
+        // Validate Table Name
+        $valid_tables = $wpdb->get_col( "SHOW TABLES" );
+        if ( ! in_array( $table, $valid_tables ) ) {
+            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        }
+
+        if ( empty( $data ) ) {
+            return new \WP_Error( 'missing_data', 'Missing data.', [ 'status' => 400 ] );
+        }
+
+        $auto_inc_col = null;
+        $columns = $wpdb->get_results( "SHOW COLUMNS FROM `$table`" );
+        foreach ( $columns as $col ) {
+            if ( stripos( $col->Extra, 'auto_increment' ) !== false ) {
+                $auto_inc_col = $col->Field;
+                break;
+            }
+        }
+
+        // Clean empty values
+        foreach( $data as $key => $value ) {
+            if ( $value === '' ) {
+                // If this is the auto_increment column, remove it so the DB handles it
+                if ( $key === $auto_inc_col ) {
+                    unset( $data[$key] );
+                } else {
+                    // Otherwise convert empty strings to NULL
+                    $data[$key] = null;
+                }
+            }
+        }
+
+        // Perform the insert
+        $result = $wpdb->insert( $table, $data );
+        if ( false === $result ) {
+            return new \WP_Error( 'insert_failed', 'Database insert failed: ' . $wpdb->last_error, [ 'status' => 500 ] );
+        }
+
+        return [ 'success' => true, 'id' => $wpdb->insert_id ];
+    }
+
+    public function delete_database_row( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+
+        global $wpdb;
+        $params = $request->get_json_params();
+        
+        $table = $params['table'] ?? '';
+        $where = $params['where'] ?? [];
+
+        // Validate Table Name
+        $valid_tables = $wpdb->get_col( "SHOW TABLES" );
+        if ( ! in_array( $table, $valid_tables ) ) {
+            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        }
+
+        if ( empty( $where ) ) {
+            return new \WP_Error( 'missing_data', 'Missing primary key identification.', [ 'status' => 400 ] );
+        }
+
+        // Perform the delete
+        $result = $wpdb->delete( $table, $where );
+        
+        if ( false === $result ) {
+            return new \WP_Error( 'delete_failed', 'Database delete failed: ' . $wpdb->last_error, [ 'status' => 500 ] );
+        }
+
+        return [ 'success' => true, 'rows_affected' => $result ];
+    }
+
+    public function get_table_rows( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        
+        global $wpdb;
+        $table = $request['table'];
+        $limit = isset($request['limit']) ? intval($request['limit']) : 1000;
+        $page  = isset($request['page']) ? intval($request['page']) : 1;
+        $offset = ($page - 1) * $limit;
+
+        // Sorting parameters
+        $orderby = isset($request['orderby']) ? $request['orderby'] : null;
+        $order   = isset($request['order']) && strtoupper($request['order']) === 'DESC' ? 'DESC' : 'ASC';
+
+        // 1. Validate Table Name
+        $valid_tables = $wpdb->get_col( "SHOW TABLES" );
+        if ( ! in_array( $table, $valid_tables ) ) {
+            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        }
+
+        // 2. Build Query
+        $sql = "SELECT * FROM `{$table}`";
+
+        // 3. Handle Sorting securely
+        if ( $orderby ) {
+            // Get valid columns for this table to ensure the 'orderby' param is safe
+            $valid_columns = $wpdb->get_col( "DESCRIBE `{$table}`" );
+            if ( in_array( $orderby, $valid_columns ) ) {
+                $sql .= " ORDER BY `{$orderby}` {$order}";
+            }
+        }
+
+        // 4. Add Limits
+        $sql .= $wpdb->prepare( " LIMIT %d OFFSET %d", $limit, $offset );
+
+        // 5. Execute
+        $rows = $wpdb->get_results( $sql, ARRAY_A );
+        
+        // Get total rows for pagination
+        $total = $wpdb->get_var( "SELECT COUNT(*) FROM `{$table}`" );
+
+        return [
+            'rows' => $rows,
+            'total' => (int)$total
+        ];
+    }
+
+    public function get_table_schema( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+
+        global $wpdb;
+        $table = $request['table'];
+
+        // Security: Validate table existence
+        $valid_tables = $wpdb->get_col( "SHOW TABLES" );
+        if ( ! in_array( $table, $valid_tables ) ) {
+            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        }
+
+        // Get Table Structure
+        $structure = $wpdb->get_results( "DESCRIBE `{$table}`" );
+        
+        // Get Table Status (for engine, collation, etc.)
+        $status = $wpdb->get_row( "SHOW TABLE STATUS LIKE '{$table}'" );
+
+        return [
+            'structure' => $structure,
+            'status'    => $status
+        ];
+    }
+
+    function save_file( $request ) {
+        // 1. Security Check
+        $params = $request->get_json_params();
+        $token = $params['token'] ?? null;
+        
+        // Manually create request for auth check
+        $auth_request = new \WP_REST_Request();
+        $auth_request->set_param('token', $token);
+
+        if ( ! User::allowed( $auth_request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Invalid token.', [ 'status' => 403 ] );
+        }
+
+        $file_path = $params['file'] ?? null;
+        $content   = $params['content'] ?? '';
+
+        if ( empty( $file_path ) ) {
+            return new \WP_Error( 'missing_params', 'File path is required.', [ 'status' => 400 ] );
+        }
+
+        // 2. Path Resolution (Same security logic as stream_file)
+        $base_dir = realpath( dirname( WP_CONTENT_DIR ) );
+        $core_dir = realpath( ABSPATH );
+        
+        $full_path = realpath($base_dir . '/' . $file_path);
+        if ( !$full_path && $base_dir !== $core_dir ) {
+            $full_path = realpath($core_dir . '/' . $file_path);
+        }
+
+        $is_in_base_dir = $full_path && strpos( $full_path, $base_dir ) === 0;
+        $is_in_core_dir = $full_path && $core_dir !== $base_dir && strpos( $full_path, $core_dir ) === 0;
+
+        if ( !$full_path || ( !$is_in_base_dir && !$is_in_core_dir ) ) {
+            return new \WP_Error( 'invalid_path', 'Invalid file path.', [ 'status' => 400 ] );
+        }
+
+        // 3. Write File
+        if ( !is_writable( $full_path ) ) {
+            return new \WP_Error( 'not_writable', 'File is not writable.', [ 'status' => 500 ] );
+        }
+
+        if ( false === file_put_contents( $full_path, $content ) ) {
+            return new \WP_Error( 'write_failed', 'Failed to save file content.', [ 'status' => 500 ] );
+        }
+
+        return [ 'success' => true ];
+    }
+
+    function rename_file( $request ) {
+        $params = $request->get_json_params();
+        $token = $params['token'] ?? null;
+        
+        // Auth Check
+        $auth_request = new \WP_REST_Request();
+        $auth_request->set_param('token', $token);
+        if ( ! User::allowed( $auth_request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Invalid token.', [ 'status' => 403 ] );
+        }
+
+        $old_path_relative = $params['old_path'] ?? '';
+        $new_name          = $params['new_name'] ?? '';
+
+        if ( empty( $old_path_relative ) || empty( $new_name ) ) {
+            return new \WP_Error( 'missing_params', 'Missing required parameters.', [ 'status' => 400 ] );
+        }
+
+        // Security: Prevent directory traversal
+        if ( strpos( $new_name, '/' ) !== false || strpos( $new_name, '..' ) !== false ) {
+            return new \WP_Error( 'invalid_name', 'Invalid file name.', [ 'status' => 400 ] );
+        }
+
+        // Resolve Paths
+        $base_dir = realpath( dirname( WP_CONTENT_DIR ) );
+        $core_dir = realpath( ABSPATH );
+        
+        // Determine full path of the EXISTING file
+        $old_full_path = realpath($base_dir . '/' . $old_path_relative);
+        if ( !$old_full_path && $base_dir !== $core_dir ) {
+            $old_full_path = realpath($core_dir . '/' . $old_path_relative);
+        }
+
+        // Verify it exists and is safe
+        if ( !$old_full_path || ( strpos( $old_full_path, $base_dir ) !== 0 && strpos( $old_full_path, $core_dir ) !== 0 ) ) {
+            return new \WP_Error( 'invalid_path', 'Invalid source file.', [ 'status' => 400 ] );
+        }
+
+        // Calculate new full path
+        $directory = dirname( $old_full_path );
+        $new_full_path = $directory . '/' . $new_name;
+
+        if ( file_exists( $new_full_path ) ) {
+            return new \WP_Error( 'exists', 'A file or folder with that name already exists.', [ 'status' => 409 ] );
+        }
+
+        if ( rename( $old_full_path, $new_full_path ) ) {
+            return [ 'success' => true ];
+        }
+
+        return new \WP_Error( 'rename_failed', 'Could not rename file.', [ 'status' => 500 ] );
+    }
     
     function regenerate_manifest( $request ) {
         if ( ! User::allowed( $request ) ) {
@@ -263,12 +579,15 @@ class Run {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
         $backup_token = $request['backup_token'];
-        $files_list   = $request['files']; // This will be an array of file objects
+        $files_list   = $request['files'];
+        $archive_name = $request['archive_name'] ?? null;
+
         if ( empty( $backup_token ) || ! is_array( $files_list ) ) {
             return new \WP_Error( 'missing_params', 'Missing backup_token or files list.', [ 'status' => 400 ] );
         }
-        // We need a new method in Backup.php to handle this
-        return ( new Backup( $backup_token ) )->zip_file_list( $files_list );
+        
+        // Pass the archive name to the backup function
+        return ( new Backup( $backup_token ) )->zip_file_list( $files_list, $archive_name );
     }
 
     function zip_database ( $request ) {
@@ -309,8 +628,8 @@ class Run {
         $backup_token = $request['backup_token'];
         $tables       = $request['tables'];
 
-        if ( empty( $backup_token ) || ! is_array( $tables ) || empty( $tables ) ) {
-            return new \WP_Error( 'missing_params', 'Missing backup_token or tables array.', [ 'status' => 400 ] );
+        if ( ! is_array( $tables ) || empty( $tables ) ) {
+            return new \WP_Error( 'missing_params', 'Missing tables array.', [ 'status' => 400 ] );
         }
 
         return ( new Backup( $backup_token ) )->database_export_batch( $tables );
