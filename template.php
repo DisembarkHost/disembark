@@ -221,7 +221,6 @@
             <div v-if="files_total > 0">({{ formatLargeNumbers(files_total) }} files found)</div>
         </div>
     </v-overlay>
-    <div style="opacity:0;"><textarea id="clipboard" style="height:1px;width:10px;display:flex;cursor:default"></textarea></div>
     <v-row v-if="ui_state === 'backing_up' || ui_state === 'connected'">
         <v-col cols="12" sm="12" md="6" v-if="database.length > 0">
             <v-toolbar flat dark density="compact" color="primary" class="text-white pr-5">
@@ -2445,14 +2444,38 @@ createApp({
                 throw new Error("Could not regenerate the file manifest. " + error.message);
             }
         },
-        copyText( value ) {
-            var clipboard = document.getElementById("clipboard");
-            clipboard.value = value;
-            clipboard.focus()
-            clipboard.select()
-            document.execCommand("copy");
-            this.snackbar.message = "Copied to clipboard.";
-            this.snackbar.show = true;
+        async copyText( value ) {
+            try {
+                // 1. Try the modern Clipboard API (No selection/focus needed)
+                await navigator.clipboard.writeText(value);
+                this.snackbar.message = "Copied to clipboard.";
+                this.snackbar.show = true;
+            } catch (err) {
+                // 2. Fallback for non-secure contexts (http) or older browsers
+                const textArea = document.createElement("textarea");
+                textArea.value = value;
+                
+                // Position fixed ensures focusing doesn't scroll the page
+                textArea.style.position = "fixed";
+                textArea.style.left = "-9999px";
+                textArea.style.top = "0";
+                document.body.appendChild(textArea);
+                
+                textArea.focus();
+                textArea.select();
+                
+                try {
+                    document.execCommand('copy');
+                    this.snackbar.message = "Copied to clipboard.";
+                    this.snackbar.show = true;
+                } catch (err) {
+                    console.error('Copy failed', err);
+                    this.snackbar.message = "Failed to copy.";
+                    this.snackbar.show = true;
+                }
+                
+                document.body.removeChild(textArea);
+            }
         },
         formatSize (fileSizeInBytes) {
             if ( fileSizeInBytes == null ) { return 0; }
