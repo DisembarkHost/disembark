@@ -5,7 +5,7 @@
              <template v-slot:activator="{ props }">
                  <v-btn icon variant="text" v-bind="props">
                      <v-icon>mdi-tools</v-icon>
-                     <v-tooltip location="left" activator="parent" text="Cleanup & Settings"></v-tooltip>
+                     <v-tooltip location="left" activator="parent" text="Settings"></v-tooltip>
                  </v-btn>
              </template>
              <v-card max-width="350" class="pa-3">
@@ -251,7 +251,7 @@
                 </v-btn>
                 {{ formatSize(totalDatabaseSize) }}
             </v-toolbar>
-            <v-toolbar v-show="options.include_database" density="compact" flat color="white" class="px-4">
+            <v-toolbar v-show="options.include_database" density="compact" flat :color="isDarkMode ? 'surface' : 'white'" class="px-4">
                 <v-text-field
                     v-model="database_search"
                     label="Search Tables"
@@ -2562,6 +2562,7 @@ createApp({
             // Return an object with each command
             return {
                 connect: connectCommand,
+                info: `disembark info ${this.home_url}`,
                 backup: backupCommand + sessionIdFlag,
                 sync: syncCommand + sessionIdFlag,
                 ncdu: ncduCommand + sessionIdFlag
@@ -2782,7 +2783,7 @@ createApp({
     mounted() {
         const storedTheme = localStorage.getItem('theme');
         if (storedTheme) {
-            this.$vuetify.theme.global.name = storedTheme;
+            this.$vuetify.theme.change( storedTheme );
             if (storedTheme === 'dark') {
                 document.body.classList.add('disembark-dark-mode');
             }
