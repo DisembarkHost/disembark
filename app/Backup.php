@@ -617,23 +617,30 @@ class Backup {
         return "{$this->backup_url}/{$file_name}.zip";
     }
 
-    function zip_file_list( $files = [] ) {
+    function zip_file_list( $files = [], $archive_name = null ) {
         if ( empty( $files ) ) {
             return new \WP_Error( 'no_files', 'No files provided to zip.' );
         }
-        // Use a unique name for this sync zip
-        $file_name = "sync-files-" . uniqid();
+
+        if ( !empty( $archive_name ) ) {
+            $safe_name = preg_replace( '/[^a-zA-Z0-9._-]/', '', basename( $archive_name ) );
+            $file_name = str_replace( '.zip', '', $safe_name );
+        } else {
+            $file_name = "sync-files-" . uniqid();
+        }
+
         $zip_name  = "{$this->backup_path}/{$file_name}.zip";
         $web_root  = dirname( WP_CONTENT_DIR );
         $core_root = rtrim( ABSPATH, '/' );
-        $files_added = 0; // Add a counter
-
-        // We don't need to check $exclude_paths, the client already filtered.
+        
+        // CHECK: Did the zip exist before we started this specific chunk?
+        $zip_existed_before = file_exists( $zip_name );
+        $files_added = 0;
 
         if ( $this->archiver_type === 'ZipArchive' ) {
+            // ZipArchive::CREATE opens existing files for appending, which is what we want.
             if ( $this->zip_object->open( $zip_name, \ZipArchive::CREATE ) === TRUE ) {
                 foreach( $files as $file_obj ) {
-                    // $file_obj is an associative array from the client
                     if ( !is_array($file_obj) || empty($file_obj['name']) ) continue;
                     $file_relative_path = $file_obj['name'];
 
@@ -641,10 +648,10 @@ class Backup {
                     if ( $web_root !== $core_root && ! file_exists( $full_file_path ) && file_exists( "{$core_root}/{$file_relative_path}" ) ) {
                         $full_file_path = "{$core_root}/{$file_relative_path}";
                     }
-                    // Only add if it exists, otherwise zip fails
+
                     if ( file_exists( $full_file_path ) && is_readable( $full_file_path ) ) {
                         if ( $this->zip_object->addFile( $full_file_path, $file_relative_path ) ) {
-                            $files_added++; // Increment counter
+                            $files_added++;
                         }
                     }
                 }
@@ -657,7 +664,6 @@ class Backup {
             $www_files = [];
             $core_files = [];
             foreach( $files as $file_obj ) {
-                // $file_obj is an associative array from the client
                 if ( !is_array($file_obj) || empty($file_obj['name']) ) continue;
                 $file_relative_path = $file_obj['name'];
                 
@@ -671,19 +677,23 @@ class Backup {
                 }
             }
             
-            $files_added = count($www_files) + count($core_files); // Set counter
+            $files_added = count($www_files) + count($core_files);
+            
+            // If zip exists, use 'add', otherwise 'create'.
+            // PclZip::create overwrites, PclZip::add appends.
+            $pclzip_method = $zip_existed_before ? 'add' : 'create';
             
             $result = 0;
             if ( !empty($www_files) ) {
-                $result = $zip->create( $www_files, PCLZIP_OPT_REMOVE_PATH, $web_root );
+                $result = $zip->$pclzip_method( $www_files, PCLZIP_OPT_REMOVE_PATH, $web_root );
                 if ( $result != 0 && !empty($core_files) ) {
+                    // Always 'add' for the second batch in the same request
                     $result = $zip->add( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
                 }
             } elseif ( !empty($core_files) ) {
-                 $result = $zip->create( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
+                 $result = $zip->$pclzip_method( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
             }
 
-            // Only error if PclZip failed AND we actually had files to add
             if ( $result == 0 && $files_added > 0 ) {
                 return new \WP_Error('pclzip_failed', 'Could not create zip: ' . $zip->errorInfo(true));
             }
@@ -691,17 +701,15 @@ class Backup {
             return new \WP_Error('no_zip_method', 'No supported zipping library found.');
         }
 
-        // Check if we successfully added any files
-        if ( $files_added === 0 ) {
-            // We successfully "created" an empty zip or no zip at all because no files were found/readable.
-            // Delete the empty zip if it exists and return an error.
+        // Only delete if no files were added AND it didn't exist before.
+        // This prevents deleting a valid zip just because the current chunk was empty/skipped.
+        if ( $files_added === 0 && ! $zip_existed_before ) {
             if ( file_exists( $zip_name ) ) {
                 unlink( $zip_name );
             }
-            return new \WP_Error('zip_failed_no_files', 'Zip creation failed. None of the requested ' . count($files) . ' files could be found or read on the server.');
+            return new \WP_Error('zip_failed_no_files', 'Zip creation failed. None of the requested files could be found.');
         }
 
-        // Return the public URL
         return "{$this->backup_url}/{$file_name}.zip";
     }
     
