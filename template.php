@@ -935,6 +935,7 @@ createApp({
             scan_progress: { total: 1, scanned: 0, status: 'initializing' },
             api_token: "<?php echo \Disembark\Token::get(); ?>",
             home_url: "<?php echo home_url(); ?>",
+            api_root: "<?php echo esc_url_raw( rest_url('disembark/v1/') ); ?>",
             backup_token: "",
             database: [],
             files: [],
@@ -1107,7 +1108,9 @@ createApp({
         },
         async fetchBackupSize() {
             try {
-                const response = await axios.get(`/wp-json/disembark/v1/backup-size?token=${this.api_token}`);
+                const response = await axios.get(this.api_root + 'backup-size', { 
+                    params: { token: this.api_token } 
+                });
                 this.backup_disk_size = response.data.size;
                 this.last_scan_stats = response.data.scan_stats;
                 this.previous_scans = response.data.sessions || [];
@@ -1115,12 +1118,15 @@ createApp({
                 console.error("Could not fetch backup size:", error);
                 this.backup_disk_size = 0;
                 this.last_scan_stats = null;
+                this.previous_scans = [];
             }
         },
         async cleanupBackups() {
             this.cleaning_up = true;
             try {
-                await axios.get(`/wp-json/disembark/v1/cleanup?token=${this.api_token}`);
+                await axios.get(`${this.api_root}cleanup`, { 
+                    params: { token: this.api_token } 
+                });
                 this.snackbar.message = "Temporary files have been cleaned up.";
                 this.snackbar.show = true;
                 await this.fetchBackupSize(); // Refresh size
@@ -1829,7 +1835,7 @@ createApp({
             this.regenerating_token = true;
             try {
                 // Pass the current token in the POST body for authorization
-                const response = await axios.post(`/wp-json/disembark/v1/regenerate-token`, { token: this.api_token });
+                const response = await axios.post(`${this.api_root}regenerate-token`, { token: this.api_token });
                 this.api_token = response.data.token; // Update the app's token
                 this.snackbar.message = "New token successfully generated.";
                 this.snackbar.show = true;
@@ -1843,7 +1849,7 @@ createApp({
         },
         toggleTheme() {
             const newTheme = this.$vuetify.theme.global.current.dark ? 'light' : 'dark';
-            this.$vuetify.theme.global.name = newTheme;
+            this.$vuetify.theme.change( newTheme );
             localStorage.setItem('theme', newTheme);
             document.body.classList.toggle('disembark-dark-mode', newTheme === 'dark');
         },
@@ -1892,7 +1898,7 @@ createApp({
                 this.explorer.preview_type = 'image';
                 try {
                     // Use axios.post
-                    const response = await axios.post( '/wp-json/disembark/v1/stream-file', postData, { responseType: 'blob' });
+                    const response = await axios.post( `${this.api_root}stream-file`, postData, { responseType: 'blob' });
                     this.explorer.preview_content = URL.createObjectURL(response.data);
                 } catch (error) {
                     this.explorer.preview_content = 'Error loading image.';
@@ -1950,11 +1956,7 @@ createApp({
             };
 
             try {
-                const response = await axios.post(
-                    '/wp-json/disembark/v1/stream-file',
-                    postData,
-                    { responseType: 'blob' }
-                );
+                const response = await axios.post( `${this.api_root}stream-file`, postData, { responseType: 'blob' } );
 
                 // Create a new Blob object using the response data
                 const blob = new Blob([response.data], { type: response.headers['content-type'] });
@@ -2383,7 +2385,9 @@ createApp({
             this.manifest_progress = { fetched: 0, total: 0 };
             this.scan_progress = { total: 1, scanned: 0, status: 'initializing' };
             try {
-                const dbResponse = await axios.get(`/wp-json/disembark/v1/database?token=${this.api_token}`);
+                const dbResponse = await axios.get(`${this.api_root}database`, { 
+                    params: { token: this.api_token } 
+                });
                 if (!dbResponse.data || dbResponse.data.error) {
                     throw new Error(dbResponse.data.error || "Could not fetch database info.");
                 }
@@ -2415,11 +2419,11 @@ createApp({
         },
         async runManifestGeneration() {
             try {
-                await axios.post('/wp-json/disembark/v1/regenerate-manifest', { token: this.api_token, backup_token: this.backup_token, step: 'initiate' });
+                await axios.post(`${this.api_root}regenerate-manifest`, { token: this.api_token, backup_token: this.backup_token, step: 'initiate' });
                 this.scan_progress.status = 'scanning';
                 let scan_complete = false;
                 while (!scan_complete) {
-                    const scanResponse = await axios.post('/wp-json/disembark/v1/regenerate-manifest', { token: this.api_token, backup_token: this.backup_token, step: 'scan', exclude_files: this.options.exclude_files });
+                    const scanResponse = await axios.post(`${this.api_root}regenerate-manifest`, { token: this.api_token, backup_token: this.backup_token, step: 'scan', exclude_files: this.options.exclude_files });
                     if (scanResponse.data.status === 'scan_complete') {
                         scan_complete = true;
                     }
@@ -2428,16 +2432,16 @@ createApp({
                 }
 
                 this.scan_progress.status = 'chunking';
-                const chunkifyResponse = await axios.post('/wp-json/disembark/v1/regenerate-manifest', { token: this.api_token, backup_token: this.backup_token, step: 'chunkify' });
+                const chunkifyResponse = await axios.post(`${this.api_root}regenerate-manifest`, { token: this.api_token, backup_token: this.backup_token, step: 'chunkify' });
                 const total_chunks = chunkifyResponse.data.total_chunks;
                 this.manifest_progress.total = total_chunks;
 
                 for (let i = 1; i <= total_chunks; i++) {
-                    await axios.post('/wp-json/disembark/v1/regenerate-manifest', { token: this.api_token, backup_token: this.backup_token, step: 'process_chunk', chunk: i });
+                    await axios.post(`${this.api_root}regenerate-manifest`, { token: this.api_token, backup_token: this.backup_token, step: 'process_chunk', chunk: i });
                     this.manifest_progress.fetched = i;
                 }
 
-                const finalizeResponse = await axios.post('/wp-json/disembark/v1/regenerate-manifest', { token: this.api_token, backup_token: this.backup_token, step: 'finalize' });
+                const finalizeResponse = await axios.post(`${this.api_root}regenerate-manifest`, { token: this.api_token, backup_token: this.backup_token, step: 'finalize' });
                 return finalizeResponse.data;
             } catch (error) {
                 console.error("Manifest generation failed:", error);
@@ -2573,7 +2577,8 @@ createApp({
         },
         downloadUrl() {
             if (!this.explorer.selected_node) return '#';
-            return `/wp-json/disembark/v1/stream-file?token=${encodeURIComponent(this.api_token)}&file=${encodeURIComponent(this.explorer.selected_node.id)}`;
+            const separator = this.api_root.includes('?') ? '&' : '?';
+            return `${this.api_root}stream-file${separator}token=${encodeURIComponent(this.api_token)}&file=${encodeURIComponent(this.explorer.selected_node.id)}`;
         },
         isDarkMode() {
             if (!this.$vuetify || !this.$vuetify.theme) return false;
