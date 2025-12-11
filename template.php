@@ -92,6 +92,44 @@
                     Analyze Site & Prepare Backup
                     <v-icon class="ml-2">mdi-magnify-scan</v-icon>
                 </v-btn>
+                <div v-if="previous_scans.length > 0">
+                    <div class="text-caption text-medium-emphasis mb-2 text-uppercase font-weight-bold">Resume Previous Scan</div>
+                    <v-alert
+                        type="warning"
+                        variant="tonal"
+                        density="compact"
+                        class="mb-2 text-caption"
+                        icon="mdi-alert-circle-outline"
+                    >
+                        <strong>Note:</strong> Files may have changed since these scans were created.
+                    </v-alert>
+                    <v-card variant="outlined" class="mb-2">
+                        <v-list density="compact" lines="one">
+                            <v-list-item
+                                v-for="session in previous_scans"
+                                :key="session.token"
+                                @click="resumeSession(session)"
+                                link
+                            >
+                                <template v-slot:prepend>
+                                    <v-icon icon="mdi-history" color="primary" class="mr-2"></v-icon>
+                                </template>
+                                
+                                <v-list-item-title class="font-weight-medium">
+                                    {{ formatDate(session.timestamp) }}
+                                </v-list-item-title>
+                                
+                                <v-list-item-subtitle>
+                                    {{ formatTimeAgo(session.timestamp) }} • ID: {{ session.token.substring(0, 8) }}...
+                                </v-list-item-subtitle>
+                                
+                                <template v-slot:append>
+                                    <v-icon icon="mdi-chevron-right" size="small"></v-icon>
+                                </template>
+                            </v-list-item>
+                        </v-list>
+                    </v-card>
+                </div>
             </v-col>
         </v-row>
         <v-row v-if="ui_state === 'connected' && !backup_ready">
@@ -498,6 +536,7 @@ createApp({
             files: [],
             files_total: 0,
             last_scan_stats: null,
+            previous_scans: [],
             backup_ready: false,
             options: {
                 database: true,
@@ -565,11 +604,66 @@ createApp({
             if (hours < 24) return `${hours}h ago`;
             return `${Math.floor(hours / 24)}d ago`;
         },
+        async resumeSession( session ) {
+            this.analyzing = true;
+            this.backup_ready = false;
+            this.backup_token = session.token;
+            
+            // Reset State
+            this.database = [];
+            this.files = [];
+            this.files_total = 0;
+            this.excluded_nodes = [];
+            this.explorer.raw_file_list = [];
+            this.scan_progress = { total: 1, scanned: 0, status: 'loading' };
+
+            try {
+                // 1. Fetch Database Info
+                const dbResponse = await axios.get(this.api_root + 'database', { 
+                    params: { token: this.api_token } 
+                });
+                if (!dbResponse.data || dbResponse.data.error) throw new Error("Could not fetch database info.");
+                this.database = dbResponse.data.map(table => ({...table, included: true}));
+                this.included_tables = [...this.database];
+
+                // 2. Fetch Manifest directly
+                const manifestResponse = await axios.get(this.api_root + 'manifest', { 
+                    params: { 
+                        token: this.api_token,
+                        backup_token: this.backup_token
+                    }
+                });
+                this.files = manifestResponse.data;
+                this.tree_loading = true;
+                this.manifest_progress.fetched = 0;
+                
+                // 3. Process the Manifests
+                this.manifest_progress.total = manifestResponse.data.length;
+                await this.fetchAndProcessManifests(manifestResponse.data);
+                
+                // 4. Build Tree & UI
+                this.explorer.items = this.buildInitialTree(this.explorer.raw_file_list);
+                this.tree_loading = false;
+                this.ui_state = 'connected';
+                
+                this.snackbar.message = "Session resumed successfully.";
+                this.snackbar.show = true;
+
+            } catch (error) {
+                this.snackbar.message = `Could not resume session. ${error.message}`;
+                this.snackbar.show = true;
+                this.ui_state = 'initial';
+                this.backup_token = ""; // Reset on fail
+            } finally {
+                this.analyzing = false;
+            }
+        },
         async fetchBackupSize() {
             try {
                 const response = await axios.get(`/wp-json/disembark/v1/backup-size?token=${this.api_token}`);
                 this.backup_disk_size = response.data.size;
                 this.last_scan_stats = response.data.scan_stats;
+                this.previous_scans = response.data.sessions || [];
             } catch (error) {
                 console.error("Could not fetch backup size:", error);
                 this.backup_disk_size = 0;
