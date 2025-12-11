@@ -179,18 +179,19 @@
         </v-card>
     </v-card-text>
     </v-card>
-    <v-overlay v-model="loading" contained persistent attach="#app" opacity="0.7" class="align-center justify-center">
+    <v-overlay v-model="loading" contained persistent attach="#app" opacity="0.7" class="align-center justify-center" z-index="3000">
         <div class="text-center text-white text-body-1 disembark-overlay-content" style="width: 500px; max-width: 90vw;">
-            <div class="mb-5"><strong>Backup in progress...</strong></div>
+            
+            <div class="mb-5"><strong>{{ loading_message }}</strong></div>
 
-            <div v-if="included_tables.length > 0 && this.options.include_database" class="mb-4">
+            <div v-if="included_tables.length > 0 && this.options.include_database && !is_folder_downloading" class="mb-4">
                 <div class="text-left text-body-2 mb-1">Database</div>
                 <v-progress-linear v-model="databaseProgress" color="amber" height="25">
                     Copied {{ database_progress.copied }} of {{ database_backup_queue.length }} items
                 </v-progress-linear>
             </div>
 
-            <div v-if="exclusionReport.remainingFiles > 0">
+            <div v-if="exclusionReport.remainingFiles > 0 && !is_folder_downloading">
                 <div class="text-left text-body-2 mb-1">Files</div>
                 <v-progress-linear v-model="filesProgress" color="amber" height="25">
                     Copied {{ formatLargeNumbers( files_progress.copied ) }} of {{ formatLargeNumbers ( exclusionReport.remainingFiles ) }}
@@ -1902,16 +1903,24 @@ createApp({
                 }
             } else {
                 this.explorer.preview_type = 'code';
+                this.explorer.is_editing = false; 
+
                 try {
-                    if (item.size > 1024 * 500) { // 500KB limit
+                    if (item.size > 1024 * 500) {
                         throw new Error('File is too large to preview.');
                     }
-                    // Use axios.post
-                    const response = await axios.post('/wp-json/disembark/v1/stream-file', postData );
+                    
+                    const response = await axios.post(`${this.api_root}stream-file`, postData );
+                    
+                    // Convert object to string if JSON
                     let content = (typeof response.data === 'object' && response.data !== null) ? JSON.stringify(response.data, null, 2) : response.data;
+
+                    // -- STORE RAW CONTENT FOR EDITING --
+                    this.explorer.raw_content = content; 
+
                     let language = (extension === 'js') ? 'javascript' : extension;
                     if (Prism.languages[language]) {
-                         this.explorer.preview_content = Prism.highlight(content, Prism.languages[language], language);
+                        this.explorer.preview_content = Prism.highlight(content, Prism.languages[language], language);
                     } else {
                         const esc = document.createElement('textarea');
                         esc.textContent = content;
@@ -1927,6 +1936,11 @@ createApp({
         },
         async downloadFile(node) {
             if (!node) return;
+
+            if (node.children) {
+                this.downloadFolder(node);
+                return;
+            }
 
             this.snackbar.message = `Preparing download for ${node.name}...`;
             this.snackbar.show = true;
@@ -1963,6 +1977,152 @@ createApp({
                 this.snackbar.message = `Could not download ${node.name}. An error occurred.`;
                 this.snackbar.show = true;
             }
+        },
+        async downloadFolder(node) {
+            this.is_folder_downloading = true;
+            this.loading_message = `Analyzing folder "${node.name}"...`;
+            
+            // Constant name for the entire loop so PHP appends to one file
+            const timestamp = Math.floor(Date.now() / 1000);
+            const safeName = node.name.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+            const archiveName = `${safeName}-${timestamp}.zip`;
+
+            // Thresholds
+            const MAX_CHUNK_SIZE = 100 * 1024 * 1024; // 100 MB
+            const MAX_CHUNK_FILES = 500;              // 500 Files
+            const LARGE_FILE_ISOLATION = 20 * 1024 * 1024; // 20 MB
+
+            try {
+                const folderPrefix = node.id + '/';
+                const sourceFiles = this.explorer.raw_file_list
+                    .filter(f => f.type === 'file' && f.name.startsWith(folderPrefix));
+
+                if (sourceFiles.length === 0) throw new Error("Folder appears to be empty.");
+
+                // Smart Chunking
+                const chunks = [];
+                let currentChunk = [];
+                let currentChunkSize = 0;
+
+                sourceFiles.forEach(file => {
+                    const fileSize = parseInt(file.size) || 0;
+                    
+                    // Logic: Isolate large files to prevent timeouts, 
+                    // or push batch if size/count limit reached.
+                    const isLarge = fileSize > LARGE_FILE_ISOLATION;
+                    const isFull = (currentChunkSize + fileSize > MAX_CHUNK_SIZE) || (currentChunk.length >= MAX_CHUNK_FILES);
+
+                    if ((isFull || isLarge) && currentChunk.length > 0) {
+                        chunks.push(currentChunk);
+                        currentChunk = [];
+                        currentChunkSize = 0;
+                    }
+
+                    currentChunk.push({ name: file.name });
+                    currentChunkSize += fileSize;
+
+                    // If this was a large file, force a push immediately so it processes alone
+                    if (isLarge) {
+                        chunks.push(currentChunk);
+                        currentChunk = [];
+                        currentChunkSize = 0;
+                    }
+                });
+                
+                if (currentChunk.length > 0) {
+                    chunks.push(currentChunk);
+                }
+
+                // Sequential Upload Loop (Appends to same file on server)
+                let processedChunks = 0;
+                let zipUrl = "";
+                const totalChunks = chunks.length;
+
+                for (const chunk of chunks) {
+                    processedChunks++;
+                    this.loading_message = `Archiving ${node.name} (Batch ${processedChunks}/${totalChunks})...`;
+                    
+                    const response = await axios.post( `${this.api_root}zip-sync-files`, {
+                        token: this.api_token,
+                        backup_token: this.backup_token,
+                        files: chunk,
+                        archive_name: archiveName // Sending same name appends to the file
+                    });
+
+                    if (response.data && response.data.error) throw new Error(response.data.message);
+                    
+                    zipUrl = response.data;
+                }
+
+                // Trigger Download
+                this.loading_message = "Download starting...";
+                const link = document.createElement('a');
+                link.href = zipUrl;
+                link.setAttribute('download', archiveName);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+
+                // --- FIX: Correct Size Reporting ---
+                // Default to sum of files (uncompressed) just in case
+                this.zip_cleanup.size = node.stats ? node.stats.totalSize : 0; 
+
+                try {
+                    // Ask the server for the actual Content-Length of the generated zip
+                    const headResponse = await axios.head(zipUrl);
+                    if (headResponse.headers['content-length']) {
+                        this.zip_cleanup.size = parseInt(headResponse.headers['content-length']);
+                    }
+                } catch (e) {
+                    console.log("Could not fetch actual zip size, using estimated size.");
+                }
+                // -----------------------------------
+
+                // Show Cleanup Dialog
+                this.zip_cleanup.file_name = archiveName;
+                this.zip_cleanup.folder_name = node.name;
+                // Size is already set above
+                this.zip_cleanup.show = true;
+
+            } catch (error) {
+                console.error("Folder download failed:", error);
+                this.snackbar.message = `Failed to download folder: ${error.message}`;
+                this.snackbar.show = true;
+            } finally {
+                this.is_folder_downloading = false;
+                this.loading_message = "Backup in progress...";
+            }
+        },
+        async performZipCleanup() {
+            this.zip_cleanup.loading = true;
+            try {
+                await axios.post( `${this.api_root}cleanup-file`, {
+                    token: this.api_token,
+                    backup_token: this.backup_token,
+                    file_name: this.zip_cleanup.file_name
+                });
+                this.snackbar.message = "Temporary zip file deleted.";
+                this.snackbar.show = true;
+                this.zip_cleanup.show = false;
+                await this.fetchBackupSize(); // Refresh stats
+            } catch (error) {
+                this.snackbar.message = "Failed to delete temporary file.";
+                this.snackbar.show = true;
+            } finally {
+                this.zip_cleanup.loading = false;
+            }
+        },
+        areAllTablesSelected() {
+            if (this.filteredDbTables.length === 0) return false;
+            // Check if every currently filtered table is in the selected list
+            return this.filteredDbTables.every(t => this.dbExplorer.selectedTables.includes(t.table));
+        },
+        isSelectionIndeterminate() {
+            if (this.filteredDbTables.length === 0) return false;
+            // Count how many visible tables are selected
+            const selectedCount = this.filteredDbTables.filter(t => this.dbExplorer.selectedTables.includes(t.table)).length;
+            // Return true if some, but not all, are selected
+            return selectedCount > 0 && selectedCount < this.filteredDbTables.length;
         },
         calculateFolderStats(folderNode) {
             const stats = { fileCount: 0, totalSize: 0 };
