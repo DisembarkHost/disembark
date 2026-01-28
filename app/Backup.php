@@ -14,7 +14,17 @@ class Backup {
         $bytes             = random_bytes( 20 );
         $this->token       = empty( $token ) ? substr( bin2hex( $bytes ), 0, -28) : $token;
         $this->backup_path = wp_upload_dir()["basedir"] . "/disembark/{$this->token}";
-        $this->backup_url  = wp_upload_dir()["baseurl"] . "/disembark/{$this->token}";
+        $backup_url        = wp_upload_dir()["baseurl"] . "/disembark/{$this->token}";
+        // Ensure URL scheme matches the current request to prevent mixed content issues
+        // Check multiple indicators for HTTPS (handles reverse proxy scenarios)
+        $is_https = is_ssl()
+            || ( isset( $_SERVER['HTTP_X_FORWARDED_PROTO'] ) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' )
+            || ( isset( $_SERVER['HTTP_X_FORWARDED_SSL'] ) && $_SERVER['HTTP_X_FORWARDED_SSL'] === 'on' )
+            || ( isset( $_SERVER['REQUEST_SCHEME'] ) && $_SERVER['REQUEST_SCHEME'] === 'https' );
+        if ( $is_https ) {
+            $backup_url = preg_replace( '/^http:\/\//', 'https://', $backup_url );
+        }
+        $this->backup_url = $backup_url;
         if ( ! file_exists( $this->backup_path )) {
             mkdir( $this->backup_path, 0777, true );
         }
