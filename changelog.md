@@ -1,5 +1,23 @@
 # Changelog
 
+## **v2.7.0** - January 28, 2026
+
+### Added
+* **Database Explorer:** A new full-screen database explorer allows you to browse tables, view their structure and data, and export selected tables directly from the UI.
+* **Folder Downloads:** You can now download entire folders as zip archives directly from the File Explorer.
+* **Session Resume:** Previous scan sessions are now saved and displayed on the initial screen, allowing you to resume a prior session without re-scanning.
+* **CLI Info Command:** Added the `disembark info` command to the CLI panel, which displays connection status, storage usage, and previous sessions.
+
+### Improved
+* **UI Polish:** Refined the settings menu, CLI command panel layout, and dark mode styling for the scan info panel.
+* **Clipboard Handling:** Improved copy-to-clipboard functionality across the interface.
+* **PHP 7 Compatibility:** Added polyfills for better compatibility with PHP 7 environments.
+* **Endpoint Responses:** Cleaned up REST API endpoint responses for consistency.
+
+### Fixed
+* **HTTPS Behind Proxy:** Fixed an issue where backup URLs were generated with `http://` instead of `https://` on sites running behind a reverse proxy (e.g., load balancers, Cloudflare). The plugin now correctly detects HTTPS from `X-Forwarded-Proto` and other proxy headers.
+* **Dark Mode:** Resolved a styling issue affecting the dark mode theme.
+
 ### **v2.6.0** - November 25, 2025
 
 ### Added
