@@ -18,7 +18,7 @@
 * **HTTPS Behind Proxy:** Fixed an issue where backup URLs were generated with `http://` instead of `https://` on sites running behind a reverse proxy (e.g., load balancers, Cloudflare). The plugin now correctly detects HTTPS from `X-Forwarded-Proto` and other proxy headers.
 * **Dark Mode:** Resolved a styling issue affecting the dark mode theme.
 
-### **v2.6.0** - November 25, 2025
+## **v2.6.0** - November 25, 2025
 
 ### Added
 * **Scan History**: The settings menu now displays cached statistics from the last file analysis, including the total number of files found, total size, and the time elapsed since the scan.
