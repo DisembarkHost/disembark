@@ -348,6 +348,12 @@ class Import {
         $statements_executed = 0;
         $errors              = [];
 
+        // The import overwrites wp_options (and wp_users) with the source's
+        // data, which would replace this site's Disembark token and lock the
+        // CLI out of the remaining steps. Remember it and restore it afterward
+        // so the tool stays authenticated through search-replace/finalize.
+        $preserved_token = get_option( 'disembark_token' );
+
         // Split into individual statements with a quote/comment-aware scanner.
         // A column value may legitimately contain ";" (or ";\n"), so splitting
         // on the delimiter naively would cut a statement mid-value.
@@ -394,6 +400,16 @@ class Import {
 
         $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
         $wpdb->query( 'SET UNIQUE_CHECKS = 1' );
+
+        // Restore the preserved Disembark token. The raw SQL import bypassed the
+        // options cache, so clear it first — otherwise update_option would see a
+        // stale "unchanged" value and skip the write, leaving the source's token
+        // in the row and breaking auth for the next request.
+        if ( $preserved_token !== false ) {
+            wp_cache_delete( 'disembark_token', 'options' );
+            wp_cache_delete( 'alloptions', 'options' );
+            update_option( 'disembark_token', $preserved_token );
+        }
 
         return [
             'statements_executed' => $statements_executed,
