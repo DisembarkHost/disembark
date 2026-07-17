@@ -139,7 +139,7 @@ class Import {
     }
 
     /**
-     * Receives a ZIP of files and extracts to the staging directory.
+     * Receives a ZIP of files (single POST) and extracts to staging.
      */
     public function upload_zip( $uploaded_file ) {
         if ( ! is_dir( $this->staging_path ) ) {
@@ -153,42 +153,82 @@ class Import {
         $zip_path = $this->staging_path . '/upload-' . uniqid() . '.zip';
         move_uploaded_file( $uploaded_file['tmp_name'], $zip_path );
 
+        $result = $this->extract_zip_file( $zip_path );
+        @unlink( $zip_path );
+        if ( is_wp_error( $result ) ) {
+            return $result;
+        }
+
+        return [
+            'success'      => true,
+            'files_staged' => $this->count_staged_files(),
+        ];
+    }
+
+    /**
+     * Extracts a ZIP that was uploaded in chunks (reassembled into staging by
+     * upload_chunk) and removes it. Lets large sites avoid a single huge POST.
+     */
+    public function extract_staged_zip( $file_path ) {
+        if ( ! $this->is_safe_relative_path( $file_path ) ) {
+            return new \WP_Error( 'invalid_path', 'Invalid file path.', [ 'status' => 400 ] );
+        }
+        $zip_path = $this->staging_path . '/' . $file_path;
+        if ( ! file_exists( $zip_path ) ) {
+            return new \WP_Error( 'not_found', 'Staged ZIP not found.', [ 'status' => 404 ] );
+        }
+        $result = $this->extract_zip_file( $zip_path );
+        @unlink( $zip_path );
+        if ( is_wp_error( $result ) ) {
+            return $result;
+        }
+        return [
+            'success'      => true,
+            'files_staged' => $this->count_staged_files(),
+        ];
+    }
+
+    /**
+     * Extracts a ZIP into the staging directory, skipping any zip-slip entry
+     * names. Uses ZipArchive, falling back to PclZip. Returns true or WP_Error.
+     */
+    private function extract_zip_file( $zip_path ) {
         if ( ! class_exists( 'ZipArchive' ) ) {
-            // Fall back to PclZip
             if ( ! class_exists( 'PclZip' ) ) {
                 require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
             }
             $zip    = new \PclZip( $zip_path );
             $result = $zip->extract( PCLZIP_OPT_PATH, $this->staging_path );
             if ( $result == 0 ) {
-                @unlink( $zip_path );
                 return new \WP_Error( 'extract_failed', 'Failed to extract ZIP: ' . $zip->errorInfo( true ), [ 'status' => 500 ] );
             }
-        } else {
-            $zip = new \ZipArchive();
-            if ( $zip->open( $zip_path ) !== true ) {
-                @unlink( $zip_path );
-                return new \WP_Error( 'extract_failed', 'Failed to open ZIP archive.', [ 'status' => 500 ] );
-            }
-            // Extract entry-by-entry, skipping any name that could escape the
-            // staging directory (zip-slip). extractTo() on the whole archive
-            // would honour "../" entries.
-            $safe_entries = [];
-            for ( $i = 0; $i < $zip->numFiles; $i++ ) {
-                $name = $zip->getNameIndex( $i );
-                if ( $this->is_safe_relative_path( $name ) ) {
-                    $safe_entries[] = $name;
-                }
-            }
-            if ( ! empty( $safe_entries ) ) {
-                $zip->extractTo( $this->staging_path, $safe_entries );
-            }
-            $zip->close();
+            return true;
         }
 
-        @unlink( $zip_path );
+        $zip = new \ZipArchive();
+        if ( $zip->open( $zip_path ) !== true ) {
+            return new \WP_Error( 'extract_failed', 'Failed to open ZIP archive.', [ 'status' => 500 ] );
+        }
+        // Extract entry-by-entry, skipping any name that could escape staging
+        // (zip-slip); extractTo() on the whole archive would honour "../".
+        $safe_entries = [];
+        for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+            $name = $zip->getNameIndex( $i );
+            if ( $this->is_safe_relative_path( $name ) ) {
+                $safe_entries[] = $name;
+            }
+        }
+        if ( ! empty( $safe_entries ) ) {
+            $zip->extractTo( $this->staging_path, $safe_entries );
+        }
+        $zip->close();
+        return true;
+    }
 
-        // Count extracted files
+    /**
+     * Counts files currently staged for deployment.
+     */
+    private function count_staged_files() {
         $count = 0;
         if ( is_dir( $this->staging_path ) ) {
             $it = new \RecursiveIteratorIterator(
@@ -200,11 +240,7 @@ class Import {
                 }
             }
         }
-
-        return [
-            'success'     => true,
-            'files_staged' => $count,
-        ];
+        return $count;
     }
 
     /**

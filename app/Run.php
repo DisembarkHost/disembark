@@ -201,6 +201,10 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'import_upload_chunk' ]
         ]);
+        register_rest_route('disembark/v1', '/import/extract-zip', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_extract_zip' ]
+        ]);
         register_rest_route('disembark/v1', '/import/deploy-files', [
             'methods'  => 'POST',
             'callback' => [ $this, 'import_deploy_files' ]
@@ -886,6 +890,22 @@ class Run {
 
         $import = new Import( $import_id );
         return $import->upload_chunk( $files['file'], $file_path, $chunk_index, $total_chunks );
+    }
+
+    function import_extract_zip( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        $file_path = $params['file_path'] ?? '';
+
+        if ( empty( $import_id ) || empty( $file_path ) ) {
+            return new \WP_Error( 'missing_params', 'import_id and file_path are required.', [ 'status' => 400 ] );
+        }
+
+        $import = new Import( $import_id );
+        return $import->extract_staged_zip( $file_path );
     }
 
     function import_deploy_files( $request ) {
