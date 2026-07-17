@@ -1,0 +1,532 @@
+<?php
+
+namespace Disembark;
+
+class Import {
+
+    private $import_id;
+    private $import_path;
+    private $staging_path;
+    private $rollback_path;
+
+    public function __construct( $import_id = '' ) {
+        // Strip everything but hex so a caller-supplied id can never be used to
+        // climb out of the uploads/disembark directory via the path templates
+        // below. All ids we mint are hex (random_bytes / rollback-<hex>).
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) );
+        if ( empty( $import_id ) ) {
+            $import_id = substr( bin2hex( random_bytes( 16 ) ), 0, 24 );
+        }
+        $this->import_id     = $import_id;
+        $base                = wp_upload_dir()['basedir'] . '/disembark';
+        $this->import_path   = "{$base}/_import_{$import_id}";
+        $this->staging_path  = "{$this->import_path}/staging";
+        $this->rollback_path = "{$this->import_path}/rollback";
+    }
+
+    public function get_import_id() {
+        return $this->import_id;
+    }
+
+    /**
+     * Rejects a caller-supplied relative path that could climb out of the
+     * staging / web-root tree (absolute paths, "..", or null bytes).
+     */
+    private function is_safe_relative_path( $relative_path ) {
+        if ( ! is_string( $relative_path ) || $relative_path === '' ) {
+            return false;
+        }
+        if ( strpos( $relative_path, "\0" ) !== false ) {
+            return false;
+        }
+        // No absolute paths and no Windows drive letters.
+        if ( $relative_path[0] === '/' || $relative_path[0] === '\\' || preg_match( '#^[a-zA-Z]:#', $relative_path ) ) {
+            return false;
+        }
+        // No parent-directory traversal in any segment.
+        foreach ( preg_split( '#[/\\\\]+#', $relative_path ) as $segment ) {
+            if ( $segment === '..' ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Returns destination metadata the CLI needs to plan transformations.
+     */
+    public function preflight() {
+        global $wpdb;
+
+        $tables = [];
+        $rows   = $wpdb->get_results(
+            "SELECT table_name AS `table`, data_length + index_length AS `size`
+             FROM information_schema.TABLES
+             WHERE table_schema = '" . DB_NAME . "'
+             ORDER BY (data_length + index_length) DESC"
+        );
+        foreach ( $rows as $row ) {
+            $tables[] = $row->table;
+        }
+
+        $mysql_version = $wpdb->get_var( 'SELECT VERSION()' );
+
+        return [
+            'db_prefix'          => $wpdb->prefix,
+            'home_url'           => home_url(),
+            'site_url'           => site_url(),
+            'abspath'            => ABSPATH,
+            'upload_max_filesize' => ini_get( 'upload_max_filesize' ),
+            'post_max_size'      => ini_get( 'post_max_size' ),
+            'max_execution_time' => ini_get( 'max_execution_time' ),
+            'tables'             => $tables,
+            'php_version'        => phpversion(),
+            'mysql_version'      => $mysql_version,
+            'disembark_token'    => get_option( 'disembark_token' ),
+        ];
+    }
+
+    /**
+     * Creates a rollback snapshot of the destination database and file manifest.
+     */
+    public function snapshot() {
+        global $wpdb;
+
+        if ( ! is_dir( $this->rollback_path ) ) {
+            mkdir( $this->rollback_path, 0755, true );
+        }
+
+        // Export all tables
+        $all_tables = $wpdb->get_col( 'SHOW TABLES' );
+        if ( empty( $all_tables ) ) {
+            return new \WP_Error( 'no_tables', 'No tables found to snapshot.', [ 'status' => 500 ] );
+        }
+
+        $backup   = new Backup( 'rollback-' . $this->import_id );
+        $file_url = $backup->database_export_batch( $all_tables );
+
+        if ( ! $file_url ) {
+            return new \WP_Error( 'snapshot_failed', 'Failed to create database snapshot.', [ 'status' => 500 ] );
+        }
+
+        // Move the exported SQL to our rollback directory
+        $backup_base = wp_upload_dir()['basedir'] . '/disembark/rollback-' . $this->import_id;
+        $sql_files   = glob( "{$backup_base}/*.sql.txt" );
+        foreach ( $sql_files as $sql_file ) {
+            $dest = $this->rollback_path . '/' . basename( $sql_file );
+            rename( $sql_file, $dest );
+        }
+
+        // Clean up the backup directory
+        if ( is_dir( $backup_base ) ) {
+            @rmdir( $backup_base );
+        }
+
+        // Save rollback metadata
+        $meta = [
+            'import_id'   => $this->import_id,
+            'created_at'  => time(),
+            'tables'      => $all_tables,
+            'deployed_files' => [],
+            'backed_up_files' => [],
+        ];
+        file_put_contents( $this->rollback_path . '/meta.json', json_encode( $meta, JSON_PRETTY_PRINT ) );
+
+        return [
+            'rollback_id' => $this->import_id,
+            'tables'      => count( $all_tables ),
+        ];
+    }
+
+    /**
+     * Receives a ZIP of files and extracts to the staging directory.
+     */
+    public function upload_zip( $uploaded_file ) {
+        if ( ! is_dir( $this->staging_path ) ) {
+            mkdir( $this->staging_path, 0755, true );
+        }
+
+        if ( empty( $uploaded_file['tmp_name'] ) || ! is_uploaded_file( $uploaded_file['tmp_name'] ) ) {
+            return new \WP_Error( 'no_file', 'No file uploaded.', [ 'status' => 400 ] );
+        }
+
+        $zip_path = $this->staging_path . '/upload-' . uniqid() . '.zip';
+        move_uploaded_file( $uploaded_file['tmp_name'], $zip_path );
+
+        if ( ! class_exists( 'ZipArchive' ) ) {
+            // Fall back to PclZip
+            if ( ! class_exists( 'PclZip' ) ) {
+                require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
+            }
+            $zip    = new \PclZip( $zip_path );
+            $result = $zip->extract( PCLZIP_OPT_PATH, $this->staging_path );
+            if ( $result == 0 ) {
+                @unlink( $zip_path );
+                return new \WP_Error( 'extract_failed', 'Failed to extract ZIP: ' . $zip->errorInfo( true ), [ 'status' => 500 ] );
+            }
+        } else {
+            $zip = new \ZipArchive();
+            if ( $zip->open( $zip_path ) !== true ) {
+                @unlink( $zip_path );
+                return new \WP_Error( 'extract_failed', 'Failed to open ZIP archive.', [ 'status' => 500 ] );
+            }
+            // Extract entry-by-entry, skipping any name that could escape the
+            // staging directory (zip-slip). extractTo() on the whole archive
+            // would honour "../" entries.
+            $safe_entries = [];
+            for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+                $name = $zip->getNameIndex( $i );
+                if ( $this->is_safe_relative_path( $name ) ) {
+                    $safe_entries[] = $name;
+                }
+            }
+            if ( ! empty( $safe_entries ) ) {
+                $zip->extractTo( $this->staging_path, $safe_entries );
+            }
+            $zip->close();
+        }
+
+        @unlink( $zip_path );
+
+        // Count extracted files
+        $count = 0;
+        if ( is_dir( $this->staging_path ) ) {
+            $it = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator( $this->staging_path, \RecursiveDirectoryIterator::SKIP_DOTS )
+            );
+            foreach ( $it as $file ) {
+                if ( $file->isFile() ) {
+                    $count++;
+                }
+            }
+        }
+
+        return [
+            'success'     => true,
+            'files_staged' => $count,
+        ];
+    }
+
+    /**
+     * Receives a chunk of a large file. Reassembles when all chunks arrive.
+     */
+    public function upload_chunk( $uploaded_file, $file_path, $chunk_index, $total_chunks ) {
+        if ( ! $this->is_safe_relative_path( $file_path ) ) {
+            return new \WP_Error( 'invalid_path', 'Invalid file path.', [ 'status' => 400 ] );
+        }
+        if ( ! is_dir( $this->staging_path ) ) {
+            mkdir( $this->staging_path, 0755, true );
+        }
+
+        $chunk_dir = $this->staging_path . '/_chunks/' . md5( $file_path );
+        if ( ! is_dir( $chunk_dir ) ) {
+            mkdir( $chunk_dir, 0755, true );
+        }
+
+        $chunk_file = $chunk_dir . '/chunk-' . str_pad( $chunk_index, 6, '0', STR_PAD_LEFT );
+        move_uploaded_file( $uploaded_file['tmp_name'], $chunk_file );
+
+        // Check if all chunks are present
+        $existing_chunks = glob( $chunk_dir . '/chunk-*' );
+        if ( count( $existing_chunks ) < $total_chunks ) {
+            return [
+                'success'         => true,
+                'chunks_received' => count( $existing_chunks ),
+                'total_chunks'    => $total_chunks,
+                'complete'        => false,
+            ];
+        }
+
+        // Reassemble
+        $final_dir = dirname( $this->staging_path . '/' . $file_path );
+        if ( ! is_dir( $final_dir ) ) {
+            mkdir( $final_dir, 0755, true );
+        }
+        $final_path = $this->staging_path . '/' . $file_path;
+        $fp         = fopen( $final_path, 'wb' );
+        if ( ! $fp ) {
+            return new \WP_Error( 'write_failed', 'Could not create final file.', [ 'status' => 500 ] );
+        }
+
+        sort( $existing_chunks );
+        foreach ( $existing_chunks as $chunk ) {
+            fwrite( $fp, file_get_contents( $chunk ) );
+            @unlink( $chunk );
+        }
+        fclose( $fp );
+        @rmdir( $chunk_dir );
+
+        return [
+            'success'  => true,
+            'complete' => true,
+            'file'     => $file_path,
+            'size'     => filesize( $final_path ),
+        ];
+    }
+
+    /**
+     * Deploys files from staging to their final WordPress paths.
+     * Backs up originals for rollback tracking.
+     */
+    public function deploy_files( $files ) {
+        $web_root  = dirname( WP_CONTENT_DIR );
+        $deployed  = [];
+        $errors    = [];
+        $backed_up = [];
+
+        foreach ( $files as $relative_path ) {
+            if ( ! $this->is_safe_relative_path( $relative_path ) ) {
+                $errors[] = "Unsafe path skipped: {$relative_path}";
+                continue;
+            }
+
+            $source = $this->staging_path . '/' . $relative_path;
+            $dest   = $web_root . '/' . $relative_path;
+
+            if ( ! file_exists( $source ) ) {
+                $errors[] = "Source not found: {$relative_path}";
+                continue;
+            }
+
+            // Skip wp-config.php
+            if ( basename( $relative_path ) === 'wp-config.php' ) {
+                continue;
+            }
+
+            // Backup original if it exists
+            if ( file_exists( $dest ) ) {
+                $backup_dest = $this->rollback_path . '/files/' . $relative_path;
+                $backup_dir  = dirname( $backup_dest );
+                if ( ! is_dir( $backup_dir ) ) {
+                    mkdir( $backup_dir, 0755, true );
+                }
+                copy( $dest, $backup_dest );
+                $backed_up[] = $relative_path;
+            }
+
+            // Create destination directory
+            $dest_dir = dirname( $dest );
+            if ( ! is_dir( $dest_dir ) ) {
+                mkdir( $dest_dir, 0755, true );
+            }
+
+            // Move file
+            if ( rename( $source, $dest ) ) {
+                $deployed[] = $relative_path;
+            } else {
+                // Try copy + delete as fallback
+                if ( copy( $source, $dest ) ) {
+                    @unlink( $source );
+                    $deployed[] = $relative_path;
+                } else {
+                    $errors[] = "Failed to deploy: {$relative_path}";
+                }
+            }
+        }
+
+        // Update rollback metadata with deployed files
+        $meta_file = $this->rollback_path . '/meta.json';
+        if ( file_exists( $meta_file ) ) {
+            $meta = json_decode( file_get_contents( $meta_file ), true );
+            $meta['deployed_files']  = array_merge( $meta['deployed_files'] ?? [], $deployed );
+            $meta['backed_up_files'] = array_merge( $meta['backed_up_files'] ?? [], $backed_up );
+            file_put_contents( $meta_file, json_encode( $meta, JSON_PRETTY_PRINT ) );
+        }
+
+        return [
+            'deployed' => count( $deployed ),
+            'errors'   => $errors,
+        ];
+    }
+
+    /**
+     * Executes pre-transformed SQL statements on the destination database.
+     */
+    public function execute_sql( $sql_content ) {
+        global $wpdb;
+
+        $statements_executed = 0;
+        $errors              = [];
+
+        // Split on statement boundaries (semicolons followed by newline)
+        $statements = preg_split( '/;\s*\n/', $sql_content );
+
+        // Temporarily disable FK checks for the import
+        $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
+        $wpdb->query( 'SET UNIQUE_CHECKS = 0' );
+        $wpdb->query( "SET sql_mode='NO_AUTO_VALUE_ON_ZERO'" );
+
+        foreach ( $statements as $statement ) {
+            $statement = trim( $statement );
+            if ( empty( $statement ) ) {
+                continue;
+            }
+
+            // Skip SET statements we handle ourselves
+            if ( preg_match( '/^SET\s+(FOREIGN_KEY_CHECKS|UNIQUE_CHECKS|sql_mode|NAMES)/i', $statement ) ) {
+                continue;
+            }
+
+            // Skip the DISABLE/ENABLE KEYS comments
+            if ( preg_match( '/^\/\*!\d+\s+ALTER TABLE/', $statement ) ) {
+                continue;
+            }
+
+            // Add semicolon back for execution
+            $result = $wpdb->query( $statement );
+            if ( $result === false ) {
+                $error_msg = $wpdb->last_error;
+                // Don't fail on DROP TABLE errors
+                if ( stripos( $statement, 'DROP TABLE' ) === 0 ) {
+                    continue;
+                }
+                $errors[] = substr( $error_msg, 0, 200 ) . ' | SQL: ' . substr( $statement, 0, 100 );
+                if ( count( $errors ) > 50 ) {
+                    $errors[] = '...truncated (too many errors)';
+                    break;
+                }
+            } else {
+                $statements_executed++;
+            }
+        }
+
+        $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
+        $wpdb->query( 'SET UNIQUE_CHECKS = 1' );
+
+        return [
+            'statements_executed' => $statements_executed,
+            'errors'              => $errors,
+        ];
+    }
+
+    /**
+     * Restores the destination to pre-import state using the rollback snapshot.
+     */
+    public function rollback() {
+        global $wpdb;
+
+        $meta_file = $this->rollback_path . '/meta.json';
+        if ( ! file_exists( $meta_file ) ) {
+            return new \WP_Error( 'no_rollback', 'No rollback data found for this import ID.', [ 'status' => 404 ] );
+        }
+
+        $meta   = json_decode( file_get_contents( $meta_file ), true );
+        $errors = [];
+
+        // 1. Restore database from snapshot SQL
+        $sql_files = glob( $this->rollback_path . '/*.sql.txt' );
+        if ( ! empty( $sql_files ) ) {
+            $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
+            $wpdb->query( 'SET UNIQUE_CHECKS = 0' );
+
+            // Drop all current tables first
+            $current_tables = $wpdb->get_col( 'SHOW TABLES' );
+            foreach ( $current_tables as $table ) {
+                $wpdb->query( "DROP TABLE IF EXISTS `{$table}`" );
+            }
+
+            // Re-import snapshot
+            foreach ( $sql_files as $sql_file ) {
+                $content    = file_get_contents( $sql_file );
+                $statements = preg_split( '/;\s*\n/', $content );
+                foreach ( $statements as $statement ) {
+                    $statement = trim( $statement );
+                    if ( empty( $statement ) ) {
+                        continue;
+                    }
+                    $result = $wpdb->query( $statement );
+                    if ( $result === false && stripos( $statement, 'SET ' ) !== 0 ) {
+                        $errors[] = 'SQL Error: ' . substr( $wpdb->last_error, 0, 200 );
+                    }
+                }
+            }
+
+            $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
+            $wpdb->query( 'SET UNIQUE_CHECKS = 1' );
+        }
+
+        // 2. Restore backed-up files
+        $web_root    = dirname( WP_CONTENT_DIR );
+        $backed_up   = $meta['backed_up_files'] ?? [];
+        foreach ( $backed_up as $relative_path ) {
+            $backup_src = $this->rollback_path . '/files/' . $relative_path;
+            $dest       = $web_root . '/' . $relative_path;
+            if ( file_exists( $backup_src ) ) {
+                $dest_dir = dirname( $dest );
+                if ( ! is_dir( $dest_dir ) ) {
+                    mkdir( $dest_dir, 0755, true );
+                }
+                if ( ! rename( $backup_src, $dest ) ) {
+                    copy( $backup_src, $dest );
+                }
+            }
+        }
+
+        // 3. Delete newly deployed files that weren't overwriting originals
+        $deployed = $meta['deployed_files'] ?? [];
+        foreach ( $deployed as $relative_path ) {
+            if ( in_array( $relative_path, $backed_up, true ) ) {
+                continue; // Already restored from backup
+            }
+            $file = $web_root . '/' . $relative_path;
+            if ( file_exists( $file ) ) {
+                @unlink( $file );
+            }
+        }
+
+        return [
+            'success'          => true,
+            'tables_restored'  => count( $sql_files ),
+            'files_restored'   => count( $backed_up ),
+            'files_removed'    => count( array_diff( $deployed, $backed_up ) ),
+            'errors'           => $errors,
+        ];
+    }
+
+    /**
+     * Cleans up staging directory. Keeps rollback data.
+     */
+    public function finalize() {
+        // Remove staging directory
+        if ( is_dir( $this->staging_path ) ) {
+            self::delete_directory_recursive( $this->staging_path );
+        }
+
+        // Remove leftover chunk directories
+        $chunks_dir = $this->staging_path;
+        if ( is_dir( $chunks_dir ) ) {
+            self::delete_directory_recursive( $chunks_dir );
+        }
+
+        // Flush rewrite rules
+        flush_rewrite_rules();
+
+        // Flush object cache
+        wp_cache_flush();
+
+        return [
+            'success'     => true,
+            'rollback_id' => $this->import_id,
+            'message'     => 'Import finalized. Rollback data retained.',
+        ];
+    }
+
+    /**
+     * Recursively delete a directory.
+     */
+    private static function delete_directory_recursive( $dir ) {
+        if ( ! is_dir( $dir ) ) {
+            return;
+        }
+        $it    = new \RecursiveDirectoryIterator( $dir, \RecursiveDirectoryIterator::SKIP_DOTS );
+        $files = new \RecursiveIteratorIterator( $it, \RecursiveIteratorIterator::CHILD_FIRST );
+        foreach ( $files as $file ) {
+            if ( $file->isDir() ) {
+                @rmdir( $file->getRealPath() );
+            } else {
+                @unlink( $file->getRealPath() );
+            }
+        }
+        @rmdir( $dir );
+    }
+}
