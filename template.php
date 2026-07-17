@@ -935,11 +935,12 @@
                             autocapitalize="none"
                             autocorrect="off"
                             autocomplete="off"
+                            @paste="handleConnectPaste"
                         ></v-text-field>
                         <v-text-field
                             v-model="restore.source_token"
                             label="Source connection token"
-                            hint="From the source site’s Tools → Disembark (Regenerate token)."
+                            hint="Tip: paste the source site’s full “disembark connect …” line into either field to fill both."
                             persistent-hint
                             prepend-inner-icon="mdi-key-variant"
                             density="compact"
@@ -949,6 +950,7 @@
                             autocapitalize="none"
                             autocorrect="off"
                             autocomplete="off"
+                            @paste="handleConnectPaste"
                         ></v-text-field>
                     </div>
                     <div v-else>
@@ -2774,6 +2776,43 @@ createApp({
                 return null;
             } else {
                 return number.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, '$1,');
+            }
+        },
+        // Parses a source connection out of pasted text. Accepts the exact line
+        // the source site's dashboard offers ("disembark connect <url> <token>"),
+        // or just "<url> <token>". Returns {url, token} or null when the text
+        // isn't a connection string (so a plain URL or token paste is untouched).
+        parseConnectString(text) {
+            const parts = (text || "").trim().split(/\s+/).filter(Boolean);
+            if (parts.length >= 2 && parts[0].toLowerCase() === "disembark" && parts[1].toLowerCase() === "connect") {
+                parts.splice(0, 2);
+            }
+            if (parts.length !== 2) {
+                return null;
+            }
+            let [url, token] = parts;
+            if (!/^https?:\/\//i.test(url)) {
+                if (!url.includes(".")) {
+                    return null;
+                }
+                url = "https://" + url;
+            }
+            // Disembark tokens are long and alphanumeric — anything else is
+            // probably not a token, so leave the paste alone.
+            if (!/^[A-Za-z0-9]{20,}$/.test(token)) {
+                return null;
+            }
+            return { url: url.replace(/\/+$/, ""), token };
+        },
+        // One-paste restore setup: pasting the whole connect command into either
+        // field fills both.
+        handleConnectPaste(event) {
+            const clipboard = event.clipboardData || window.clipboardData;
+            const parsed = this.parseConnectString(clipboard ? clipboard.getData("text") : "");
+            if (parsed) {
+                event.preventDefault();
+                this.restore.source_site = parsed.url;
+                this.restore.source_token = parsed.token;
             }
         },
     },
