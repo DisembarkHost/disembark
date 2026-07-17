@@ -7,3 +7,6 @@ disembark-dump.txt
 *-dump.txt
 snapshot-*/
 snapshot-*.zip
+
+# Internal dev notes / audit handoffs
+*-AUDIT.md
