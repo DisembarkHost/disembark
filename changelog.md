@@ -1,6 +1,6 @@
 # Changelog
 
-## **v2.8.0** - Unreleased
+## **v2.8.0** - July 17, 2026
 
 ### Added
 * **Restore a Backup (dashboard):** A new "Restore a Backup" flow under Tools → Disembark restores a site from an uploaded backup `.zip` — staged upload (chunked for large archives), a rollback point saved first, file deploy, database import, URL rewrite, and one-click rollback.
