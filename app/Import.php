@@ -269,12 +269,10 @@ class Import {
         if ( ! file_exists( $path ) ) {
             return new \WP_Error( 'not_found', 'Staged SQL file not found.', [ 'status' => 404 ] );
         }
-        $sql = file_get_contents( $path );
-        if ( $old_prefix && $new_prefix && $old_prefix !== $new_prefix ) {
-            $sql = str_replace( '`' . $old_prefix, '`' . $new_prefix, $sql );
-        }
-        $sql = preg_replace( '/CREATE TABLE `([^`]+)`/', "DROP TABLE IF EXISTS `$1`;\nCREATE TABLE `$1`", $sql );
-        return $this->execute_sql( $sql );
+        $sql        = file_get_contents( $path );
+        $statements = self::split_sql_statements( $sql );
+        $statements = self::transform_statements( $statements, $old_prefix, $new_prefix );
+        return $this->execute_statements( $statements );
     }
 
     /**
@@ -466,9 +464,50 @@ class Import {
     }
 
     /**
-     * Executes pre-transformed SQL statements on the destination database.
+     * Applies restore transformations to already-split statements: remaps the
+     * table-name prefix and injects a DROP TABLE before each CREATE TABLE.
+     * Both operate on the statement's leading keyword + identifier only —
+     * running them over the whole dump would also rewrite INSERT *values*
+     * (a post containing `wp_options` or the text "CREATE TABLE" would be
+     * mangled, and a prefix-length change would break serialized data).
+     * Prefix-scoped values inside the data are handled after import by
+     * remap_table_prefix(), which re-serializes safely.
+     */
+    private static function transform_statements( $statements, $old_prefix = '', $new_prefix = '' ) {
+        $remap = ( $old_prefix !== '' && $new_prefix !== '' && $old_prefix !== $new_prefix );
+        $out   = [];
+        foreach ( $statements as $statement ) {
+            if ( $remap ) {
+                $statement = preg_replace_callback(
+                    '/^((?:\/\*!\d+\s+)?(?:CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT\s+INTO|REPLACE\s+INTO|ALTER\s+TABLE|LOCK\s+TABLES|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|TRUNCATE\s+TABLE)\s+`)' . preg_quote( $old_prefix, '/' ) . '/i',
+                    function ( $m ) use ( $new_prefix ) {
+                        return $m[1] . $new_prefix;
+                    },
+                    $statement
+                );
+            }
+            if ( preg_match( '/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`([^`]+)`/i', $statement, $m ) ) {
+                $out[] = 'DROP TABLE IF EXISTS `' . $m[1] . '`';
+            }
+            $out[] = $statement;
+        }
+        return $out;
+    }
+
+    /**
+     * Executes pre-transformed SQL on the destination database.
      */
     public function execute_sql( $sql_content ) {
+        // Split into individual statements with a quote/comment-aware scanner.
+        // A column value may legitimately contain ";" (or ";\n"), so splitting
+        // on the delimiter naively would cut a statement mid-value.
+        return $this->execute_statements( self::split_sql_statements( $sql_content ) );
+    }
+
+    /**
+     * Executes a list of individual SQL statements on the destination database.
+     */
+    private function execute_statements( $statements ) {
         global $wpdb;
 
         $statements_executed = 0;
@@ -479,11 +518,6 @@ class Import {
         // CLI out of the remaining steps. Remember it and restore it afterward
         // so the tool stays authenticated through search-replace/finalize.
         $preserved_token = get_option( 'disembark_token' );
-
-        // Split into individual statements with a quote/comment-aware scanner.
-        // A column value may legitimately contain ";" (or ";\n"), so splitting
-        // on the delimiter naively would cut a statement mid-value.
-        $statements = self::split_sql_statements( $sql_content );
 
         // Temporarily disable FK checks for the import
         $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
