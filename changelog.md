@@ -1,5 +1,19 @@
 # Changelog
 
+## **v2.8.0** - Unreleased
+
+### Added
+* **Restore / Import:** New REST endpoints power restoring a backup into a site — preflight, rollback snapshot, chunked file upload with server-side extraction, database import, serialize-aware search/replace, finalize, and rollback.
+* **Serialize-aware search/replace:** URL/text replacement runs across the database after import and re-serializes PHP serialized values so length prefixes stay valid (widgets, theme mods, nested and doubly-serialized options survive a URL change).
+
+### Improved
+* **Authentication:** Endpoints now authorize administrators first (application password or cookie + REST nonce) and fall back to the per-site token, so the dashboard and CLI can use standard WordPress auth. The token is preserved across a database import so a restore stays authenticated through its final steps.
+
+### Security
+* **Token disclosure:** The dashboard shortcode now renders (and prints the site token) only for users who can manage the site, so it can't leak the token on a front-end page.
+* **Import hardening:** Import paths are validated against directory traversal, uploaded archives are extracted zip-slip-safe, and web-root/core path checks no longer match sibling directories.
+* **SQL import:** Statement splitting is quote- and comment-aware, so a value containing `;` no longer corrupts an import or rollback.
+
 ## **v2.7.0** - January 28, 2026
 
 ### Added
