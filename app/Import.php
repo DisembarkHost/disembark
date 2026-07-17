@@ -593,6 +593,56 @@ class Import {
     }
 
     /**
+     * Remaps prefix-scoped values that live inside the data (not just table
+     * names) after a cross-prefix import: usermeta keys like
+     * "{prefix}capabilities"/"{prefix}user_level" and the "{prefix}user_roles"
+     * option. Without this, migrated users lose their roles and get locked out.
+     * Operates on the destination (new-prefix) tables.
+     */
+    public function remap_table_prefix( $old_prefix, $new_prefix ) {
+        global $wpdb;
+
+        if ( $old_prefix === '' || $old_prefix === $new_prefix ) {
+            return [ 'keys_changed' => 0 ];
+        }
+
+        $changed = 0;
+
+        // usermeta: leading-prefix meta keys (capabilities, user_level,
+        // user-settings, dashboard_*, plus plugin keys that adopt the prefix).
+        $usermeta = $new_prefix . 'usermeta';
+        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $usermeta ) ) === $usermeta ) {
+            $like = $wpdb->esc_like( $old_prefix ) . '%';
+            $rows = $wpdb->get_results(
+                $wpdb->prepare( "SELECT umeta_id, meta_key FROM `{$usermeta}` WHERE meta_key LIKE %s", $like )
+            );
+            foreach ( $rows as $row ) {
+                // Only rewrite the leading prefix, keep the remainder intact.
+                $new_key = $new_prefix . substr( $row->meta_key, strlen( $old_prefix ) );
+                $wpdb->update( $usermeta, [ 'meta_key' => $new_key ], [ 'umeta_id' => $row->umeta_id ] );
+                $changed++;
+            }
+        }
+
+        // options: the roles are stored under "{prefix}user_roles".
+        $options = $new_prefix . 'options';
+        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $options ) ) === $options ) {
+            $res = $wpdb->update(
+                $options,
+                [ 'option_name' => $new_prefix . 'user_roles' ],
+                [ 'option_name' => $old_prefix . 'user_roles' ]
+            );
+            if ( $res ) {
+                $changed += $res;
+            }
+        }
+
+        wp_cache_flush();
+
+        return [ 'keys_changed' => $changed ];
+    }
+
+    /**
      * Restores the destination to pre-import state using the rollback snapshot.
      */
     public function rollback() {

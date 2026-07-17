@@ -217,6 +217,10 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'import_search_replace' ]
         ]);
+        register_rest_route('disembark/v1', '/import/remap-prefix', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_remap_prefix' ]
+        ]);
         register_rest_route('disembark/v1', '/import/rollback', [
             'methods'  => 'POST',
             'callback' => [ $this, 'import_rollback' ]
@@ -938,6 +942,23 @@ class Run {
 
         $import = new Import( $import_id );
         return $import->execute_sql( $sql_content );
+    }
+
+    function import_remap_prefix( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params     = $request->get_json_params();
+        $import_id  = $params['import_id'] ?? '';
+        $old_prefix = $params['old_prefix'] ?? '';
+        $new_prefix = $params['new_prefix'] ?? '';
+
+        if ( $old_prefix === '' || $new_prefix === '' ) {
+            return new \WP_Error( 'missing_params', 'old_prefix and new_prefix are required.', [ 'status' => 400 ] );
+        }
+
+        $import = new Import( $import_id );
+        return $import->remap_table_prefix( $old_prefix, $new_prefix );
     }
 
     function import_search_replace( $request ) {
