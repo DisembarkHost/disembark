@@ -209,6 +209,10 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'import_sql' ]
         ]);
+        register_rest_route('disembark/v1', '/import/search-replace', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_search_replace' ]
+        ]);
         register_rest_route('disembark/v1', '/import/rollback', [
             'methods'  => 'POST',
             'callback' => [ $this, 'import_rollback' ]
@@ -914,6 +918,27 @@ class Run {
 
         $import = new Import( $import_id );
         return $import->execute_sql( $sql_content );
+    }
+
+    function import_search_replace( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        $from      = $params['from'] ?? '';
+        $to        = $params['to'] ?? '';
+        $tables    = $params['tables'] ?? [];
+
+        if ( $from === '' ) {
+            return new \WP_Error( 'missing_params', 'A "from" value is required.', [ 'status' => 400 ] );
+        }
+        if ( ! is_array( $tables ) ) {
+            $tables = [];
+        }
+
+        $import = new Import( $import_id );
+        return $import->search_replace( $from, $to, $tables );
     }
 
     function import_rollback( $request ) {

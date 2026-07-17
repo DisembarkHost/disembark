@@ -402,6 +402,145 @@ class Import {
     }
 
     /**
+     * Serialize-aware search/replace across the destination database. Runs after
+     * the SQL import so it can operate on real row values (a dump keeps those as
+     * escaped substrings that can't be reliably unserialized). Walks every table
+     * and column, fixing PHP-serialized length prefixes as it replaces, and
+     * updates changed rows by primary key.
+     *
+     * @param string   $from   String to search for (e.g. the source home URL).
+     * @param string   $to     Replacement (e.g. the destination home URL).
+     * @param string[] $tables Optional table allowlist; defaults to all tables.
+     */
+    public function search_replace( $from, $to, $tables = [] ) {
+        global $wpdb;
+
+        if ( $from === '' || $from === $to ) {
+            return [ 'tables' => 0, 'rows_changed' => 0, 'cells_changed' => 0 ];
+        }
+
+        if ( empty( $tables ) ) {
+            $tables = $wpdb->get_col( 'SHOW TABLES' );
+        }
+
+        $rows_changed  = 0;
+        $cells_changed = 0;
+        $tables_seen   = 0;
+
+        foreach ( $tables as $table ) {
+            // Only touch real tables on this database.
+            $exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+            if ( ! $exists ) {
+                continue;
+            }
+            $tables_seen++;
+
+            $columns     = $wpdb->get_results( "SHOW COLUMNS FROM `{$table}`" );
+            $column_names = [];
+            $primary_keys = [];
+            foreach ( $columns as $col ) {
+                $column_names[] = $col->Field;
+                if ( $col->Key === 'PRI' ) {
+                    $primary_keys[] = $col->Field;
+                }
+            }
+            // Without a primary key we can't safely target an UPDATE.
+            if ( empty( $primary_keys ) || empty( $column_names ) ) {
+                continue;
+            }
+
+            $offset = 0;
+            $limit  = 1000;
+            while ( true ) {
+                $rows = $wpdb->get_results(
+                    "SELECT * FROM `{$table}` LIMIT {$limit} OFFSET {$offset}",
+                    ARRAY_A
+                );
+                if ( empty( $rows ) ) {
+                    break;
+                }
+
+                foreach ( $rows as $row ) {
+                    $update = [];
+                    foreach ( $row as $column => $value ) {
+                        if ( ! is_string( $value ) || $value === '' ) {
+                            continue;
+                        }
+                        if ( strpos( $value, $from ) === false ) {
+                            continue;
+                        }
+                        $replaced = self::recursive_unserialize_replace( $from, $to, $value );
+                        if ( $replaced !== $value ) {
+                            $update[ $column ] = $replaced;
+                            $cells_changed++;
+                        }
+                    }
+
+                    if ( ! empty( $update ) ) {
+                        $where = [];
+                        foreach ( $primary_keys as $pk ) {
+                            $where[ $pk ] = $row[ $pk ];
+                        }
+                        $result = $wpdb->update( $table, $update, $where );
+                        if ( $result !== false && $result > 0 ) {
+                            $rows_changed++;
+                        }
+                    }
+                }
+
+                $offset += $limit;
+            }
+        }
+
+        return [
+            'tables'        => $tables_seen,
+            'rows_changed'  => $rows_changed,
+            'cells_changed' => $cells_changed,
+        ];
+    }
+
+    /**
+     * Recursively replaces $from with $to inside a value, re-serializing PHP
+     * serialized strings so their length prefixes stay valid. Mirrors the
+     * approach used by WP-CLI search-replace / interconnectit's srdb.
+     */
+    private static function recursive_unserialize_replace( $from, $to, $data, $serialised = false ) {
+        try {
+            if ( is_string( $data ) && $data !== '' && ( $unserialized = @unserialize( $data ) ) !== false ) {
+                $data = self::recursive_unserialize_replace( $from, $to, $unserialized, true );
+            } elseif ( is_array( $data ) ) {
+                $result = [];
+                foreach ( $data as $key => $value ) {
+                    $result[ $key ] = self::recursive_unserialize_replace( $from, $to, $value, false );
+                }
+                $data = $result;
+                unset( $result );
+            } elseif ( is_object( $data ) ) {
+                $result = clone $data;
+                foreach ( get_object_vars( $data ) as $key => $value ) {
+                    // Skip protected/private mangled property names.
+                    if ( $key === '' || ord( $key[0] ) === 0 ) {
+                        continue;
+                    }
+                    $result->$key = self::recursive_unserialize_replace( $from, $to, $value, false );
+                }
+                $data = $result;
+                unset( $result );
+            } elseif ( is_string( $data ) ) {
+                $data = str_replace( $from, $to, $data );
+            }
+
+            if ( $serialised ) {
+                return serialize( $data );
+            }
+        } catch ( \Exception $e ) {
+            // On any failure, leave the value untouched rather than corrupt it.
+        }
+
+        return $data;
+    }
+
+    /**
      * Restores the destination to pre-import state using the rollback snapshot.
      */
     public function rollback() {
