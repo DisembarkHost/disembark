@@ -931,6 +931,10 @@
                             density="compact"
                             variant="outlined"
                             :disabled="restore.running"
+                            spellcheck="false"
+                            autocapitalize="none"
+                            autocorrect="off"
+                            autocomplete="off"
                         ></v-text-field>
                         <v-text-field
                             v-model="restore.source_token"
@@ -941,7 +945,10 @@
                             density="compact"
                             variant="outlined"
                             :disabled="restore.running"
-                            class="mb-2"
+                            spellcheck="false"
+                            autocapitalize="none"
+                            autocorrect="off"
+                            autocomplete="off"
                         ></v-text-field>
                     </div>
                     <div v-else>
@@ -978,6 +985,9 @@
                         <span class="text-h6">Restore complete</span>
                     </div>
                     <p class="text-body-2 mb-2">This site now reflects the restored content.</p>
+                    <v-alert type="warning" variant="tonal" density="compact" class="text-caption mb-2">
+                        The user accounts were replaced by the source's, so your current login no longer applies. <strong>Log in with the source site's credentials.</strong>
+                    </v-alert>
                     <v-alert type="info" variant="tonal" density="compact" class="text-caption">
                         Rollback id: <code>{{ restore.rollback_id }}</code><br>
                         To undo from the CLI: <code>disembark restore {{ home_url }} --rollback={{ restore.rollback_id }}</code>

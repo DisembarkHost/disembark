@@ -18,7 +18,8 @@ class Run {
         add_action( 'init', [ $this, 'register_shortcode' ] );
 
         add_action( 'rest_api_init', [ $this, 'register_rest_endpoints' ] );
-        
+        add_filter( 'rest_authentication_errors', [ $this, 'allow_token_auth' ], 99 );
+
         if ( defined( 'WP_CLI' ) && \WP_CLI ) {
             \WP_CLI::add_command( 'disembark', new class {}, [
                 'shortdesc' => 'Disembark helper commands.',
@@ -26,6 +27,39 @@ class Run {
             \WP_CLI::add_command( 'disembark token', [ 'Disembark\Command', "token" ]  );
             \WP_CLI::add_command( 'disembark cli-info', [ 'Disembark\Command', 'cli_info' ] );
         }
+    }
+
+    /**
+     * When a request to a Disembark route carries a valid token, treat it as
+     * authenticated so WordPress's cookie/nonce check (rest_cookie_check_errors)
+     * doesn't reject it. This is essential during a restore: importing the
+     * database replaces wp_users, which invalidates the admin's session
+     * mid-flow — the browser then sends a stale nonce that would otherwise 403
+     * the remaining steps ("Cookie check failed"). The token, preserved across
+     * the import, keeps the request authorized. Scoped to Disembark routes; the
+     * per-endpoint User::allowed() check still runs.
+     */
+    public function allow_token_auth( $errors ) {
+        $uri = isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '';
+        if ( strpos( $uri, 'disembark' ) === false ) {
+            return $errors;
+        }
+
+        $token = isset( $_REQUEST['token'] ) ? $_REQUEST['token'] : null;
+        if ( ! $token && isset( $_SERVER['CONTENT_TYPE'] ) && stripos( $_SERVER['CONTENT_TYPE'], 'application/json' ) !== false ) {
+            $body = file_get_contents( 'php://input' );
+            if ( $body ) {
+                $json = json_decode( $body, true );
+                if ( is_array( $json ) && ! empty( $json['token'] ) ) {
+                    $token = $json['token'];
+                }
+            }
+        }
+
+        if ( $token && hash_equals( Token::get(), (string) $token ) ) {
+            return true; // valid token → skip the cookie/nonce requirement
+        }
+        return $errors;
     }
 
     /**
