@@ -348,8 +348,10 @@ class Import {
         $statements_executed = 0;
         $errors              = [];
 
-        // Split on statement boundaries (semicolons followed by newline)
-        $statements = preg_split( '/;\s*\n/', $sql_content );
+        // Split into individual statements with a quote/comment-aware scanner.
+        // A column value may legitimately contain ";" (or ";\n"), so splitting
+        // on the delimiter naively would cut a statement mid-value.
+        $statements = self::split_sql_statements( $sql_content );
 
         // Temporarily disable FK checks for the import
         $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
@@ -428,7 +430,7 @@ class Import {
             // Re-import snapshot
             foreach ( $sql_files as $sql_file ) {
                 $content    = file_get_contents( $sql_file );
-                $statements = preg_split( '/;\s*\n/', $content );
+                $statements = self::split_sql_statements( $content );
                 foreach ( $statements as $statement ) {
                     $statement = trim( $statement );
                     if ( empty( $statement ) ) {
@@ -509,6 +511,131 @@ class Import {
             'rollback_id' => $this->import_id,
             'message'     => 'Import finalized. Rollback data retained.',
         ];
+    }
+
+    /**
+     * Splits a SQL dump into individual statements, respecting quoting and
+     * comments so a ";" inside a string/identifier/comment never ends a
+     * statement. Handles single/double quotes (backslash escapes and doubled
+     * quotes), backtick identifiers, "--"/"#" line comments, and "/* *\/"
+     * block comments (including "/*!" executable comments). Returns trimmed,
+     * non-empty statements without their trailing ";".
+     */
+    private static function split_sql_statements( $sql ) {
+        $statements = [];
+        $current    = '';
+        $len        = strlen( $sql );
+        $state      = 'normal'; // normal | squote | dquote | backtick | line_comment | block_comment
+        $i          = 0;
+
+        while ( $i < $len ) {
+            $ch  = $sql[ $i ];
+            $nxt = ( $i + 1 < $len ) ? $sql[ $i + 1 ] : '';
+
+            switch ( $state ) {
+                case 'normal':
+                    if ( $ch === '-' && $nxt === '-' && ( $i + 2 >= $len || ctype_space( $sql[ $i + 2 ] ) ) ) {
+                        $state    = 'line_comment';
+                        $current .= $ch;
+                        $i++;
+                        break;
+                    }
+                    if ( $ch === '#' ) {
+                        $state    = 'line_comment';
+                        $current .= $ch;
+                        $i++;
+                        break;
+                    }
+                    if ( $ch === '/' && $nxt === '*' ) {
+                        $state    = 'block_comment';
+                        $current .= $ch . $nxt;
+                        $i       += 2;
+                        break;
+                    }
+                    if ( $ch === "'" ) { $state = 'squote';   $current .= $ch; $i++; break; }
+                    if ( $ch === '"' ) { $state = 'dquote';   $current .= $ch; $i++; break; }
+                    if ( $ch === '`' ) { $state = 'backtick'; $current .= $ch; $i++; break; }
+                    if ( $ch === ';' ) {
+                        $stmt = trim( $current );
+                        if ( $stmt !== '' ) {
+                            $statements[] = $stmt;
+                        }
+                        $current = '';
+                        $i++;
+                        break;
+                    }
+                    $current .= $ch;
+                    $i++;
+                    break;
+
+                case 'squote':
+                case 'dquote':
+                    $q = ( $state === 'squote' ) ? "'" : '"';
+                    if ( $ch === '\\' ) {
+                        // Backslash escapes the next character.
+                        $current .= $ch . $nxt;
+                        $i       += 2;
+                        break;
+                    }
+                    if ( $ch === $q ) {
+                        if ( $nxt === $q ) {
+                            // Doubled quote is a literal quote, not a terminator.
+                            $current .= $ch . $nxt;
+                            $i       += 2;
+                            break;
+                        }
+                        $state    = 'normal';
+                        $current .= $ch;
+                        $i++;
+                        break;
+                    }
+                    $current .= $ch;
+                    $i++;
+                    break;
+
+                case 'backtick':
+                    if ( $ch === '`' ) {
+                        if ( $nxt === '`' ) {
+                            $current .= $ch . $nxt;
+                            $i       += 2;
+                            break;
+                        }
+                        $state    = 'normal';
+                        $current .= $ch;
+                        $i++;
+                        break;
+                    }
+                    $current .= $ch;
+                    $i++;
+                    break;
+
+                case 'line_comment':
+                    $current .= $ch;
+                    if ( $ch === "\n" ) {
+                        $state = 'normal';
+                    }
+                    $i++;
+                    break;
+
+                case 'block_comment':
+                    if ( $ch === '*' && $nxt === '/' ) {
+                        $current .= $ch . $nxt;
+                        $i       += 2;
+                        $state    = 'normal';
+                        break;
+                    }
+                    $current .= $ch;
+                    $i++;
+                    break;
+            }
+        }
+
+        $stmt = trim( $current );
+        if ( $stmt !== '' ) {
+            $statements[] = $stmt;
+        }
+
+        return $statements;
     }
 
     /**
