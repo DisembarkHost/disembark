@@ -189,6 +189,23 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'import_preflight' ]
         ]);
+        // Pull (direct site-to-site) endpoints
+        register_rest_route('disembark/v1', '/import/pull/connect', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_connect' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/pull/scan', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_scan' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/pull/fetch-files', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_fetch_files' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/pull/fetch-database', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_fetch_database' ]
+        ]);
         register_rest_route('disembark/v1', '/import/snapshot', [
             'methods'  => 'POST',
             'callback' => [ $this, 'import_snapshot' ]
@@ -967,6 +984,60 @@ class Run {
 
         $import = new Import( $import_id );
         return $import->remap_table_prefix( $old_prefix, $new_prefix );
+    }
+
+    function import_pull_connect( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params       = $request->get_json_params();
+        $import_id    = $params['import_id'] ?? '';
+        $source_url   = $params['source_url'] ?? '';
+        $source_token = $params['source_token'] ?? '';
+        if ( empty( $source_url ) || empty( $source_token ) ) {
+            return new \WP_Error( 'missing_params', 'source_url and source_token are required.', [ 'status' => 400 ] );
+        }
+        return ( new Pull( $import_id ) )->connect( $source_url, $source_token );
+    }
+
+    function import_pull_scan( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        $step      = $params['step'] ?? '';
+        $chunk     = isset( $params['chunk'] ) ? (int) $params['chunk'] : 0;
+        if ( empty( $import_id ) || empty( $step ) ) {
+            return new \WP_Error( 'missing_params', 'import_id and step are required.', [ 'status' => 400 ] );
+        }
+        return ( new Pull( $import_id ) )->scan_step( $step, $chunk );
+    }
+
+    function import_pull_fetch_files( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        $offset    = isset( $params['offset'] ) ? (int) $params['offset'] : 0;
+        $count     = isset( $params['count'] ) ? (int) $params['count'] : 300;
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        return ( new Pull( $import_id ) )->fetch_files( $offset, $count );
+    }
+
+    function import_pull_fetch_database( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        return ( new Pull( $import_id ) )->fetch_database();
     }
 
     function import_staged_info( $request ) {

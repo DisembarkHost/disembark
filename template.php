@@ -917,26 +917,55 @@
                     <v-alert type="warning" variant="tonal" density="compact" class="mb-4 text-caption">
                         <strong>This overwrites this site.</strong> A rollback point is saved first so the import can be undone.
                     </v-alert>
-                    <v-file-input
-                        v-model="restore.file"
-                        label="Backup .zip (from “disembark backup”)"
-                        accept=".zip"
-                        prepend-icon="mdi-folder-zip-outline"
-                        density="compact"
-                        variant="outlined"
-                        :disabled="restore.running"
-                        show-size
-                    ></v-file-input>
-                    <v-text-field
-                        v-model="restore.source_url"
-                        label="Source URL to rewrite (optional)"
-                        hint="Defaults to the origin recorded in the backup. Rewritten to this site’s URL."
-                        persistent-hint
-                        density="compact"
-                        variant="outlined"
-                        :disabled="restore.running"
-                        class="mb-2"
-                    ></v-text-field>
+                    <v-btn-toggle v-model="restore.mode" mandatory divided density="compact" color="secondary" class="mb-4" style="width:100%;">
+                        <v-btn value="site" :disabled="restore.running" style="flex:1;"><v-icon start>mdi-transit-connection-variant</v-icon>From a live site</v-btn>
+                        <v-btn value="file" :disabled="restore.running" style="flex:1;"><v-icon start>mdi-folder-zip-outline</v-icon>From a backup file</v-btn>
+                    </v-btn-toggle>
+
+                    <div v-if="restore.mode === 'site'">
+                        <v-text-field
+                            v-model="restore.source_site"
+                            label="Source site URL"
+                            placeholder="https://oldsite.com"
+                            prepend-inner-icon="mdi-web"
+                            density="compact"
+                            variant="outlined"
+                            :disabled="restore.running"
+                        ></v-text-field>
+                        <v-text-field
+                            v-model="restore.source_token"
+                            label="Source connection token"
+                            hint="From the source site’s Tools → Disembark (Regenerate token)."
+                            persistent-hint
+                            prepend-inner-icon="mdi-key-variant"
+                            density="compact"
+                            variant="outlined"
+                            :disabled="restore.running"
+                            class="mb-2"
+                        ></v-text-field>
+                    </div>
+                    <div v-else>
+                        <v-file-input
+                            v-model="restore.file"
+                            label="Backup .zip (from “disembark backup”)"
+                            accept=".zip"
+                            prepend-icon="mdi-folder-zip-outline"
+                            density="compact"
+                            variant="outlined"
+                            :disabled="restore.running"
+                            show-size
+                        ></v-file-input>
+                        <v-text-field
+                            v-model="restore.source_url"
+                            label="Source URL to rewrite (optional)"
+                            hint="Defaults to the origin recorded in the backup. Rewritten to this site’s URL."
+                            persistent-hint
+                            density="compact"
+                            variant="outlined"
+                            :disabled="restore.running"
+                            class="mb-2"
+                        ></v-text-field>
+                    </div>
                     <div v-if="restore.running || restore.log.length" class="mt-3" style="background:#1e1e1e;border-radius:4px;padding:12px;max-height:220px;overflow:auto;">
                         <div v-for="(line, i) in restore.log" :key="i" style="font-family:monospace;font-size:12px;color:#d6ebf6;line-height:1.6;">{{ line }}</div>
                         <div v-if="restore.running" style="font-family:monospace;font-size:12px;color:#8fb0c2;">{{ restore.progress }}</div>
@@ -948,7 +977,7 @@
                         <v-icon color="success" class="mr-2">mdi-check-circle</v-icon>
                         <span class="text-h6">Restore complete</span>
                     </div>
-                    <p class="text-body-2 mb-2">This site now reflects the uploaded backup.</p>
+                    <p class="text-body-2 mb-2">This site now reflects the restored content.</p>
                     <v-alert type="info" variant="tonal" density="compact" class="text-caption">
                         Rollback id: <code>{{ restore.rollback_id }}</code><br>
                         To undo from the CLI: <code>disembark restore {{ home_url }} --rollback={{ restore.rollback_id }}</code>
@@ -958,7 +987,7 @@
             <v-card-actions>
                 <v-spacer></v-spacer>
                 <v-btn v-if="!restore.done" variant="text" color="grey" :disabled="restore.running" @click="restore.show = false">Cancel</v-btn>
-                <v-btn v-if="!restore.done" color="secondary" variant="flat" :loading="restore.running" :disabled="!restore.file" @click="startRestore">Restore</v-btn>
+                <v-btn v-if="!restore.done" color="secondary" variant="flat" :loading="restore.running" :disabled="!restoreReady" @click="startRestore">Restore</v-btn>
                 <v-btn v-else color="primary" variant="flat" @click="finishRestore">Done</v-btn>
             </v-card-actions>
         </v-card>
@@ -1012,8 +1041,11 @@ createApp({
             backup_ready: false,
             restore: {
                 show: false,
+                mode: "site",
                 file: null,
                 source_url: "",
+                source_site: "",
+                source_token: "",
                 running: false,
                 done: false,
                 error: "",
@@ -1114,7 +1146,7 @@ createApp({
     },
     methods: {
         openRestore() {
-            this.restore = { show: true, file: null, source_url: "", running: false, done: false, error: "", progress: "", log: [], rollback_id: "" };
+            this.restore = { show: true, mode: "site", file: null, source_url: "", source_site: "", source_token: "", running: false, done: false, error: "", progress: "", log: [], rollback_id: "" };
         },
         finishRestore() {
             this.restore.show = false;
@@ -1156,11 +1188,49 @@ createApp({
                 await axios.post(this.api_root + 'import/extract-zip', { token: this.api_token, import_id: importId, file_path: 'restore.zip' });
             }
         },
+        // Pulls a backup directly from a live source site into staging, driving
+        // the source's REST API server-side (connect -> manifest scan -> file
+        // batches -> database). Returns the source URL used for URL rewriting.
+        async stageFromSite(importId) {
+            const t = this.api_token, root = this.api_root;
+            this.rlog('Connecting to source...');
+            const c = (await axios.post(root + 'import/pull/connect', {
+                token: t, import_id: importId,
+                source_url: this.restore.source_site,
+                source_token: this.restore.source_token
+            })).data;
+            this.rlog('Connected. Source: ' + c.source_home + ' (' + c.table_count + ' tables).');
+
+            this.rlog('Scanning source files...');
+            const scan = (step, chunk) => axios.post(root + 'import/pull/scan', { token: t, import_id: importId, step: step, chunk: chunk || 0 }).then(r => r.data);
+            await scan('initiate');
+            for (let i = 0; i < 600; i++) {
+                const s = await scan('scan');
+                if (s.status === 'scan_complete') break;
+                if (s.scanned_dirs && s.total_dirs) this.restore.progress = 'Scanning... ' + s.scanned_dirs + '/' + s.total_dirs + ' dirs';
+            }
+            const ch = await scan('chunkify');
+            const totalChunks = ch.total_chunks || 0;
+            for (let c2 = 1; c2 <= totalChunks; c2++) { await scan('process_chunk', c2); }
+            const fin = await scan('finalize');
+            const totalFiles = fin.total_files || 0;
+            this.rlog(totalFiles + ' files to pull.');
+
+            const BATCH = 1000;
+            let done = false, fetched = 0;
+            while (!done) {
+                const r = (await axios.post(root + 'import/pull/fetch-files', { token: t, import_id: importId, offset: fetched, count: BATCH })).data;
+                fetched = r.fetched; done = r.done;
+                this.restore.progress = 'Pulling files... ' + fetched + '/' + r.total;
+            }
+            this.rlog('Pulled ' + fetched + ' files.');
+
+            this.rlog('Pulling database...');
+            const db = (await axios.post(root + 'import/pull/fetch-database', { token: t, import_id: importId })).data;
+            this.rlog('Database pulled (' + (db.tables || 0) + ' tables).');
+            return (c.source_home || '').replace(/\/$/, '');
+        },
         async startRestore() {
-            if (!this.restore.file) return;
-            // v-file-input can hand back a single File or an array depending on version.
-            const file = Array.isArray(this.restore.file) ? this.restore.file[0] : this.restore.file;
-            if (!file) return;
             this.restore.running = true;
             this.restore.error = "";
             this.restore.log = [];
@@ -1176,13 +1246,21 @@ createApp({
                 const destPrefix = pre.db_prefix || '';
                 const destHome = (pre.home_url || this.home_url || '').replace(/\/$/, '');
 
-                this.rlog('Uploading backup...');
-                await this.uploadRestoreZip(file, importId);
+                // Stage the backup (direct pull, or uploaded file).
+                let siteSrcHome = "";
+                if (this.restore.mode === 'site') {
+                    siteSrcHome = await this.stageFromSite(importId);
+                } else {
+                    const file = Array.isArray(this.restore.file) ? this.restore.file[0] : this.restore.file;
+                    if (!file) { this.restore.running = false; return; }
+                    this.rlog('Uploading backup...');
+                    await this.uploadRestoreZip(file, importId);
+                }
 
                 this.rlog('Reading backup...');
                 const info = (await axios.post(root + 'import/staged-info', { token: t, import_id: importId })).data;
                 const srcPrefix = (info.source && info.source.db_prefix) || '';
-                const srcHome = (this.restore.source_url || (info.source && info.source.home_url) || '').replace(/\/$/, '');
+                const srcHome = (this.restore.source_url || siteSrcHome || (info.source && info.source.home_url) || '').replace(/\/$/, '');
                 this.rlog(info.files + ' files staged' + (info.sql_file ? ', database found.' : ', no database.'));
 
                 this.rlog('Creating rollback snapshot...');
@@ -2687,6 +2765,12 @@ createApp({
         },
     },
     computed: {
+        restoreReady() {
+            if (this.restore.mode === 'site') {
+                return !!(this.restore.source_site && this.restore.source_token);
+            }
+            return !!this.restore.file;
+        },
         cliCommands() {
             if (!this.home_url || !this.api_token) return {}; // Return empty object
 
