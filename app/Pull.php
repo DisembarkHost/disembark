@@ -47,6 +47,19 @@ class Pull {
     }
 
     /**
+     * Whether to verify TLS certificates (and reject internal/unsafe URLs) on
+     * the pull channel. Defaults ON — this channel carries the source's
+     * full-access token and pulls executable files and SQL, so a MITM here is
+     * code execution on the destination. Opt out for known self-signed or
+     * local sources via DISEMBARK_DEV_MODE or the disembark_pull_sslverify
+     * filter.
+     */
+    private function sslverify() {
+        $verify = ! ( defined( 'DISEMBARK_DEV_MODE' ) && DISEMBARK_DEV_MODE );
+        return (bool) apply_filters( 'disembark_pull_sslverify', $verify );
+    }
+
+    /**
      * Calls the source site's Disembark REST API, honoring its permalink style.
      */
     private function source_request( $endpoint, $payload = [], $method = 'POST', $timeout = 120 ) {
@@ -62,7 +75,13 @@ class Pull {
             [ 'token' => $state['source_token'] ?? '', 'backup_token' => $state['backup_token'] ?? '' ],
             $payload
         );
-        $args = [ 'timeout' => $timeout, 'sslverify' => false, 'headers' => [ 'Content-Type' => 'application/json' ] ];
+        $verify = $this->sslverify();
+        $args   = [
+            'timeout'            => $timeout,
+            'sslverify'          => $verify,
+            'reject_unsafe_urls' => $verify,
+            'headers'            => [ 'Content-Type' => 'application/json' ],
+        ];
 
         if ( strtoupper( $method ) === 'GET' ) {
             $sep  = ( strpos( $url, '?' ) !== false ) ? '&' : '?';
@@ -78,7 +97,9 @@ class Pull {
         $code = wp_remote_retrieve_response_code( $resp );
         $raw  = wp_remote_retrieve_body( $resp );
         if ( $code !== 200 ) {
-            return new \WP_Error( 'source_error', "Source responded {$code} for {$endpoint}.", [ 'status' => 502, 'body' => substr( $raw, 0, 300 ) ] );
+            // Don't echo the remote body back to the browser — it can contain
+            // internal details from the source (or whatever answered for it).
+            return new \WP_Error( 'source_error', "Source responded {$code} for {$endpoint}.", [ 'status' => 502 ] );
         }
         $decoded = json_decode( $raw );
         // Some endpoints return a raw URL string, not JSON.
@@ -89,10 +110,37 @@ class Pull {
     }
 
     /**
+     * Downloads a URL to a temp file with the pull channel's safety posture:
+     * http(s) only, unsafe/internal hosts rejected, TLS verified — unless
+     * verification is opted out (see sslverify()). The URLs handed here come
+     * from the source's responses, so they are untrusted input. Returns the
+     * temp path or WP_Error.
+     */
+    private function guarded_download( $url ) {
+        if ( ! is_string( $url ) || ! preg_match( '#^https?://#i', $url ) ) {
+            return new \WP_Error( 'invalid_url', 'Refusing to download a non-http(s) URL from the source.', [ 'status' => 502 ] );
+        }
+        $verify = $this->sslverify();
+        if ( $verify && ! wp_http_validate_url( $url ) ) {
+            return new \WP_Error( 'invalid_url', 'Refusing to download an unsafe URL from the source.', [ 'status' => 502 ] );
+        }
+        if ( ! $verify ) {
+            add_filter( 'https_ssl_verify', '__return_false' );
+            add_filter( 'http_request_host_is_external', '__return_true' );
+        }
+        $tmp = download_url( $url, 600 );
+        if ( ! $verify ) {
+            remove_filter( 'https_ssl_verify', '__return_false' );
+            remove_filter( 'http_request_host_is_external', '__return_true' );
+        }
+        return $tmp;
+    }
+
+    /**
      * Downloads a URL to a local path (streamed to disk).
      */
     private function download_to( $url, $dest_path ) {
-        $tmp = download_url( $url, 600 );
+        $tmp = $this->guarded_download( $url );
         if ( is_wp_error( $tmp ) ) {
             return $tmp;
         }
@@ -122,7 +170,8 @@ class Pull {
             $path = ( $candidate === 'rest_route' )
                 ? '/?rest_route=/disembark/v1/database&token=' . rawurlencode( $source_token )
                 : '/wp-json/disembark/v1/database?token=' . rawurlencode( $source_token );
-            $resp = wp_remote_get( $source_url . $path, [ 'timeout' => 60, 'sslverify' => false ] );
+            $verify = $this->sslverify();
+            $resp   = wp_remote_get( $source_url . $path, [ 'timeout' => 60, 'sslverify' => $verify, 'reject_unsafe_urls' => $verify ] );
             if ( ! is_wp_error( $resp ) && wp_remote_retrieve_response_code( $resp ) === 200 ) {
                 $tables = json_decode( wp_remote_retrieve_body( $resp ) );
                 if ( ! empty( $tables ) ) {
@@ -219,7 +268,7 @@ class Pull {
             if ( ! is_object( $chunk ) || empty( $chunk->url ) ) {
                 continue;
             }
-            $tmp = download_url( $chunk->url, 300 );
+            $tmp = $this->guarded_download( $chunk->url );
             if ( is_wp_error( $tmp ) ) {
                 return $tmp;
             }
@@ -322,7 +371,9 @@ class Pull {
                 require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
             }
             $pcl = new \PclZip( $zip_path );
-            if ( $pcl->extract( PCLZIP_OPT_PATH, $this->staging_public ) == 0 ) {
+            // Same zip-slip filtering as the ZipArchive branch — without the
+            // guard PclZip would honour "../" entry names.
+            if ( $pcl->extract( PCLZIP_OPT_PATH, $this->staging_public, PCLZIP_CB_PRE_EXTRACT, 'Disembark\\pclzip_pre_extract_guard' ) == 0 ) {
                 return new \WP_Error( 'extract_failed', 'Could not extract batch zip.', [ 'status' => 500 ] );
             }
             return true;
@@ -330,7 +381,7 @@ class Pull {
         $safe = [];
         for ( $i = 0; $i < $zip->numFiles; $i++ ) {
             $name = $zip->getNameIndex( $i );
-            if ( $name !== false && strpos( $name, '..' ) === false && $name[0] !== '/' ) {
+            if ( $name !== false && Import::is_safe_relative_path( $name ) ) {
                 $safe[] = $name;
             }
         }

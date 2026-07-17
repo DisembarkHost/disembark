@@ -30,9 +30,10 @@ class Import {
 
     /**
      * Rejects a caller-supplied relative path that could climb out of the
-     * staging / web-root tree (absolute paths, "..", or null bytes).
+     * staging / web-root tree (absolute paths, "..", or null bytes). Public
+     * static so Pull and the PclZip pre-extract guard share the same rule.
      */
-    private function is_safe_relative_path( $relative_path ) {
+    public static function is_safe_relative_path( $relative_path ) {
         if ( ! is_string( $relative_path ) || $relative_path === '' ) {
             return false;
         }
@@ -170,7 +171,7 @@ class Import {
      * upload_chunk) and removes it. Lets large sites avoid a single huge POST.
      */
     public function extract_staged_zip( $file_path ) {
-        if ( ! $this->is_safe_relative_path( $file_path ) ) {
+        if ( ! self::is_safe_relative_path( $file_path ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid file path.', [ 'status' => 400 ] );
         }
         $zip_path = $this->staging_path . '/' . $file_path;
@@ -198,7 +199,9 @@ class Import {
                 require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
             }
             $zip    = new \PclZip( $zip_path );
-            $result = $zip->extract( PCLZIP_OPT_PATH, $this->staging_path );
+            // The pre-extract guard applies the same zip-slip filtering the
+            // ZipArchive branch does — without it PclZip would honour "../".
+            $result = $zip->extract( PCLZIP_OPT_PATH, $this->staging_path, PCLZIP_CB_PRE_EXTRACT, 'Disembark\\pclzip_pre_extract_guard' );
             if ( $result == 0 ) {
                 return new \WP_Error( 'extract_failed', 'Failed to extract ZIP: ' . $zip->errorInfo( true ), [ 'status' => 500 ] );
             }
@@ -214,7 +217,7 @@ class Import {
         $safe_entries = [];
         for ( $i = 0; $i < $zip->numFiles; $i++ ) {
             $name = $zip->getNameIndex( $i );
-            if ( $this->is_safe_relative_path( $name ) ) {
+            if ( self::is_safe_relative_path( $name ) ) {
                 $safe_entries[] = $name;
             }
         }
@@ -262,7 +265,7 @@ class Import {
      * DROP-before-CREATE the CLI does, then runs it.
      */
     public function import_staged_sql( $sql_file, $old_prefix = '', $new_prefix = '' ) {
-        if ( ! $this->is_safe_relative_path( $sql_file ) ) {
+        if ( ! self::is_safe_relative_path( $sql_file ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid SQL file path.', [ 'status' => 400 ] );
         }
         $path = $this->staging_path . '/' . $sql_file;
@@ -324,7 +327,7 @@ class Import {
      * Receives a chunk of a large file. Reassembles when all chunks arrive.
      */
     public function upload_chunk( $uploaded_file, $file_path, $chunk_index, $total_chunks ) {
-        if ( ! $this->is_safe_relative_path( $file_path ) ) {
+        if ( ! self::is_safe_relative_path( $file_path ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid file path.', [ 'status' => 400 ] );
         }
         if ( ! is_dir( $this->staging_path ) ) {
@@ -399,7 +402,7 @@ class Import {
         }
 
         foreach ( $files as $relative_path ) {
-            if ( ! $this->is_safe_relative_path( $relative_path ) ) {
+            if ( ! self::is_safe_relative_path( $relative_path ) ) {
                 $errors[] = "Unsafe path skipped: {$relative_path}";
                 continue;
             }
@@ -1021,4 +1024,14 @@ class Import {
         }
         @rmdir( $dir );
     }
+}
+
+/**
+ * PclZip pre-extract guard shared by Import and Pull: skips any entry whose
+ * stored name could escape the extraction root (zip-slip). PclZip callbacks
+ * must be plain function names (function_exists is used to validate them), so
+ * this lives outside the class. Returns 1 to extract, 0 to skip.
+ */
+function pclzip_pre_extract_guard( $event, &$header ) {
+    return Import::is_safe_relative_path( isset( $header['stored_filename'] ) ? $header['stored_filename'] : '' ) ? 1 : 0;
 }
