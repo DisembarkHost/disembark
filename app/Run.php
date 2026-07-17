@@ -18,7 +18,8 @@ class Run {
         add_action( 'init', [ $this, 'register_shortcode' ] );
 
         add_action( 'rest_api_init', [ $this, 'register_rest_endpoints' ] );
-        
+        add_filter( 'rest_authentication_errors', [ $this, 'allow_token_auth' ], 99 );
+
         if ( defined( 'WP_CLI' ) && \WP_CLI ) {
             \WP_CLI::add_command( 'disembark', new class {}, [
                 'shortdesc' => 'Disembark helper commands.',
@@ -26,6 +27,43 @@ class Run {
             \WP_CLI::add_command( 'disembark token', [ 'Disembark\Command', "token" ]  );
             \WP_CLI::add_command( 'disembark cli-info', [ 'Disembark\Command', 'cli_info' ] );
         }
+    }
+
+    /**
+     * When a request to a Disembark route carries a valid token, treat it as
+     * authenticated so WordPress's cookie/nonce check (rest_cookie_check_errors)
+     * doesn't reject it. This is essential during a restore: importing the
+     * database replaces wp_users, which invalidates the admin's session
+     * mid-flow — the browser then sends a stale nonce that would otherwise 403
+     * the remaining steps ("Cookie check failed"). The token, preserved across
+     * the import, keeps the request authorized. Scoped to Disembark routes; the
+     * per-endpoint User::allowed() check still runs.
+     */
+    public function allow_token_auth( $errors ) {
+        // Scope strictly to Disembark's own REST namespace (pretty and
+        // ?rest_route= forms) — matching "disembark" anywhere in the URI would
+        // relax the cookie/nonce check for unrelated routes too.
+        $uri    = rawurldecode( isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '' );
+        $prefix = '/' . rest_get_url_prefix() . '/disembark/v1';
+        if ( strpos( $uri, $prefix ) === false && strpos( $uri, 'rest_route=/disembark/v1' ) === false ) {
+            return $errors;
+        }
+
+        $token = isset( $_REQUEST['token'] ) ? $_REQUEST['token'] : null;
+        if ( ! $token && isset( $_SERVER['CONTENT_TYPE'] ) && stripos( $_SERVER['CONTENT_TYPE'], 'application/json' ) !== false ) {
+            $body = file_get_contents( 'php://input' );
+            if ( $body ) {
+                $json = json_decode( $body, true );
+                if ( is_array( $json ) && ! empty( $json['token'] ) ) {
+                    $token = $json['token'];
+                }
+            }
+        }
+
+        if ( $token && hash_equals( Token::get(), (string) $token ) ) {
+            return true; // valid token → skip the cookie/nonce requirement
+        }
+        return $errors;
     }
 
     /**
@@ -67,6 +105,12 @@ class Run {
      * @return string The HTML content of the template file.
      */
     public function render_shortcode_ui() {
+        // The template prints the site's Disembark token (full file/database
+        // access) into the page. Only render it for users who can manage the
+        // site, so the shortcode can't leak the token on a front-end page.
+        if ( ! current_user_can( 'manage_options' ) ) {
+            return '';
+        }
         ob_start();
         include_once $this->plugin_path . '/template.php';
         return ob_get_clean();
@@ -85,6 +129,34 @@ class Run {
         wp_enqueue_style( 'vuejs-icons', "https://cdnjs.cloudflare.com/ajax/libs/MaterialDesign-Webfont/7.4.47/css/materialdesignicons.min.css" );
         wp_enqueue_style( 'vuetify', "https://cdn.jsdelivr.net/npm/vuetify@v3.6.10/dist/vuetify.min.css" );
         wp_enqueue_style( 'disembark-styles', $this->plugin_url . 'css/style.css' );
+
+        // A restore intentionally replaces the users table, which invalidates
+        // the current session. Suppress WordPress's "session expired" heartbeat
+        // modal on this page so it doesn't flash over the restore UI — the
+        // dashboard shows its own "log in with the source's credentials" notice.
+        wp_dequeue_script( 'wp-auth-check' );
+        wp_deregister_script( 'wp-auth-check' );
+        add_filter( 'wp_auth_check_load', '__return_false' );
+    }
+
+    /**
+     * Exposes the login URL to the dashboard so it can send the user to a clean
+     * re-login after a restore (their old session was replaced).
+     */
+    public function login_url() {
+        return wp_login_url( admin_url( 'tools.php?page=disembark' ) );
+    }
+
+    /**
+     * True when $path is $base itself or sits inside it. Compares against
+     * "$base/" so a sibling like "/var/www/htmlX" can't pass a "/var/www/html"
+     * check (a bare strpos( $path, $base ) === 0 would).
+     */
+    protected function path_within( $path, $base ) {
+        if ( ! $path || ! $base ) {
+            return false;
+        }
+        return $path === $base || strpos( $path, rtrim( $base, DIRECTORY_SEPARATOR ) . DIRECTORY_SEPARATOR ) === 0;
     }
 
     // --- REST API Endpoints ---
@@ -164,6 +236,77 @@ class Run {
         register_rest_route('disembark/v1', '/cleanup-file', [
             'methods'  => 'POST',
             'callback' => [ $this, 'cleanup_file' ]
+        ]);
+
+        // Import / Restore endpoints
+        register_rest_route('disembark/v1', '/import/preflight', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_preflight' ]
+        ]);
+        // Pull (direct site-to-site) endpoints
+        register_rest_route('disembark/v1', '/import/pull/connect', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_connect' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/pull/scan', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_scan' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/pull/fetch-files', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_fetch_files' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/pull/fetch-database', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_fetch_database' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/snapshot', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_snapshot' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/upload-zip', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_upload_zip' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/upload-chunk', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_upload_chunk' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/extract-zip', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_extract_zip' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/deploy-files', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_deploy_files' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/sql', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_sql' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/staged-info', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_staged_info' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/import-staged-sql', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_staged_sql' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/search-replace', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_search_replace' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/remap-prefix', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_remap_prefix' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/rollback', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_rollback' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/finalize', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_finalize' ]
         ]);
     }
 
@@ -462,11 +605,17 @@ class Run {
             $full_path = realpath($core_dir . '/' . $file_path);
         }
 
-        $is_in_base_dir = $full_path && strpos( $full_path, $base_dir ) === 0;
-        $is_in_core_dir = $full_path && $core_dir !== $base_dir && strpos( $full_path, $core_dir ) === 0;
+        $is_in_base_dir = $this->path_within( $full_path, $base_dir );
+        $is_in_core_dir = $core_dir !== $base_dir && $this->path_within( $full_path, $core_dir );
 
         if ( !$full_path || ( !$is_in_base_dir && !$is_in_core_dir ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid file path.', [ 'status' => 400 ] );
+        }
+
+        // wp-config.php holds credentials and is deliberately never deployed
+        // by a restore — keep the file editor consistent with that rule.
+        if ( basename( $full_path ) === 'wp-config.php' ) {
+            return new \WP_Error( 'protected_file', 'wp-config.php cannot be modified through Disembark.', [ 'status' => 400 ] );
         }
 
         // 3. Write File
@@ -504,6 +653,11 @@ class Run {
             return new \WP_Error( 'invalid_name', 'Invalid file name.', [ 'status' => 400 ] );
         }
 
+        // Same wp-config.php protection as save_file, in both directions.
+        if ( basename( $old_path_relative ) === 'wp-config.php' || $new_name === 'wp-config.php' ) {
+            return new \WP_Error( 'protected_file', 'wp-config.php cannot be renamed through Disembark.', [ 'status' => 400 ] );
+        }
+
         // Resolve Paths
         $base_dir = realpath( dirname( WP_CONTENT_DIR ) );
         $core_dir = realpath( ABSPATH );
@@ -515,7 +669,7 @@ class Run {
         }
 
         // Verify it exists and is safe
-        if ( !$old_full_path || ( strpos( $old_full_path, $base_dir ) !== 0 && strpos( $old_full_path, $core_dir ) !== 0 ) ) {
+        if ( !$old_full_path || ( !$this->path_within( $old_full_path, $base_dir ) && !$this->path_within( $old_full_path, $core_dir ) ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid source file.', [ 'status' => 400 ] );
         }
 
@@ -684,8 +838,8 @@ class Run {
             $full_path = realpath($core_dir . '/' . $file_path);
         }
 
-        $is_in_base_dir = $full_path && strpos( $full_path, $base_dir ) === 0;
-        $is_in_core_dir = $full_path && $core_dir !== $base_dir && strpos( $full_path, $core_dir ) === 0;
+        $is_in_base_dir = $this->path_within( $full_path, $base_dir );
+        $is_in_core_dir = $core_dir !== $base_dir && $this->path_within( $full_path, $core_dir );
         if ( !$full_path || ( !$is_in_base_dir && !$is_in_core_dir ) ) {
             header("HTTP/1.1 400 Bad Request");
             die('400 Bad Request: Invalid file path.');
@@ -753,6 +907,281 @@ class Run {
         }
         
         exit;
+    }
+
+    // --- Import / Restore Endpoint Callbacks ---
+
+    function import_preflight( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        $import    = new Import( $import_id );
+        return $import->preflight();
+    }
+
+    function import_snapshot( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        $import = new Import( $import_id );
+        return $import->snapshot();
+    }
+
+    function import_upload_zip( $request ) {
+        $params = $request->get_params();
+        $token  = $params['token'] ?? null;
+
+        $auth_request = new \WP_REST_Request();
+        $auth_request->set_param( 'token', $token );
+        if ( ! User::allowed( $auth_request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+
+        $import_id = $params['import_id'] ?? '';
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+
+        $files = $request->get_file_params();
+        if ( empty( $files['file'] ) ) {
+            return new \WP_Error( 'no_file', 'No file uploaded.', [ 'status' => 400 ] );
+        }
+
+        $import = new Import( $import_id );
+        return $import->upload_zip( $files['file'] );
+    }
+
+    function import_upload_chunk( $request ) {
+        $params = $request->get_params();
+        $token  = $params['token'] ?? null;
+
+        $auth_request = new \WP_REST_Request();
+        $auth_request->set_param( 'token', $token );
+        if ( ! User::allowed( $auth_request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+
+        $import_id    = $params['import_id'] ?? '';
+        $file_path    = $params['file_path'] ?? '';
+        $chunk_index  = isset( $params['chunk_index'] ) ? (int) $params['chunk_index'] : -1;
+        $total_chunks = isset( $params['total_chunks'] ) ? (int) $params['total_chunks'] : 0;
+
+        if ( empty( $import_id ) || empty( $file_path ) || $chunk_index < 0 || $total_chunks < 1 ) {
+            return new \WP_Error( 'missing_params', 'Missing required parameters.', [ 'status' => 400 ] );
+        }
+
+        $files = $request->get_file_params();
+        if ( empty( $files['file'] ) ) {
+            return new \WP_Error( 'no_file', 'No chunk file uploaded.', [ 'status' => 400 ] );
+        }
+
+        $import = new Import( $import_id );
+        return $import->upload_chunk( $files['file'], $file_path, $chunk_index, $total_chunks );
+    }
+
+    function import_extract_zip( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        $file_path = $params['file_path'] ?? '';
+
+        if ( empty( $import_id ) || empty( $file_path ) ) {
+            return new \WP_Error( 'missing_params', 'import_id and file_path are required.', [ 'status' => 400 ] );
+        }
+
+        $import = new Import( $import_id );
+        return $import->extract_staged_zip( $file_path );
+    }
+
+    function import_deploy_files( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        $files     = $params['files'] ?? [];
+
+        if ( empty( $import_id ) || empty( $files ) ) {
+            return new \WP_Error( 'missing_params', 'import_id and files array required.', [ 'status' => 400 ] );
+        }
+
+        $import = new Import( $import_id );
+        return $import->deploy_files( $files );
+    }
+
+    function import_sql( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params      = $request->get_json_params();
+        $import_id   = $params['import_id'] ?? '';
+        $sql_content = $params['sql'] ?? '';
+
+        if ( empty( $sql_content ) ) {
+            return new \WP_Error( 'missing_sql', 'SQL content is required.', [ 'status' => 400 ] );
+        }
+
+        $import = new Import( $import_id );
+        return $import->execute_sql( $sql_content );
+    }
+
+    function import_remap_prefix( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params     = $request->get_json_params();
+        $import_id  = $params['import_id'] ?? '';
+        $old_prefix = $params['old_prefix'] ?? '';
+        $new_prefix = $params['new_prefix'] ?? '';
+
+        if ( $old_prefix === '' || $new_prefix === '' ) {
+            return new \WP_Error( 'missing_params', 'old_prefix and new_prefix are required.', [ 'status' => 400 ] );
+        }
+
+        $import = new Import( $import_id );
+        return $import->remap_table_prefix( $old_prefix, $new_prefix );
+    }
+
+    function import_pull_connect( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params       = $request->get_json_params();
+        $import_id    = $params['import_id'] ?? '';
+        $source_url   = $params['source_url'] ?? '';
+        $source_token = $params['source_token'] ?? '';
+        if ( empty( $source_url ) || empty( $source_token ) ) {
+            return new \WP_Error( 'missing_params', 'source_url and source_token are required.', [ 'status' => 400 ] );
+        }
+        return ( new Pull( $import_id ) )->connect( $source_url, $source_token );
+    }
+
+    function import_pull_scan( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        $step      = $params['step'] ?? '';
+        $chunk     = isset( $params['chunk'] ) ? (int) $params['chunk'] : 0;
+        if ( empty( $import_id ) || empty( $step ) ) {
+            return new \WP_Error( 'missing_params', 'import_id and step are required.', [ 'status' => 400 ] );
+        }
+        return ( new Pull( $import_id ) )->scan_step( $step, $chunk );
+    }
+
+    function import_pull_fetch_files( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        $offset    = isset( $params['offset'] ) ? (int) $params['offset'] : 0;
+        $count     = isset( $params['count'] ) ? (int) $params['count'] : 300;
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        return ( new Pull( $import_id ) )->fetch_files( $offset, $count );
+    }
+
+    function import_pull_fetch_database( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        return ( new Pull( $import_id ) )->fetch_database();
+    }
+
+    function import_staged_info( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        return ( new Import( $import_id ) )->staged_info();
+    }
+
+    function import_staged_sql( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params     = $request->get_json_params();
+        $import_id  = $params['import_id'] ?? '';
+        $sql_file   = $params['sql_file'] ?? '';
+        $old_prefix = $params['old_prefix'] ?? '';
+        $new_prefix = $params['new_prefix'] ?? '';
+
+        if ( empty( $import_id ) || empty( $sql_file ) ) {
+            return new \WP_Error( 'missing_params', 'import_id and sql_file are required.', [ 'status' => 400 ] );
+        }
+        return ( new Import( $import_id ) )->import_staged_sql( $sql_file, $old_prefix, $new_prefix );
+    }
+
+    function import_search_replace( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        $from      = $params['from'] ?? '';
+        $to        = $params['to'] ?? '';
+        $tables    = $params['tables'] ?? [];
+
+        if ( $from === '' ) {
+            return new \WP_Error( 'missing_params', 'A "from" value is required.', [ 'status' => 400 ] );
+        }
+        if ( ! is_array( $tables ) ) {
+            $tables = [];
+        }
+
+        $import = new Import( $import_id );
+        return $import->search_replace( $from, $to, $tables );
+    }
+
+    function import_rollback( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id (rollback_id) is required.', [ 'status' => 400 ] );
+        }
+
+        $import = new Import( $import_id );
+        return $import->rollback();
+    }
+
+    function import_finalize( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+
+        $import = new Import( $import_id );
+        return $import->finalize();
     }
 
     function cleanup( $request ) {

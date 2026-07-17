@@ -1,0 +1,12 @@
+# OS / editor
+.DS_Store
+.claude/
+
+# Local dev + test artifacts (never ship these in the release zip)
+disembark-dump.txt
+*-dump.txt
+snapshot-*/
+snapshot-*.zip
+
+# Internal dev notes / audit handoffs
+*-AUDIT.md

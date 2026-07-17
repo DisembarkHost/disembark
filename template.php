@@ -92,9 +92,13 @@
                     <v-icon left class="mr-2">mdi-database-search-outline</v-icon>
                     Explore Database
                 </v-btn>
-                <v-btn block color="primary" @click="handleMainAction" size="large" class="mb-6">
+                <v-btn block color="primary" @click="handleMainAction" size="large" class="mb-4">
                     Analyze Site & Prepare Backup
                     <v-icon class="ml-2">mdi-magnify-scan</v-icon>
+                </v-btn>
+                <v-btn block variant="tonal" color="secondary" size="large" class="mb-6" @click="openRestore">
+                    <v-icon left class="mr-2">mdi-backup-restore</v-icon>
+                    Restore a Backup
                 </v-btn>
                 <div v-if="previous_scans.length > 0">
                     <div class="text-caption text-medium-emphasis mb-2 text-uppercase font-weight-bold">Resume Previous Scan</div>
@@ -900,6 +904,106 @@
             </v-card-actions>
         </v-card>
     </v-dialog>
+    <v-dialog v-model="restore.show" max-width="620" persistent>
+        <v-card>
+            <v-card-title class="text-h6 d-flex align-center">
+                <v-icon color="secondary" class="mr-2">mdi-backup-restore</v-icon>
+                Restore a Backup
+                <v-spacer></v-spacer>
+                <v-btn v-if="!restore.running" variant="text" icon size="small" @click="restore.show = false"><v-icon>mdi-close</v-icon></v-btn>
+            </v-card-title>
+            <v-card-text>
+                <div v-if="!restore.done">
+                    <v-alert type="warning" variant="tonal" density="compact" class="mb-4 text-caption">
+                        <strong>This overwrites this site.</strong> A rollback point is saved first so the import can be undone.
+                    </v-alert>
+                    <v-btn-toggle v-model="restore.mode" mandatory divided density="compact" color="secondary" class="mb-4" style="width:100%;">
+                        <v-btn value="site" :disabled="restore.running" style="flex:1;"><v-icon start>mdi-transit-connection-variant</v-icon>From a live site</v-btn>
+                        <v-btn value="file" :disabled="restore.running" style="flex:1;"><v-icon start>mdi-folder-zip-outline</v-icon>From a backup file</v-btn>
+                    </v-btn-toggle>
+
+                    <div v-if="restore.mode === 'site'">
+                        <v-text-field
+                            v-model="restore.source_site"
+                            label="Source site URL"
+                            placeholder="https://oldsite.com"
+                            prepend-inner-icon="mdi-web"
+                            density="compact"
+                            variant="outlined"
+                            :disabled="restore.running"
+                            spellcheck="false"
+                            autocapitalize="none"
+                            autocorrect="off"
+                            autocomplete="off"
+                            @paste="handleConnectPaste"
+                        ></v-text-field>
+                        <v-text-field
+                            v-model="restore.source_token"
+                            label="Source connection token"
+                            hint="Tip: paste the source site’s full “disembark connect …” line into either field to fill both."
+                            persistent-hint
+                            prepend-inner-icon="mdi-key-variant"
+                            density="compact"
+                            variant="outlined"
+                            :disabled="restore.running"
+                            spellcheck="false"
+                            autocapitalize="none"
+                            autocorrect="off"
+                            autocomplete="off"
+                            @paste="handleConnectPaste"
+                        ></v-text-field>
+                    </div>
+                    <div v-else>
+                        <v-file-input
+                            v-model="restore.file"
+                            label="Backup .zip (from “disembark backup”)"
+                            accept=".zip"
+                            prepend-icon="mdi-folder-zip-outline"
+                            density="compact"
+                            variant="outlined"
+                            :disabled="restore.running"
+                            show-size
+                        ></v-file-input>
+                        <v-text-field
+                            v-model="restore.source_url"
+                            label="Source URL to rewrite (optional)"
+                            hint="Defaults to the origin recorded in the backup. Rewritten to this site’s URL."
+                            persistent-hint
+                            density="compact"
+                            variant="outlined"
+                            :disabled="restore.running"
+                            class="mb-2"
+                        ></v-text-field>
+                    </div>
+                    <div v-if="restore.running || restore.log.length" class="mt-3" style="background:#1e1e1e;border-radius:4px;padding:12px;max-height:220px;overflow:auto;">
+                        <div v-for="(line, i) in restore.log" :key="i" style="font-family:monospace;font-size:12px;color:#d6ebf6;line-height:1.6;">{{ line }}</div>
+                        <div v-if="restore.running" style="font-family:monospace;font-size:12px;color:#8fb0c2;">{{ restore.progress }}</div>
+                    </div>
+                    <v-alert v-if="restore.error" type="error" variant="tonal" density="compact" class="mt-3 text-caption">{{ restore.error }}</v-alert>
+                </div>
+                <div v-else>
+                    <div class="d-flex align-center mb-3">
+                        <v-icon color="success" class="mr-2">mdi-check-circle</v-icon>
+                        <span class="text-h6">Restore complete</span>
+                    </div>
+                    <p class="text-body-2 mb-2">This site now reflects the restored content.</p>
+                    <v-alert type="warning" variant="tonal" density="compact" class="text-caption mb-2">
+                        The user accounts were replaced by the source's, so your current login no longer applies. <strong>Log in with the source site's credentials.</strong>
+                    </v-alert>
+                    <v-alert type="info" variant="tonal" density="compact" class="text-caption">
+                        Rollback id: <code>{{ restore.rollback_id }}</code><br>
+                        To undo from the CLI: <code>disembark restore {{ home_url }} --rollback={{ restore.rollback_id }}</code>
+                    </v-alert>
+                </div>
+            </v-card-text>
+            <v-card-actions>
+                <v-spacer></v-spacer>
+                <v-btn v-if="!restore.done" variant="text" color="grey" :disabled="restore.running" @click="restore.show = false">Cancel</v-btn>
+                <v-btn v-if="!restore.done" color="secondary" variant="flat" :loading="restore.running" :disabled="!restoreReady" @click="startRestore">Restore</v-btn>
+                <v-btn v-else color="primary" variant="flat" @click="finishRestore">Done</v-btn>
+            </v-card-actions>
+        </v-card>
+    </v-dialog>
     <v-snackbar :timeout="3000" :multi-line="true" v-model="snackbar.show" variant="outlined" attach="#app" z-index="9999999">
         {{ snackbar.message }}
     </v-snackbar>
@@ -913,6 +1017,10 @@
 <script src="https://cdn.jsdelivr.net/npm/vuetify@v3.10.5/dist/vuetify.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/axios@1.12.2/dist/axios.min.js"></script>
 <script>
+// Authenticate dashboard requests as the logged-in administrator (cookie + REST
+// nonce → current_user_can). The token sent in request bodies stays only as a
+// fallback for hosts where this can't be used.
+axios.defaults.headers.common['X-WP-Nonce'] = "<?php echo esc_js( wp_create_nonce( 'wp_rest' ) ); ?>";
 const { createApp } = Vue;
 const { createVuetify } = Vuetify;
 const vuetify = createVuetify({
@@ -935,6 +1043,7 @@ createApp({
             scan_progress: { total: 1, scanned: 0, status: 'initializing' },
             api_token: "<?php echo \Disembark\Token::get(); ?>",
             home_url: "<?php echo home_url(); ?>",
+            login_url: "<?php echo esc_url_raw( wp_login_url( admin_url( 'tools.php?page=disembark' ) ) ); ?>",
             api_root: "<?php echo esc_url_raw( rest_url('disembark/v1/') ); ?>",
             backup_token: "",
             database: [],
@@ -943,6 +1052,20 @@ createApp({
             last_scan_stats: null,
             previous_scans: [],
             backup_ready: false,
+            restore: {
+                show: false,
+                mode: "site",
+                file: null,
+                source_url: "",
+                source_site: "",
+                source_token: "",
+                running: false,
+                done: false,
+                error: "",
+                progress: "",
+                log: [],
+                rollback_id: ""
+            },
             options: {
                 database: true,
                 files: true,
@@ -1035,6 +1158,163 @@ createApp({
         },
     },
     methods: {
+        openRestore() {
+            this.restore = { show: true, mode: "site", file: null, source_url: "", source_site: "", source_token: "", running: false, done: false, error: "", progress: "", log: [], rollback_id: "" };
+        },
+        finishRestore() {
+            this.restore.show = false;
+            // The restore replaced the users table, so this session is gone.
+            // Send the user to a clean login rather than reloading into an
+            // expired-session admin screen.
+            window.location.href = this.login_url;
+        },
+        rlog(msg) {
+            this.restore.log.push(msg);
+        },
+        randomHex(len) {
+            const bytes = new Uint8Array(len / 2);
+            (window.crypto || window.msCrypto).getRandomValues(bytes);
+            return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+        },
+        // Uploads the backup zip to staging: chunked so large files never need a
+        // single huge request, then extracted server-side.
+        async uploadRestoreZip(file, importId) {
+            const CHUNK = 20 * 1024 * 1024; // 20MB
+            const total = Math.max(1, Math.ceil(file.size / CHUNK));
+            if (total === 1) {
+                const fd = new FormData();
+                fd.append('import_id', importId);
+                fd.append('token', this.api_token);
+                fd.append('file', file, 'restore.zip');
+                await axios.post(this.api_root + 'import/upload-zip', fd);
+            } else {
+                for (let i = 0; i < total; i++) {
+                    const blob = file.slice(i * CHUNK, Math.min(file.size, (i + 1) * CHUNK));
+                    const fd = new FormData();
+                    fd.append('import_id', importId);
+                    fd.append('token', this.api_token);
+                    fd.append('file_path', 'restore.zip');
+                    fd.append('chunk_index', i);
+                    fd.append('total_chunks', total);
+                    fd.append('file', blob, 'restore.zip');
+                    await axios.post(this.api_root + 'import/upload-chunk', fd);
+                    this.restore.progress = 'Uploading chunk ' + (i + 1) + '/' + total + '...';
+                }
+                await axios.post(this.api_root + 'import/extract-zip', { token: this.api_token, import_id: importId, file_path: 'restore.zip' });
+            }
+        },
+        // Pulls a backup directly from a live source site into staging, driving
+        // the source's REST API server-side (connect -> manifest scan -> file
+        // batches -> database). Returns the source URL used for URL rewriting.
+        async stageFromSite(importId) {
+            const t = this.api_token, root = this.api_root;
+            this.rlog('Connecting to source...');
+            const c = (await axios.post(root + 'import/pull/connect', {
+                token: t, import_id: importId,
+                source_url: this.restore.source_site,
+                source_token: this.restore.source_token
+            })).data;
+            this.rlog('Connected. Source: ' + c.source_home + ' (' + c.table_count + ' tables).');
+
+            this.rlog('Scanning source files...');
+            const scan = (step, chunk) => axios.post(root + 'import/pull/scan', { token: t, import_id: importId, step: step, chunk: chunk || 0 }).then(r => r.data);
+            await scan('initiate');
+            for (let i = 0; i < 600; i++) {
+                const s = await scan('scan');
+                if (s.status === 'scan_complete') break;
+                if (s.scanned_dirs && s.total_dirs) this.restore.progress = 'Scanning... ' + s.scanned_dirs + '/' + s.total_dirs + ' dirs';
+            }
+            const ch = await scan('chunkify');
+            const totalChunks = ch.total_chunks || 0;
+            for (let c2 = 1; c2 <= totalChunks; c2++) { await scan('process_chunk', c2); }
+            const fin = await scan('finalize');
+            const totalFiles = fin.total_files || 0;
+            this.rlog(totalFiles + ' files to pull.');
+
+            const BATCH = 1000;
+            let done = false, fetched = 0;
+            while (!done) {
+                const r = (await axios.post(root + 'import/pull/fetch-files', { token: t, import_id: importId, offset: fetched, count: BATCH })).data;
+                fetched = r.fetched; done = r.done;
+                this.restore.progress = 'Pulling files... ' + fetched + '/' + r.total;
+            }
+            this.rlog('Pulled ' + fetched + ' files.');
+
+            this.rlog('Pulling database...');
+            const db = (await axios.post(root + 'import/pull/fetch-database', { token: t, import_id: importId })).data;
+            this.rlog('Database pulled (' + (db.tables || 0) + ' tables).');
+            return (c.source_home || '').replace(/\/$/, '');
+        },
+        async startRestore() {
+            this.restore.running = true;
+            this.restore.error = "";
+            this.restore.log = [];
+            const importId = this.randomHex(24);
+            // Every call carries the token: the DB import replaces this site's
+            // users, which invalidates the cookie session mid-flow. The plugin
+            // preserves the token across import, so token auth carries through.
+            const t = this.api_token;
+            const root = this.api_root;
+            try {
+                this.restore.progress = 'Preflighting...';
+                const pre = (await axios.post(root + 'import/preflight', { token: t, import_id: importId })).data;
+                const destPrefix = pre.db_prefix || '';
+                const destHome = (pre.home_url || this.home_url || '').replace(/\/$/, '');
+
+                // Stage the backup (direct pull, or uploaded file).
+                let siteSrcHome = "";
+                if (this.restore.mode === 'site') {
+                    siteSrcHome = await this.stageFromSite(importId);
+                } else {
+                    const file = Array.isArray(this.restore.file) ? this.restore.file[0] : this.restore.file;
+                    if (!file) { this.restore.running = false; return; }
+                    this.rlog('Uploading backup...');
+                    await this.uploadRestoreZip(file, importId);
+                }
+
+                this.rlog('Reading backup...');
+                const info = (await axios.post(root + 'import/staged-info', { token: t, import_id: importId })).data;
+                const srcPrefix = (info.source && info.source.db_prefix) || '';
+                const srcHome = (this.restore.source_url || siteSrcHome || (info.source && info.source.home_url) || '').replace(/\/$/, '');
+                this.rlog(info.files + ' files staged' + (info.sql_file ? ', database found.' : ', no database.'));
+
+                this.rlog('Creating rollback snapshot...');
+                await axios.post(root + 'import/snapshot', { token: t, import_id: importId });
+
+                this.rlog('Deploying files...');
+                const dep = (await axios.post(root + 'import/deploy-files', { token: t, import_id: importId, files: ['*'] })).data;
+                this.rlog('Deployed ' + (dep.deployed || 0) + ' files.');
+
+                if (info.sql_file) {
+                    this.rlog('Importing database...');
+                    const sq = (await axios.post(root + 'import/import-staged-sql', { token: t, import_id: importId, sql_file: info.sql_file, old_prefix: srcPrefix, new_prefix: destPrefix })).data;
+                    this.rlog((sq.statements_executed || 0) + ' statements executed.');
+
+                    if (srcPrefix && destPrefix && srcPrefix !== destPrefix) {
+                        const rp = (await axios.post(root + 'import/remap-prefix', { token: t, import_id: importId, old_prefix: srcPrefix, new_prefix: destPrefix })).data;
+                        this.rlog('Prefix remapped (' + (rp.keys_changed || 0) + ' keys).');
+                    }
+                    if (srcHome && destHome && srcHome !== destHome) {
+                        this.rlog('Rewriting URLs ' + srcHome + ' -> ' + destHome + '...');
+                        const sr = (await axios.post(root + 'import/search-replace', { token: t, import_id: importId, from: srcHome, to: destHome })).data;
+                        this.rlog((sr.cells_changed || 0) + ' cells updated.');
+                    }
+                }
+
+                this.rlog('Finalizing...');
+                await axios.post(root + 'import/finalize', { token: t, import_id: importId });
+
+                this.restore.rollback_id = importId;
+                this.restore.done = true;
+            } catch (e) {
+                const msg = (e.response && e.response.data && e.response.data.message) ? e.response.data.message : e.message;
+                this.restore.error = 'Restore failed: ' + msg;
+                this.rlog('ERROR: ' + msg);
+            } finally {
+                this.restore.running = false;
+                this.restore.progress = "";
+            }
+        },
         toggleDatabaseSort() {
             this.database_sort_key = this.database_sort_key === 'table' ? 'size' : 'table';
         },
@@ -2498,8 +2778,51 @@ createApp({
                 return number.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, '$1,');
             }
         },
+        // Parses a source connection out of pasted text. Accepts the exact line
+        // the source site's dashboard offers ("disembark connect <url> <token>"),
+        // or just "<url> <token>". Returns {url, token} or null when the text
+        // isn't a connection string (so a plain URL or token paste is untouched).
+        parseConnectString(text) {
+            const parts = (text || "").trim().split(/\s+/).filter(Boolean);
+            if (parts.length >= 2 && parts[0].toLowerCase() === "disembark" && parts[1].toLowerCase() === "connect") {
+                parts.splice(0, 2);
+            }
+            if (parts.length !== 2) {
+                return null;
+            }
+            let [url, token] = parts;
+            if (!/^https?:\/\//i.test(url)) {
+                if (!url.includes(".")) {
+                    return null;
+                }
+                url = "https://" + url;
+            }
+            // Disembark tokens are long and alphanumeric — anything else is
+            // probably not a token, so leave the paste alone.
+            if (!/^[A-Za-z0-9]{20,}$/.test(token)) {
+                return null;
+            }
+            return { url: url.replace(/\/+$/, ""), token };
+        },
+        // One-paste restore setup: pasting the whole connect command into either
+        // field fills both.
+        handleConnectPaste(event) {
+            const clipboard = event.clipboardData || window.clipboardData;
+            const parsed = this.parseConnectString(clipboard ? clipboard.getData("text") : "");
+            if (parsed) {
+                event.preventDefault();
+                this.restore.source_site = parsed.url;
+                this.restore.source_token = parsed.token;
+            }
+        },
     },
     computed: {
+        restoreReady() {
+            if (this.restore.mode === 'site') {
+                return !!(this.restore.source_site && this.restore.source_token);
+            }
+            return !!this.restore.file;
+        },
         cliCommands() {
             if (!this.home_url || !this.api_token) return {}; // Return empty object
 

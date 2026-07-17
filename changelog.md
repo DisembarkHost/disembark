@@ -1,5 +1,25 @@
 # Changelog
 
+## **v2.8.0** - July 17, 2026
+
+### Added
+* **Restore a Backup (dashboard):** A new "Restore a Backup" flow under Tools → Disembark restores a site from an uploaded backup `.zip` — staged upload (chunked for large archives), a rollback point saved first, file deploy, database import, URL rewrite, and one-click rollback.
+* **Restore from a live site (dashboard):** Migrate directly from another Disembark-connected site — the destination pulls files and database from the source's REST API server-to-server, no intermediate download. Paste the source's `disembark connect …` line into either field to fill both the URL and token.
+* **Restore / Import REST API:** New endpoints power all restore entry points (dashboard and CLI) — preflight, rollback snapshot, chunked upload with server-side extraction, staged database import, serialize-aware search/replace, prefix remap, finalize, and rollback.
+* **Cross-prefix migration:** Restoring into a site with a different `$table_prefix` remaps table names during import and fixes prefix-scoped data afterward (usermeta capabilities, the `user_roles` option), so migrated users keep their roles.
+* **Serialize-aware search/replace:** URL/text replacement runs across the database after import and re-serializes PHP serialized values so length prefixes stay valid (widgets, theme mods, nested and doubly-serialized options survive a URL change).
+
+### Improved
+* **Authentication:** Endpoints now authorize administrators first (application password or cookie + REST nonce) and fall back to the per-site token, so the dashboard and CLI can use standard WordPress auth. The token is preserved across a database import so a restore stays authenticated through its final steps.
+* **Restore session handling:** The database import replaces the users table (ending the current login), so the restore page suppresses the "session expired" modal and finishes with a clean log-in prompt for the restored site's credentials.
+
+### Security
+* **Pull channel verifies TLS (behavior change):** Live-site restores verify the source's certificate and refuse internal/non-http(s) URLs by default. For a self-signed or local source, opt out with `define( 'DISEMBARK_DEV_MODE', true )` or the `disembark_pull_sslverify` filter.
+* **SQL transforms are statement-anchored:** The prefix remap and DROP-before-CREATE injection apply only to each statement's leading identifier — post content containing backticked table names, `CREATE TABLE` text, or serialized data can never be corrupted by a restore.
+* **Token disclosure:** The dashboard shortcode now renders (and prints the site token) only for users who can manage the site, so it can't leak the token on a front-end page. The token-auth REST bypass is scoped strictly to Disembark's own routes.
+* **Import hardening:** Import paths are validated against directory traversal, uploaded archives are extracted zip-slip-safe in both the ZipArchive and PclZip paths, web-root/core path checks no longer match sibling directories, and `wp-config.php` cannot be modified through the file editor or a restore.
+* **SQL import:** Statement splitting is quote- and comment-aware, so a value containing `;` no longer corrupts an import or rollback.
+
 ## **v2.7.0** - January 28, 2026
 
 ### Added
