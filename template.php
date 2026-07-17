@@ -913,6 +913,10 @@
 <script src="https://cdn.jsdelivr.net/npm/vuetify@v3.10.5/dist/vuetify.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/axios@1.12.2/dist/axios.min.js"></script>
 <script>
+// Authenticate dashboard requests as the logged-in administrator (cookie + REST
+// nonce → current_user_can). The token sent in request bodies stays only as a
+// fallback for hosts where this can't be used.
+axios.defaults.headers.common['X-WP-Nonce'] = "<?php echo esc_js( wp_create_nonce( 'wp_rest' ) ); ?>";
 const { createApp } = Vue;
 const { createVuetify } = Vuetify;
 const vuetify = createVuetify({
