@@ -92,9 +92,13 @@
                     <v-icon left class="mr-2">mdi-database-search-outline</v-icon>
                     Explore Database
                 </v-btn>
-                <v-btn block color="primary" @click="handleMainAction" size="large" class="mb-6">
+                <v-btn block color="primary" @click="handleMainAction" size="large" class="mb-4">
                     Analyze Site & Prepare Backup
                     <v-icon class="ml-2">mdi-magnify-scan</v-icon>
+                </v-btn>
+                <v-btn block variant="tonal" color="secondary" size="large" class="mb-6" @click="openRestore">
+                    <v-icon left class="mr-2">mdi-backup-restore</v-icon>
+                    Restore a Backup
                 </v-btn>
                 <div v-if="previous_scans.length > 0">
                     <div class="text-caption text-medium-emphasis mb-2 text-uppercase font-weight-bold">Resume Previous Scan</div>
@@ -900,6 +904,65 @@
             </v-card-actions>
         </v-card>
     </v-dialog>
+    <v-dialog v-model="restore.show" max-width="620" persistent>
+        <v-card>
+            <v-card-title class="text-h6 d-flex align-center">
+                <v-icon color="secondary" class="mr-2">mdi-backup-restore</v-icon>
+                Restore a Backup
+                <v-spacer></v-spacer>
+                <v-btn v-if="!restore.running" variant="text" icon size="small" @click="restore.show = false"><v-icon>mdi-close</v-icon></v-btn>
+            </v-card-title>
+            <v-card-text>
+                <div v-if="!restore.done">
+                    <v-alert type="warning" variant="tonal" density="compact" class="mb-4 text-caption">
+                        <strong>This overwrites this site.</strong> A rollback point is saved first so the import can be undone.
+                    </v-alert>
+                    <v-file-input
+                        v-model="restore.file"
+                        label="Backup .zip (from “disembark backup”)"
+                        accept=".zip"
+                        prepend-icon="mdi-folder-zip-outline"
+                        density="compact"
+                        variant="outlined"
+                        :disabled="restore.running"
+                        show-size
+                    ></v-file-input>
+                    <v-text-field
+                        v-model="restore.source_url"
+                        label="Source URL to rewrite (optional)"
+                        hint="Defaults to the origin recorded in the backup. Rewritten to this site’s URL."
+                        persistent-hint
+                        density="compact"
+                        variant="outlined"
+                        :disabled="restore.running"
+                        class="mb-2"
+                    ></v-text-field>
+                    <div v-if="restore.running || restore.log.length" class="mt-3" style="background:#1e1e1e;border-radius:4px;padding:12px;max-height:220px;overflow:auto;">
+                        <div v-for="(line, i) in restore.log" :key="i" style="font-family:monospace;font-size:12px;color:#d6ebf6;line-height:1.6;">{{ line }}</div>
+                        <div v-if="restore.running" style="font-family:monospace;font-size:12px;color:#8fb0c2;">{{ restore.progress }}</div>
+                    </div>
+                    <v-alert v-if="restore.error" type="error" variant="tonal" density="compact" class="mt-3 text-caption">{{ restore.error }}</v-alert>
+                </div>
+                <div v-else>
+                    <div class="d-flex align-center mb-3">
+                        <v-icon color="success" class="mr-2">mdi-check-circle</v-icon>
+                        <span class="text-h6">Restore complete</span>
+                    </div>
+                    <p class="text-body-2 mb-2">This site now reflects the uploaded backup.</p>
+                    <v-alert type="info" variant="tonal" density="compact" class="text-caption">
+                        Rollback id: <code>{{ restore.rollback_id }}</code><br>
+                        To undo from the CLI: <code>disembark restore {{ home_url }} --rollback={{ restore.rollback_id }}</code>
+                    </v-alert>
+                </div>
+            </v-card-text>
+            <v-card-actions>
+                <v-spacer></v-spacer>
+                <v-btn v-if="!restore.done" variant="text" color="grey" :disabled="restore.running" @click="restore.show = false">Cancel</v-btn>
+                <v-btn v-if="!restore.done" color="secondary" variant="flat" :loading="restore.running" :disabled="!restore.file" @click="startRestore">Restore</v-btn>
+                <v-btn v-else color="primary" variant="flat" @click="finishRestore">Done</v-btn>
+            </v-card-actions>
+        </v-card>
+    </v-dialog>
     <v-snackbar :timeout="3000" :multi-line="true" v-model="snackbar.show" variant="outlined" attach="#app" z-index="9999999">
         {{ snackbar.message }}
     </v-snackbar>
@@ -947,6 +1010,17 @@ createApp({
             last_scan_stats: null,
             previous_scans: [],
             backup_ready: false,
+            restore: {
+                show: false,
+                file: null,
+                source_url: "",
+                running: false,
+                done: false,
+                error: "",
+                progress: "",
+                log: [],
+                rollback_id: ""
+            },
             options: {
                 database: true,
                 files: true,
@@ -1039,6 +1113,115 @@ createApp({
         },
     },
     methods: {
+        openRestore() {
+            this.restore = { show: true, file: null, source_url: "", running: false, done: false, error: "", progress: "", log: [], rollback_id: "" };
+        },
+        finishRestore() {
+            this.restore.show = false;
+            // The database was replaced; reload so the admin reflects the restore.
+            window.location.reload();
+        },
+        rlog(msg) {
+            this.restore.log.push(msg);
+        },
+        randomHex(len) {
+            const bytes = new Uint8Array(len / 2);
+            (window.crypto || window.msCrypto).getRandomValues(bytes);
+            return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+        },
+        // Uploads the backup zip to staging: chunked so large files never need a
+        // single huge request, then extracted server-side.
+        async uploadRestoreZip(file, importId) {
+            const CHUNK = 20 * 1024 * 1024; // 20MB
+            const total = Math.max(1, Math.ceil(file.size / CHUNK));
+            if (total === 1) {
+                const fd = new FormData();
+                fd.append('import_id', importId);
+                fd.append('token', this.api_token);
+                fd.append('file', file, 'restore.zip');
+                await axios.post(this.api_root + 'import/upload-zip', fd);
+            } else {
+                for (let i = 0; i < total; i++) {
+                    const blob = file.slice(i * CHUNK, Math.min(file.size, (i + 1) * CHUNK));
+                    const fd = new FormData();
+                    fd.append('import_id', importId);
+                    fd.append('token', this.api_token);
+                    fd.append('file_path', 'restore.zip');
+                    fd.append('chunk_index', i);
+                    fd.append('total_chunks', total);
+                    fd.append('file', blob, 'restore.zip');
+                    await axios.post(this.api_root + 'import/upload-chunk', fd);
+                    this.restore.progress = 'Uploading chunk ' + (i + 1) + '/' + total + '...';
+                }
+                await axios.post(this.api_root + 'import/extract-zip', { token: this.api_token, import_id: importId, file_path: 'restore.zip' });
+            }
+        },
+        async startRestore() {
+            if (!this.restore.file) return;
+            // v-file-input can hand back a single File or an array depending on version.
+            const file = Array.isArray(this.restore.file) ? this.restore.file[0] : this.restore.file;
+            if (!file) return;
+            this.restore.running = true;
+            this.restore.error = "";
+            this.restore.log = [];
+            const importId = this.randomHex(24);
+            // Every call carries the token: the DB import replaces this site's
+            // users, which invalidates the cookie session mid-flow. The plugin
+            // preserves the token across import, so token auth carries through.
+            const t = this.api_token;
+            const root = this.api_root;
+            try {
+                this.restore.progress = 'Preflighting...';
+                const pre = (await axios.post(root + 'import/preflight', { token: t, import_id: importId })).data;
+                const destPrefix = pre.db_prefix || '';
+                const destHome = (pre.home_url || this.home_url || '').replace(/\/$/, '');
+
+                this.rlog('Uploading backup...');
+                await this.uploadRestoreZip(file, importId);
+
+                this.rlog('Reading backup...');
+                const info = (await axios.post(root + 'import/staged-info', { token: t, import_id: importId })).data;
+                const srcPrefix = (info.source && info.source.db_prefix) || '';
+                const srcHome = (this.restore.source_url || (info.source && info.source.home_url) || '').replace(/\/$/, '');
+                this.rlog(info.files + ' files staged' + (info.sql_file ? ', database found.' : ', no database.'));
+
+                this.rlog('Creating rollback snapshot...');
+                await axios.post(root + 'import/snapshot', { token: t, import_id: importId });
+
+                this.rlog('Deploying files...');
+                const dep = (await axios.post(root + 'import/deploy-files', { token: t, import_id: importId, files: ['*'] })).data;
+                this.rlog('Deployed ' + (dep.deployed || 0) + ' files.');
+
+                if (info.sql_file) {
+                    this.rlog('Importing database...');
+                    const sq = (await axios.post(root + 'import/import-staged-sql', { token: t, import_id: importId, sql_file: info.sql_file, old_prefix: srcPrefix, new_prefix: destPrefix })).data;
+                    this.rlog((sq.statements_executed || 0) + ' statements executed.');
+
+                    if (srcPrefix && destPrefix && srcPrefix !== destPrefix) {
+                        const rp = (await axios.post(root + 'import/remap-prefix', { token: t, import_id: importId, old_prefix: srcPrefix, new_prefix: destPrefix })).data;
+                        this.rlog('Prefix remapped (' + (rp.keys_changed || 0) + ' keys).');
+                    }
+                    if (srcHome && destHome && srcHome !== destHome) {
+                        this.rlog('Rewriting URLs ' + srcHome + ' -> ' + destHome + '...');
+                        const sr = (await axios.post(root + 'import/search-replace', { token: t, import_id: importId, from: srcHome, to: destHome })).data;
+                        this.rlog((sr.cells_changed || 0) + ' cells updated.');
+                    }
+                }
+
+                this.rlog('Finalizing...');
+                await axios.post(root + 'import/finalize', { token: t, import_id: importId });
+
+                this.restore.rollback_id = importId;
+                this.restore.done = true;
+            } catch (e) {
+                const msg = (e.response && e.response.data && e.response.data.message) ? e.response.data.message : e.message;
+                this.restore.error = 'Restore failed: ' + msg;
+                this.rlog('ERROR: ' + msg);
+            } finally {
+                this.restore.running = false;
+                this.restore.progress = "";
+            }
+        },
         toggleDatabaseSort() {
             this.database_sort_key = this.database_sort_key === 'table' ? 'size' : 'table';
         },

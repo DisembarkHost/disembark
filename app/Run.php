@@ -213,6 +213,14 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'import_sql' ]
         ]);
+        register_rest_route('disembark/v1', '/import/staged-info', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_staged_info' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/import-staged-sql', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_staged_sql' ]
+        ]);
         register_rest_route('disembark/v1', '/import/search-replace', [
             'methods'  => 'POST',
             'callback' => [ $this, 'import_search_replace' ]
@@ -959,6 +967,34 @@ class Run {
 
         $import = new Import( $import_id );
         return $import->remap_table_prefix( $old_prefix, $new_prefix );
+    }
+
+    function import_staged_info( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        return ( new Import( $import_id ) )->staged_info();
+    }
+
+    function import_staged_sql( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params     = $request->get_json_params();
+        $import_id  = $params['import_id'] ?? '';
+        $sql_file   = $params['sql_file'] ?? '';
+        $old_prefix = $params['old_prefix'] ?? '';
+        $new_prefix = $params['new_prefix'] ?? '';
+
+        if ( empty( $import_id ) || empty( $sql_file ) ) {
+            return new \WP_Error( 'missing_params', 'import_id and sql_file are required.', [ 'status' => 400 ] );
+        }
+        return ( new Import( $import_id ) )->import_staged_sql( $sql_file, $old_prefix, $new_prefix );
     }
 
     function import_search_replace( $request ) {

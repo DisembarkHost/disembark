@@ -226,6 +226,85 @@ class Import {
     }
 
     /**
+     * Lists deployable staged files (archive-relative), skipping Disembark's own
+     * metadata, the SQL dump, and chunk-reassembly leftovers.
+     */
+    private function list_staged_files( $root ) {
+        $files = [];
+        if ( ! is_dir( $root ) ) {
+            return $files;
+        }
+        $it = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator( $root, \RecursiveDirectoryIterator::SKIP_DOTS )
+        );
+        foreach ( $it as $file ) {
+            if ( ! $file->isFile() ) {
+                continue;
+            }
+            $rel = ltrim( str_replace( '\\', '/', substr( $file->getPathname(), strlen( $root ) ) ), '/' );
+            if ( $rel === 'disembark-source.json' || $rel === 'restore.zip' ) {
+                continue;
+            }
+            if ( preg_match( '#^database-.*\.sql$#', basename( $rel ) ) ) {
+                continue;
+            }
+            if ( strpos( $rel, '_chunks/' ) === 0 ) {
+                continue;
+            }
+            $files[] = $rel;
+        }
+        return $files;
+    }
+
+    /**
+     * Imports a SQL dump already sitting in staging (dashboard flow — the client
+     * never holds the SQL). Applies the same identifier prefix remap and
+     * DROP-before-CREATE the CLI does, then runs it.
+     */
+    public function import_staged_sql( $sql_file, $old_prefix = '', $new_prefix = '' ) {
+        if ( ! $this->is_safe_relative_path( $sql_file ) ) {
+            return new \WP_Error( 'invalid_path', 'Invalid SQL file path.', [ 'status' => 400 ] );
+        }
+        $path = $this->staging_path . '/' . $sql_file;
+        if ( ! file_exists( $path ) ) {
+            return new \WP_Error( 'not_found', 'Staged SQL file not found.', [ 'status' => 404 ] );
+        }
+        $sql = file_get_contents( $path );
+        if ( $old_prefix && $new_prefix && $old_prefix !== $new_prefix ) {
+            $sql = str_replace( '`' . $old_prefix, '`' . $new_prefix, $sql );
+        }
+        $sql = preg_replace( '/CREATE TABLE `([^`]+)`/', "DROP TABLE IF EXISTS `$1`;\nCREATE TABLE `$1`", $sql );
+        return $this->execute_sql( $sql );
+    }
+
+    /**
+     * Reports what is staged for a dashboard restore: file count, the located
+     * SQL dump, and the captured source metadata.
+     */
+    public function staged_info() {
+        $sql_rel = null;
+        foreach ( [ '/public', '' ] as $sub ) {
+            $matches = glob( $this->staging_path . $sub . '/database-*.sql' );
+            if ( ! empty( $matches ) ) {
+                $sql_rel = ltrim( str_replace( '\\', '/', substr( $matches[0], strlen( $this->staging_path ) ) ), '/' );
+                break;
+            }
+        }
+        $source = null;
+        foreach ( [ '/public/disembark-source.json', '/disembark-source.json' ] as $rel ) {
+            if ( file_exists( $this->staging_path . $rel ) ) {
+                $source = json_decode( file_get_contents( $this->staging_path . $rel ) );
+                break;
+            }
+        }
+        return [
+            'files'    => $this->count_staged_files(),
+            'sql_file' => $sql_rel,
+            'source'   => $source,
+        ];
+    }
+
+    /**
      * Counts files currently staged for deployment.
      */
     private function count_staged_files() {
@@ -310,13 +389,24 @@ class Import {
         $errors    = [];
         $backed_up = [];
 
+        // The dashboard (thin client) can't list staged files, so it passes
+        // ["*"] to deploy everything. A whole-snapshot zip nests the site under
+        // public/, so treat that as the staging root when present.
+        $staging_root = $this->staging_path;
+        if ( count( $files ) === 1 && $files[0] === '*' ) {
+            if ( is_dir( $this->staging_path . '/public/wp-includes' ) || is_dir( $this->staging_path . '/public/wp-content' ) ) {
+                $staging_root = $this->staging_path . '/public';
+            }
+            $files = $this->list_staged_files( $staging_root );
+        }
+
         foreach ( $files as $relative_path ) {
             if ( ! $this->is_safe_relative_path( $relative_path ) ) {
                 $errors[] = "Unsafe path skipped: {$relative_path}";
                 continue;
             }
 
-            $source = $this->staging_path . '/' . $relative_path;
+            $source = $staging_root . '/' . $relative_path;
             $dest   = $web_root . '/' . $relative_path;
 
             if ( ! file_exists( $source ) ) {
