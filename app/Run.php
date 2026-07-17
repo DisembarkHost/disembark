@@ -125,6 +125,22 @@ class Run {
         wp_enqueue_style( 'vuejs-icons', "https://cdnjs.cloudflare.com/ajax/libs/MaterialDesign-Webfont/7.4.47/css/materialdesignicons.min.css" );
         wp_enqueue_style( 'vuetify', "https://cdn.jsdelivr.net/npm/vuetify@v3.6.10/dist/vuetify.min.css" );
         wp_enqueue_style( 'disembark-styles', $this->plugin_url . 'css/style.css' );
+
+        // A restore intentionally replaces the users table, which invalidates
+        // the current session. Suppress WordPress's "session expired" heartbeat
+        // modal on this page so it doesn't flash over the restore UI — the
+        // dashboard shows its own "log in with the source's credentials" notice.
+        wp_dequeue_script( 'wp-auth-check' );
+        wp_deregister_script( 'wp-auth-check' );
+        add_filter( 'wp_auth_check_load', '__return_false' );
+    }
+
+    /**
+     * Exposes the login URL to the dashboard so it can send the user to a clean
+     * re-login after a restore (their old session was replaced).
+     */
+    public function login_url() {
+        return wp_login_url( admin_url( 'tools.php?page=disembark' ) );
     }
 
     /**

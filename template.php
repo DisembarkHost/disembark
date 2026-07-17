@@ -1041,6 +1041,7 @@ createApp({
             scan_progress: { total: 1, scanned: 0, status: 'initializing' },
             api_token: "<?php echo \Disembark\Token::get(); ?>",
             home_url: "<?php echo home_url(); ?>",
+            login_url: "<?php echo esc_url_raw( wp_login_url( admin_url( 'tools.php?page=disembark' ) ) ); ?>",
             api_root: "<?php echo esc_url_raw( rest_url('disembark/v1/') ); ?>",
             backup_token: "",
             database: [],
@@ -1160,8 +1161,10 @@ createApp({
         },
         finishRestore() {
             this.restore.show = false;
-            // The database was replaced; reload so the admin reflects the restore.
-            window.location.reload();
+            // The restore replaced the users table, so this session is gone.
+            // Send the user to a clean login rather than reloading into an
+            // expired-session admin screen.
+            window.location.href = this.login_url;
         },
         rlog(msg) {
             this.restore.log.push(msg);
