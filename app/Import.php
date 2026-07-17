@@ -735,18 +735,25 @@ class Import {
 
         $changed = 0;
 
-        // usermeta: leading-prefix meta keys (capabilities, user_level,
-        // user-settings, dashboard_*, plus plugin keys that adopt the prefix).
-        $usermeta = $new_prefix . 'usermeta';
+        // usermeta: core prefix-scoped meta keys only. An allowlist keeps a
+        // plugin key that merely *starts* with the old prefix as literal text
+        // (e.g. "wp_stripe_customer_id" on a "wp_" -> "mig_" move) from being
+        // rewritten. Plugin keys that adopt the prefix are intentionally left
+        // alone — their plugins regenerate them.
+        $allowed_keys = [ 'capabilities', 'user_level', 'user-settings', 'user-settings-time', 'persisted_preferences' ];
+        $usermeta     = $new_prefix . 'usermeta';
         if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $usermeta ) ) === $usermeta ) {
             $like = $wpdb->esc_like( $old_prefix ) . '%';
             $rows = $wpdb->get_results(
                 $wpdb->prepare( "SELECT umeta_id, meta_key FROM `{$usermeta}` WHERE meta_key LIKE %s", $like )
             );
             foreach ( $rows as $row ) {
+                $remainder = substr( $row->meta_key, strlen( $old_prefix ) );
+                if ( ! in_array( $remainder, $allowed_keys, true ) && strpos( $remainder, 'dashboard_' ) !== 0 ) {
+                    continue;
+                }
                 // Only rewrite the leading prefix, keep the remainder intact.
-                $new_key = $new_prefix . substr( $row->meta_key, strlen( $old_prefix ) );
-                $wpdb->update( $usermeta, [ 'meta_key' => $new_key ], [ 'umeta_id' => $row->umeta_id ] );
+                $wpdb->update( $usermeta, [ 'meta_key' => $new_prefix . $remainder ], [ 'umeta_id' => $row->umeta_id ] );
                 $changed++;
             }
         }

@@ -40,8 +40,12 @@ class Run {
      * per-endpoint User::allowed() check still runs.
      */
     public function allow_token_auth( $errors ) {
-        $uri = isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '';
-        if ( strpos( $uri, 'disembark' ) === false ) {
+        // Scope strictly to Disembark's own REST namespace (pretty and
+        // ?rest_route= forms) — matching "disembark" anywhere in the URI would
+        // relax the cookie/nonce check for unrelated routes too.
+        $uri    = rawurldecode( isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '' );
+        $prefix = '/' . rest_get_url_prefix() . '/disembark/v1';
+        if ( strpos( $uri, $prefix ) === false && strpos( $uri, 'rest_route=/disembark/v1' ) === false ) {
             return $errors;
         }
 
@@ -608,6 +612,12 @@ class Run {
             return new \WP_Error( 'invalid_path', 'Invalid file path.', [ 'status' => 400 ] );
         }
 
+        // wp-config.php holds credentials and is deliberately never deployed
+        // by a restore — keep the file editor consistent with that rule.
+        if ( basename( $full_path ) === 'wp-config.php' ) {
+            return new \WP_Error( 'protected_file', 'wp-config.php cannot be modified through Disembark.', [ 'status' => 400 ] );
+        }
+
         // 3. Write File
         if ( !is_writable( $full_path ) ) {
             return new \WP_Error( 'not_writable', 'File is not writable.', [ 'status' => 500 ] );
@@ -641,6 +651,11 @@ class Run {
         // Security: Prevent directory traversal
         if ( strpos( $new_name, '/' ) !== false || strpos( $new_name, '..' ) !== false ) {
             return new \WP_Error( 'invalid_name', 'Invalid file name.', [ 'status' => 400 ] );
+        }
+
+        // Same wp-config.php protection as save_file, in both directions.
+        if ( basename( $old_path_relative ) === 'wp-config.php' || $new_name === 'wp-config.php' ) {
+            return new \WP_Error( 'protected_file', 'wp-config.php cannot be renamed through Disembark.', [ 'status' => 400 ] );
         }
 
         // Resolve Paths
