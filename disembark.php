@@ -8,7 +8,7 @@
  * @wordpress-plugin
  * Plugin Name:       Disembark
  * Plugin URI:        https://disembark.host
- * Description:       Safe journeys as you travel to your next WordPress host.
+ * Description:       Back up, restore, or migrate your files and database in the dashboard or CLI.
  * Version:           2.8.0
  * Author:            Austin Ginder
  * Author URI:        https://austinginder.com

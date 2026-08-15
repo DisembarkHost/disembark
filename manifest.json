@@ -13,7 +13,7 @@
     "last_updated": "2026-07-17 16:00:00",
     "homepage": "https://disembark.host",
     "sections": {
-        "description": "Safe journeys as you travel to your next WordPress host."
+        "description": "Back up, restore, or migrate your files and database in the dashboard or CLI."
     },
     "banners": {
         "low": "https://disembark.host/images/disembark-772x250.webp",
