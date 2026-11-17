@@ -349,8 +349,9 @@ class Backup {
         $rows_start       = 0;
         $insert_sql       = "";
         
-        // Use a .txt extension to avoid server-side .sql file download blocks
-        $file_ext         = ".sql.txt";
+        // Hosts commonly block downloads of *.sql and *.sql.* (and some block
+        // *.sql.txt), so exports carry no "sql" in their name at all.
+        $file_ext         = self::EXPORT_EXT;
         $backup_file      = "{$this->backup_path}/{$table}{$file_ext}";
         $backup_url       = "{$this->backup_url}/{$table}{$file_ext}";
         if ( ! empty( $parts ) ) {
@@ -451,7 +452,7 @@ class Backup {
         }
 
         $batch_hash  = md5( implode( ',', $tables ) );
-        $file_ext    = ".sql.txt";
+        $file_ext    = self::EXPORT_EXT;
         $backup_file = "{$this->backup_path}/batch-{$batch_hash}{$file_ext}";
         $backup_url  = "{$this->backup_url}/batch-{$batch_hash}{$file_ext}";
 
@@ -554,6 +555,24 @@ class Backup {
      * Last statement of every batch export. A harmless SQL statement rather
      * than a comment, so older importers that run every statement don't error.
      */
+    /**
+     * File extension of database exports. Older versions wrote *.sql.txt;
+     * export_files() reads both.
+     */
+    const EXPORT_EXT = '.db.txt';
+
+    /**
+     * Database export files in $dir, current and legacy names, sorted.
+     */
+    public static function export_files( $dir ) {
+        $files = array_merge(
+            glob( rtrim( $dir, '/' ) . '/*' . self::EXPORT_EXT ) ?: [],
+            glob( rtrim( $dir, '/' ) . '/*.sql.txt' ) ?: []
+        );
+        sort( $files );
+        return $files;
+    }
+
     const EXPORT_COMPLETE_MARKER = 'SET @disembark_export_complete = 1;';
 
     public static function primary_key_columns( $table ) {
@@ -764,8 +783,7 @@ class Backup {
     
     function zip_database() {
         $sql_files = glob( "{$this->backup_path}/*.sql" );
-        $sql_txt_files = glob( "{$this->backup_path}/*.sql.txt" );
-        $sql_files = array_merge( $sql_files, $sql_txt_files );
+        $sql_files = array_merge( $sql_files, self::export_files( $this->backup_path ) );
         $zip_name = "{$this->backup_path}/database.zip";
         
         if ( $this->archiver_type === 'ZipArchive' ) {

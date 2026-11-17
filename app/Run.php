@@ -1044,6 +1044,7 @@ class Run {
         }
 
         $import = new Import( $import_id );
+        $import->set_request_token( (string) $request->get_param( 'token' ) );
         return $import->execute_sql( $sql_content );
     }
 
@@ -1143,7 +1144,9 @@ class Run {
         if ( empty( $import_id ) || empty( $sql_file ) ) {
             return new \WP_Error( 'missing_params', 'import_id and sql_file are required.', [ 'status' => 400 ] );
         }
-        return ( new Import( $import_id ) )->import_staged_sql( $sql_file, $old_prefix, $new_prefix );
+        return ( new Import( $import_id ) )
+            ->set_request_token( (string) $request->get_param( 'token' ) )
+            ->import_staged_sql( $sql_file, $old_prefix, $new_prefix );
     }
 
     function import_search_replace( $request ) {
@@ -1179,6 +1182,7 @@ class Run {
         }
 
         $import = new Import( $import_id );
+        $import->set_request_token( (string) $request->get_param( 'token' ) );
         return $import->rollback();
     }
 

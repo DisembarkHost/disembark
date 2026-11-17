@@ -1735,9 +1735,7 @@ createApp({
             
             // Clean up filename (remove .txt extension added for security)
             let fileName = url.substring(url.lastIndexOf('/') + 1);
-            if (fileName.endsWith('.sql.txt')) {
-                fileName = fileName.replace('.sql.txt', '.sql');
-            }
+            fileName = fileName.replace(/\.(db|sql)\.txt$/, '.sql');
             
             link.setAttribute('download', fileName);
             document.body.appendChild(link);

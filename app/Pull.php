@@ -58,16 +58,24 @@ class Pull {
     }
 
     /**
+     * URL of one of the source's Disembark REST endpoints, honoring its
+     * permalink style.
+     */
+    private function source_endpoint( $endpoint ) {
+        $state = $this->state();
+        $base  = rtrim( $state['source_url'], '/' );
+        $style = $state['rest_style'] ?? 'pretty';
+        return $base . ( ( $style === 'rest_route' )
+            ? '/?rest_route=/disembark/v1' . $endpoint
+            : '/wp-json/disembark/v1' . $endpoint );
+    }
+
+    /**
      * Calls the source site's Disembark REST API, honoring its permalink style.
      */
     private function source_request( $endpoint, $payload = [], $method = 'POST', $timeout = 120 ) {
         $state = $this->state();
-        $base  = rtrim( $state['source_url'], '/' );
-        $style = $state['rest_style'] ?? 'pretty';
-        $path  = ( $style === 'rest_route' )
-            ? '/?rest_route=/disembark/v1' . $endpoint
-            : '/wp-json/disembark/v1' . $endpoint;
-        $url = $base . $path;
+        $url   = $this->source_endpoint( $endpoint );
 
         $body = array_merge(
             [ 'token' => $state['source_token'] ?? '', 'backup_token' => $state['backup_token'] ?? '' ],
@@ -135,10 +143,72 @@ class Pull {
     }
 
     /**
+     * Downloads a file the source made for this pull (export, zip, manifest
+     * chunk) to a temp file. Tries the file's URL first; when that fails —
+     * hosts often refuse direct downloads of database dumps, for example any
+     * URL containing ".sql." — falls back to the source's /stream-file
+     * endpoint, which serves the same file through PHP. Returns the temp path
+     * or WP_Error.
+     */
+    private function fetch_source_file( $url ) {
+        $tmp = $this->guarded_download( $url );
+        if ( ! is_wp_error( $tmp ) || $tmp->get_error_code() === 'invalid_url' ) {
+            return $tmp;
+        }
+        $streamed = $this->stream_from_source( $url );
+        return is_wp_error( $streamed ) ? $tmp : $streamed;
+    }
+
+    /**
+     * Downloads one of the source's files through its /stream-file endpoint
+     * (token-authenticated, every v2 source has it). Only for URLs on the
+     * source's own host. Returns the temp path or WP_Error.
+     */
+    private function stream_from_source( $url ) {
+        $state = $this->state();
+        $base  = $state['source_url'] ?? '';
+        $host  = is_string( $url ) ? strtolower( (string) parse_url( $url, PHP_URL_HOST ) ) : '';
+        if ( $host === '' || $host !== strtolower( (string) parse_url( $base, PHP_URL_HOST ) ) ) {
+            return new \WP_Error( 'invalid_url', 'Refusing to stream a file from another host.', [ 'status' => 502 ] );
+        }
+        // /stream-file takes a path relative to the source's root folder.
+        $path      = rawurldecode( (string) parse_url( $url, PHP_URL_PATH ) );
+        $base_path = rtrim( (string) parse_url( $base, PHP_URL_PATH ), '/' );
+        if ( $base_path !== '' && strpos( $path, $base_path . '/' ) === 0 ) {
+            $path = substr( $path, strlen( $base_path ) );
+        }
+        $relative = ltrim( $path, '/' );
+        if ( $relative === '' ) {
+            return new \WP_Error( 'invalid_url', 'Source file URL has no path.', [ 'status' => 502 ] );
+        }
+
+        $tmp = wp_tempnam( basename( $relative ) );
+        if ( ! $tmp ) {
+            return new \WP_Error( 'download_failed', 'Could not create a temporary file.', [ 'status' => 500 ] );
+        }
+        $verify = $this->sslverify();
+        $resp   = wp_remote_post( $this->source_endpoint( '/stream-file' ), [
+            'timeout'            => 600,
+            'stream'             => true,
+            'filename'           => $tmp,
+            'sslverify'          => $verify,
+            'reject_unsafe_urls' => $verify,
+            'headers'            => [ 'Content-Type' => 'application/json' ],
+            'body'               => wp_json_encode( [ 'token' => $state['source_token'] ?? '', 'file' => $relative ] ),
+        ] );
+        if ( is_wp_error( $resp ) || wp_remote_retrieve_response_code( $resp ) !== 200 ) {
+            @unlink( $tmp );
+            $code = is_wp_error( $resp ) ? $resp->get_error_message() : wp_remote_retrieve_response_code( $resp );
+            return new \WP_Error( 'download_failed', "Source could not stream {$relative} ({$code}).", [ 'status' => 502 ] );
+        }
+        return $tmp;
+    }
+
+    /**
      * Downloads a URL to a local path (streamed to disk).
      */
     private function download_to( $url, $dest_path ) {
-        $tmp = $this->guarded_download( $url );
+        $tmp = $this->fetch_source_file( $url );
         if ( is_wp_error( $tmp ) ) {
             return $tmp;
         }
@@ -283,7 +353,7 @@ class Pull {
             if ( ! is_object( $chunk ) || empty( $chunk->url ) ) {
                 continue;
             }
-            $tmp = $this->guarded_download( $chunk->url );
+            $tmp = $this->fetch_source_file( $chunk->url );
             if ( is_wp_error( $tmp ) ) {
                 return $tmp;
             }

@@ -8,6 +8,7 @@ class Import {
     private $import_path;
     private $staging_path;
     private $rollback_path;
+    private $request_token = '';
 
     public function __construct( $import_id = '' ) {
         // Strip everything but hex so a caller-supplied id can never be used to
@@ -32,6 +33,16 @@ class Import {
      */
     private function prepare_import_dir() {
         Storage::ensure_dir( $this->import_path );
+    }
+
+    /**
+     * The token the current request authenticated with. A retried import or
+     * a rollback uses it to recover this site's real token when the options
+     * table already holds the source's (see begin_statements()).
+     */
+    public function set_request_token( $token ) {
+        $this->request_token = is_string( $token ) ? $token : '';
+        return $this;
     }
 
     public function get_import_id() {
@@ -122,7 +133,7 @@ class Import {
 
         // Move the exported SQL to our rollback directory
         $backup_base = wp_upload_dir()['basedir'] . '/disembark/rollback-' . $this->import_id;
-        $sql_files   = glob( "{$backup_base}/*.sql.txt" );
+        $sql_files   = Backup::export_files( $backup_base );
         foreach ( $sql_files as $sql_file ) {
             $dest = $this->rollback_path . '/' . basename( $sql_file );
             rename( $sql_file, $dest );
@@ -134,7 +145,7 @@ class Import {
         }
 
         $sql_sizes = [];
-        foreach ( glob( $this->rollback_path . '/*.sql.txt' ) as $sql_file ) {
+        foreach ( Backup::export_files( $this->rollback_path ) as $sql_file ) {
             $sql_sizes[ basename( $sql_file ) ] = filesize( $sql_file );
         }
 
@@ -564,13 +575,31 @@ class Import {
     private function begin_statements() {
         global $wpdb;
 
-        $preserved_token = Token::read();
-        if ( ! empty( $preserved_token ) ) {
-            $this->prepare_import_dir();
-            file_put_contents( $this->import_path . '/token-guard.json', wp_json_encode( [
-                'sha256'     => hash( 'sha256', (string) $preserved_token ),
-                'created_at' => time(),
-            ] ) );
+        $current = (string) Token::read();
+        $guard   = self::read_token_guard( $this->import_id );
+        if ( $guard ) {
+            // An earlier attempt of this import (or of its rollback) already
+            // recorded this site's real token. If that attempt died after the
+            // options table was replaced, Token::read() now returns the
+            // source's token, so never overwrite the guard: keep the token that
+            // matches it (the one the caller authenticated with, or the stored
+            // one when the options table hasn't been replaced yet).
+            $preserved_token = '';
+            foreach ( [ $this->request_token, $current ] as $candidate ) {
+                if ( $candidate !== '' && hash_equals( $guard['sha256'], hash( 'sha256', $candidate ) ) ) {
+                    $preserved_token = $candidate;
+                    break;
+                }
+            }
+        } else {
+            $preserved_token = $current;
+            if ( $preserved_token !== '' ) {
+                $this->prepare_import_dir();
+                file_put_contents( $this->import_path . '/token-guard.json', wp_json_encode( [
+                    'sha256'     => hash( 'sha256', $preserved_token ),
+                    'created_at' => time(),
+                ] ) );
+            }
         }
 
         $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
@@ -646,19 +675,31 @@ class Import {
      * finish or roll back with the token the dashboard or CLI holds.
      */
     public static function token_guard_matches( $import_id, $token ) {
-        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) );
-        if ( $import_id === '' || ! is_string( $token ) || $token === '' ) {
+        if ( ! is_string( $token ) || $token === '' ) {
             return false;
+        }
+        $guard = self::read_token_guard( $import_id );
+        return $guard !== null && hash_equals( $guard['sha256'], hash( 'sha256', $token ) );
+    }
+
+    /**
+     * The token guard for import $import_id when it exists and is under a day
+     * old, else null.
+     */
+    private static function read_token_guard( $import_id ) {
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) );
+        if ( $import_id === '' ) {
+            return null;
         }
         $file = Storage::base_dir() . "/_import_{$import_id}/token-guard.json";
         if ( ! is_file( $file ) ) {
-            return false;
+            return null;
         }
         $guard = json_decode( (string) file_get_contents( $file ), true );
-        if ( empty( $guard['sha256'] ) || empty( $guard['created_at'] ) || time() - (int) $guard['created_at'] > DAY_IN_SECONDS ) {
-            return false;
+        if ( ! is_array( $guard ) || empty( $guard['sha256'] ) || ! is_string( $guard['sha256'] ) || empty( $guard['created_at'] ) || time() - (int) $guard['created_at'] > DAY_IN_SECONDS ) {
+            return null;
         }
-        return hash_equals( (string) $guard['sha256'], hash( 'sha256', $token ) );
+        return $guard;
     }
 
     /**
@@ -1052,7 +1093,7 @@ class Import {
         // 1. Restore database from snapshot SQL. Validate the whole snapshot
         // before anything is dropped: a missing, truncated or unreadable
         // snapshot must leave the current database alone.
-        $sql_files = glob( $this->rollback_path . '/*.sql.txt' );
+        $sql_files = Backup::export_files( $this->rollback_path );
         $check     = self::validate_snapshot( $sql_files, $meta );
         if ( is_wp_error( $check ) ) {
             return $check;
