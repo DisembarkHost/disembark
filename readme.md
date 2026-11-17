@@ -9,7 +9,7 @@ Disembark provides a user-friendly interface within your WordPress admin area to
 As of v2.8, Disembark also restores: bring a backup `.zip` into any site running the plugin, or migrate directly from one live Disembark site into another — a rollback point is saved first so any restore can be undone with one click.
 
 Features include:
-- A modern interface built with Vue.js.
+- A dashboard under Tools → Disembark with no outside dependencies: every script, style and font ships with the plugin.
 - **Restore a Backup** — restore from an uploaded backup file, or pull directly from a live source site (server-to-server), with URL rewriting, cross-prefix support, and one-click rollback.
 - A file explorer to browse your site's structure, preview images and code, and download individual files.
 - A database explorer to browse tables, view structure and data, and export selected tables.

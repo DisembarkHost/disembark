@@ -84,20 +84,15 @@ class Run {
     }
     
     /**
-     * Renders the main container for the Disembark admin page.
-     * The Vue.js application is injected into this page via a shortcode.
+     * Renders the Disembark admin page. The dashboard draws its own header, so
+     * the page is just the app's mount point (via the shortcode).
      */
     public function render_admin_page() {
-        ?>
-        <div class="wrap disembark-wrapper">
-            <h1><?php echo esc_html( get_admin_page_title() ); ?></h1>
-            <?php echo do_shortcode( '[disembark_ui]' ); ?>
-        </div>
-        <?php
+        echo '<div class="wrap disembark-wrap">' . do_shortcode( '[disembark_ui]' ) . '</div>';
     }
 
     /**
-     * Registers the shortcode used to embed the Vue.js application.
+     * Registers the shortcode that embeds the dashboard.
      */
     public function register_shortcode() {
         add_shortcode( 'disembark_ui', [ $this, 'render_shortcode_ui' ] );
@@ -115,8 +110,9 @@ class Run {
         if ( ! User::can_manage() ) {
             return '';
         }
+        $this->enqueue_app_assets();
         ob_start();
-        include_once $this->plugin_path . '/template.php';
+        include $this->plugin_path . '/template.php';
         return ob_get_clean();
     }
 
@@ -129,10 +125,7 @@ class Run {
         if ( 'tools_page_disembark' !== $hook ) {
             return;
         }
-        wp_enqueue_style( 'vuejs-font', "https://fonts.googleapis.com/css?family=Roboto:100,300,400,500,700,900" );
-        wp_enqueue_style( 'vuejs-icons', "https://cdnjs.cloudflare.com/ajax/libs/MaterialDesign-Webfont/7.4.47/css/materialdesignicons.min.css" );
-        wp_enqueue_style( 'vuetify', "https://cdn.jsdelivr.net/npm/vuetify@v3.6.10/dist/vuetify.min.css" );
-        wp_enqueue_style( 'disembark-styles', $this->plugin_url . 'css/style.css' );
+        $this->enqueue_app_assets();
 
         // A restore intentionally replaces the users table, which invalidates
         // the current session. Suppress WordPress's "session expired" heartbeat
@@ -141,6 +134,57 @@ class Run {
         wp_dequeue_script( 'wp-auth-check' );
         wp_deregister_script( 'wp-auth-check' );
         add_filter( 'wp_auth_check_load', '__return_false' );
+    }
+
+    /**
+     * Enqueues the dashboard: one stylesheet and a few plain scripts that share
+     * the window.Disembark namespace. Everything ships with the plugin (no
+     * CDNs) and is versioned by file time, so an update always busts caches.
+     * Safe to call more than once.
+     */
+    public function enqueue_app_assets() {
+        if ( wp_script_is( 'disembark-app', 'enqueued' ) ) {
+            return;
+        }
+        $base = $this->plugin_url . 'assets/';
+        $dir  = $this->plugin_path . '/assets/';
+        $ver  = function ( $file ) use ( $dir ) {
+            return file_exists( $dir . $file ) ? (string) filemtime( $dir . $file ) : null;
+        };
+
+        wp_enqueue_style( 'disembark-admin', $base . 'admin.css', [], $ver( 'admin.css' ) );
+
+        // Prism only highlights what the Files section asks it to.
+        wp_register_script( 'disembark-prism', $base . 'vendor/prism/prism.js', [], $ver( 'vendor/prism/prism.js' ), true );
+        wp_add_inline_script( 'disembark-prism', 'window.Prism = window.Prism || {}; window.Prism.manual = true;', 'before' );
+
+        $scripts = [
+            'disembark-core'     => [ 'js/core.js', [ 'disembark-prism' ] ],
+            'disembark-tree'     => [ 'js/tree.js', [ 'disembark-core' ] ],
+            'disembark-backup'   => [ 'js/backup.js', [ 'disembark-tree' ] ],
+            'disembark-restore'  => [ 'js/restore.js', [ 'disembark-core' ] ],
+            'disembark-files'    => [ 'js/files.js', [ 'disembark-tree' ] ],
+            'disembark-database' => [ 'js/database.js', [ 'disembark-core' ] ],
+            'disembark-settings' => [ 'js/settings.js', [ 'disembark-core' ] ],
+            'disembark-app'      => [ 'js/app.js', [ 'disembark-backup', 'disembark-restore', 'disembark-files', 'disembark-database', 'disembark-settings' ] ],
+        ];
+        foreach ( $scripts as $handle => list( $file, $deps ) ) {
+            wp_register_script( $handle, $base . $file, $deps, $ver( $file ), true );
+        }
+
+        $plugin  = get_file_data( $this->plugin_path . '/disembark.php', [ 'Version' => 'Version' ] );
+        $config  = [
+            'apiRoot'   => esc_url_raw( rest_url( 'disembark/v1/' ) ),
+            'nonce'     => wp_create_nonce( 'wp_rest' ),
+            'token'     => Token::get(),
+            'homeUrl'   => home_url(),
+            'loginUrl'  => wp_login_url( admin_url( 'tools.php?page=disembark' ) ),
+            'version'   => $plugin['Version'],
+            'fileEdits' => User::file_edits_allowed(),
+            'multisite' => is_multisite(),
+        ];
+        wp_add_inline_script( 'disembark-core', 'window.DisembarkConfig = ' . wp_json_encode( $config ) . ';', 'before' );
+        wp_enqueue_script( 'disembark-app' );
     }
 
     /**
