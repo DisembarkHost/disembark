@@ -356,6 +356,10 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'import_finalize' ]
         ]);
+        register_rest_route('disembark/v1', '/backup/archive', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'backup_archive' ]
+        ]);
         register_rest_route('disembark/v1', '/restore-points', [
             'methods'  => 'GET',
             'callback' => [ $this, 'restore_points' ]
@@ -1008,6 +1012,34 @@ class Run {
         }
         $import = new Import( $import_id );
         return $import->snapshot( (string) ( $params['label'] ?? '' ) );
+    }
+
+    /**
+     * Builds a backup zip in the browser's session folder, step by step:
+     * step=files (files[]), step=database (tables[], or table+part+rows_per_part),
+     * step=finish (returns the zip URL).
+     */
+    function backup_archive( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $token = Storage::sanitize_session( (string) ( $request['backup_token'] ?? '' ) );
+        if ( $token === '' ) {
+            return new \WP_Error( 'missing_token', 'backup_token is required.', [ 'status' => 400 ] );
+        }
+        $backup  = new Backup( $token );
+        $archive = (string) ( $request['archive'] ?? '' );
+        switch ( (string) ( $request['step'] ?? '' ) ) {
+            case 'files':
+                return $backup->archive_add_files( $archive, (array) ( $request['files'] ?? [] ) );
+            case 'database':
+                $table = preg_replace( '/[^a-zA-Z0-9_$-]/', '', (string) ( $request['table'] ?? '' ) );
+                $tables = array_values( array_filter( (array) ( $request['tables'] ?? [] ), 'is_string' ) );
+                return $backup->archive_add_database( $archive, $tables, $table, (int) ( $request['part'] ?? 0 ), (int) ( $request['rows_per_part'] ?? 0 ) );
+            case 'finish':
+                return $backup->archive_finish( $archive );
+        }
+        return new \WP_Error( 'bad_step', 'Unknown step.', [ 'status' => 400 ] );
     }
 
     function restore_points( $request ) {

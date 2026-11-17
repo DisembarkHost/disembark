@@ -685,6 +685,127 @@ class Backup {
         return "{$this->backup_url}/{$file_name}.zip";
     }
 
+    /**
+     * Builds a full backup zip in steps, in the same layout as a CLI backup
+     * (everything under public/, with database-<name>.sql and
+     * disembark-source.json), so it restores from the dashboard or the CLI.
+     * Needs ZipArchive.
+     */
+    private function archive_paths( $archive_name ) {
+        $base = preg_replace( '/[^a-zA-Z0-9._-]/', '', str_replace( '.zip', '', basename( (string) $archive_name ) ) );
+        if ( $base === '' ) {
+            return new \WP_Error( 'bad_archive', 'Archive name is required.', [ 'status' => 400 ] );
+        }
+        return [
+            'base' => $base,
+            'zip'  => "{$this->backup_path}/{$base}.zip",
+            'url'  => "{$this->backup_url}/{$base}.zip",
+            'sql'  => "{$this->backup_path}/{$base}-database" . self::EXPORT_EXT,
+        ];
+    }
+
+    /** Adds site files (paths relative to the site root) under public/. */
+    public function archive_add_files( $archive_name, $files ) {
+        if ( $this->archiver_type !== 'ZipArchive' ) {
+            return new \WP_Error( 'no_zip', 'This server has no ZipArchive, so backups have to run through the CLI.', [ 'status' => 501 ] );
+        }
+        $paths = $this->archive_paths( $archive_name );
+        if ( is_wp_error( $paths ) ) {
+            return $paths;
+        }
+        $web_root  = dirname( WP_CONTENT_DIR );
+        $core_root = rtrim( ABSPATH, '/' );
+        $zip       = new \ZipArchive();
+        if ( $zip->open( $paths['zip'], \ZipArchive::CREATE ) !== true ) {
+            return new \WP_Error( 'zip_open_failed', 'Could not open the backup zip.', [ 'status' => 500 ] );
+        }
+        $added = 0;
+        $missing = 0;
+        foreach ( (array) $files as $file ) {
+            $relative = is_array( $file ) ? ( $file['name'] ?? '' ) : (string) $file;
+            $relative = ltrim( str_replace( '\\', '/', (string) $relative ), '/' );
+            if ( $relative === '' || strpos( '/' . $relative . '/', '/../' ) !== false ) {
+                continue;
+            }
+            $full = "{$web_root}/{$relative}";
+            if ( $web_root !== $core_root && ! file_exists( $full ) && file_exists( "{$core_root}/{$relative}" ) ) {
+                $full = "{$core_root}/{$relative}";
+            }
+            if ( is_file( $full ) && is_readable( $full ) && $zip->addFile( $full, 'public/' . $relative ) ) {
+                $added++;
+            } else {
+                $missing++;
+            }
+        }
+        if ( ! $zip->close() ) {
+            return new \WP_Error( 'zip_write_failed', 'Could not write the backup zip (is the disk full?).', [ 'status' => 500 ] );
+        }
+        return [ 'added' => $added, 'missing' => $missing, 'size' => filesize( $paths['zip'] ) ];
+    }
+
+    /**
+     * Exports a batch of tables (or one part of a large table) and appends the
+     * SQL to the archive's database dump.
+     */
+    public function archive_add_database( $archive_name, $tables = [], $table = '', $part = 0, $rows_per_part = 0 ) {
+        $paths = $this->archive_paths( $archive_name );
+        if ( is_wp_error( $paths ) ) {
+            return $paths;
+        }
+        if ( $table !== '' ) {
+            $url = $this->database_export( $table, (int) $part, (int) $rows_per_part );
+            if ( ! $url ) {
+                return new \WP_Error( 'export_failed', "Could not export {$table}.", [ 'status' => 500 ] );
+            }
+        } else {
+            $url = $this->database_export_batch( (array) $tables );
+            if ( is_wp_error( $url ) ) {
+                return $url;
+            }
+        }
+        $part_file = $this->backup_path . '/' . basename( (string) $url );
+        $in  = @fopen( $part_file, 'rb' );
+        $out = @fopen( $paths['sql'], 'ab' );
+        if ( ! $in || ! $out ) {
+            return new \WP_Error( 'export_failed', 'Could not assemble the database dump.', [ 'status' => 500 ] );
+        }
+        $copied = stream_copy_to_stream( $in, $out );
+        fclose( $in );
+        fclose( $out );
+        @unlink( $part_file );
+        if ( $copied === false ) {
+            return new \WP_Error( 'export_failed', 'Could not write the database dump (is the disk full?).', [ 'status' => 500 ] );
+        }
+        return [ 'bytes' => $copied, 'dump_size' => filesize( $paths['sql'] ) ];
+    }
+
+    /** Adds the database dump and the source record, and returns the zip's URL. */
+    public function archive_finish( $archive_name ) {
+        global $wpdb;
+        $paths = $this->archive_paths( $archive_name );
+        if ( is_wp_error( $paths ) ) {
+            return $paths;
+        }
+        $zip = new \ZipArchive();
+        if ( $zip->open( $paths['zip'], \ZipArchive::CREATE ) !== true ) {
+            return new \WP_Error( 'zip_open_failed', 'Could not open the backup zip.', [ 'status' => 500 ] );
+        }
+        if ( file_exists( $paths['sql'] ) ) {
+            $zip->addFile( $paths['sql'], 'public/database-' . $paths['base'] . '.sql' );
+        }
+        $zip->addFromString( 'public/disembark-source.json', wp_json_encode( [
+            'home_url'  => home_url(),
+            'site_url'  => site_url(),
+            'db_prefix' => $wpdb->prefix,
+            'captured'  => gmdate( 'c' ),
+        ], JSON_PRETTY_PRINT ) );
+        if ( ! $zip->close() ) {
+            return new \WP_Error( 'zip_write_failed', 'Could not finish the backup zip (is the disk full?).', [ 'status' => 500 ] );
+        }
+        @unlink( $paths['sql'] );
+        return [ 'url' => $paths['url'], 'file_name' => basename( $paths['zip'] ), 'size' => filesize( $paths['zip'] ) ];
+    }
+
     function zip_file_list( $files = [], $archive_name = null ) {
         if ( empty( $files ) ) {
             return new \WP_Error( 'no_files', 'No files provided to zip.' );

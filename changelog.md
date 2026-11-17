@@ -7,6 +7,7 @@
 
 ### Added
 * **Restore points:** Restore lists every saved rollback point (what it was for, when, how big, whether it's been rolled back to) with **Roll back** and **Delete**. New endpoints: `GET /restore-points` and `POST /restore-points/delete`; snapshots take an optional `label`.
+* **Back up in the browser:** Back up → **Download a backup zip** builds a zip of your choices on the server in batches (with progress and Cancel) and downloads it, no CLI needed. It uses the CLI backup layout (`public/`, `database-*.sql`, `disembark-source.json`), so it restores from the dashboard or with `disembark restore`. Afterwards it offers to delete the zip from the server. New endpoint: `POST /backup/archive` (`files`, `database`, `finish` steps; needs ZipArchive).
 * **Search & replace:** Database → **Search & replace** rewrites text across the database with the restore engine (serialized PHP and JSON stay valid). Preview shows the cells, rows and tables that would change with before/after samples; replacing saves a rollback point first and offers Undo. New endpoint: `POST /search-replace` (with `dry_run`).
 
 ### Improved

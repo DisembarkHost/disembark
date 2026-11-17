@@ -339,18 +339,7 @@
    * 200 MB per dump, big tables split into parts of at most 200 MB / 1M rows.
    */
   async function exportBatch(tables, btn) {
-    var MAX_SIZE = 200 * 1024 * 1024, MAX_ROWS = 1000000, queue = [], batch = [], batchSize = 0;
-    tables.forEach(function (t) {
-      if ((t.size > MAX_SIZE || t.row_count > MAX_ROWS) && t.row_count > 0) {
-        if (batch.length) { queue.push({ tables: batch }); batch = []; batchSize = 0; }
-        var parts = Math.max(Math.ceil(t.size / MAX_SIZE), Math.ceil(t.row_count / MAX_ROWS));
-        for (var i = 1; i <= parts; i++) queue.push({ table: t.table, part: i, parts: parts, rows: Math.ceil(t.row_count / parts) });
-      } else {
-        if (batchSize + t.size > MAX_SIZE && batch.length) { queue.push({ tables: batch }); batch = []; batchSize = 0; }
-        batch.push(t.table); batchSize += t.size;
-      }
-    });
-    if (batch.length) queue.push({ tables: batch });
+    var queue = D.planDbExport(tables);
     var token = S.backupToken || D.randomHex(12), label = btn.lastChild, original = label.textContent;
     btn.disabled = true;
     try {

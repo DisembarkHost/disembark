@@ -414,6 +414,27 @@
     return h('div', { class: 'dsk-empty' }, h('div', null, D.art(kind), h('h3', null, title), text ? h('p', null, text) : null, action ? h('div', { style: { marginTop: '14px' } }, action) : null));
   };
 
+  /**
+   * Plans a database export the way the CLI does: small tables batched up to
+   * 200 MB per dump, big tables split into parts of at most 200 MB / 1M rows.
+   * tables: [{ table, size, row_count }] → [{ tables } | { table, part, parts, rows }].
+   */
+  D.planDbExport = function (tables) {
+    var MAX_SIZE = 200 * 1024 * 1024, MAX_ROWS = 1000000, queue = [], batch = [], batchSize = 0;
+    tables.forEach(function (t) {
+      if ((t.size > MAX_SIZE || t.row_count > MAX_ROWS) && t.row_count > 0) {
+        if (batch.length) { queue.push({ tables: batch, size: batchSize }); batch = []; batchSize = 0; }
+        var parts = Math.max(Math.ceil(t.size / MAX_SIZE), Math.ceil(t.row_count / MAX_ROWS));
+        for (var i = 1; i <= parts; i++) queue.push({ table: t.table, part: i, parts: parts, rows: Math.ceil(t.row_count / parts), size: t.size / parts });
+      } else {
+        if (batchSize + t.size > MAX_SIZE && batch.length) { queue.push({ tables: batch, size: batchSize }); batch = []; batchSize = 0; }
+        batch.push(t.table); batchSize += t.size;
+      }
+    });
+    if (batch.length) queue.push({ tables: batch, size: batchSize });
+    return queue;
+  };
+
   /* ------------------------------------------------------------ Navigation */
 
   D.sections = [];

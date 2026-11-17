@@ -128,7 +128,7 @@
       }
       vs.on(['excluded', 'included', 'includeDb', 'includeFiles'], renderSummary);
       renderSummary();
-      return h('div', { class: 'dsk-stack' }, summary, h('div', { class: 'dsk-grid two' }, dbCard(), filesCard()), cliCard(true));
+      return h('div', { class: 'dsk-stack' }, summary, h('div', { class: 'dsk-grid two' }, dbCard(), filesCard()), browserCard(), cliCard(true));
     }
 
     function stat(label, value, sub, color) {
@@ -215,6 +215,85 @@
         hint, body);
       body.hidden = hint.hidden = !S.includeFiles;
       return card;
+    }
+
+    /* Back up in the browser */
+    function browserCard() {
+      var btn = h('button', { class: 'dsk-btn primary', onclick: function () { browserBackup(); } }, D.icon('download'), 'Download a backup zip');
+      return h('div', { class: 'dsk-card dsk-card-pad dsk-row', style: { gap: '18px', alignItems: 'center' } },
+        h('div', { style: { flex: 1, minWidth: '260px' } },
+          h('h3', { style: { display: 'flex', gap: '9px', alignItems: 'center', marginBottom: '4px' } }, D.icon('zip'), 'Back up in the browser'),
+          h('p', { class: 'muted' }, 'Builds a zip of your choices on the server, then downloads it. No CLI needed. Restores from Restore → From a backup file, or with the CLI. For very large sites the CLI is faster and never stores a copy on the server.')),
+        btn);
+    }
+
+    async function browserBackup() {
+      if (!S.includeFiles && !S.includeDb) { D.toast('Include files, the database, or both.', 'error'); return; }
+      var files = S.includeFiles ? S.files.filter(function (f) { return !D.isExcluded(f.name); }) : [];
+      var tables = S.includeDb ? S.database.filter(function (t) { return S.included.has(t.table); }) : [];
+      var MAX = 150 * 1024 * 1024, MAX_FILES = 1500, BIG = 40 * 1024 * 1024, batches = [], cur = [], curSize = 0;
+      files.forEach(function (f) {
+        var size = Number(f.size) || 0, big = size > BIG;
+        if ((big || curSize + size > MAX || cur.length >= MAX_FILES) && cur.length) { batches.push({ files: cur, size: curSize }); cur = []; curSize = 0; }
+        cur.push(f.name); curSize += size;
+        if (big) { batches.push({ files: cur, size: curSize }); cur = []; curSize = 0; }
+      });
+      if (cur.length) batches.push({ files: cur, size: curSize });
+      var dbJobs = D.planDbExport(tables);
+      var total = batches.reduce(function (a, b) { return a + b.size; }, 0) + dbJobs.reduce(function (a, j) { return a + (j.size || 0); }, 0) || 1;
+      var stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 13);
+      var archive = D.host(D.config.homeUrl).replace(/[^a-z0-9.-]/gi, '_') + '-' + stamp + '.zip';
+      var token = S.backupToken, done = 0, cancelled = false, close = null;
+
+      var bar = D.progress(), line = h('div', { class: 'muted mono', style: { fontSize: '12.5px', minHeight: '18px' } });
+      D.modal({
+        title: 'Building your backup', persistent: true,
+        body: h('div', { class: 'dsk-stack', style: { gap: '12px' } },
+          h('p', null, D.fmt.plural(files.length, 'file') + ' and ' + D.fmt.plural(tables.length, 'table') + ', about ' + D.fmt.size(total) + ' before compression.'),
+          bar, line, h('p', { class: 'muted' }, 'Keep this tab open until it finishes.')),
+        actions: [{ label: 'Cancel', value: 'cancel' }],
+        onOpen: function (dlg, d) { close = d; }
+      }).then(function (v) { if (v === 'cancel') cancelled = true; });
+
+      function tick(size, text) { done += size || 0; bar.set((done / total) * 100); if (text) line.textContent = text; }
+      async function step(body) { if (cancelled) throw new Error('cancelled'); return D.api.post('backup/archive', Object.assign({ backup_token: token, archive: archive }, body)); }
+      try {
+        for (var i = 0; i < batches.length; i++) {
+          line.textContent = 'Adding files\u2026 batch ' + (i + 1) + ' of ' + batches.length;
+          await step({ step: 'files', files: batches[i].files });
+          tick(batches[i].size);
+        }
+        for (var j = 0; j < dbJobs.length; j++) {
+          var job = dbJobs[j];
+          line.textContent = job.tables ? 'Exporting the database\u2026 ' + (j + 1) + ' of ' + dbJobs.length : 'Exporting ' + job.table + ' (part ' + job.part + ' of ' + job.parts + ')\u2026';
+          await step(job.tables ? { step: 'database', tables: job.tables } : { step: 'database', table: job.table, part: job.part, rows_per_part: job.rows });
+          tick(job.size);
+        }
+        line.textContent = 'Finishing the zip\u2026';
+        var fin = await step({ step: 'finish' });
+        bar.set(100);
+        if (close) close(null);
+        D.download(fin.url, fin.file_name);
+        var choice = await D.modal({
+          title: 'Backup ready',
+          body: h('div', { class: 'dsk-stack', style: { gap: '10px' } },
+            h('p', null, h('strong', null, fin.file_name), ' (' + D.fmt.size(fin.size) + ') is downloading.'),
+            h('p', { class: 'muted' }, 'Delete it from the server once the download finishes? It\u2019s a full copy of the site in a public folder (with an unguessable name).')),
+          actions: [{ label: 'Keep it for now', value: 'keep' }, { label: 'Delete from server', kind: 'primary', value: 'delete' }]
+        });
+        if (choice === 'delete') { await cleanupArchive(); D.toast('Backup zip deleted from the server.'); }
+        D.loadStatus();
+      } catch (e) {
+        if (close) close(null);
+        await cleanupArchive();
+        if (!cancelled) D.toast('The backup did not finish: ' + D.errorText(e), 'error'); else D.toast('Backup cancelled.');
+      }
+      async function cleanupArchive() {
+        var base = archive.replace(/\.zip$/, '');
+        for (var n of [archive, base + '-database.db.txt']) {
+          try { await D.api.post('cleanup-file', { backup_token: token, file_name: n }); } catch (x) { /* best effort */ }
+        }
+      }
     }
 
     /* CLI commands */
