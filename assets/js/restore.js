@@ -64,7 +64,7 @@
    * }
    */
   D.runMove = function (view, opts) {
-    var importId = D.randomHex(24), rollbackId = '';
+    var importId = D.randomHex(24), rollbackId = '', codeMentions = null;
     var log = h('div', { class: 'dsk-log', hidden: true });
     var stepEls = {}, current = null, line = h('div', { class: 'muted', style: { minHeight: '20px', marginTop: '10px', fontFamily: 'var(--mono)', fontSize: '12.5px' } });
     var steps = h('div', { class: 'dsk-steps' }, STEPS.map(function (s, i) {
@@ -224,7 +224,13 @@
             rlog('Rewriting ' + srcHome + ' → ' + destHome + '…');
             var sr = await api.post('import/search-replace', t({ from: srcHome, to: destHome }));
             rlog(D.fmt.num(sr.cells_changed || 0) + ' cells updated.');
-            stepEls.urls.meta.textContent = D.fmt.num(sr.cells_changed || 0) + ' cells';
+            stepEls.urls.meta.textContent = D.fmt.num(sr.cells_changed || 0) + ' cells' + (sr.files_rewritten ? ' · ' + D.fmt.plural(sr.files_rewritten, 'file') : '');
+            if (sr.files_rewritten) rlog('Rewrote the old address in ' + D.fmt.plural(sr.files_rewritten, 'file') + ' under uploads (' + (sr.files_rewritten_list || []).slice(0, 3).join(', ') + (sr.files_rewritten > 3 ? ', \u2026' : '') + ').');
+            if (sr.elementor_css_cleared) rlog('Cleared Elementor\u2019s generated CSS so it rebuilds with the new address.');
+            if (sr.files_mentioning_total) {
+              codeMentions = { total: sr.files_mentioning_total, list: sr.files_mentioning_source || [], from: srcHome };
+              rlog(D.fmt.plural(sr.files_mentioning_total, 'theme or plugin file') + (sr.files_mentioning_total === 1 ? ' still mentions ' : ' still mention ') + srcHome + ' (left as is).', 'dim');
+            }
           } else skip('urls', 'same address');
         } else { skip('db', 'none in backup'); skip('urls', 'not needed'); }
 
@@ -235,6 +241,13 @@
         rlog('Done.', 'ok');
         title.textContent = opts.doneTitle || 'Restored';
         opts.done(outcome, ctx);
+        if (codeMentions) {
+          outcome.appendChild(h('div', { style: { marginTop: '14px' } }, D.note('warn', [
+            h('strong', null, D.fmt.plural(codeMentions.total, 'theme or plugin file') + (codeMentions.total === 1 ? ' still mentions ' : ' still mention ') + D.host(codeMentions.from) + '. '),
+            'Disembark doesn\u2019t edit code, so check these by hand:',
+            h('ul', { style: { margin: '8px 0 0', paddingLeft: '18px', fontFamily: 'var(--mono)', fontSize: '12px' } }, codeMentions.list.map(function (f) { return h('li', null, f); }),
+              codeMentions.total > codeMentions.list.length ? h('li', null, '\u2026 and ' + (codeMentions.total - codeMentions.list.length) + ' more') : null)])));
+        }
       } catch (e) {
         var msg = D.errorText(e);
         rlog('ERROR: ' + msg, 'err');

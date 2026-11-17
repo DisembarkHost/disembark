@@ -302,7 +302,26 @@ class Import {
                 return true;
             }
         }
+        // Never overwrite the Disembark that is running this restore. The
+        // backup carries the source's copy (often another version), and every
+        // step after the file deploy (database import, URL rewrite, finalize)
+        // would otherwise run the source's code. The destination keeps its own.
+        $own = self::own_plugin_dir();
+        if ( $own !== '' && ( $rel === rtrim( $own, '/' ) || strpos( $rel, $own ) === 0 ) ) {
+            return true;
+        }
         return false;
+    }
+
+    /** This plugin's folder relative to the site root ("wp-content/plugins/disembark/"), or ''. */
+    private static function own_plugin_dir() {
+        static $dir = null;
+        if ( $dir === null ) {
+            $web_root = rtrim( wp_normalize_path( dirname( WP_CONTENT_DIR ) ), '/' ) . '/';
+            $plugin   = rtrim( wp_normalize_path( dirname( __DIR__ ) ), '/' ) . '/';
+            $dir      = strpos( $plugin, $web_root ) === 0 ? substr( $plugin, strlen( $web_root ) ) : '';
+        }
+        return $dir;
     }
 
     private function list_staged_files( $root ) {
@@ -918,6 +937,97 @@ class Import {
     }
 
     /**
+     * After a restore's database rewrite: rewrites the old address in text
+     * files the restore brought in under the uploads folder (page-builder CSS
+     * and the like, #10), clears Elementor's generated CSS so it rebuilds from
+     * the rewritten data, and lists theme and plugin files that still mention
+     * the old address (reported, never edited: that's code). Safe to roll
+     * back: these files were deployed by this import, and rollback restores
+     * whatever was there before.
+     */
+    public function rewrite_files( $pairs ) {
+        $report = [ 'files_rewritten' => 0, 'files_rewritten_list' => [], 'files_mentioning_source' => [], 'files_mentioning_total' => 0, 'elementor_css_cleared' => false ];
+        // Deploying moves files out of staging, so the list of what this
+        // import put in place comes from its rollback metadata.
+        $meta = is_file( $this->rollback_path . '/meta.json' ) ? json_decode( (string) file_get_contents( $this->rollback_path . '/meta.json' ), true ) : null;
+        $deployed = is_array( $meta ) ? array_unique( (array) ( $meta['deployed_files'] ?? [] ) ) : [];
+        if ( ! $deployed ) {
+            return $report;
+        }
+        $web_root = wp_normalize_path( dirname( WP_CONTENT_DIR ) );
+        $uploads  = ltrim( substr( wp_normalize_path( wp_upload_dir()['basedir'] ), strlen( $web_root ) ), '/' ) . '/';
+        $content  = ltrim( substr( wp_normalize_path( WP_CONTENT_DIR ), strlen( $web_root ) ), '/' ) . '/';
+        $code_dirs = [ $content . 'themes/', $content . 'plugins/', $content . 'mu-plugins/' ];
+
+        foreach ( $deployed as $rel ) {
+            $rel = ltrim( str_replace( '\\', '/', (string) $rel ), '/' );
+            if ( $rel === '' || ! self::is_safe_relative_path( $rel ) ) {
+                continue;
+            }
+            $in_uploads = strpos( $rel, $uploads ) === 0;
+            $rewrite    = $in_uploads && preg_match( '/\.(css|js|json|html?|svg|xml|txt)$/i', $rel ) && strpos( $rel, $uploads . 'disembark/' ) !== 0;
+            $report_it  = ! $in_uploads && preg_match( '/\.(php|css|js|html?|json)$/i', $rel );
+            if ( $report_it ) {
+                $report_it = false;
+                foreach ( $code_dirs as $dir ) {
+                    if ( strpos( $rel, $dir ) === 0 ) { $report_it = true; break; }
+                }
+            }
+            if ( ! $rewrite && ! $report_it ) {
+                continue;
+            }
+            $path = $web_root . '/' . $rel;
+            $size = is_file( $path ) ? filesize( $path ) : 0;
+            if ( ! $size || $size > ( $rewrite ? 5 : 1 ) * 1024 * 1024 ) {
+                continue;
+            }
+            $contents = file_get_contents( $path );
+            if ( $contents === false || ! self::contains_any( $contents, $pairs ) ) {
+                continue;
+            }
+            if ( $rewrite ) {
+                $updated = strtr( $contents, $pairs );
+                if ( $updated !== $contents && file_put_contents( $path, $updated ) !== false ) {
+                    $report['files_rewritten']++;
+                    if ( count( $report['files_rewritten_list'] ) < 25 ) {
+                        $report['files_rewritten_list'][] = $rel;
+                    }
+                }
+            } else {
+                $report['files_mentioning_total']++;
+                if ( count( $report['files_mentioning_source'] ) < 25 ) {
+                    $report['files_mentioning_source'][] = $rel;
+                }
+            }
+        }
+        $report['elementor_css_cleared'] = self::clear_elementor_css();
+        return $report;
+    }
+
+    /**
+     * Elementor writes per-page CSS (with absolute image URLs) to
+     * uploads/elementor/css and records it in _elementor_css. Clearing both,
+     * as its own "Regenerate CSS" does, makes it rebuild on the next view.
+     */
+    private static function clear_elementor_css() {
+        global $wpdb;
+        $dir = wp_upload_dir()['basedir'] . '/elementor/css';
+        if ( ! is_dir( $dir ) ) {
+            return false;
+        }
+        foreach ( (array) glob( $dir . '/*.css' ) as $file ) {
+            @unlink( $file );
+        }
+        $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->postmeta} WHERE meta_key = %s", '_elementor_css' ) );
+        foreach ( [ '_elementor_global_css', 'elementor-custom-breakpoints-files' ] as $option ) {
+            $wpdb->delete( $wpdb->options, [ 'option_name' => $option ] );
+            wp_cache_delete( $option, 'options' );
+        }
+        wp_cache_delete( 'alloptions', 'options' );
+        return true;
+    }
+
+    /**
      * Every saved rollback point (newest first): what it was for, when, how
      * big, and whether it has been rolled back to.
      */
@@ -984,6 +1094,22 @@ class Import {
      */
     public static function replacement_pairs( $from, $to ) {
         $pairs = [ $from => $to ];
+
+        // Percent-encoded spellings (#9): redirect and return-URL parameters,
+        // settings that store an encoded address. rawurlencode() output, its
+        // lowercase-hex form and double encoding, each rewritten in its own
+        // encoding so a redirect wrapper keeps its own URL.
+        $enc_from = rawurlencode( $from );
+        if ( $enc_from !== $from ) {
+            $enc_to = rawurlencode( $to );
+            $lower  = function ( $value ) {
+                return preg_replace_callback( '/%[0-9A-F]{2}/', function ( $m ) { return strtolower( $m[0] ); }, $value );
+            };
+            $pairs[ $enc_from ]               = $enc_to;
+            $pairs[ $lower( $enc_from ) ]     = $lower( $enc_to );
+            $pairs[ rawurlencode( $enc_from ) ] = rawurlencode( $enc_to );
+        }
+
         if ( strpos( $from, '/' ) === false ) {
             return $pairs;
         }

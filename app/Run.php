@@ -1302,7 +1302,13 @@ class Run {
         }
 
         $import = new Import( $import_id );
-        return $import->search_replace( $from, $to, $tables );
+        $result = $import->search_replace( $from, $to, $tables );
+        // A restore also fixes the old address in the text files it brought
+        // in (uploads) and reports code that still mentions it.
+        if ( $import_id !== '' && is_array( $result ) ) {
+            $result = array_merge( $result, $import->rewrite_files( Import::replacement_pairs( $from, $to ) ) );
+        }
+        return $result;
     }
 
     function import_rollback( $request ) {
