@@ -823,9 +823,10 @@ class Run {
         $token = $params['token'] ?? null;
         $file_path = $params['file'] ?? null;
         
-        // New params for chunking
-        $offset = isset($params['offset']) ? (int)$params['offset'] : 0;
-        $length = isset($params['length']) ? (int)$params['length'] : null;
+        // New params for chunking. Negative values are clamped (a negative
+        // length used to reach fread() and throw a ValueError).
+        $offset = isset($params['offset']) ? max( 0, (int)$params['offset'] ) : 0;
+        $length = isset($params['length']) ? max( 0, (int)$params['length'] ) : null;
 
         // Manually create a new request object for User::allowed()
         $auth_request = new \WP_REST_Request();
@@ -870,11 +871,17 @@ class Run {
         header('Cache-Control: must-revalidate');
         header('Pragma: public');
         
+        // Never promise more bytes than the file has past the offset.
+        $available = max( 0, filesize( $full_path ) - $offset );
+        if ( $length !== null ) {
+            $length = min( $length, $available );
+        }
+
         // If length is specified, we are sending a partial content
         if ($length !== null) {
              header('Content-Length: ' . $length);
         } else {
-             header('Content-Length: ' . filesize($full_path));
+             header('Content-Length: ' . $available);
         }
         
         flush();

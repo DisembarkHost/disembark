@@ -8,7 +8,7 @@
     "download_url": "https://github.com/DisembarkHost/disembark/releases/download/v2.8.0/disembark.zip",
     "requires": "5.6",
     "tested": "6.9",
-    "requires_php": "5.6",
+    "requires_php": "7.0",
     "added": "2024-06-05 16:00:00",
     "last_updated": "2026-07-17 16:00:00",
     "homepage": "https://disembark.host",

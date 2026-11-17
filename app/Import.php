@@ -31,6 +31,20 @@ class Import {
      * it is deployed to the web root, so a guard file there would overwrite
      * the site's own index.php.
      */
+    /**
+     * Largest upload chunk this host accepts, capped at 20 MB. Hosts with a
+     * small upload_max_filesize or post_max_size would otherwise reject the
+     * dashboard's and CLI's chunks outright.
+     */
+    public static function upload_chunk_bytes() {
+        $max = function_exists( 'wp_max_upload_size' ) ? (int) wp_max_upload_size() : 0;
+        if ( $max <= 0 ) {
+            $max = 20 * 1024 * 1024;
+        }
+        // Leave room for the multipart envelope and the other form fields.
+        return (int) max( 256 * 1024, min( 20 * 1024 * 1024, $max - 64 * 1024 ) );
+    }
+
     private function prepare_import_dir() {
         Storage::ensure_dir( $this->import_path );
     }
@@ -100,6 +114,7 @@ class Import {
             'abspath'            => ABSPATH,
             'upload_max_filesize' => ini_get( 'upload_max_filesize' ),
             'post_max_size'      => ini_get( 'post_max_size' ),
+            'upload_chunk_bytes' => self::upload_chunk_bytes(),
             'max_execution_time' => ini_get( 'max_execution_time' ),
             'tables'             => $tables,
             'php_version'        => phpversion(),
@@ -524,6 +539,10 @@ class Import {
         $remap = ( $old_prefix !== '' && $new_prefix !== '' && $old_prefix !== $new_prefix );
         $out   = [];
         foreach ( $statements as $statement ) {
+            // mysqldump puts "-- ..." comment lines in front of DROP TABLE and
+            // LOCK TABLES. The statement anchors below would miss those, so
+            // leading comments go first (executable /*!...*/ ones are kept).
+            $statement = self::strip_leading_comments( $statement );
             if ( $remap ) {
                 $statement = preg_replace_callback(
                     '/^((?:\/\*!\d+\s+)?(?:CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT\s+INTO|REPLACE\s+INTO|ALTER\s+TABLE|LOCK\s+TABLES|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|TRUNCATE\s+TABLE)\s+`)' . preg_quote( $old_prefix, '/' ) . '/i',
@@ -532,6 +551,10 @@ class Import {
                     },
                     $statement
                 );
+                // Foreign keys name their parent table too.
+                if ( preg_match( '/^(?:\/\*!\d+\s+)?(?:CREATE|ALTER)\s+TABLE/i', $statement ) ) {
+                    $statement = preg_replace( '/(\bREFERENCES\s+`)' . preg_quote( $old_prefix, '/' ) . '/i', '${1}' . str_replace( [ '\\', '$' ], [ '\\\\', '\\$' ], $new_prefix ), $statement );
+                }
             }
             if ( preg_match( '/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`([^`]+)`/i', $statement, $m ) ) {
                 $out[] = 'DROP TABLE IF EXISTS `' . $m[1] . '`';
@@ -539,6 +562,37 @@ class Import {
             $out[] = $statement;
         }
         return $out;
+    }
+
+    /**
+     * Drops "-- ", "#" and plain block comments (and whitespace) from the start
+     * of a statement. MySQL executable comments (slash-star-bang, such as
+     * the 40101 SET lines in mysqldump output) are kept: they are the statement.
+     */
+    private static function strip_leading_comments( $statement ) {
+        $i   = 0;
+        $len = strlen( $statement );
+        while ( $i < $len ) {
+            $c = $statement[ $i ];
+            if ( $c === ' ' || $c === "\t" || $c === "\n" || $c === "\r" ) {
+                $i++;
+            } elseif ( $c === '#' || ( $c === '-' && substr( $statement, $i, 2 ) === '--' && ( $i + 2 >= $len || strpos( " \t\r\n", $statement[ $i + 2 ] ) !== false ) ) ) {
+                $nl = strpos( $statement, "\n", $i );
+                if ( $nl === false ) {
+                    return '';
+                }
+                $i = $nl + 1;
+            } elseif ( $c === '/' && substr( $statement, $i, 2 ) === '/*' && substr( $statement, $i, 3 ) !== '/*!' ) {
+                $end = strpos( $statement, '*/', $i + 2 );
+                if ( $end === false ) {
+                    return '';
+                }
+                $i = $end + 2;
+            } else {
+                break;
+            }
+        }
+        return $i ? substr( $statement, $i ) : $statement;
     }
 
     /**

@@ -1213,8 +1213,9 @@ createApp({
         },
         // Uploads the backup zip to staging: chunked so large files never need a
         // single huge request, then extracted server-side.
-        async uploadRestoreZip(file, importId) {
-            const CHUNK = 20 * 1024 * 1024; // 20MB
+        async uploadRestoreZip(file, importId, chunkBytes) {
+            // The destination reports the largest chunk its PHP limits accept.
+            const CHUNK = chunkBytes > 0 ? chunkBytes : 20 * 1024 * 1024;
             const total = Math.max(1, Math.ceil(file.size / CHUNK));
             if (total === 1) {
                 const fd = new FormData();
@@ -1306,7 +1307,7 @@ createApp({
                     const file = Array.isArray(this.restore.file) ? this.restore.file[0] : this.restore.file;
                     if (!file) { this.restore.running = false; return; }
                     this.rlog('Uploading backup...');
-                    await this.uploadRestoreZip(file, importId);
+                    await this.uploadRestoreZip(file, importId, pre.upload_chunk_bytes);
                 }
 
                 this.rlog('Reading backup...');
