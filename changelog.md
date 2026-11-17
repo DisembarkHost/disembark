@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+* **URLs inside JSON are rewritten on restore ([#6](https://github.com/DisembarkHost/disembark/issues/6)):** Search/replace now also matches the escaped spellings JSON uses for a URL (`http:\/\/…`, JSON stored inside JSON, and `\u002F`), each rewritten in its own encoding so the JSON stays valid. This covers PHP's default `json_encode()` output, including page-builder data such as Elementor's `_elementor_data`.
+* **Protected and private object properties are rewritten on restore ([#7](https://github.com/DisembarkHost/disembark/issues/7)):** Serialized values are now rewritten token by token instead of being unserialized and re-serialized, so URLs in non-public properties (including a parent class's private ones) are updated. No restored object is instantiated during the rewrite, so no plugin `__wakeup()`/`__destruct()` code runs, objects whose class isn't loaded or that have readonly properties are handled, and every byte outside a replaced string (floats, references, `Serializable` payloads) is kept exactly as stored.
+
 ## **v2.8.0** - July 17, 2026
 
 ### Added

@@ -602,6 +602,8 @@ class Import {
             $tables = $wpdb->get_col( 'SHOW TABLES' );
         }
 
+        $pairs = self::replacement_pairs( $from, $to );
+
         $rows_changed  = 0;
         $cells_changed = 0;
         $tables_seen   = 0;
@@ -645,10 +647,10 @@ class Import {
                         if ( ! is_string( $value ) || $value === '' ) {
                             continue;
                         }
-                        if ( strpos( $value, $from ) === false ) {
+                        if ( ! self::contains_any( $value, $pairs ) ) {
                             continue;
                         }
-                        $replaced = self::recursive_unserialize_replace( $from, $to, $value );
+                        $replaced = self::replace_in_value( $value, $pairs );
                         if ( $replaced !== $value ) {
                             $update[ $column ] = $replaced;
                             $cells_changed++;
@@ -678,45 +680,221 @@ class Import {
         ];
     }
 
-    /**
-     * Recursively replaces $from with $to inside a value, re-serializing PHP
-     * serialized strings so their length prefixes stay valid. Mirrors the
-     * approach used by WP-CLI search-replace / interconnectit's srdb.
-     */
-    private static function recursive_unserialize_replace( $from, $to, $data, $serialised = false ) {
-        try {
-            if ( is_string( $data ) && $data !== '' && ( $unserialized = @unserialize( $data ) ) !== false ) {
-                $data = self::recursive_unserialize_replace( $from, $to, $unserialized, true );
-            } elseif ( is_array( $data ) ) {
-                $result = [];
-                foreach ( $data as $key => $value ) {
-                    $result[ $key ] = self::recursive_unserialize_replace( $from, $to, $value, false );
-                }
-                $data = $result;
-                unset( $result );
-            } elseif ( is_object( $data ) ) {
-                $result = clone $data;
-                foreach ( get_object_vars( $data ) as $key => $value ) {
-                    // Skip protected/private mangled property names.
-                    if ( $key === '' || ord( $key[0] ) === 0 ) {
-                        continue;
-                    }
-                    $result->$key = self::recursive_unserialize_replace( $from, $to, $value, false );
-                }
-                $data = $result;
-                unset( $result );
-            } elseif ( is_string( $data ) ) {
-                $data = str_replace( $from, $to, $data );
+    private static function contains_any( $value, $pairs ) {
+        foreach ( $pairs as $search => $replace ) {
+            if ( strpos( $value, (string) $search ) !== false ) {
+                return true;
             }
+        }
+        return false;
+    }
 
-            if ( $serialised ) {
-                return serialize( $data );
-            }
-        } catch ( \Exception $e ) {
-            // On any failure, leave the value untouched rather than corrupt it.
+    /**
+     * The spellings a URL takes in stored data, each mapped to its replacement.
+     * The import screen and the CLI pass the plain home URLs, but JSON written
+     * by PHP's default encoder escapes every slash (http:\/\/), JSON stored
+     * inside JSON escapes it twice (http:\\\/\\\/), and some encoders spell it
+     * as \u002F. Each form is rewritten in its own encoding so the JSON stays
+     * valid. Elementor's _elementor_data is the common real-world case.
+     *
+     * @return array<string,string> search => replace, ready for strtr().
+     */
+    public static function replacement_pairs( $from, $to ) {
+        $pairs = [ $from => $to ];
+        if ( strpos( $from, '/' ) === false ) {
+            return $pairs;
+        }
+        $escapes = [ '\/', '\\\\\\/', '\u002F', '\u002f' ];
+        foreach ( $escapes as $escape ) {
+            $pairs[ str_replace( '/', $escape, $from ) ] = str_replace( '/', $escape, $to );
+        }
+        return $pairs;
+    }
+
+    /**
+     * Replaces every search key of $pairs in one value. PHP serialized data is
+     * rewritten token by token (see rewrite_serialized()) so length prefixes
+     * stay valid; anything else gets a single-pass strtr(), which never
+     * re-matches its own output when the new URL contains the old one.
+     */
+    public static function replace_in_value( $value, $pairs, $depth = 0 ) {
+        if ( ! is_string( $value ) || $value === '' ) {
+            return $value;
         }
 
-        return $data;
+        if ( $depth < 32 && self::looks_serialized( $value ) ) {
+            $offset    = 0;
+            $rewritten = self::rewrite_serialized( $value, $offset, $pairs, $depth, 0 );
+            if ( $rewritten !== null && $offset === strlen( $value ) ) {
+                // Safety net: never turn a value PHP can read into one it can't.
+                if ( $rewritten !== $value && ! self::unserializes( $rewritten ) && self::unserializes( $value ) ) {
+                    return $value;
+                }
+                return $rewritten;
+            }
+        }
+
+        return strtr( $value, $pairs );
+    }
+
+    private static function looks_serialized( $value ) {
+        if ( $value === 'N;' ) {
+            return true;
+        }
+        return strlen( $value ) >= 4
+            && strpos( 'bidsaOCE', $value[0] ) !== false
+            && $value[1] === ':'
+            && in_array( substr( $value, -1 ), [ ';', '}' ], true );
+    }
+
+    private static function unserializes( $value ) {
+        return $value === 'b:0;' || @unserialize( $value, [ 'allowed_classes' => false ] ) !== false;
+    }
+
+    /**
+     * Walks one PHP serialized value starting at $i and returns it with every
+     * string payload replaced and its s:N length fixed, or null if the input is
+     * not well formed. Works on the serialized text itself rather than calling
+     * unserialize(), so:
+     *  - protected and private object properties (mangled \0 names) are
+     *    rewritten like public ones,
+     *  - no class is instantiated, so no __wakeup()/__unserialize()/
+     *    __destruct() code runs during a restore and readonly properties or
+     *    classes missing on the destination don't matter,
+     *  - every byte outside a replaced string (floats, ints, references,
+     *    Serializable C: payloads, enums) is kept exactly as stored.
+     * Array keys and property names are copied unchanged; string payloads are
+     * passed back through replace_in_value(), so nested serialized strings and
+     * JSON inside them are handled too.
+     */
+    private static function rewrite_serialized( $s, &$i, $pairs, $depth, $level ) {
+        if ( $level > 512 || ! isset( $s[ $i ] ) ) {
+            return null;
+        }
+        $type = $s[ $i ];
+
+        if ( $type === 'N' ) {
+            if ( substr( $s, $i, 2 ) !== 'N;' ) {
+                return null;
+            }
+            $i += 2;
+            return 'N;';
+        }
+
+        if ( ( $type === 'b' || $type === 'i' || $type === 'd' || $type === 'r' || $type === 'R' ) ) {
+            if ( ( $s[ $i + 1 ] ?? '' ) !== ':' ) {
+                return null;
+            }
+            $end = strpos( $s, ';', $i + 2 );
+            if ( $end === false ) {
+                return null;
+            }
+            $scalar  = substr( $s, $i + 2, $end - $i - 2 );
+            $pattern = $type === 'd' ? '/^(-?INF|NAN|[-+0-9.eE]+)$/' : '/^-?[0-9]+$/';
+            if ( ! preg_match( $pattern, $scalar ) ) {
+                return null;
+            }
+            $token = substr( $s, $i, $end - $i + 1 );
+            $i     = $end + 1;
+            return $token;
+        }
+
+        if ( $type === 's' ) {
+            $string = self::read_length_prefixed( $s, $i, '";' );
+            if ( $string === null ) {
+                return null;
+            }
+            $new = self::replace_in_value( $string, $pairs, $depth + 1 );
+            return 's:' . strlen( $new ) . ':"' . $new . '";';
+        }
+
+        if ( $type === 'E' ) {
+            $start = $i;
+            if ( self::read_length_prefixed( $s, $i, '";' ) === null ) {
+                return null;
+            }
+            return substr( $s, $start, $i - $start );
+        }
+
+        if ( $type === 'C' ) {
+            // C:len:"Class":len:{payload} — the payload's format belongs to the
+            // class, so it is copied untouched.
+            $start = $i;
+            if ( self::read_length_prefixed( $s, $i, '":' ) === null ) {
+                return null;
+            }
+            if ( ! preg_match( '/\G([0-9]+):\{/', $s, $m, 0, $i ) ) {
+                return null;
+            }
+            $i += strlen( $m[0] ) + (int) $m[1];
+            if ( ( $s[ $i ] ?? '' ) !== '}' ) {
+                return null;
+            }
+            $i++;
+            return substr( $s, $start, $i - $start );
+        }
+
+        if ( $type === 'a' || $type === 'O' ) {
+            $start = $i;
+            if ( $type === 'O' ) {
+                if ( self::read_length_prefixed( $s, $i, '":' ) === null ) {
+                    return null;
+                }
+                if ( ! preg_match( '/\G([0-9]+):\{/', $s, $m, 0, $i ) ) {
+                    return null;
+                }
+            } elseif ( ! preg_match( '/\Ga:([0-9]+):\{/', $s, $m, 0, $i ) ) {
+                return null;
+            }
+            $count  = (int) $m[1];
+            $i     += strlen( $m[0] );
+            $output = substr( $s, $start, $i - $start );
+
+            for ( $n = 0; $n < $count; $n++ ) {
+                // Key / property name: copied as stored.
+                $key_start = $i;
+                if ( ( $s[ $i ] ?? '' ) === 'i' ) {
+                    if ( self::rewrite_serialized( $s, $i, [], $depth, $level + 1 ) === null ) {
+                        return null;
+                    }
+                } elseif ( self::read_length_prefixed( $s, $i, '";' ) === null ) {
+                    return null;
+                }
+                $output .= substr( $s, $key_start, $i - $key_start );
+
+                $value = self::rewrite_serialized( $s, $i, $pairs, $depth, $level + 1 );
+                if ( $value === null ) {
+                    return null;
+                }
+                $output .= $value;
+            }
+
+            if ( ( $s[ $i ] ?? '' ) !== '}' ) {
+                return null;
+            }
+            $i++;
+            return $output . '}';
+        }
+
+        return null;
+    }
+
+    /**
+     * Reads X:len:"payload" followed by $terminator at $i (s:, E:, and the
+     * class name of O:/C:), advances $i past the terminator and returns the
+     * payload, or null if the length doesn't land on the terminator.
+     */
+    private static function read_length_prefixed( $s, &$i, $terminator ) {
+        if ( ! preg_match( '/\G[sEOC]:([0-9]+):"/', $s, $m, 0, $i ) ) {
+            return null;
+        }
+        $length = (int) $m[1];
+        $start  = $i + strlen( $m[0] );
+        if ( substr( $s, $start + $length, strlen( $terminator ) ) !== $terminator ) {
+            return null;
+        }
+        $i = $start + $length + strlen( $terminator );
+        return substr( $s, $start, $length );
     }
 
     /**
