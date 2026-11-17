@@ -24,8 +24,14 @@ class Run {
             \WP_CLI::add_command( 'disembark', new class {}, [
                 'shortdesc' => 'Disembark helper commands.',
             ] );
-            \WP_CLI::add_command( 'disembark token', [ 'Disembark\Command', "token" ]  );
+            \WP_CLI::add_command( 'disembark token', [ 'Disembark\Command', 'token' ] );
+            \WP_CLI::add_command( 'disembark connect-line', [ 'Disembark\Command', 'cli_info' ] );
             \WP_CLI::add_command( 'disembark cli-info', [ 'Disembark\Command', 'cli_info' ] );
+            \WP_CLI::add_command( 'disembark pull', [ 'Disembark\Command', 'pull' ] );
+            \WP_CLI::add_command( 'disembark restore-points', [ 'Disembark\Command', 'restore_points' ] );
+            \WP_CLI::add_command( 'disembark rollback', [ 'Disembark\Command', 'rollback' ] );
+            \WP_CLI::add_command( 'disembark delete-restore-point', [ 'Disembark\Command', 'delete_restore_point' ] );
+            \WP_CLI::add_command( 'disembark search-replace', [ 'Disembark\Command', 'search_replace' ] );
         }
     }
 
@@ -1162,8 +1168,11 @@ class Run {
             return new \WP_Error( 'missing_params', 'import_id and files array required.', [ 'status' => 400 ] );
         }
 
+        // keep_host_files (default on) leaves the destination's mu-plugins
+        // and cache drop-ins in place; false brings the source's over too.
+        $keep   = ! array_key_exists( 'keep_host_files', $params ) || ! empty( $params['keep_host_files'] );
         $import = new Import( $import_id );
-        return $import->deploy_files( $files );
+        return $import->deploy_files( $files, $keep );
     }
 
     function import_sql( $request ) {

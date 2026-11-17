@@ -397,10 +397,32 @@ class Import {
             }
         }
         return [
-            'files'    => $this->count_staged_files(),
-            'sql_file' => $sql_rel,
-            'source'   => $source,
+            'files'     => $this->count_staged_files(),
+            'sql_file'  => $sql_rel,
+            'source'    => $source,
+            'multisite' => $this->staged_multisite_constants(),
         ];
+    }
+
+    /**
+     * The multisite define() lines from the staged wp-config.php, or [] when
+     * the source isn't a network. A restore keeps the destination's own
+     * wp-config.php, so these have to be added there by hand.
+     */
+    private function staged_multisite_constants() {
+        foreach ( [ '/public/wp-config.php', '/wp-config.php' ] as $rel ) {
+            $file = $this->staging_path . $rel;
+            if ( ! is_file( $file ) ) {
+                continue;
+            }
+            $config = (string) file_get_contents( $file, false, null, 0, 262144 );
+            if ( ! preg_match( '/define\(\s*[\'"]MULTISITE[\'"]\s*,\s*true\s*\)/i', $config ) ) {
+                return [];
+            }
+            preg_match_all( '/^\s*define\(\s*[\'"](WP_ALLOW_MULTISITE|MULTISITE|SUBDOMAIN_INSTALL|DOMAIN_CURRENT_SITE|PATH_CURRENT_SITE|SITE_ID_CURRENT_SITE|BLOG_ID_CURRENT_SITE|SUNRISE|NOBLOGREDIRECT|COOKIE_DOMAIN)[\'"].*?\);/mi', $config, $m );
+            return array_map( 'trim', $m[0] );
+        }
+        return [];
     }
 
     /**
@@ -483,11 +505,12 @@ class Import {
      * Deploys files from staging to their final WordPress paths.
      * Backs up originals for rollback tracking.
      */
-    public function deploy_files( $files ) {
+    public function deploy_files( $files, $keep_host_files = true ) {
         $web_root  = dirname( WP_CONTENT_DIR );
         $deployed  = [];
         $errors    = [];
         $backed_up = [];
+        $kept      = [];
 
         // The dashboard (thin client) can't list staged files, so it passes
         // ["*"] to deploy everything. A whole-snapshot zip nests the site under
@@ -522,6 +545,15 @@ class Import {
             // the web root, even when a client lists it explicitly.
             if ( self::never_deploy( $relative_path ) ) {
                 continue;
+            }
+            // Leave the destination's host setup alone: its mu-plugins and
+            // cache drop-ins belong to the server, not the site being moved.
+            if ( $keep_host_files ) {
+                $host = self::host_file( $relative_path, $web_root );
+                if ( $host !== '' ) {
+                    $kept[ $host ] = true;
+                    continue;
+                }
             }
 
             // Backup original if it exists
@@ -565,9 +597,57 @@ class Import {
         }
 
         return [
-            'deployed' => count( $deployed ),
-            'errors'   => $errors,
+            'deployed'        => count( $deployed ),
+            'errors'          => $errors,
+            'host_files_kept' => array_keys( $kept ),
         ];
+    }
+
+    /**
+     * Names of mu-plugins that hosts install for their own platform. A site
+     * leaving one of these hosts carries them along, and they don't belong
+     * (or work) anywhere else. Matched against the first path segment under
+     * mu-plugins/, case-insensitively, as a prefix.
+     */
+    const HOST_MU_PLUGINS = [
+        'wpengine', 'wpe-', 'mu-plugin.php', 'slt-force-strong-passwords', 'force-strong-passwords', 'stop-long-comments',
+        'kinsta-mu-plugins', 'gd-system-plugin', 'pantheon', 'wpcomsh', 'endurance-', 'flywheel', 'pressable',
+        'sg-security', 'sg-cachepress', 'wp-cloudflare-page-cache', 'liquidweb', 'nexcess', 'cloudways', 'bluehost',
+        'dreamhost', 'hostinger', 'ionos',
+    ];
+
+    /**
+     * When $relative_path is part of the destination's host setup, the name
+     * to report it under; '' when it should be deployed. Covers:
+     * - mu-plugins the destination already has (its whole entry is kept),
+     * - mu-plugins known to belong to a hosting platform,
+     * - the cache and database drop-ins (object-cache.php, advanced-cache.php,
+     *   db.php), which point at the source host's services.
+     */
+    private static function host_file( $relative_path, $web_root ) {
+        $rel = ltrim( str_replace( '\\', '/', (string) $relative_path ), '/' );
+        foreach ( [ 'object-cache.php', 'advanced-cache.php', 'db.php' ] as $dropin ) {
+            if ( $rel === 'wp-content/' . $dropin ) {
+                return $rel;
+            }
+        }
+        $mu = 'wp-content/mu-plugins/';
+        if ( strpos( $rel, $mu ) !== 0 ) {
+            return '';
+        }
+        $top = strtok( substr( $rel, strlen( $mu ) ), '/' );
+        if ( $top === false || $top === '' ) {
+            return '';
+        }
+        if ( file_exists( $web_root . '/' . $mu . $top ) ) {
+            return $mu . $top;
+        }
+        foreach ( self::HOST_MU_PLUGINS as $name ) {
+            if ( stripos( $top, $name ) === 0 ) {
+                return $mu . $top;
+            }
+        }
+        return '';
     }
 
     /**

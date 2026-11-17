@@ -191,7 +191,7 @@
         h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('database'), 'Database'), h('span', { class: 'grow' }), D.toggle('Include', S.includeDb, function (v) { D.store.set({ includeDb: v }); body.hidden = !v; tools.hidden = !v; })),
         null, body);
       var tools = h('div', { class: 'dsk-row', style: { padding: '10px 14px', borderBottom: '1px solid var(--line)' } },
-        h('div', { style: { flex: 1, minWidth: '160px' } }, D.search('Search tables', function (v) { q = v; renderList(); })),
+        h('div', { style: { flex: '1 1 120px', minWidth: '120px' } }, D.search('Search tables', function (v) { q = v; renderList(); })),
         sortBtn,
         h('button', { class: 'dsk-btn ghost sm', onclick: function () { setIncluded(visible().map(function (t) { return t.table; }), true); } }, 'All'),
         h('button', { class: 'dsk-btn ghost sm', onclick: function () { setIncluded(visible().map(function (t) { return t.table; }), false); } }, 'None'));

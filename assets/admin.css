@@ -202,7 +202,7 @@ body.tools_page_disembark .notice, body.tools_page_disembark .update-nag { margi
 .dsk-step.done .mark { background: var(--teal); border-color: var(--teal); color: #fff; }
 .dsk-step.failed { color: var(--danger); font-weight: 500; }
 .dsk-step.failed .mark { border-color: var(--danger); background: var(--danger); color: #fff; }
-.dsk-step .meta { margin-left: auto; font: 400 12.5px/1 var(--mono); color: var(--ink-3); }
+.dsk-step .meta { margin-left: auto; padding-left: 12px; white-space: nowrap; font: 400 12.5px/1 var(--mono); color: var(--ink-3); }
 
 /* Lists */
 .dsk-list { list-style: none; margin: 0; padding: 0; }

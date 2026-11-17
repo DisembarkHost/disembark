@@ -187,6 +187,7 @@
         var srcHome = String(opts.sourceUrl || siteHome || (info.source && info.source.home_url) || '').replace(/\/$/, '');
         rlog(D.fmt.plural(info.files || 0, 'file') + ' staged' + (info.sql_file ? ', database found.' : ', no database.'));
         stepEls.read.meta.textContent = D.fmt.plural(info.files || 0, 'file');
+        if (info.multisite && info.multisite.length) rlog('The source is a multisite network. This site keeps its own wp-config.php, so add: ' + info.multisite.join(' '), 'err');
 
         step('snap');
         await api.post('import/snapshot', t({ label: opts.label || '' }));
@@ -199,6 +200,7 @@
         step('files');
         var dep = await api.post('import/deploy-files', t({ files: ['*'] }));
         rlog('Placed ' + D.fmt.plural(dep.deployed || 0, 'file') + '.');
+        if (dep.host_files_kept && dep.host_files_kept.length) rlog('Left out host files (this site keeps its own): ' + dep.host_files_kept.join(', ') + '.', 'dim');
         stepEls.files.meta.textContent = D.fmt.num(dep.deployed || 0);
         if (dep.errors && dep.errors.length) {
           dep.errors.slice(0, 5).forEach(function (e) { rlog('  ' + e, 'err'); });

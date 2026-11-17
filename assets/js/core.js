@@ -96,7 +96,8 @@
     zip: '<path d="M6 3h8l4 4v14H6z"/><path d="M11 3v2h2v2h-2v2h2v2h-2v2"/><rect x="10" y="14" width="4" height="4" rx="1"/>',
     play: '<path d="M7 5v14l11-7z"/>',
     ship: '<path d="M3 15h18l-2.4 5.2Q12 22.4 5.4 20.2Z"/><path d="M6 15V9h12v6"/><path d="M12 9V4"/>',
-    anchor: '<circle cx="12" cy="5" r="2"/><path d="M12 7v14M8 11h8"/><path d="M5 14c0 4 3 7 7 7s7-3 7-7"/>'
+    anchor: '<circle cx="12" cy="5" r="2"/><path d="M12 7v14M8 11h8"/><path d="M5 14c0 4 3 7 7 7s7-3 7-7"/>',
+    sparkle: '<path d="M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1L5 10.5l5.1-1.9z"/><path d="M18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/>'
   };
   D.icon = function (name, cls) {
     var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');

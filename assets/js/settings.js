@@ -11,10 +11,14 @@
   function mount(root) {
     var home = D.config.homeUrl;
     var connect = D.cmd('', { label: 'Connect', hint: 'Links the CLI on your machine (or another site) to this site.' });
+    // A ready-to-paste prompt for an AI coding agent (Claude Code, Cursor,
+    // Codex…): the connect line plus the instructions page it should read.
+    var agent = D.cmd('', { plain: true });
     var tokenText = h('code', { class: 'mono', style: { fontSize: '13px', padding: '6px 10px', wordBreak: 'break-all' } });
     var shown = false;
     function syncToken() {
       connect.querySelector('pre').textContent = 'disembark connect ' + home + ' ' + S.token;
+      agent.set('Move the WordPress site ' + home + ' to my new host with Disembark. Instructions: https://disembark.host/disembark.md\nSource connect line: disembark connect ' + home + ' ' + S.token);
       tokenText.textContent = shown ? S.token : S.token.slice(0, 4) + '•'.repeat(Math.max(8, S.token.length - 8)) + S.token.slice(-4);
     }
     D.store.on(['token'], syncToken);
@@ -44,6 +48,12 @@
               D.cmd('wget https://github.com/DisembarkHost/disembark-cli/releases/latest/download/disembark.phar\nchmod +x disembark.phar\nsudo mv disembark.phar /usr/local/bin/disembark', { label: 'Install', hint: 'Once per machine. Needs PHP.' }),
               connect,
               D.note('', ['Prefer WordPress accounts? Connect with an application password instead of the token: ', h('code', null, 'disembark connect ' + home + ' "user:app password"')]))),
+          h('div', { class: 'dsk-card' },
+            h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('sparkle'), 'Hand it to an AI agent')),
+            h('div', { class: 'dsk-card-pad dsk-stack', style: { gap: '14px' } },
+              h('p', { class: 'muted' }, 'Using Claude Code, Cursor or Codex with SSH to your new host? Paste this and the agent runs the move with WP-CLI: install, pull, check, clean up.'),
+              agent,
+              D.note('warn', ['The prompt includes this site’s token. Regenerate it below once the move is done.']))),
           h('div', { class: 'dsk-card' },
             h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('key'), 'Connection token')),
             h('div', { class: 'dsk-card-pad dsk-stack', style: { gap: '14px' } },
