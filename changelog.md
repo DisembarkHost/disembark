@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## **v2.9.0** - November 17, 2026
 
 ### Security
 * **Database dumps never reach the web root:** The restore deploy step now refuses every database dump, not just Disembark's own `database-*.sql`: any `.sql` file at the site root (such as a `disembark sync` mirror's `database.sql`) and Disembark's working folders are skipped, even when a client lists them explicitly. CLI 2.8.0 restoring a sync mirror deployed its `database.sql` publicly.
