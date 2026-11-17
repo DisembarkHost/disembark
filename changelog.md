@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Security
+* **Database dumps never reach the web root:** The restore deploy step now refuses every database dump, not just Disembark's own `database-*.sql`: any `.sql` file at the site root (such as a `disembark sync` mirror's `database.sql`) and Disembark's working folders are skipped, even when a client lists them explicitly. CLI 2.8.0 restoring a sync mirror deployed its `database.sql` publicly.
 * **Multisite takes a super admin:** On multisite, Disembark (which reads and writes every table and file of the network) now requires a super admin. A subsite administrator's `manage_options` no longer grants access, and the token moved to network options so it no longer shows on a subsite's Settings → All Options screen. The main site's existing token is carried over.
 * **File editor honors `DISALLOW_FILE_EDIT` and `DISALLOW_FILE_MODS`:** Saving or renaming files through Disembark is refused when either is set, matching WordPress's own editors.
 * **Working files are guarded:** Folders under `uploads/disembark` get blank index files so they can't be listed. A live-site restore deletes each dump, zip and manifest it pulls from the source's uploads as soon as it is downloaded, and drops the source's token from the destination once the database is pulled; finalizing or rolling back removes the rest of the pull state.

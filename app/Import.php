@@ -278,6 +278,32 @@ class Import {
      * Lists deployable staged files (archive-relative), skipping Disembark's own
      * metadata, the SQL dump, and chunk-reassembly leftovers.
      */
+    /**
+     * Staged paths that must never reach the web root: database dumps (a full
+     * database at a guessable URL) and Disembark's own working files. Covers
+     * Disembark's dumps anywhere (database-*.sql) and any .sql at the site
+     * root, such as a sync mirror's database.sql or a db_export.sql.
+     */
+    private static function never_deploy( $rel ) {
+        $rel  = ltrim( str_replace( '\\', '/', (string) $rel ), '/' );
+        $base = basename( $rel );
+        if ( $rel === 'disembark-source.json' || $rel === 'restore.zip' ) {
+            return true;
+        }
+        if ( preg_match( '#^database-.*\.sql$#i', $base ) ) {
+            return true;
+        }
+        if ( strpos( $rel, '/' ) === false && preg_match( '#\.sql$#i', $rel ) ) {
+            return true;
+        }
+        foreach ( [ '_chunks/', '.disembark-db-parts/', '.disembark-manifests/' ] as $dir ) {
+            if ( strpos( $rel, $dir ) === 0 ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private function list_staged_files( $root ) {
         $files = [];
         if ( ! is_dir( $root ) ) {
@@ -291,13 +317,7 @@ class Import {
                 continue;
             }
             $rel = ltrim( str_replace( '\\', '/', substr( $file->getPathname(), strlen( $root ) ) ), '/' );
-            if ( $rel === 'disembark-source.json' || $rel === 'restore.zip' ) {
-                continue;
-            }
-            if ( preg_match( '#^database-.*\.sql$#', basename( $rel ) ) ) {
-                continue;
-            }
-            if ( strpos( $rel, '_chunks/' ) === 0 ) {
+            if ( self::never_deploy( $rel ) ) {
                 continue;
             }
             $files[] = $rel;
@@ -476,6 +496,11 @@ class Import {
 
             // Skip wp-config.php
             if ( basename( $relative_path ) === 'wp-config.php' ) {
+                continue;
+            }
+            // Never put a database dump (or Disembark's own working files) in
+            // the web root, even when a client lists it explicitly.
+            if ( self::never_deploy( $relative_path ) ) {
                 continue;
             }
 
