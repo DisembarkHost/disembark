@@ -353,7 +353,7 @@
           : await D.api.post('export/database/' + job.table, { backup_token: token, parts: job.part, rows_per_part: job.rows });
         if (!url || typeof url !== 'string') throw new Error('The server returned no download link.');
         var name = url.slice(url.lastIndexOf('/') + 1).replace(/\.(db|sql)\.txt$/, '.sql');
-        D.download(url, name);
+        await D.downloadSiteFile(url, name);
         if (q < queue.length - 1) await D.sleep(1500); // browsers throttle rapid downloads
       }
       D.toast('Export ready: ' + D.fmt.plural(queue.length, 'download') + '.');

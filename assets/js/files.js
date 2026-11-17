@@ -189,7 +189,7 @@
             url = await D.api.post('zip-sync-files', { backup_token: token, files: chunks[i], archive_name: archive });
             if (url && url.error) throw new Error(url.message);
           }
-          D.download(url, archive);
+          await D.downloadSiteFile(url, archive);
           var keep = await D.modal({
             title: 'Download started',
             body: h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, h('strong', null, node.name), ' was zipped on the server and is downloading.'),

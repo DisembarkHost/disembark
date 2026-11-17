@@ -13,6 +13,7 @@
 
 ### Improved
 * **Back up:** a step-by-step scan with live counts, a summary of what's included, and commands that update as you leave files or tables out.
+* **Zips download on hosts like Kinsta:** ZipArchive writes archives with owner-only permissions, so where the web server runs as a different user than PHP (Kinsta, for one) a zip's link answered 404 — folder downloads and browser backups failed there. Finished zips now get normal file permissions, and the dashboard checks a download link first and falls back to streaming the file through `/stream-file` (which now also accepts a form post) when the host won't serve it.
 * **Restores and pushes ride out network blips:** a dropped connection (not a server error) is retried up to three times with a short wait, instead of ending a long move.
 * **Restore:** a confirmation before anything changes, a step list (with the full log under "Show details"), the rollback point shown the moment it exists, and "Start another restore" after a rollback.
 * **Files:** find any file by path, see the largest items in a folder, and edit with Tab and ⌘S. Files open as raw text, so a JSON file is no longer reformatted when edited. Edit and rename are hidden when file edits are disabled on the site.

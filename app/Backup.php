@@ -636,6 +636,7 @@ class Backup {
                     }
                 }
                 $this->zip_object->close();
+                self::make_readable( $zip_name );
             } else {
                  return new \WP_Error('zip_open_failed', 'Could not create the zip file using ZipArchive.');
             }
@@ -683,6 +684,17 @@ class Backup {
 
         // Return the public URL
         return "{$this->backup_url}/{$file_name}.zip";
+    }
+
+    /**
+     * ZipArchive writes archives through a temp file created 0600, so on hosts
+     * where the web server runs as another user (Kinsta, for one) the zip's
+     * URL answers 404. Give finished zips normal file permissions.
+     */
+    private static function make_readable( $path ) {
+        if ( is_file( $path ) ) {
+            @chmod( $path, defined( 'FS_CHMOD_FILE' ) ? FS_CHMOD_FILE : 0644 );
+        }
     }
 
     /**
@@ -740,6 +752,7 @@ class Backup {
         if ( ! $zip->close() ) {
             return new \WP_Error( 'zip_write_failed', 'Could not write the backup zip (is the disk full?).', [ 'status' => 500 ] );
         }
+        self::make_readable( $paths['zip'] );
         return [ 'added' => $added, 'missing' => $missing, 'size' => filesize( $paths['zip'] ) ];
     }
 
@@ -802,6 +815,7 @@ class Backup {
         if ( ! $zip->close() ) {
             return new \WP_Error( 'zip_write_failed', 'Could not finish the backup zip (is the disk full?).', [ 'status' => 500 ] );
         }
+        self::make_readable( $paths['zip'] );
         @unlink( $paths['sql'] );
         return [ 'url' => $paths['url'], 'file_name' => basename( $paths['zip'] ), 'size' => filesize( $paths['zip'] ) ];
     }
@@ -845,6 +859,7 @@ class Backup {
                     }
                 }
                 $this->zip_object->close();
+                self::make_readable( $zip_name );
             } else {
                  return new \WP_Error('zip_open_failed', 'Could not create the zip file using ZipArchive.');
             }
@@ -913,6 +928,7 @@ class Backup {
                     $this->zip_object->addFile( $file, basename( $file ) );
                 }
                 $this->zip_object->close();
+                self::make_readable( $zip_name );
             }
         } elseif ( $this->archiver_type === 'PclZip' ) {
             $zip = new \PclZip($zip_name);

@@ -387,6 +387,27 @@
     var a = h('a', { href: url, download: name || '' });
     document.body.appendChild(a); a.click(); a.remove();
   };
+  /**
+   * Downloads a file Disembark made in uploads/disembark. Checks the direct
+   * link first; if the host won't serve it (permissions, a security rule),
+   * falls back to a form post to /stream-file so PHP streams it straight to
+   * disk, without holding a big file in the browser's memory.
+   */
+  D.downloadSiteFile = async function (url, name) {
+    var ok = false;
+    try { ok = (await fetch(url, { method: 'HEAD', credentials: 'same-origin', cache: 'no-store' })).ok; } catch (e) { ok = false; }
+    if (ok) { D.download(url, name); return 'direct'; }
+    var path = new URL(url, location.href).pathname;
+    var home = new URL(cfg.homeUrl, location.href).pathname.replace(/\/$/, '');
+    if (home && path.indexOf(home + '/') === 0) path = path.slice(home.length);
+    var form = h('form', { method: 'POST', action: apiUrl('stream-file'), style: { display: 'none' } },
+      h('input', { type: 'hidden', name: 'token', value: D.store.state.token }),
+      h('input', { type: 'hidden', name: 'file', value: decodeURIComponent(path.replace(/^\//, '')) }));
+    document.body.appendChild(form);
+    form.submit();
+    form.remove();
+    return 'stream';
+  };
   D.downloadBlob = function (blob, name) {
     var url = URL.createObjectURL(blob);
     D.download(url, name);

@@ -273,7 +273,7 @@
         var fin = await step({ step: 'finish' });
         bar.set(100);
         if (close) close(null);
-        D.download(fin.url, fin.file_name);
+        await D.downloadSiteFile(fin.url, fin.file_name);
         var choice = await D.modal({
           title: 'Backup ready',
           body: h('div', { class: 'dsk-stack', style: { gap: '10px' } },

@@ -879,8 +879,12 @@ class Run {
     }
 
     function stream_file( $request ) {
-        // Get params from the JSON body
+        // JSON body (the CLI, fetch) or a plain form post (the dashboard's
+        // download fallback, which lets the browser stream big files to disk).
         $params = $request->get_json_params();
+        if ( empty( $params ) ) {
+            $params = $request->get_body_params();
+        }
         $token = $params['token'] ?? null;
         $file_path = $params['file'] ?? null;
         
