@@ -9,7 +9,9 @@ class Updater {
     public $cache_allowed;
 
     public function __construct() {
-        if ( defined( 'DISEMBARK_DEV_MODE' ) ) {
+        // Only when the constant is true: define( 'DISEMBARK_DEV_MODE', false )
+        // must not switch off TLS checks for every request the site makes.
+        if ( defined( 'DISEMBARK_DEV_MODE' ) && DISEMBARK_DEV_MODE ) {
             add_filter('https_ssl_verify', '__return_false');
             add_filter('https_local_ssl_verify', '__return_false');
             add_filter('http_request_host_is_external', '__return_true');
@@ -17,7 +19,7 @@ class Updater {
         $this->plugin_slug   = 'disembark';
         $this->version       = '2.8.0';
         $this->cache_key     = 'disembark_updater';
-        $this->cache_allowed = false;
+        $this->cache_allowed = true;
         
         add_filter( 'plugins_api', [ $this, 'info' ], 30, 3 );
         add_filter( 'site_transient_update_plugins', [ $this, 'update' ] );
@@ -40,19 +42,30 @@ class Updater {
         // Attempt to get the remote manifest from the transient cache.
         $remote = get_transient( $this->cache_key );
 
-        if( false === $remote || ! $this->cache_allowed ) {
+        // The update_plugins transient is read on every admin page, so the
+        // manifest is fetched at most once a day (and a failed fetch is not
+        // retried for an hour) rather than on every read.
+        if ( false === $remote || ! $this->cache_allowed ) {
+            if ( $this->cache_allowed && get_transient( $this->cache_key . '_failed' ) ) {
+                return $local_manifest;
+            }
             $remote_response = wp_remote_get( 'https://raw.githubusercontent.com/DisembarkHost/disembark/main/manifest.json', [
-                    'timeout' => 30,
+                    'timeout' => 10,
                     'headers' => [ 'Accept' => 'application/json' ]
                 ]
             );
 
             // If the remote request fails, return the modified local manifest.
             if ( is_wp_error( $remote_response ) || 200 !== wp_remote_retrieve_response_code( $remote_response ) || empty( wp_remote_retrieve_body( $remote_response ) ) ) {
+                set_transient( $this->cache_key . '_failed', 1, HOUR_IN_SECONDS );
                 return $local_manifest;
             }
 
             $remote = json_decode( wp_remote_retrieve_body( $remote_response ) );
+            if ( ! is_object( $remote ) ) {
+                set_transient( $this->cache_key . '_failed', 1, HOUR_IN_SECONDS );
+                return $local_manifest;
+            }
             set_transient( $this->cache_key, $remote, DAY_IN_SECONDS );
         }
 

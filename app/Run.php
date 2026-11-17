@@ -49,18 +49,22 @@ class Run {
             return $errors;
         }
 
-        $token = isset( $_REQUEST['token'] ) ? $_REQUEST['token'] : null;
+        $token     = isset( $_REQUEST['token'] ) ? $_REQUEST['token'] : null;
+        $import_id = isset( $_REQUEST['import_id'] ) ? $_REQUEST['import_id'] : '';
         if ( ! $token && isset( $_SERVER['CONTENT_TYPE'] ) && stripos( $_SERVER['CONTENT_TYPE'], 'application/json' ) !== false ) {
             $body = file_get_contents( 'php://input' );
             if ( $body ) {
                 $json = json_decode( $body, true );
                 if ( is_array( $json ) && ! empty( $json['token'] ) ) {
                     $token = $json['token'];
+                    if ( ! empty( $json['import_id'] ) && is_string( $json['import_id'] ) ) {
+                        $import_id = $json['import_id'];
+                    }
                 }
             }
         }
 
-        if ( $token && hash_equals( Token::get(), (string) $token ) ) {
+        if ( is_string( $token ) && User::token_valid( $token, is_string( $import_id ) ? $import_id : '' ) ) {
             return true; // valid token → skip the cookie/nonce requirement
         }
         return $errors;
@@ -73,7 +77,7 @@ class Run {
         add_management_page(
             '',
             'Disembark',
-            'manage_options',
+            User::menu_capability(),
             'disembark',
             [ $this, 'render_admin_page' ]
         );
@@ -108,7 +112,7 @@ class Run {
         // The template prints the site's Disembark token (full file/database
         // access) into the page. Only render it for users who can manage the
         // site, so the shortcode can't leak the token on a front-end page.
-        if ( ! current_user_can( 'manage_options' ) ) {
+        if ( ! User::can_manage() ) {
             return '';
         }
         ob_start();
@@ -589,6 +593,10 @@ class Run {
             return new \WP_Error( 'rest_forbidden', 'Invalid token.', [ 'status' => 403 ] );
         }
 
+        if ( ! User::file_edits_allowed() ) {
+            return new \WP_Error( 'file_edit_disabled', 'File editing is disabled on this site (DISALLOW_FILE_EDIT or DISALLOW_FILE_MODS).', [ 'status' => 403 ] );
+        }
+
         $file_path = $params['file'] ?? null;
         $content   = $params['content'] ?? '';
 
@@ -639,6 +647,10 @@ class Run {
         $auth_request->set_param('token', $token);
         if ( ! User::allowed( $auth_request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Invalid token.', [ 'status' => 403 ] );
+        }
+
+        if ( ! User::file_edits_allowed() ) {
+            return new \WP_Error( 'file_edit_disabled', 'File editing is disabled on this site (DISALLOW_FILE_EDIT or DISALLOW_FILE_MODS).', [ 'status' => 403 ] );
         }
 
         $old_path_relative = $params['old_path'] ?? '';
@@ -697,6 +709,7 @@ class Run {
         $step             = $request['step'] ?? 'initiate';
         $chunk_size_mb    = 150;
         $default_excludes = [
+            Storage::relative_base_dir(),
             "wp-content/uploads/disembark",
             "wp-content/updraft",
             "wp-content/ai1wm-backups",
@@ -758,7 +771,7 @@ class Run {
         }
 
         $token = wp_generate_password( 42, false );
-        update_option( "disembark_token", $token );
+        Token::set( $token );
 
         return [ 'token' => $token ];
     }
@@ -1184,30 +1197,51 @@ class Run {
         return $import->finalize();
     }
 
+    /**
+     * Deletes backup working files. With a backup_token, only that session's
+     * folder goes (the CLI passes its own at the end of every backup, so a
+     * parallel backup or pull keeps its files). Without one, every backup
+     * session goes. Restore folders (_import_*: staged restores and their
+     * rollback points) are kept unless include_restore_points is set, so a
+     * backup taken after a restore can't silently remove the way back.
+     */
     function cleanup( $request ) {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
-        $directory = wp_upload_dir()["basedir"] . "/disembark/";
-        $files     = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($directory, \RecursiveDirectoryIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::SELF_FIRST
-        );
-        header('Content-Type: text/plain');
-        foreach ( $files as $file ) {
-            if ( $file->isDir() ){ continue; }
-            if ($file->isLink()) { continue; }
-            echo "Removing {$file->getPathname()}\n";
-            unlink( $file->getPathname() );
+        $base    = Storage::base_dir();
+        $session = Storage::sanitize_session( $request['backup_token'] ?? '' );
+        $targets = [];
+        if ( $session !== '' ) {
+            $targets[] = "{$base}/{$session}";
+        } else {
+            $include_restore_points = ! empty( $request['include_restore_points'] );
+            foreach ( (array) glob( "{$base}/*", GLOB_ONLYDIR ) as $dir ) {
+                if ( strpos( basename( $dir ), '_import_' ) === 0 && ! $include_restore_points ) {
+                    continue;
+                }
+                $targets[] = $dir;
+            }
         }
-        $directories = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($directory, \RecursiveDirectoryIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::CHILD_FIRST
-        );
-        foreach( $directories as $dir ) {
-            if ( $dir->isDir() ){
-                rmdir( $dir->getPathname() );
-            }   
+
+        header( 'Content-Type: text/plain' );
+        foreach ( $targets as $dir ) {
+            if ( ! is_dir( $dir ) || is_link( $dir ) ) {
+                continue;
+            }
+            $items = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator( $dir, \RecursiveDirectoryIterator::SKIP_DOTS ),
+                \RecursiveIteratorIterator::CHILD_FIRST
+            );
+            foreach ( $items as $item ) {
+                if ( $item->isDir() && ! $item->isLink() ) {
+                    @rmdir( $item->getPathname() );
+                } else {
+                    echo "Removing {$item->getPathname()}\n";
+                    @unlink( $item->getPathname() );
+                }
+            }
+            @rmdir( $dir );
         }
         exit;
     }

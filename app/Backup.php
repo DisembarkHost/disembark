@@ -12,6 +12,9 @@ class Backup {
     private $zip_object       = null;
     public function __construct( $token = "" ) {
         $bytes             = random_bytes( 20 );
+        // The token names a folder under uploads/disembark; strip anything
+        // that could climb out of it (e.g. "../.." via /cleanup-file).
+        $token             = Storage::sanitize_session( $token );
         $this->token       = empty( $token ) ? substr( bin2hex( $bytes ), 0, -28) : $token;
         $this->backup_path = wp_upload_dir()["basedir"] . "/disembark/{$this->token}";
         $backup_url        = wp_upload_dir()["baseurl"] . "/disembark/{$this->token}";
@@ -25,9 +28,7 @@ class Backup {
             $backup_url = preg_replace( '/^http:\/\//', 'https://', $backup_url );
         }
         $this->backup_url = $backup_url;
-        if ( ! file_exists( $this->backup_path )) {
-            mkdir( $this->backup_path, 0777, true );
-        }
+        Storage::ensure_dir( $this->backup_path );
         
         if ( class_exists( 'ZipArchive' ) ) {
             $this->archiver_type = 'ZipArchive';
@@ -128,7 +129,8 @@ class Backup {
                 $home_path = $core_root;
             }
 
-            while ( $item = array_shift( $state['current_directory_items'] ) ) {
+            // !== null, not truthiness: an entry named "0" is a real file.
+            while ( ( $item = array_shift( $state['current_directory_items'] ) ) !== null ) {
                 
                 $operations_this_batch++;
                 if ( $operations_this_batch >= $operation_limit ) {
@@ -382,10 +384,13 @@ class Backup {
                 $select_row_limit = $rows_per_part - $query_count;
                 $rows_remain = false;
             }
-            $query       = "SELECT * FROM `$table` LIMIT " . $rows_start . ',' . $select_row_limit;
+            // ORDER BY the primary key: without it MySQL may return pages in
+            // any order, so separate LIMIT/OFFSET requests can skip or repeat rows.
+            $query       = "SELECT * FROM `$table`" . self::order_by_primary_key( $table ) . " LIMIT " . (int) $rows_start . ',' . (int) $select_row_limit;
             $table_query = $wpdb->get_results( $query, ARRAY_N );
             $rows_start += $select_row_limit;
-            if ( false === $table_query ) {
+            if ( $wpdb->last_error ) {
+                @fclose( $file_handle );
                 return false;
             }
             $table_count = count( $table_query );
@@ -429,115 +434,149 @@ class Backup {
         return $backup_url;
     }
 
+    /**
+     * Exports several tables into one dump and returns its URL, or WP_Error.
+     * Used for CLI backups, a pull's database, and the rollback snapshot, so
+     * it fails loudly: a table that can't be read or a write that doesn't land
+     * (disk full) is an error, never a quietly truncated dump. Rows are read in
+     * primary-key order, by key range where the table has a single-column key
+     * (no OFFSET drift while the site keeps writing). The dump ends with
+     * EXPORT_COMPLETE_MARKER so a reader can tell it is whole.
+     */
     public function database_export_batch( $tables = [] ) {
         global $wpdb;
 
         if ( empty( $tables ) ) {
-            return false;
+            return new \WP_Error( 'missing_tables', 'No tables to export.', [ 'status' => 400 ] );
         }
 
-        // Create a unique-ish name for the batch file
-        $batch_hash = md5( implode( ',', $tables ) );
+        $batch_hash  = md5( implode( ',', $tables ) );
         $file_ext    = ".sql.txt";
         $backup_file = "{$this->backup_path}/batch-{$batch_hash}{$file_ext}";
         $backup_url  = "{$this->backup_url}/batch-{$batch_hash}{$file_ext}";
 
-        if ( false === ( $file_handle = fopen( $backup_file, 'w' ) ) ) { // Use 'w' to create a new file
-            return false;
+        if ( false === ( $file_handle = fopen( $backup_file, 'w' ) ) ) {
+            return new \WP_Error( 'export_failed', 'Could not create the database export file.', [ 'status' => 500 ] );
+        }
+        $fail = function ( $message ) use ( $file_handle, $backup_file ) {
+            @fclose( $file_handle );
+            @unlink( $backup_file );
+            return new \WP_Error( 'export_failed', $message, [ 'status' => 500 ] );
+        };
+        $write = function ( $data ) use ( $file_handle ) {
+            return $data === '' || fwrite( $file_handle, $data ) === strlen( $data );
+        };
+
+        if ( ! $write( "SET FOREIGN_KEY_CHECKS = 0;\nSET UNIQUE_CHECKS = 0;\n" ) ) {
+            return $fail( 'Could not write the database export (disk full?).' );
         }
 
-        // Write headers once
-        fwrite( $file_handle, "SET FOREIGN_KEY_CHECKS = 0;\nSET UNIQUE_CHECKS = 0;\n" );
-
-        // Add paging
-        $select_row_limit = 1000; // Use the same paging as the single export
+        $select_row_limit = 1000;
 
         foreach ( $tables as $table ) {
-            $insert_sql = '';
-            // 1. Get CREATE TABLE statement
-            $create_table = $wpdb->get_results( "SHOW CREATE TABLE `{$table}`", ARRAY_N );
-            if ( false === $create_table || ! isset( $create_table[0] ) ) {
-                continue; // Skip this table on error
+            $table        = (string) $table;
+            $create_table = $wpdb->get_results( "SHOW CREATE TABLE `" . str_replace( '`', '``', $table ) . "`", ARRAY_N );
+            if ( empty( $create_table[0][1] ) ) {
+                return $fail( "Could not read the structure of table {$table}." );
             }
-            $create_table_array = $create_table[0];
-            unset( $create_table );
-            $insert_sql .= str_replace( "\n", '', $create_table_array[1] ) . ";\n";
-            unset( $create_table_array );
-
-            // 2. Add DISABLE KEYS
-            $insert_sql .= "/*!40000 ALTER TABLE `{$table}` DISABLE KEYS */;\n";
-            if ( false === fwrite( $file_handle, $insert_sql ) ) {
-                continue; // Error writing
+            if ( ! $write( str_replace( "\n", '', $create_table[0][1] ) . ";\n/*!40000 ALTER TABLE `{$table}` DISABLE KEYS */;\n" ) ) {
+                return $fail( 'Could not write the database export (disk full?).' );
             }
-            $insert_sql = ''; // Reset for rows
 
-            // 3. Get rows WITH PAGING
-            $rows_start = 0;
-            $rows_remain = true;
-            $num_fields = 0;
-            $first_run = true;
+            $keys     = self::primary_key_columns( $table );
+            $keyset   = count( $keys ) === 1;
+            $order_by = self::order_by_primary_key( $table );
+            $offset   = 0;
+            $last_key = null;
+            $key_pos  = null;
 
-            while ( true === $rows_remain ) {
-                $query       = "SELECT * FROM `$table` LIMIT " . $rows_start . ',' . $select_row_limit;
-                $table_query = $wpdb->get_results( $query, ARRAY_N );
-                $rows_start += $select_row_limit;
-
-                if ( false === $table_query ) {
-                    $rows_remain = false; // Error, stop processing this table
-                    break; 
+            while ( true ) {
+                if ( $keyset && $last_key !== null ) {
+                    $query = $wpdb->prepare( "SELECT * FROM `{$table}` WHERE `{$keys[0]}` > %s{$order_by} LIMIT %d", $last_key, $select_row_limit );
+                } else {
+                    $query = "SELECT * FROM `{$table}`{$order_by} LIMIT " . (int) $offset . ',' . (int) $select_row_limit;
                 }
-
-                if ( $first_run ) {
-                    $columns = $wpdb->get_col_info(); // Get info from the first query
-                    $num_fields = count( $columns );
-                    $first_run = false;
+                $rows = $wpdb->get_results( $query, ARRAY_N );
+                if ( $wpdb->last_error ) {
+                    return $fail( "Could not read rows from table {$table}: " . substr( $wpdb->last_error, 0, 200 ) );
                 }
-                
-                $table_count = count( $table_query );
-                if ( 0 == $table_count || $table_count < $select_row_limit ) {
-                    $rows_remain = false;
+                if ( empty( $rows ) ) {
+                    break;
                 }
-                
-                if ( $num_fields == 0 ) {
-                    // No columns found, or table is empty. In either case, we're done.
-                    $rows_remain = false;
-                    continue;
-                }
-
-                // 4. Loop through rows and build INSERT statements
-                foreach ( $table_query as $fetch_row ) {
-                    $insert_sql .= "INSERT INTO `$table` VALUES(";
-                    for ( $n = 1; $n <= $num_fields; $n++ ) {
-                        $m = $n - 1;
-                        if ( null === $fetch_row[ $m ] ) {
-                            $insert_sql .= 'NULL, ';
-                        } else {
-                            $insert_sql .= "'" . self::db_escape( $fetch_row[ $m ] ) . "', ";
+                if ( $keyset && $key_pos === null ) {
+                    foreach ( (array) $wpdb->get_col_info( 'name' ) as $pos => $name ) {
+                        if ( $name === $keys[0] ) {
+                            $key_pos = $pos;
                         }
                     }
-                    $insert_sql  = substr( $insert_sql, 0, -2 );
-                    $insert_sql .= ");\n";
-                    
-                    // Write to file
-                    if ( false === fwrite( $file_handle, $insert_sql ) ) {
-                        $rows_remain = false; // Stop processing this table if write fails
-                        break; 
+                    if ( $key_pos === null ) {
+                        $keyset = false; // Couldn't locate the key column: fall back to OFFSET.
                     }
-                    $insert_sql = '';
                 }
-            } // end while $rows_remain
-            
-            // 5. Add ENABLE KEYS
-            $insert_sql = "/*!40000 ALTER TABLE `{$table}` ENABLE KEYS */;\n";
-            fwrite( $file_handle, $insert_sql );
-        } // end foreach $tables
 
-        // Write footers once
-        fwrite( $file_handle, "SET FOREIGN_KEY_CHECKS = 1;\nSET UNIQUE_CHECKS = 1;\n" );
-        
-        @fclose( $file_handle );
-        // Return the public URL
+                $insert_sql = '';
+                foreach ( $rows as $fetch_row ) {
+                    $values = [];
+                    foreach ( $fetch_row as $value ) {
+                        $values[] = ( null === $value ) ? 'NULL' : "'" . self::db_escape( $value ) . "'";
+                    }
+                    $insert_sql .= "INSERT INTO `{$table}` VALUES(" . implode( ', ', $values ) . ");\n";
+                }
+                if ( ! $write( $insert_sql ) ) {
+                    return $fail( 'Could not write the database export (disk full?).' );
+                }
+
+                if ( count( $rows ) < $select_row_limit ) {
+                    break;
+                }
+                $offset += $select_row_limit;
+                if ( $keyset ) {
+                    $last_key = $rows[ count( $rows ) - 1 ][ $key_pos ];
+                }
+            }
+
+            if ( ! $write( "/*!40000 ALTER TABLE `{$table}` ENABLE KEYS */;\n" ) ) {
+                return $fail( 'Could not write the database export (disk full?).' );
+            }
+        }
+
+        if ( ! $write( "SET FOREIGN_KEY_CHECKS = 1;\nSET UNIQUE_CHECKS = 1;\n" . self::EXPORT_COMPLETE_MARKER . "\n" ) ) {
+            return $fail( 'Could not write the database export (disk full?).' );
+        }
+        if ( ! fclose( $file_handle ) ) {
+            @unlink( $backup_file );
+            return new \WP_Error( 'export_failed', 'Could not finish writing the database export.', [ 'status' => 500 ] );
+        }
         return $backup_url;
+    }
+
+    /**
+     * Last statement of every batch export. A harmless SQL statement rather
+     * than a comment, so older importers that run every statement don't error.
+     */
+    const EXPORT_COMPLETE_MARKER = 'SET @disembark_export_complete = 1;';
+
+    public static function primary_key_columns( $table ) {
+        global $wpdb;
+        static $cache = [];
+        if ( isset( $cache[ $table ] ) ) {
+            return $cache[ $table ];
+        }
+        $keys = $wpdb->get_results( "SHOW KEYS FROM `" . str_replace( '`', '``', $table ) . "` WHERE Key_name = 'PRIMARY'" );
+        $cols = [];
+        foreach ( (array) $keys as $key ) {
+            $cols[ (int) $key->Seq_in_index ] = $key->Column_name;
+        }
+        ksort( $cols );
+        return $cache[ $table ] = array_values( $cols );
+    }
+
+    private static function order_by_primary_key( $table ) {
+        $cols = self::primary_key_columns( $table );
+        if ( empty( $cols ) ) {
+            return '';
+        }
+        return ' ORDER BY ' . implode( ', ', array_map( function ( $c ) { return '`' . str_replace( '`', '``', $c ) . '`'; }, $cols ) );
     }
 
     function zip_files( $file_manifest = "", $exclude_paths = [] ) {
@@ -731,14 +770,14 @@ class Backup {
         
         if ( $this->archiver_type === 'ZipArchive' ) {
             if ( $this->zip_object->open ( $zip_name, \ZipArchive::CREATE ) === TRUE) {
-                foreach( $database_files as $file ) {
+                foreach( $sql_files as $file ) {
                     $this->zip_object->addFile( $file, basename( $file ) );
                 }
                 $this->zip_object->close();
             }
         } elseif ( $this->archiver_type === 'PclZip' ) {
             $zip = new \PclZip($zip_name);
-            $result = $zip->create($database_files, PCLZIP_OPT_REMOVE_PATH, $this->backup_path);
+            $result = $zip->create($sql_files, PCLZIP_OPT_REMOVE_PATH, $this->backup_path);
             if ($result == 0) {
                 return new \WP_Error('pclzip_failed', 'Could not create zip: ' . $zip->errorInfo(true));
             }
@@ -746,7 +785,7 @@ class Backup {
             return new \WP_Error('no_zip_method', 'No supported zipping library found.');
         }
 
-        foreach( $database_files as $file ) {
+        foreach( $sql_files as $file ) {
             unlink( $file );
         }
 

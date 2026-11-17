@@ -979,7 +979,14 @@
                         <div v-for="(line, i) in restore.log" :key="i" style="font-family:monospace;font-size:12px;color:#d6ebf6;line-height:1.6;">{{ line }}</div>
                         <div v-if="restore.running" style="font-family:monospace;font-size:12px;color:#8fb0c2;">{{ restore.progress }}</div>
                     </div>
-                    <v-alert v-if="restore.error" type="error" variant="tonal" density="compact" class="mt-3 text-caption">{{ restore.error }}</v-alert>
+                    <v-alert v-if="restore.error" type="error" variant="tonal" density="compact" class="mt-3 text-caption">
+                        {{ restore.error }}
+                        <div v-if="restore.rollback_id && !restore.rolled_back" class="mt-2">
+                            This site may be partly restored. Roll back to the snapshot taken before the restore (rollback id <code>{{ restore.rollback_id }}</code>).
+                            <div class="mt-2"><v-btn size="small" color="error" variant="flat" :loading="restore.rolling_back" :disabled="restore.running" @click="rollbackRestore">Roll back</v-btn></div>
+                        </div>
+                    </v-alert>
+                    <v-alert v-if="restore.rolled_back" type="success" variant="tonal" density="compact" class="mt-3 text-caption">Rolled back. This site is back to how it was before the restore.</v-alert>
                 </div>
                 <div v-else>
                     <div class="d-flex align-center mb-3">
@@ -993,7 +1000,9 @@
                     <v-alert type="info" variant="tonal" density="compact" class="text-caption">
                         Rollback id: <code>{{ restore.rollback_id }}</code><br>
                         To undo from the CLI: <code>disembark restore {{ home_url }} --rollback={{ restore.rollback_id }}</code>
+                        <div class="mt-2"><v-btn size="small" variant="outlined" :loading="restore.rolling_back" @click="rollbackRestore">Undo restore</v-btn></div>
                     </v-alert>
+                    <v-alert v-if="restore.error" type="error" variant="tonal" density="compact" class="mt-2 text-caption">{{ restore.error }}</v-alert>
                 </div>
             </v-card-text>
             <v-card-actions>
@@ -1064,7 +1073,9 @@ createApp({
                 error: "",
                 progress: "",
                 log: [],
-                rollback_id: ""
+                rollback_id: "",
+                rolling_back: false,
+                rolled_back: false
             },
             options: {
                 database: true,
@@ -1159,7 +1170,7 @@ createApp({
     },
     methods: {
         openRestore() {
-            this.restore = { show: true, mode: "site", file: null, source_url: "", source_site: "", source_token: "", running: false, done: false, error: "", progress: "", log: [], rollback_id: "" };
+            this.restore = { show: true, mode: "site", file: null, source_url: "", source_site: "", source_token: "", running: false, done: false, error: "", progress: "", log: [], rollback_id: "", rolling_back: false, rolled_back: false };
         },
         finishRestore() {
             this.restore.show = false;
@@ -1170,6 +1181,30 @@ createApp({
         },
         rlog(msg) {
             this.restore.log.push(msg);
+        },
+        // Restores the snapshot taken before the restore. Token auth (with the
+        // import id) still works when the import replaced this site's users.
+        async rollbackRestore() {
+            if (!this.restore.rollback_id) return;
+            this.restore.rolling_back = true;
+            this.restore.error = "";
+            this.rlog('Rolling back to the snapshot...');
+            try {
+                const r = (await axios.post(this.api_root + 'import/rollback', { token: this.api_token, import_id: this.restore.rollback_id })).data;
+                if (r.errors && r.errors.length) {
+                    r.errors.slice(0, 5).forEach(err => this.rlog('  ' + err));
+                    throw new Error('Rollback reported ' + r.errors.length + ' error(s). It can be run again from the CLI: disembark restore ' + this.home_url + ' --rollback=' + this.restore.rollback_id);
+                }
+                this.rlog('Rolled back.');
+                this.restore.rolled_back = true;
+                this.restore.done = false;
+            } catch (e) {
+                const msg = (e.response && e.response.data && e.response.data.message) ? e.response.data.message : e.message;
+                this.restore.error = 'Rollback failed: ' + msg;
+                this.rlog('ERROR: ' + msg);
+            } finally {
+                this.restore.rolling_back = false;
+            }
         },
         randomHex(len) {
             const bytes = new Uint8Array(len / 2);
@@ -1249,6 +1284,8 @@ createApp({
             this.restore.running = true;
             this.restore.error = "";
             this.restore.log = [];
+            this.restore.rollback_id = "";
+            this.restore.rolled_back = false;
             const importId = this.randomHex(24);
             // Every call carries the token: the DB import replaces this site's
             // users, which invalidates the cookie session mid-flow. The plugin
@@ -1280,15 +1317,27 @@ createApp({
 
                 this.rlog('Creating rollback snapshot...');
                 await axios.post(root + 'import/snapshot', { token: t, import_id: importId });
+                // From here on the site can change, so the way back is shown
+                // whatever happens next.
+                this.restore.rollback_id = importId;
+                this.rlog('Rollback point saved (id ' + importId + ').');
 
                 this.rlog('Deploying files...');
                 const dep = (await axios.post(root + 'import/deploy-files', { token: t, import_id: importId, files: ['*'] })).data;
                 this.rlog('Deployed ' + (dep.deployed || 0) + ' files.');
+                if (dep.errors && dep.errors.length) {
+                    dep.errors.slice(0, 5).forEach(err => this.rlog('  ' + err));
+                    throw new Error(dep.errors.length + ' file(s) could not be deployed. Stopped before the database import.');
+                }
 
                 if (info.sql_file) {
                     this.rlog('Importing database...');
                     const sq = (await axios.post(root + 'import/import-staged-sql', { token: t, import_id: importId, sql_file: info.sql_file, old_prefix: srcPrefix, new_prefix: destPrefix })).data;
                     this.rlog((sq.statements_executed || 0) + ' statements executed.');
+                    if (sq.errors && sq.errors.length) {
+                        sq.errors.slice(0, 5).forEach(err => this.rlog('  ' + err));
+                        throw new Error('The database import reported ' + sq.errors.length + ' error(s). Stopped before rewriting URLs.');
+                    }
 
                     if (srcPrefix && destPrefix && srcPrefix !== destPrefix) {
                         const rp = (await axios.post(root + 'import/remap-prefix', { token: t, import_id: importId, old_prefix: srcPrefix, new_prefix: destPrefix })).data;
@@ -1304,7 +1353,6 @@ createApp({
                 this.rlog('Finalizing...');
                 await axios.post(root + 'import/finalize', { token: t, import_id: importId });
 
-                this.restore.rollback_id = importId;
                 this.restore.done = true;
             } catch (e) {
                 const msg = (e.response && e.response.data && e.response.data.message) ? e.response.data.message : e.message;

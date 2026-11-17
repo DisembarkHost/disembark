@@ -40,9 +40,7 @@ class Pull {
     }
 
     private function save_state( $state ) {
-        if ( ! is_dir( dirname( $this->state_file ) ) ) {
-            mkdir( dirname( $this->state_file ), 0755, true );
-        }
+        Storage::ensure_dir( dirname( $this->state_file ) );
         file_put_contents( $this->state_file, wp_json_encode( $state ) );
     }
 
@@ -152,6 +150,23 @@ class Pull {
             @unlink( $tmp );
         }
         return true;
+    }
+
+    /**
+     * Deletes a file this pull made in its session folder on the source
+     * (export dumps, batch zips, manifest chunks). Those sit in the source's
+     * public uploads folder and are a full copy of its database and files, so
+     * each goes as soon as it is downloaded. Uses /cleanup-file, which every
+     * v2 source has and which only touches this pull's own session folder.
+     * Best effort: a failure never fails the pull.
+     */
+    private function cleanup_source_file( $url ) {
+        $path = is_string( $url ) ? parse_url( $url, PHP_URL_PATH ) : '';
+        $name = $path ? basename( $path ) : '';
+        if ( $name === '' ) {
+            return;
+        }
+        $this->source_request( '/cleanup-file', [ 'file_name' => $name ], 'POST', 30 );
     }
 
     /**
@@ -274,6 +289,7 @@ class Pull {
             }
             $list = json_decode( file_get_contents( $tmp ) );
             @unlink( $tmp );
+            $this->cleanup_source_file( $chunk->url );
             if ( is_array( $list ) ) {
                 foreach ( $list as $f ) {
                     if ( is_object( $f ) && ! empty( $f->name ) ) {
@@ -282,6 +298,7 @@ class Pull {
                 }
             }
         }
+        $this->source_request( '/cleanup-file', [ 'file_name' => 'manifest.json' ], 'POST', 30 );
         $state = $this->state();
         $state['file_list'] = $this->staging_dir() . '/file-list.json';
         file_put_contents( $state['file_list'], wp_json_encode( $files ) );
@@ -320,6 +337,7 @@ class Pull {
 
         $zip_path = $this->staging_dir() . '/pull-batch.zip';
         $dl = $this->download_to( $url, $zip_path );
+        $this->cleanup_source_file( $url );
         if ( is_wp_error( $dl ) ) {
             return $dl;
         }
@@ -352,9 +370,15 @@ class Pull {
         }
         $dest = $this->staging_public . '/database-pull.sql';
         $dl   = $this->download_to( $url, $dest );
+        $this->cleanup_source_file( $url );
         if ( is_wp_error( $dl ) ) {
             return $dl;
         }
+        // The database is the last thing pulled; the source's full-access
+        // token isn't needed from here on, so don't leave it on disk.
+        $state = $this->state();
+        unset( $state['source_token'] );
+        $this->save_state( $state );
         return [ 'ok' => true, 'tables' => count( $tables ), 'bytes' => filesize( $dest ) ];
     }
 
@@ -365,8 +389,8 @@ class Pull {
         if ( ! is_dir( $this->staging_public ) ) {
             mkdir( $this->staging_public, 0755, true );
         }
-        $zip = new \ZipArchive();
-        if ( $zip->open( $zip_path ) !== true ) {
+        $zip = class_exists( 'ZipArchive' ) ? new \ZipArchive() : null;
+        if ( ! $zip || $zip->open( $zip_path ) !== true ) {
             if ( ! class_exists( 'PclZip' ) ) {
                 require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
             }

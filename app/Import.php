@@ -24,6 +24,16 @@ class Import {
         $this->rollback_path = "{$this->import_path}/rollback";
     }
 
+    /**
+     * Creates this import's folder and guards it (and the base folder) against
+     * directory listing. Staging is deliberately never guarded: everything in
+     * it is deployed to the web root, so a guard file there would overwrite
+     * the site's own index.php.
+     */
+    private function prepare_import_dir() {
+        Storage::ensure_dir( $this->import_path );
+    }
+
     public function get_import_id() {
         return $this->import_id;
     }
@@ -83,7 +93,7 @@ class Import {
             'tables'             => $tables,
             'php_version'        => phpversion(),
             'mysql_version'      => $mysql_version,
-            'disembark_token'    => get_option( 'disembark_token' ),
+            'disembark_token'    => Token::read(),
         ];
     }
 
@@ -93,9 +103,8 @@ class Import {
     public function snapshot() {
         global $wpdb;
 
-        if ( ! is_dir( $this->rollback_path ) ) {
-            mkdir( $this->rollback_path, 0755, true );
-        }
+        $this->prepare_import_dir();
+        Storage::ensure_dir( $this->rollback_path );
 
         // Export all tables
         $all_tables = $wpdb->get_col( 'SHOW TABLES' );
@@ -106,8 +115,9 @@ class Import {
         $backup   = new Backup( 'rollback-' . $this->import_id );
         $file_url = $backup->database_export_batch( $all_tables );
 
-        if ( ! $file_url ) {
-            return new \WP_Error( 'snapshot_failed', 'Failed to create database snapshot.', [ 'status' => 500 ] );
+        if ( ! $file_url || is_wp_error( $file_url ) ) {
+            $why = is_wp_error( $file_url ) ? ' ' . $file_url->get_error_message() : '';
+            return new \WP_Error( 'snapshot_failed', 'Failed to create database snapshot.' . $why . ' Nothing was changed.', [ 'status' => 500 ] );
         }
 
         // Move the exported SQL to our rollback directory
@@ -118,16 +128,25 @@ class Import {
             rename( $sql_file, $dest );
         }
 
-        // Clean up the backup directory
+        // Clean up the temporary export folder (and its listing guards).
         if ( is_dir( $backup_base ) ) {
-            @rmdir( $backup_base );
+            self::delete_directory_recursive( $backup_base );
         }
 
-        // Save rollback metadata
+        $sql_sizes = [];
+        foreach ( glob( $this->rollback_path . '/*.sql.txt' ) as $sql_file ) {
+            $sql_sizes[ basename( $sql_file ) ] = filesize( $sql_file );
+        }
+
+        // Save rollback metadata. format 2 snapshots end with the export's
+        // completeness marker and record their sizes, which rollback() checks
+        // before it touches anything.
         $meta = [
             'import_id'   => $this->import_id,
+            'format'      => 2,
             'created_at'  => time(),
             'tables'      => $all_tables,
+            'sql_files'   => $sql_sizes,
             'deployed_files' => [],
             'backed_up_files' => [],
         ];
@@ -143,6 +162,7 @@ class Import {
      * Receives a ZIP of files (single POST) and extracts to staging.
      */
     public function upload_zip( $uploaded_file ) {
+        $this->prepare_import_dir();
         if ( ! is_dir( $this->staging_path ) ) {
             mkdir( $this->staging_path, 0755, true );
         }
@@ -272,10 +292,22 @@ class Import {
         if ( ! file_exists( $path ) ) {
             return new \WP_Error( 'not_found', 'Staged SQL file not found.', [ 'status' => 404 ] );
         }
-        $sql        = file_get_contents( $path );
-        $statements = self::split_sql_statements( $sql );
-        $statements = self::transform_statements( $statements, $old_prefix, $new_prefix );
-        return $this->execute_statements( $statements );
+        // Streamed statement by statement: reading the whole dump (and every
+        // split statement) into memory needs a multiple of its size and runs
+        // out of memory on large sites.
+        $run  = $this->begin_statements();
+        $read = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, $old_prefix, $new_prefix ) {
+            foreach ( self::transform_statements( [ $statement ], $old_prefix, $new_prefix ) as $transformed ) {
+                if ( ! $this->run_statement( $transformed, $run ) ) {
+                    return false;
+                }
+            }
+            return true;
+        } );
+        if ( is_wp_error( $read ) ) {
+            $run['errors'][] = $read->get_error_message();
+        }
+        return $this->end_statements( $run );
     }
 
     /**
@@ -330,6 +362,7 @@ class Import {
         if ( ! self::is_safe_relative_path( $file_path ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid file path.', [ 'status' => 400 ] );
         }
+        $this->prepare_import_dir();
         if ( ! is_dir( $this->staging_path ) ) {
             mkdir( $this->staging_path, 0755, true );
         }
@@ -511,73 +544,121 @@ class Import {
      * Executes a list of individual SQL statements on the destination database.
      */
     private function execute_statements( $statements ) {
+        $run = $this->begin_statements();
+        foreach ( $statements as $statement ) {
+            if ( ! $this->run_statement( $statement, $run ) ) {
+                break;
+            }
+        }
+        return $this->end_statements( $run );
+    }
+
+    /**
+     * Starts a SQL import. The import overwrites the options table (and the
+     * users table) with the source's, which replaces this site's Disembark
+     * token and ends the admin's login. The token is written back at the end;
+     * the token guard (a hash of it in this import's folder) keeps the
+     * remaining steps and a rollback authorized even if the import dies before
+     * that (out of memory, a killed worker) — see token_guard_matches().
+     */
+    private function begin_statements() {
         global $wpdb;
 
-        $statements_executed = 0;
-        $errors              = [];
+        $preserved_token = Token::read();
+        if ( ! empty( $preserved_token ) ) {
+            $this->prepare_import_dir();
+            file_put_contents( $this->import_path . '/token-guard.json', wp_json_encode( [
+                'sha256'     => hash( 'sha256', (string) $preserved_token ),
+                'created_at' => time(),
+            ] ) );
+        }
 
-        // The import overwrites wp_options (and wp_users) with the source's
-        // data, which would replace this site's Disembark token and lock the
-        // CLI out of the remaining steps. Remember it and restore it afterward
-        // so the tool stays authenticated through search-replace/finalize.
-        $preserved_token = get_option( 'disembark_token' );
-
-        // Temporarily disable FK checks for the import
         $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
         $wpdb->query( 'SET UNIQUE_CHECKS = 0' );
         $wpdb->query( "SET sql_mode='NO_AUTO_VALUE_ON_ZERO'" );
 
-        foreach ( $statements as $statement ) {
-            $statement = trim( $statement );
-            if ( empty( $statement ) ) {
-                continue;
-            }
+        return [
+            'preserved_token'     => $preserved_token,
+            'statements_executed' => 0,
+            'errors'              => [],
+        ];
+    }
 
-            // Skip SET statements we handle ourselves
-            if ( preg_match( '/^SET\s+(FOREIGN_KEY_CHECKS|UNIQUE_CHECKS|sql_mode|NAMES)/i', $statement ) ) {
-                continue;
-            }
+    /**
+     * Runs one statement. Returns false once too many errors have piled up,
+     * which stops the import.
+     */
+    private function run_statement( $statement, &$run ) {
+        global $wpdb;
 
-            // Skip the DISABLE/ENABLE KEYS comments
-            if ( preg_match( '/^\/\*!\d+\s+ALTER TABLE/', $statement ) ) {
-                continue;
-            }
-
-            // Add semicolon back for execution
-            $result = $wpdb->query( $statement );
-            if ( $result === false ) {
-                $error_msg = $wpdb->last_error;
-                // Don't fail on DROP TABLE errors
-                if ( stripos( $statement, 'DROP TABLE' ) === 0 ) {
-                    continue;
-                }
-                $errors[] = substr( $error_msg, 0, 200 ) . ' | SQL: ' . substr( $statement, 0, 100 );
-                if ( count( $errors ) > 50 ) {
-                    $errors[] = '...truncated (too many errors)';
-                    break;
-                }
-            } else {
-                $statements_executed++;
-            }
+        $statement = trim( $statement );
+        if ( $statement === '' ) {
+            return true;
         }
+        // Skip SET statements we handle ourselves
+        if ( preg_match( '/^SET\s+(FOREIGN_KEY_CHECKS|UNIQUE_CHECKS|sql_mode|NAMES)/i', $statement ) ) {
+            return true;
+        }
+        // Skip the DISABLE/ENABLE KEYS comments
+        if ( preg_match( '/^\/\*!\d+\s+ALTER TABLE/', $statement ) ) {
+            return true;
+        }
+
+        $result = $wpdb->query( $statement );
+        if ( $result === false ) {
+            // Don't fail on DROP TABLE errors
+            if ( stripos( $statement, 'DROP TABLE' ) === 0 ) {
+                return true;
+            }
+            $run['errors'][] = substr( $wpdb->last_error, 0, 200 ) . ' | SQL: ' . substr( $statement, 0, 100 );
+            if ( count( $run['errors'] ) > 50 ) {
+                $run['errors'][] = '...truncated (too many errors)';
+                return false;
+            }
+            return true;
+        }
+        $run['statements_executed']++;
+        return true;
+    }
+
+    private function end_statements( $run ) {
+        global $wpdb;
 
         $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
         $wpdb->query( 'SET UNIQUE_CHECKS = 1' );
 
-        // Restore the preserved Disembark token. The raw SQL import bypassed the
-        // options cache, so clear it first — otherwise update_option would see a
-        // stale "unchanged" value and skip the write, leaving the source's token
-        // in the row and breaking auth for the next request.
-        if ( $preserved_token !== false ) {
-            wp_cache_delete( 'disembark_token', 'options' );
-            wp_cache_delete( 'alloptions', 'options' );
-            update_option( 'disembark_token', $preserved_token );
+        // Restore the preserved Disembark token (Token::set() clears the
+        // options cache the raw import bypassed).
+        if ( ! empty( $run['preserved_token'] ) ) {
+            Token::set( $run['preserved_token'] );
         }
 
         return [
-            'statements_executed' => $statements_executed,
-            'errors'              => $errors,
+            'statements_executed' => $run['statements_executed'],
+            'errors'              => $run['errors'],
         ];
+    }
+
+    /**
+     * True when $token is the token this site had when import $import_id
+     * started its SQL import, within the last day. Lets a restore that died
+     * mid-import (leaving the source's token in the options table) still
+     * finish or roll back with the token the dashboard or CLI holds.
+     */
+    public static function token_guard_matches( $import_id, $token ) {
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) );
+        if ( $import_id === '' || ! is_string( $token ) || $token === '' ) {
+            return false;
+        }
+        $file = Storage::base_dir() . "/_import_{$import_id}/token-guard.json";
+        if ( ! is_file( $file ) ) {
+            return false;
+        }
+        $guard = json_decode( (string) file_get_contents( $file ), true );
+        if ( empty( $guard['sha256'] ) || empty( $guard['created_at'] ) || time() - (int) $guard['created_at'] > DAY_IN_SECONDS ) {
+            return false;
+        }
+        return hash_equals( (string) $guard['sha256'], hash( 'sha256', $token ) );
     }
 
     /**
@@ -968,36 +1049,52 @@ class Import {
         $meta   = json_decode( file_get_contents( $meta_file ), true );
         $errors = [];
 
-        // 1. Restore database from snapshot SQL
+        // 1. Restore database from snapshot SQL. Validate the whole snapshot
+        // before anything is dropped: a missing, truncated or unreadable
+        // snapshot must leave the current database alone.
         $sql_files = glob( $this->rollback_path . '/*.sql.txt' );
+        $check     = self::validate_snapshot( $sql_files, $meta );
+        if ( is_wp_error( $check ) ) {
+            return $check;
+        }
+
         if ( ! empty( $sql_files ) ) {
-            $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
-            $wpdb->query( 'SET UNIQUE_CHECKS = 0' );
-
-            // Drop all current tables first
-            $current_tables = $wpdb->get_col( 'SHOW TABLES' );
-            foreach ( $current_tables as $table ) {
-                $wpdb->query( "DROP TABLE IF EXISTS `{$table}`" );
-            }
-
-            // Re-import snapshot
+            // Each table is dropped just before the snapshot recreates it
+            // (DROP-before-CREATE), never all up front, so a rollback that
+            // stops midway leaves every table present and can be run again.
+            $run = $this->begin_statements();
             foreach ( $sql_files as $sql_file ) {
-                $content    = file_get_contents( $sql_file );
-                $statements = self::split_sql_statements( $content );
-                foreach ( $statements as $statement ) {
-                    $statement = trim( $statement );
-                    if ( empty( $statement ) ) {
-                        continue;
+                $read = self::each_sql_statement_in_file( $sql_file, function ( $statement ) use ( &$run ) {
+                    foreach ( self::transform_statements( [ $statement ] ) as $transformed ) {
+                        if ( ! $this->run_statement( $transformed, $run ) ) {
+                            return false;
+                        }
                     }
-                    $result = $wpdb->query( $statement );
-                    if ( $result === false && stripos( $statement, 'SET ' ) !== 0 ) {
-                        $errors[] = 'SQL Error: ' . substr( $wpdb->last_error, 0, 200 );
-                    }
+                    return true;
+                } );
+                if ( is_wp_error( $read ) ) {
+                    $run['errors'][] = $read->get_error_message();
+                    break;
                 }
             }
+            // The snapshot's own token row is the right one now; don't
+            // overwrite it with whatever the imported site had.
+            $run['preserved_token'] = '';
+            $result = $this->end_statements( $run );
+            $errors = $result['errors'];
 
-            $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
-            $wpdb->query( 'SET UNIQUE_CHECKS = 1' );
+            // Tables the restore added (the source's plugin tables) go only
+            // once the snapshot is fully back.
+            if ( empty( $errors ) && ! empty( $meta['tables'] ) ) {
+                $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
+                foreach ( $wpdb->get_col( 'SHOW TABLES' ) as $table ) {
+                    if ( ! in_array( $table, $meta['tables'], true ) ) {
+                        $wpdb->query( "DROP TABLE IF EXISTS `" . str_replace( '`', '``', $table ) . "`" );
+                    }
+                }
+                $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
+            }
+            wp_cache_flush();
         }
 
         // 2. Restore backed-up files
@@ -1029,8 +1126,11 @@ class Import {
             }
         }
 
+        @unlink( $this->import_path . '/token-guard.json' );
+        @unlink( $this->import_path . '/pull.json' );
+
         return [
-            'success'          => true,
+            'success'          => empty( $errors ),
             'tables_restored'  => count( $sql_files ),
             'files_restored'   => count( $backed_up ),
             'files_removed'    => count( array_diff( $deployed, $backed_up ) ),
@@ -1052,6 +1152,11 @@ class Import {
         if ( is_dir( $chunks_dir ) ) {
             self::delete_directory_recursive( $chunks_dir );
         }
+
+        // The pull state holds the source's full-access token; the token guard
+        // is only needed while the import is in flight.
+        @unlink( $this->import_path . '/pull.json' );
+        @unlink( $this->import_path . '/token-guard.json' );
 
         // Flush rewrite rules
         flush_rewrite_rules();
@@ -1076,119 +1181,270 @@ class Import {
      */
     private static function split_sql_statements( $sql ) {
         $statements = [];
-        $current    = '';
-        $len        = strlen( $sql );
-        $state      = 'normal'; // normal | squote | dquote | backtick | line_comment | block_comment
-        $i          = 0;
+        $scan       = self::sql_scanner();
+        self::sql_scan( $scan, $sql, true, function ( $statement ) use ( &$statements ) {
+            $statements[] = $statement;
+            return true;
+        } );
+        return $statements;
+    }
 
-        while ( $i < $len ) {
-            $ch  = $sql[ $i ];
-            $nxt = ( $i + 1 < $len ) ? $sql[ $i + 1 ] : '';
+    /**
+     * Streams a SQL file statement by statement into $callback (same rules
+     * as split_sql_statements()), holding only one statement in memory.
+     * $callback returns false to stop early. Returns a summary
+     * (statements, ended_cleanly, stopped) or WP_Error if the file can't be read.
+     */
+    private static function each_sql_statement_in_file( $path, $callback ) {
+        $handle = @fopen( $path, 'rb' );
+        if ( ! $handle ) {
+            return new \WP_Error( 'sql_unreadable', 'Could not read ' . basename( $path ) . '.', [ 'status' => 500 ] );
+        }
+        $scan  = self::sql_scanner();
+        $count = 0;
+        $emit  = function ( $statement ) use ( $callback, &$count ) {
+            $count++;
+            return $callback( $statement ) !== false;
+        };
+        while ( ! $scan['stopped'] && ! feof( $handle ) ) {
+            $chunk = fread( $handle, 1048576 );
+            if ( $chunk === false ) {
+                fclose( $handle );
+                return new \WP_Error( 'sql_unreadable', 'Could not read ' . basename( $path ) . '.', [ 'status' => 500 ] );
+            }
+            self::sql_scan( $scan, $chunk, false, $emit );
+        }
+        if ( ! $scan['stopped'] ) {
+            self::sql_scan( $scan, '', true, $emit );
+        }
+        fclose( $handle );
+        return [
+            'statements'    => $count,
+            'ended_cleanly' => $scan['ended_cleanly'],
+            'stopped'       => $scan['stopped'],
+        ];
+    }
+
+    private static function sql_scanner() {
+        return [ 'buf' => '', 'cur' => '', 'state' => 'normal', 'stopped' => false, 'ended_cleanly' => false ];
+    }
+
+    /**
+     * Incremental quote/comment-aware statement scanner. Feeds $data through
+     * the state machine, emitting each complete statement; bytes that need
+     * lookahead past the end of $data wait for the next call. Pass
+     * $final = true with the last piece to flush the trailing statement.
+     * Plain runs of characters are copied with strcspn() rather than one byte
+     * at a time.
+     */
+    private static function sql_scan( array &$scan, $data, $final, $emit ) {
+        $s     = $scan['buf'] . $data;
+        $len   = strlen( $s );
+        $i     = 0;
+        $state = $scan['state'];
+        $cur   = $scan['cur'];
+
+        $flush = function () use ( &$cur, &$scan, $emit ) {
+            $statement = trim( $cur );
+            $cur       = '';
+            if ( $statement !== '' && ! $emit( $statement ) ) {
+                $scan['stopped'] = true;
+            }
+        };
+
+        while ( $i < $len && ! $scan['stopped'] ) {
+            // Every transition looks at most two bytes ahead.
+            if ( ! $final && $i + 2 >= $len ) {
+                break;
+            }
+            $ch  = $s[ $i ];
+            $nxt = ( $i + 1 < $len ) ? $s[ $i + 1 ] : '';
 
             switch ( $state ) {
                 case 'normal':
-                    if ( $ch === '-' && $nxt === '-' && ( $i + 2 >= $len || ctype_space( $sql[ $i + 2 ] ) ) ) {
-                        $state    = 'line_comment';
-                        $current .= $ch;
+                    $run = strcspn( $s, "-#/'\"`;", $i );
+                    if ( $run > 0 ) {
+                        $cur .= substr( $s, $i, $run );
+                        $i   += $run;
+                        break;
+                    }
+                    if ( $ch === '-' && $nxt === '-' && ( $i + 2 >= $len || ctype_space( $s[ $i + 2 ] ) ) ) {
+                        $state = 'line_comment';
+                        $cur  .= $ch;
                         $i++;
                         break;
                     }
                     if ( $ch === '#' ) {
-                        $state    = 'line_comment';
-                        $current .= $ch;
+                        $state = 'line_comment';
+                        $cur  .= $ch;
                         $i++;
                         break;
                     }
                     if ( $ch === '/' && $nxt === '*' ) {
-                        $state    = 'block_comment';
-                        $current .= $ch . $nxt;
-                        $i       += 2;
+                        $state = 'block_comment';
+                        $cur  .= '/*';
+                        $i    += 2;
                         break;
                     }
-                    if ( $ch === "'" ) { $state = 'squote';   $current .= $ch; $i++; break; }
-                    if ( $ch === '"' ) { $state = 'dquote';   $current .= $ch; $i++; break; }
-                    if ( $ch === '`' ) { $state = 'backtick'; $current .= $ch; $i++; break; }
+                    if ( $ch === "'" ) { $state = 'squote';   $cur .= $ch; $i++; break; }
+                    if ( $ch === '"' ) { $state = 'dquote';   $cur .= $ch; $i++; break; }
+                    if ( $ch === '`' ) { $state = 'backtick'; $cur .= $ch; $i++; break; }
                     if ( $ch === ';' ) {
-                        $stmt = trim( $current );
-                        if ( $stmt !== '' ) {
-                            $statements[] = $stmt;
-                        }
-                        $current = '';
                         $i++;
+                        $flush();
                         break;
                     }
-                    $current .= $ch;
+                    $cur .= $ch; // a lone "-" or "/"
                     $i++;
                     break;
 
                 case 'squote':
                 case 'dquote':
-                    $q = ( $state === 'squote' ) ? "'" : '"';
+                    $q   = ( $state === 'squote' ) ? "'" : '"';
+                    $run = strcspn( $s, '\\' . $q, $i );
+                    if ( $run > 0 ) {
+                        $cur .= substr( $s, $i, $run );
+                        $i   += $run;
+                        break;
+                    }
                     if ( $ch === '\\' ) {
                         // Backslash escapes the next character.
-                        $current .= $ch . $nxt;
-                        $i       += 2;
+                        $cur .= $ch . $nxt;
+                        $i   += 2;
                         break;
                     }
-                    if ( $ch === $q ) {
-                        if ( $nxt === $q ) {
-                            // Doubled quote is a literal quote, not a terminator.
-                            $current .= $ch . $nxt;
-                            $i       += 2;
-                            break;
-                        }
-                        $state    = 'normal';
-                        $current .= $ch;
-                        $i++;
+                    if ( $nxt === $q ) {
+                        // Doubled quote is a literal quote, not a terminator.
+                        $cur .= $ch . $nxt;
+                        $i   += 2;
                         break;
                     }
-                    $current .= $ch;
+                    $state = 'normal';
+                    $cur  .= $ch;
                     $i++;
                     break;
 
                 case 'backtick':
-                    if ( $ch === '`' ) {
-                        if ( $nxt === '`' ) {
-                            $current .= $ch . $nxt;
-                            $i       += 2;
-                            break;
-                        }
-                        $state    = 'normal';
-                        $current .= $ch;
-                        $i++;
+                    $run = strcspn( $s, '`', $i );
+                    if ( $run > 0 ) {
+                        $cur .= substr( $s, $i, $run );
+                        $i   += $run;
                         break;
                     }
-                    $current .= $ch;
+                    if ( $nxt === '`' ) {
+                        $cur .= '``';
+                        $i   += 2;
+                        break;
+                    }
+                    $state = 'normal';
+                    $cur  .= $ch;
                     $i++;
                     break;
 
                 case 'line_comment':
-                    $current .= $ch;
-                    if ( $ch === "\n" ) {
-                        $state = 'normal';
+                    $run = strcspn( $s, "\n", $i );
+                    if ( $run > 0 ) {
+                        $cur .= substr( $s, $i, $run );
+                        $i   += $run;
+                        break;
                     }
+                    $cur  .= "\n";
+                    $state = 'normal';
                     $i++;
                     break;
 
                 case 'block_comment':
-                    if ( $ch === '*' && $nxt === '/' ) {
-                        $current .= $ch . $nxt;
-                        $i       += 2;
-                        $state    = 'normal';
+                    $run = strcspn( $s, '*', $i );
+                    if ( $run > 0 ) {
+                        $cur .= substr( $s, $i, $run );
+                        $i   += $run;
                         break;
                     }
-                    $current .= $ch;
+                    if ( $nxt === '/' ) {
+                        $cur  .= '*/';
+                        $i    += 2;
+                        $state = 'normal';
+                        break;
+                    }
+                    $cur .= '*';
                     $i++;
                     break;
             }
         }
 
-        $stmt = trim( $current );
-        if ( $stmt !== '' ) {
-            $statements[] = $stmt;
+        $scan['buf']   = $scan['stopped'] ? '' : substr( $s, $i );
+        $scan['state'] = $state;
+        $scan['cur']   = $cur;
+
+        if ( $final && ! $scan['stopped'] ) {
+            // A dump that ends inside a quote or block comment was cut off.
+            $scan['ended_cleanly'] = ( $state === 'normal' || $state === 'line_comment' );
+            $flush();
+        }
+    }
+
+    /**
+     * Checks a rollback snapshot is complete before rollback() changes
+     * anything: every file present, the recorded sizes match, each file
+     * parses to the end, every table in the snapshot has its CREATE TABLE,
+     * and (format 2) the export's completeness marker is the last statement.
+     */
+    private static function validate_snapshot( $sql_files, $meta ) {
+        $fail = function ( $why ) {
+            return new \WP_Error( 'snapshot_invalid', "The rollback snapshot can't be used ({$why}). Nothing was changed.", [ 'status' => 500 ] );
+        };
+        if ( empty( $sql_files ) ) {
+            return $fail( 'no snapshot SQL found' );
+        }
+        $format = (int) ( $meta['format'] ?? 1 );
+        if ( $format >= 2 ) {
+            $expected = (array) ( $meta['sql_files'] ?? [] );
+            $names    = array_map( 'basename', $sql_files );
+            sort( $names );
+            $recorded = array_keys( $expected );
+            sort( $recorded );
+            if ( $names !== $recorded ) {
+                return $fail( 'snapshot files are missing' );
+            }
+            foreach ( $sql_files as $file ) {
+                clearstatcache( true, $file );
+                if ( filesize( $file ) !== (int) $expected[ basename( $file ) ] ) {
+                    return $fail( basename( $file ) . ' changed size since it was taken' );
+                }
+            }
         }
 
-        return $statements;
+        $creates = [];
+        $last    = '';
+        foreach ( $sql_files as $file ) {
+            $summary = self::each_sql_statement_in_file( $file, function ( $statement ) use ( &$creates, &$last ) {
+                if ( preg_match( '/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`((?:[^`]|``)+)`/i', $statement, $m ) ) {
+                    $creates[ str_replace( '``', '`', $m[1] ) ] = true;
+                }
+                $last = $statement;
+                return true;
+            } );
+            if ( is_wp_error( $summary ) ) {
+                return $fail( $summary->get_error_message() );
+            }
+            if ( ! $summary['ended_cleanly'] ) {
+                return $fail( basename( $file ) . ' is cut off' );
+            }
+        }
+        if ( empty( $creates ) ) {
+            return $fail( 'the snapshot holds no tables' );
+        }
+        if ( $format >= 2 ) {
+            foreach ( (array) ( $meta['tables'] ?? [] ) as $table ) {
+                if ( ! isset( $creates[ $table ] ) ) {
+                    return $fail( "table {$table} is missing from it" );
+                }
+            }
+            if ( $last . ';' !== Backup::EXPORT_COMPLETE_MARKER ) {
+                return $fail( 'the export did not finish' );
+            }
+        }
+        return true;
     }
 
     /**

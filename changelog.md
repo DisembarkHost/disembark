@@ -2,7 +2,24 @@
 
 ## Unreleased
 
+### Security
+* **Multisite takes a super admin:** On multisite, Disembark (which reads and writes every table and file of the network) now requires a super admin. A subsite administrator's `manage_options` no longer grants access, and the token moved to network options so it no longer shows on a subsite's Settings → All Options screen. The main site's existing token is carried over.
+* **File editor honors `DISALLOW_FILE_EDIT` and `DISALLOW_FILE_MODS`:** Saving or renaming files through Disembark is refused when either is set, matching WordPress's own editors.
+* **Working files are guarded:** Folders under `uploads/disembark` get blank index files so they can't be listed. A live-site restore deletes each dump, zip and manifest it pulls from the source's uploads as soon as it is downloaded, and drops the source's token from the destination once the database is pulled; finalizing or rolling back removes the rest of the pull state.
+* **Backup session ids are sanitized:** A session id can no longer climb out of `uploads/disembark` (e.g. to delete `wp-config.php` through `/cleanup-file`).
+
 ### Fixed
+* **Rollback can no longer empty the database:** Rollback checks the whole snapshot first (files present, sizes unchanged, fully parsable, every table included, export finished) and changes nothing if it isn't sound. Tables are then replaced one at a time instead of all being dropped up front, and the restored site's extra tables are removed only once the snapshot is fully back. The object cache is flushed afterward.
+* **Large database imports no longer run out of memory:** Restores and rollbacks read the SQL dump statement by statement instead of loading the whole file and every statement into memory.
+* **The dashboard restore stops on errors:** A file that fails to deploy, or a database import that reports errors, now stops the restore before URLs are rewritten, instead of finishing and reporting success. The rollback id is shown as soon as the rollback point exists, and new **Roll back** / **Undo restore** buttons undo a restore from the dashboard.
+* **A restore that dies mid-import stays reachable:** If the database import is cut off (out of memory, a killed worker) after the source's options replaced this site's token, the token the dashboard or CLI holds still works for that restore (including its rollback) for 24 hours.
+* **`/cleanup` keeps rollback points and other sessions:** With a session id it removes only that session (the CLI's end-of-backup cleanup). Without one it removes every backup session but keeps restore folders and their rollback points unless `include_restore_points` is passed.
+* **Files named `0` no longer stop the scan:** The file scan treated an entry named `0` as the end of its folder and skipped the rest of that folder in backups and pulls.
+* **Database exports are complete or fail:** Exports read rows in primary-key order (by key range where the table has a single-column key), so pages can't skip or repeat rows. The multi-table export used by CLI backups, pulls and rollback snapshots now fails with an error, instead of returning a partial dump, when a table can't be read or the disk fills.
+* **Update checks are cached:** The self-updater fetched the manifest from GitHub on every admin page load; it now checks once a day and waits an hour after a failed check. Defining `DISEMBARK_DEV_MODE` as `false` no longer turns off TLS verification.
+* **Pulls work without the zip extension:** A live-site restore now falls back to PclZip when `ZipArchive` isn't available.
+* **Default exclude follows a custom uploads folder:** Backups skip Disembark's own working folder on Bedrock and custom `UPLOADS` layouts too.
+* **`/zip-database` works:** It referenced an undefined variable.
 * **URLs inside JSON are rewritten on restore ([#6](https://github.com/DisembarkHost/disembark/issues/6)):** Search/replace now also matches the escaped spellings JSON uses for a URL (`http:\/\/…`, JSON stored inside JSON, and `\u002F`), each rewritten in its own encoding so the JSON stays valid. This covers PHP's default `json_encode()` output, including page-builder data such as Elementor's `_elementor_data`.
 * **Protected and private object properties are rewritten on restore ([#7](https://github.com/DisembarkHost/disembark/issues/7)):** Serialized values are now rewritten token by token instead of being unserialized and re-serialized, so URLs in non-public properties (including a parent class's private ones) are updated. No restored object is instantiated during the rewrite, so no plugin `__wakeup()`/`__destruct()` code runs, objects whose class isn't loaded or that have readonly properties are handled, and every byte outside a replaced string (floats, references, `Serializable` payloads) is kept exactly as stored.
 

@@ -7,7 +7,7 @@ class Command {
     public function token( $args, $assoc_args ) {
         if ( isset( $assoc_args['generate'] ) ) {
             $token = wp_generate_password( 42, false );
-            update_option( "disembark_token", $token );
+            Token::set( $token );
             \WP_CLI::success( "New token generated and saved." );
         }
         $token = Token::get();
