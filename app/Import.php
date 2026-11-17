@@ -126,7 +126,7 @@ class Import {
     /**
      * Creates a rollback snapshot of the destination database and file manifest.
      */
-    public function snapshot() {
+    public function snapshot( $label = '' ) {
         global $wpdb;
 
         $this->prepare_import_dir();
@@ -171,6 +171,7 @@ class Import {
             'import_id'   => $this->import_id,
             'format'      => 2,
             'created_at'  => time(),
+            'label'       => substr( sanitize_text_field( (string) $label ), 0, 200 ),
             'tables'      => $all_tables,
             'sql_files'   => $sql_sizes,
             'deployed_files' => [],
@@ -792,12 +793,14 @@ class Import {
      * @param string   $to     Replacement (e.g. the destination home URL).
      * @param string[] $tables Optional table allowlist; defaults to all tables.
      */
-    public function search_replace( $from, $to, $tables = [] ) {
+    public function search_replace( $from, $to, $tables = [], $dry_run = false ) {
         global $wpdb;
 
         if ( $from === '' || $from === $to ) {
-            return [ 'tables' => 0, 'rows_changed' => 0, 'cells_changed' => 0 ];
+            return [ 'tables' => 0, 'rows_changed' => 0, 'cells_changed' => 0, 'by_table' => [], 'samples' => [] ];
         }
+        $by_table = [];
+        $samples  = [];
 
         if ( empty( $tables ) ) {
             $tables = $wpdb->get_col( 'SHOW TABLES' );
@@ -831,11 +834,13 @@ class Import {
                 continue;
             }
 
+            // Page in primary-key order so no row is skipped or seen twice.
+            $order  = implode( ', ', array_map( function ( $pk ) { return '`' . str_replace( '`', '``', $pk ) . '`'; }, $primary_keys ) );
             $offset = 0;
             $limit  = 1000;
             while ( true ) {
                 $rows = $wpdb->get_results(
-                    "SELECT * FROM `{$table}` LIMIT {$limit} OFFSET {$offset}",
+                    "SELECT * FROM `{$table}` ORDER BY {$order} LIMIT {$limit} OFFSET {$offset}",
                     ARRAY_A
                 );
                 if ( empty( $rows ) ) {
@@ -855,10 +860,22 @@ class Import {
                         if ( $replaced !== $value ) {
                             $update[ $column ] = $replaced;
                             $cells_changed++;
+                            $by_table[ $table ] = ( $by_table[ $table ] ?? 0 ) + 1;
+                            if ( $dry_run && count( $samples ) < 25 ) {
+                                $samples[] = [
+                                    'table'  => $table,
+                                    'column' => $column,
+                                    'key'    => implode( ', ', array_map( function ( $pk ) use ( $row ) { return $pk . '=' . $row[ $pk ]; }, $primary_keys ) ),
+                                    'before' => self::excerpt( $value, $from ),
+                                    'after'  => self::excerpt( $replaced, $to ),
+                                ];
+                            }
                         }
                     }
 
-                    if ( ! empty( $update ) ) {
+                    if ( ! empty( $update ) && $dry_run ) {
+                        $rows_changed++;
+                    } elseif ( ! empty( $update ) ) {
                         $where = [];
                         foreach ( $primary_keys as $pk ) {
                             $where[ $pk ] = $row[ $pk ];
@@ -874,11 +891,76 @@ class Import {
             }
         }
 
+        arsort( $by_table );
         return [
             'tables'        => $tables_seen,
             'rows_changed'  => $rows_changed,
             'cells_changed' => $cells_changed,
+            'by_table'      => $by_table,
+            'samples'       => $samples,
+            'dry_run'       => (bool) $dry_run,
         ];
+    }
+
+    /**
+     * A short slice of $value around the first $needle (or its start), for
+     * previews. Serialized and JSON-escaped spellings are matched too.
+     */
+    private static function excerpt( $value, $needle ) {
+        $pos = strpos( $value, $needle );
+        if ( $pos === false ) {
+            $pos = strpos( $value, str_replace( '/', '\\/', $needle ) );
+        }
+        $pos   = $pos === false ? 0 : $pos;
+        $start = max( 0, $pos - 50 );
+        $slice = substr( $value, $start, 160 );
+        return ( $start > 0 ? '…' : '' ) . $slice . ( $start + 160 < strlen( $value ) ? '…' : '' );
+    }
+
+    /**
+     * Every saved rollback point (newest first): what it was for, when, how
+     * big, and whether it has been rolled back to.
+     */
+    public static function restore_points() {
+        $points = [];
+        foreach ( (array) glob( Storage::base_dir() . '/_import_*', GLOB_ONLYDIR ) as $dir ) {
+            $meta_file = $dir . '/rollback/meta.json';
+            if ( ! is_file( $meta_file ) ) {
+                continue;
+            }
+            $meta = json_decode( (string) file_get_contents( $meta_file ), true );
+            $meta = is_array( $meta ) ? $meta : [];
+            $size = 0;
+            $it   = new \RecursiveIteratorIterator( new \RecursiveDirectoryIterator( $dir . '/rollback', \FilesystemIterator::SKIP_DOTS ) );
+            foreach ( $it as $file ) {
+                if ( $file->isFile() ) {
+                    $size += $file->getSize();
+                }
+            }
+            $points[] = [
+                'id'             => substr( basename( $dir ), strlen( '_import_' ) ),
+                'label'          => (string) ( $meta['label'] ?? '' ),
+                'created_at'     => (int) ( $meta['created_at'] ?? filemtime( $meta_file ) ),
+                'rolled_back_at' => (int) ( $meta['rolled_back_at'] ?? 0 ),
+                'tables'         => count( (array) ( $meta['tables'] ?? [] ) ),
+                'files'          => count( (array) ( $meta['backed_up_files'] ?? [] ) ),
+                'deployed'       => count( (array) ( $meta['deployed_files'] ?? [] ) ),
+                'size'           => $size,
+            ];
+        }
+        usort( $points, function ( $a, $b ) { return $b['created_at'] - $a['created_at']; } );
+        return $points;
+    }
+
+    /**
+     * Deletes this import's folder, rollback point included.
+     */
+    public function delete_restore_point() {
+        if ( ! is_dir( $this->import_path ) ) {
+            return new \WP_Error( 'not_found', 'That restore point no longer exists.', [ 'status' => 404 ] );
+        }
+        self::delete_directory_recursive( $this->import_path );
+        return [ 'deleted' => true ];
     }
 
     private static function contains_any( $value, $pairs ) {
@@ -1248,6 +1330,15 @@ class Import {
 
         @unlink( $this->import_path . '/token-guard.json' );
         @unlink( $this->import_path . '/pull.json' );
+
+        // Remember the rollback so the restore points list can show it.
+        if ( empty( $errors ) && is_file( $this->rollback_path . '/meta.json' ) ) {
+            $saved = json_decode( (string) file_get_contents( $this->rollback_path . '/meta.json' ), true );
+            if ( is_array( $saved ) ) {
+                $saved['rolled_back_at'] = time();
+                file_put_contents( $this->rollback_path . '/meta.json', json_encode( $saved, JSON_PRETTY_PRINT ) );
+            }
+        }
 
         return [
             'success'          => empty( $errors ),

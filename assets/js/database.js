@@ -19,7 +19,9 @@
     D.mount(root,
       h('div', { class: 'dsk-head' },
         h('div', null, h('h1', null, 'Database'), h('p', null, 'Browse and edit tables directly, or export them as SQL. Changes are written immediately.')),
-        h('div', { class: 'dsk-head-tools' }, h('button', { class: 'dsk-btn', onclick: function (e) { D.busy(e.currentTarget, function () { return D.loadDatabase(true).catch(function (err) { D.toast(D.errorText(err), 'error'); }); }); } }, D.icon('refresh'), 'Refresh'))),
+        h('div', { class: 'dsk-head-tools' },
+          h('button', { class: 'dsk-btn', onclick: function () { searchReplace(st.selected.slice()); } }, D.icon('search'), 'Search & replace'),
+          h('button', { class: 'dsk-btn', onclick: function (e) { D.busy(e.currentTarget, function () { return D.loadDatabase(true).catch(function (err) { D.toast(D.errorText(err), 'error'); }); }); } }, D.icon('refresh'), 'Refresh'))),
       h('div', { class: 'dsk-card dsk-split' },
         h('aside', null,
           h('div', { class: 'dsk-pad', style: { borderBottom: '1px solid var(--line)', display: 'grid', gap: '10px' } }, search,
@@ -71,6 +73,96 @@
       st.selected = all ? st.selected.filter(function (n) { return names.indexOf(n) === -1; }) : Array.from(new Set(st.selected.concat(names)));
       renderList(); renderDetail();
     }
+    /* ------------------------------------------------- Search & replace */
+    function mark(text, needle) {
+      var out = h('span'), i = 0, at;
+      if (!needle) return out.appendChild(document.createTextNode(text)), out;
+      while ((at = text.indexOf(needle, i)) !== -1) {
+        out.appendChild(document.createTextNode(text.slice(i, at)));
+        out.appendChild(h('mark', { style: { background: 'var(--accent-soft)', color: 'var(--accent)', borderRadius: '3px', padding: '0 2px' } }, needle));
+        i = at + needle.length;
+      }
+      out.appendChild(document.createTextNode(text.slice(i)));
+      return out;
+    }
+    function searchReplace(selected) {
+      var from = h('input', { class: 'dsk-input mono', placeholder: 'https://old-address.com', spellcheck: 'false' });
+      var to = h('input', { class: 'dsk-input mono', placeholder: 'https://new-address.com', spellcheck: 'false' });
+      var onlySelected = selected.length ? D.toggle('Only the ' + D.fmt.plural(selected.length, 'selected table'), false, function () { result.replaceChildren(); }) : null;
+      var result = h('div');
+      var previewBtn = h('button', { class: 'dsk-btn primary', onclick: preview }, D.icon('search'), 'Preview changes');
+      [from, to].forEach(function (i) { i.addEventListener('input', function () { result.replaceChildren(); }); i.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); preview(); } }); });
+      function scope() { return onlySelected && onlySelected.input.checked ? selected : []; }
+      D.modal({
+        title: 'Search & replace', wide: true,
+        body: h('div', { class: 'dsk-stack', style: { gap: '12px' } },
+          h('p', null, 'Rewrites text across the database, safely inside serialized PHP values and JSON (the same engine a restore uses). Preview first; a rollback point is saved before anything changes.'),
+          h('div', { class: 'dsk-grid two', style: { gap: '12px' } },
+            h('div', { class: 'dsk-field', style: { margin: 0 } }, h('label', null, 'Find'), from),
+            h('div', { class: 'dsk-field', style: { margin: 0 } }, h('label', null, 'Replace with'), to)),
+          onlySelected, h('div', null, previewBtn), result),
+        actions: [{ label: 'Close', value: null }]
+      });
+      async function preview() {
+        if (!from.value) { from.focus(); return; }
+        await D.busy(previewBtn, async function () {
+          try {
+            var r = await D.api.post('search-replace', { from: from.value, to: to.value, tables: scope(), dry_run: true });
+            showPreview(r);
+          } catch (e) { result.replaceChildren(D.note('error', D.errorText(e))); }
+        });
+      }
+      function showPreview(r) {
+        if (!r.cells_changed) { result.replaceChildren(D.note('', 'Nothing matches \u201c' + from.value + '\u201d' + (scope().length ? ' in the selected tables.' : ' anywhere in the database.'))); return; }
+        var go = h('button', { class: 'dsk-btn danger solid', onclick: function () { replace(r, go); } }, 'Replace ' + D.fmt.plural(r.cells_changed, 'cell'));
+        result.replaceChildren(h('div', { class: 'dsk-stack', style: { gap: '12px' } },
+          D.note('warn', [h('strong', null, D.fmt.plural(r.cells_changed, 'cell')), ' in ', D.fmt.plural(r.rows_changed, 'row'), ' across ', D.fmt.plural(Object.keys(r.by_table).length, 'table'), ' would change.']),
+          h('div', { class: 'dsk-row', style: { gap: '6px' } }, Object.keys(r.by_table).slice(0, 12).map(function (t) { return h('span', { class: 'dsk-badge' }, t + ' · ' + D.fmt.num(r.by_table[t])); })),
+          h('div', { class: 'dsk-table-wrap', style: { maxHeight: '260px', border: '1px solid var(--line)', borderRadius: '10px' } }, h('table', { class: 'dsk-table static' },
+            h('thead', null, h('tr', null, h('th', null, 'Where'), h('th', null, 'Before'), h('th', null, 'After'))),
+            h('tbody', null, (r.samples || []).map(function (x) {
+              return h('tr', null,
+                h('td', { style: { whiteSpace: 'normal', maxWidth: '180px' } }, x.table + '.' + x.column, h('div', { class: 'muted' }, x.key)),
+                h('td', { style: { whiteSpace: 'normal', wordBreak: 'break-all', maxWidth: '300px' } }, mark(x.before, from.value)),
+                h('td', { style: { whiteSpace: 'normal', wordBreak: 'break-all', maxWidth: '300px' } }, mark(x.after, to.value)));
+            })))),
+          (r.samples || []).length < r.cells_changed ? h('p', { class: 'muted' }, 'Showing the first ' + r.samples.length + ' changes.') : null,
+          h('div', null, go)));
+      }
+      async function replace(r, btn) {
+        var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
+          h('p', null, 'Replace ', h('strong', null, from.value), ' with ', h('strong', null, to.value || '(nothing)'), ' in ', D.fmt.plural(r.cells_changed, 'cell'), '?'),
+          h('p', { class: 'muted' }, 'A rollback point is saved first, so this can be undone.')), { title: 'Replace now?', confirmLabel: 'Replace', danger: true });
+        if (!ok) return;
+        await D.busy(btn, async function () {
+          var id = D.randomHex(24), saved = false;
+          try {
+            await D.api.post('import/snapshot', { import_id: id, label: 'Before search & replace: ' + from.value + ' → ' + (to.value || '(nothing)') });
+            saved = true;
+            var done = await D.api.post('search-replace', { from: from.value, to: to.value, tables: scope() });
+            var undo = h('button', { class: 'dsk-btn', onclick: async function () {
+              await D.busy(undo, async function () {
+                try {
+                  var rb = await D.api.post('import/rollback', { import_id: id });
+                  if (rb.errors && rb.errors.length) throw new Error(rb.errors[0]);
+                  result.replaceChildren(D.note('ok', 'Undone. The database is back to how it was before the replace.'));
+                  D.loadDatabase(true).catch(function () {});
+                } catch (e) { D.toast('Undo failed: ' + D.errorText(e), 'error'); }
+              });
+            } }, D.icon('restore'), 'Undo');
+            result.replaceChildren(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
+              D.note('ok', [h('strong', null, 'Replaced ' + D.fmt.plural(done.cells_changed, 'cell') + '.'), ' A rollback point was saved first (Restore → Restore points).']),
+              h('div', null, undo)));
+            D.loadDatabase(true).catch(function () {});
+          } catch (e) {
+            result.replaceChildren(D.note('error', saved
+              ? ['The replace stopped partway: ' + D.errorText(e) + ' Some cells may have changed. Roll back from ', h('strong', null, 'Restore → Restore points'), '.']
+              : 'Nothing was replaced: ' + D.errorText(e)));
+          }
+        });
+      }
+    }
+
     function tableInfo(name) { return S.database.find(function (t) { return t.table === name; }) || { table: name, size: 0, row_count: 0 }; }
 
     /* ---------------------------------------------------------- Detail */

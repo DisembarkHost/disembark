@@ -356,6 +356,18 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'import_finalize' ]
         ]);
+        register_rest_route('disembark/v1', '/restore-points', [
+            'methods'  => 'GET',
+            'callback' => [ $this, 'restore_points' ]
+        ]);
+        register_rest_route('disembark/v1', '/restore-points/delete', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'delete_restore_point' ]
+        ]);
+        register_rest_route('disembark/v1', '/search-replace', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'search_replace' ]
+        ]);
     }
 
     public function get_backup_size( $request ) {
@@ -995,7 +1007,42 @@ class Run {
             return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
         }
         $import = new Import( $import_id );
-        return $import->snapshot();
+        return $import->snapshot( (string) ( $params['label'] ?? '' ) );
+    }
+
+    function restore_points( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        return Import::restore_points();
+    }
+
+    function delete_restore_point( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) ( $request['import_id'] ?? '' ) ) );
+        if ( $import_id === '' ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        return ( new Import( $import_id ) )->delete_restore_point();
+    }
+
+    /**
+     * On-demand search & replace (the same serialize- and JSON-safe engine a
+     * restore uses). dry_run counts what would change and returns samples.
+     */
+    function search_replace( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $from   = (string) ( $request['from'] ?? '' );
+        $to     = (string) ( $request['to'] ?? '' );
+        $tables = array_values( array_filter( (array) ( $request['tables'] ?? [] ), 'is_string' ) );
+        if ( $from === '' ) {
+            return new \WP_Error( 'missing_from', 'Enter the text to search for.', [ 'status' => 400 ] );
+        }
+        return ( new Import() )->search_replace( $from, $to, $tables, ! empty( $request['dry_run'] ) );
     }
 
     function import_upload_zip( $request ) {

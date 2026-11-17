@@ -31,6 +31,62 @@
     { key: 'fin', label: 'Finishing up' }
   ];
 
+  /**
+   * The saved rollback points, with Roll back and Delete. Shared by Restore
+   * and Database (search & replace saves one too).
+   */
+  D.restorePoints = function () {
+    var body = h('div');
+    var card = h('div', { class: 'dsk-card' },
+      h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('anchor'), 'Restore points'), h('span', { class: 'grow' }),
+        h('span', { class: 'muted', style: { fontSize: '12.5px' } }, 'Saved before every restore and search & replace.')),
+      body);
+    async function load() {
+      D.mount(body, h('div', { class: 'dsk-card-pad muted' }, h('span', { class: 'dsk-spin' }), ' Loading\u2026'));
+      var points;
+      try { points = await D.api.get('restore-points'); }
+      catch (e) { D.mount(body, h('div', { class: 'dsk-card-pad' }, D.note('error', 'Could not list restore points: ' + D.errorText(e)))); return; }
+      if (!points.length) { D.mount(body, h('div', { class: 'dsk-card-pad muted' }, 'None yet. One is saved automatically before anything changes this site.')); return; }
+      D.mount(body, h('ul', { class: 'dsk-list' }, points.map(function (p) {
+        return h('li', { style: { padding: '12px 18px' } },
+          D.icon('anchor'),
+          h('div', { class: 'grow' },
+            h('div', { style: { fontWeight: 500 } }, p.label || 'Rollback point'),
+            h('div', { class: 'muted', style: { fontSize: '12.5px' } }, D.fmt.date(p.created_at) + ' · ' + D.fmt.ago(p.created_at) + ' · ' + D.fmt.plural(p.tables, 'table') + (p.files ? ' · ' + D.fmt.plural(p.files, 'file') : '') + ' · ' + D.fmt.size(p.size))),
+          p.rolled_back_at ? h('span', { class: 'dsk-badge ok' }, 'rolled back ' + D.fmt.ago(p.rolled_back_at)) : null,
+          h('button', { class: 'dsk-btn sm', onclick: function (e) { rollback(p, e.currentTarget); } }, D.icon('restore'), 'Roll back'),
+          h('button', { class: 'dsk-btn ghost sm icon', 'aria-label': 'Delete this restore point', title: 'Delete', onclick: function (e) { remove(p, e.currentTarget); } }, D.icon('trash')));
+      })));
+    }
+    async function rollback(p, btn) {
+      var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
+        h('p', null, 'Put this site back to how it was on ', h('strong', null, D.fmt.date(p.created_at)), '?'),
+        h('p', { class: 'muted' }, 'The database is replaced with the snapshot' + (p.files ? ' and the files a restore changed are put back' : '') + '. Anything changed since is lost.')),
+        { title: 'Roll back?', confirmLabel: 'Roll back', danger: true });
+      if (!ok) return;
+      await D.busy(btn, async function () {
+        try {
+          var r = await D.api.post('import/rollback', { import_id: p.id });
+          if (r.errors && r.errors.length) throw new Error(D.fmt.plural(r.errors.length, 'error') + ': ' + r.errors.slice(0, 2).join(' · '));
+          D.toast('Rolled back to ' + D.fmt.date(p.created_at) + '.');
+          if (D.store.state.database.length) D.loadDatabase(true).catch(function () {});
+          load();
+        } catch (e) { D.toast('Rollback failed: ' + D.errorText(e), 'error'); }
+      });
+    }
+    async function remove(p, btn) {
+      var ok = await D.confirm('Delete the restore point from ' + D.fmt.date(p.created_at) + '? You won\u2019t be able to roll back to it.', { title: 'Delete restore point?', confirmLabel: 'Delete', danger: true });
+      if (!ok) return;
+      await D.busy(btn, async function () {
+        try { await D.api.post('restore-points/delete', { import_id: p.id }); D.toast('Restore point deleted.'); load(); D.loadStatus(); }
+        catch (e) { D.toast('Could not delete it: ' + D.errorText(e), 'error'); }
+      });
+    }
+    card.reload = load;
+    load();
+    return card;
+  };
+
   function mount(root) {
     var st = { mode: 'site', file: null, site: '', token: '', sourceUrl: '', running: false };
     var view = h('div');
@@ -84,12 +140,13 @@
         st.mode = v; D.mount(panes, v === 'site' ? sitePane : filePane); sync();
       });
       sync();
-      D.mount(view, h('div', { class: 'dsk-grid two', style: { alignItems: 'start' } },
+      D.mount(view, h('div', { class: 'dsk-stack' }, h('div', { class: 'dsk-grid two', style: { alignItems: 'start' } },
         h('div', { class: 'dsk-card dsk-card-pad dsk-stack' }, seg, panes, h('div', null, startBtn)),
         h('div', { class: 'dsk-stack' },
           D.note('warn', [h('strong', null, 'This replaces this site.'), ' Its files and database are overwritten with the backup. User accounts come from the backup too, so afterwards you log in with the source site’s credentials.']),
           D.note('', ['A rollback point is saved before anything changes. If something goes wrong, or you change your mind, ', h('strong', null, 'Roll back'), ' puts this site back exactly as it was.'], 'anchor'),
-          D.note('', ['Prefer the terminal? ', h('code', null, 'disembark restore ' + D.config.homeUrl + ' <folder>'), ' does the same from a backup folder.'], 'terminal'))));
+          D.note('', ['Prefer the terminal? ', h('code', null, 'disembark restore ' + D.config.homeUrl + ' <folder>'), ' does the same from a backup folder.'], 'terminal'))),
+        D.restorePoints()));
     }
 
     async function confirmStart() {
@@ -200,7 +257,7 @@
           stepEls.read.meta.textContent = D.fmt.plural(info.files || 0, 'file');
 
           step('snap');
-          await D.api.post('import/snapshot', t());
+          await D.api.post('import/snapshot', t({ label: 'Before restore from ' + (st.mode === 'site' ? D.host(st.site) : st.file.name) }));
           rollbackId = importId;
           rlog('Rollback point saved (id ' + importId + ').', 'ok');
           showRollbackOnly();

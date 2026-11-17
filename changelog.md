@@ -5,11 +5,16 @@
 ### Changed
 * **A new dashboard, without Vue or Vuetify:** Tools → Disembark is rebuilt as plain JavaScript with a custom design. Nothing loads from a CDN any more (Vue, Vuetify, axios, Prism, Material icons and Google Fonts are gone); every script, style and font ships with the plugin. Dialogs became sections: **Back up**, **Restore**, **Files**, **Database** and **Settings**, with light and dark themes. The REST API is unchanged, so the CLI works as before.
 
+### Added
+* **Restore points:** Restore lists every saved rollback point (what it was for, when, how big, whether it's been rolled back to) with **Roll back** and **Delete**. New endpoints: `GET /restore-points` and `POST /restore-points/delete`; snapshots take an optional `label`.
+* **Search & replace:** Database → **Search & replace** rewrites text across the database with the restore engine (serialized PHP and JSON stay valid). Preview shows the cells, rows and tables that would change with before/after samples; replacing saves a rollback point first and offers Undo. New endpoint: `POST /search-replace` (with `dry_run`).
+
 ### Improved
 * **Back up:** a step-by-step scan with live counts, a summary of what's included, and commands that update as you leave files or tables out.
 * **Restore:** a confirmation before anything changes, a step list (with the full log under "Show details"), the rollback point shown the moment it exists, and "Start another restore" after a rollback.
 * **Files:** find any file by path, see the largest items in a folder, and edit with Tab and ⌘S. Files open as raw text, so a JSON file is no longer reformatted when edited. Edit and rename are hidden when file edits are disabled on the site.
 * **Database:** editing a row saves only the fields you changed (an untouched `NULL` stays `NULL`), and adding a row leaves empty fields out so auto-increment keys and column defaults apply. Deleting a row asks first.
+* **Search & replace pages in key order:** the engine (used by restores too) now reads rows in primary-key order, so a large table can't skip or repeat rows between pages.
 * **Settings:** the connection token is masked until you choose to show it, and cleanup keeps restore points unless you ask for them to go too.
 
 ## **v2.9.0** - November 17, 2026
