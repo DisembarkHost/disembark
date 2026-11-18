@@ -48,7 +48,9 @@
       } catch (e) {
         lastError = e;
         if (e.status === 403) throw new D.api.Error(host + ' rejected the token. Copy the connect line again from its Tools → Disembark → Settings.', 403);
-        if (e.status === 0) throw e;
+        // A site on plain permalinks answers /wp-json/ with its front page,
+        // which carries no CORS headers, so the browser reports it as
+        // unreachable: try the ?rest_route= form before giving up.
       }
     }
     throw lastError || new Error('Disembark doesn’t seem to be active on ' + host + '.');
