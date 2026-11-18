@@ -19,6 +19,7 @@ class Run {
 
         add_action( 'rest_api_init', [ $this, 'register_rest_endpoints' ] );
         add_filter( 'rest_authentication_errors', [ $this, 'allow_token_auth' ], 99 );
+        add_filter( 'rest_dispatch_request', [ Steps::class, 'dispatch' ], 10, 4 );
 
         if ( defined( 'WP_CLI' ) && \WP_CLI ) {
             \WP_CLI::add_command( 'disembark', new class {}, [

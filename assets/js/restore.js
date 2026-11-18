@@ -114,21 +114,72 @@
     function progress(text) { line.textContent = text || ''; }
     var t = function (body) { return Object.assign({ import_id: importId }, body || {}); };
 
-    // A dropped connection (not a server error) is retried a few times: every
-    // step is safe to repeat, and one network blip shouldn't end a long move.
+    // Every step carries a request_id. A site that says it's resumable
+    // (preflight.resumable, see app/Steps.php) runs each step once, finishes
+    // it even when the browser goes away, and answers a resent request_id
+    // with the running step's result. So a lost request (a network switch, a
+    // gateway timeout) is resent with the same id until the site is back.
+    // An older site gets the old behavior: three quick retries on a dropped
+    // connection only.
+    var resumable = false, outage = 0;
+    var TRANSIENT = [0, 408, 429, 502, 503, 504, 520, 521, 522, 523, 524];
+    var GIVE_UP_MS = 15 * 60 * 1000;
+    function waitForNetwork(ms) {
+      return new Promise(function (resolve) {
+        var timer, done = function () { clearTimeout(timer); window.removeEventListener('online', done); resolve(); };
+        timer = setTimeout(done, ms);
+        window.addEventListener('online', done);
+      });
+    }
+    function back(note) {
+      if (!outage) return;
+      outage = 0;
+      rlog(note || 'Reconnected. Carrying on.', 'ok');
+      progress('');
+    }
     async function retrying(fn) {
+      var delay = 2000;
       for (var attempt = 0; ; attempt++) {
-        try { return await fn(); }
-        catch (e) {
-          if (e.status !== 0 || attempt >= 3) throw e;
-          rlog('Connection dropped, retrying in ' + (attempt + 1) * 3 + 's\u2026', 'dim');
-          await D.sleep((attempt + 1) * 3000);
+        try {
+          var r = await fn();
+          if (r && r.code === 'disembark_step_running') {
+            // The server held the retry while the step kept running; ask again.
+            back('Reconnected. The server is still working on this step.');
+            delay = 2000;
+            continue;
+          }
+          back();
+          return r;
+        } catch (e) {
+          if (!resumable) {
+            if (e.status !== 0 || attempt >= 3) throw e;
+            rlog('Connection dropped, retrying in ' + (attempt + 1) * 3 + 's\u2026', 'dim');
+            await D.sleep((attempt + 1) * 3000);
+            continue;
+          }
+          if (TRANSIENT.indexOf(e.status) === -1) throw e;
+          if (!outage) {
+            outage = Date.now();
+            rlog(e.status === 0 ? 'Lost the connection. The server keeps working; waiting to reconnect\u2026' : 'The site answered ' + e.status + '. Trying again\u2026', 'dim');
+          }
+          if (Date.now() - outage > GIVE_UP_MS) {
+            throw new Error('Couldn\u2019t reach ' + D.host(opts.targetHome) + ' for 15 minutes, so this stopped. The step it was on may still finish on the server. (' + D.errorText(e) + ')');
+          }
+          progress(e.status === 0 ? (navigator.onLine === false ? 'Offline. Waiting for a connection\u2026' : 'Connection lost. Retrying\u2026') : 'The site answered ' + e.status + '. Retrying\u2026');
+          await waitForNetwork(delay);
+          delay = Math.min(delay * 2, 15000);
         }
       }
     }
     var api = {
-      post: function (endpoint, body) { return retrying(function () { return opts.api.post(endpoint, body); }); },
-      upload: function (endpoint, form) { return retrying(function () { return opts.api.upload(endpoint, form); }); }
+      post: function (endpoint, body) {
+        var rid = D.randomHex(24);
+        return retrying(function () { return opts.api.post(endpoint, Object.assign({ request_id: rid }, body || {})); });
+      },
+      upload: function (endpoint, form) {
+        form.append('request_id', D.randomHex(24));
+        return retrying(function () { return opts.api.upload(endpoint, form); });
+      }
     };
 
     async function stageFromSite() {
@@ -194,6 +245,7 @@
       try {
         step('pre');
         var pre = await api.post('import/preflight', t());
+        resumable = !!pre.resumable;
         var destPrefix = pre.db_prefix || '', destHome = String(pre.home_url || opts.targetHome).replace(/\/$/, '');
         opts.targetHome = destHome;
         rlog('Destination: ' + destHome + ' (prefix ' + destPrefix + ').', 'dim');

@@ -115,6 +115,8 @@ class Import {
             'upload_max_filesize' => ini_get( 'upload_max_filesize' ),
             'post_max_size'      => ini_get( 'post_max_size' ),
             'upload_chunk_bytes' => self::upload_chunk_bytes(),
+            // Steps sent with a request_id are safe to retry (see Steps).
+            'resumable'          => true,
             'max_execution_time' => ini_get( 'max_execution_time' ),
             'tables'             => $tables,
             'php_version'        => phpversion(),
