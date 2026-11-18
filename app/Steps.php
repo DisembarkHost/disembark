@@ -28,8 +28,8 @@ class Steps {
 
     /** Routes that take part: every import step, and quiet mode (turned on mid-move). */
     public static function covers( $route ) {
-        if ( $route === '/disembark/v1/import/preflight' ) {
-            return false; // read-only, and runs before the import has a folder
+        if ( in_array( $route, [ '/disembark/v1/import/resume', '/disembark/v1/import/unfinished', '/disembark/v1/import/last-pulls' ], true ) ) {
+            return false;
         }
         return strpos( $route, '/disembark/v1/import/' ) === 0 || $route === '/disembark/v1/quiet-mode';
     }
@@ -103,6 +103,24 @@ class Steps {
         flock( $lock, LOCK_UN );
         fclose( $lock );
         return $response;
+    }
+
+    /**
+     * Every finished step of an import: { request_id: response data }. A
+     * resumed move replays these instead of asking for them one by one.
+     */
+    public static function results( $import_id ) {
+        $out = [];
+        foreach ( (array) glob( Storage::base_dir() . "/_import_{$import_id}/steps/*.php" ) as $file ) {
+            if ( basename( $file ) === 'index.php' ) {
+                continue;
+            }
+            $saved = self::saved( $file );
+            if ( $saved !== null && (int) $saved['status'] < 300 ) {
+                $out[ basename( $file, '.php' ) ] = $saved['data'];
+            }
+        }
+        return $out;
     }
 
     private static function saved( $file ) {

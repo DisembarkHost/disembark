@@ -237,7 +237,9 @@
         h('div', { class: 'dsk-card-pad dsk-stack', style: { gap: '14px' } },
           h('div', null,
             h('h2', { style: { fontSize: '26px' } }, 'What to bring'),
-            h('p', { class: 'muted', style: { marginTop: '6px' } }, D.host(o.source || '') + ' holds ' + D.fmt.plural(c.files || 0, 'file') + ' (' + D.fmt.size(c.bytes || 0) + ') and ' + D.fmt.plural((c.tables || []).length, 'table') + '. The usual things to leave behind are ticked. Nothing has been copied yet.')),
+            h('p', { class: 'muted', style: { marginTop: '6px' } }, o.catchUp
+              ? 'Catching up: ' + D.fmt.plural(c.files || 0, 'file') + ' (' + D.fmt.size(c.bytes || 0) + ') on ' + D.host(o.source || '') + ' are new or changed since the last pull, and all ' + D.fmt.plural((c.tables || []).length, 'table') + ' come across again. The usual things to leave behind are ticked. Nothing has been copied yet.'
+              : D.host(o.source || '') + ' holds ' + D.fmt.plural(c.files || 0, 'file') + ' (' + D.fmt.size(c.bytes || 0) + ') and ' + D.fmt.plural((c.tables || []).length, 'table') + '. The usual things to leave behind are ticked. Nothing has been copied yet.')),
           h('div', { class: 'dsk-row' }, h('label', { class: 'muted' }, 'Start from'), startSel,
             h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: saveTemplate }, D.icon('plus'), 'Save as template'), delBtn),
           h('div', null, h('h3', { style: { marginBottom: '8px' } }, 'Leave behind'), suggBox),

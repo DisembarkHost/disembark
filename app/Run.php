@@ -34,6 +34,8 @@ class Run {
             \WP_CLI::add_command( 'disembark delete-restore-point', [ 'Disembark\Command', 'delete_restore_point' ] );
             \WP_CLI::add_command( 'disembark search-replace', [ 'Disembark\Command', 'search_replace' ] );
             \WP_CLI::add_command( 'disembark quiet-mode', [ 'Disembark\Command', 'quiet_mode' ] );
+            \WP_CLI::add_command( 'disembark unfinished', [ 'Disembark\Command', 'unfinished' ] );
+            \WP_CLI::add_command( 'disembark discard', [ 'Disembark\Command', 'discard' ] );
         }
     }
 
@@ -326,6 +328,18 @@ class Run {
         register_rest_route('disembark/v1', '/import/pull/select', [
             'methods'  => 'POST',
             'callback' => [ $this, 'import_pull_select' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/unfinished', [
+            'methods'  => 'GET',
+            'callback' => [ $this, 'import_unfinished' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/resume', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_resume' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/last-pulls', [
+            'methods'  => 'GET',
+            'callback' => [ $this, 'import_last_pulls' ]
         ]);
         register_rest_route('disembark/v1', '/import/cancel', [
             'methods'  => 'POST',
@@ -1268,7 +1282,14 @@ class Run {
         if ( empty( $source_url ) || empty( $source_token ) ) {
             return new \WP_Error( 'missing_params', 'source_url and source_token are required.', [ 'status' => 400 ] );
         }
-        return ( new Pull( $import_id ) )->connect( $source_url, $source_token );
+        $move = is_array( $params['move'] ?? null ) ? $params['move'] : [];
+        $move = [
+            'client' => 'dashboard',
+            'kind'   => ( $move['kind'] ?? '' ) === 'push' ? 'push' : 'pull',
+            'quiet'  => ! empty( $move['quiet'] ),
+            'label'  => sanitize_text_field( (string) ( $move['label'] ?? '' ) ),
+        ];
+        return ( new Pull( $import_id ) )->connect( $source_url, $source_token, $move, ! empty( $params['catch_up'] ) );
     }
 
     function import_pull_scan( $request ) {
@@ -1309,6 +1330,44 @@ class Run {
             return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
         }
         return ( new Pull( $import_id ) )->fetch_database();
+    }
+
+    /** Moves that stopped before finishing (see Pull::unfinished()). */
+    function import_unfinished( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        return Pull::unfinished();
+    }
+
+    /**
+     * Resume a move: clears a leftover cancel marker and returns every step
+     * it already finished, for the dashboard to replay.
+     */
+    function import_resume( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) ( $request['import_id'] ?? '' ) ) );
+        $found     = null;
+        foreach ( Pull::unfinished() as $move ) {
+            if ( $move['id'] === $import_id ) {
+                $found = $move;
+            }
+        }
+        if ( ! $found ) {
+            return new \WP_Error( 'not_found', 'That move has already finished or was cleaned up.', [ 'status' => 404 ] );
+        }
+        @unlink( Storage::base_dir() . "/_import_{$import_id}/cancel" );
+        return [ 'move' => $found, 'steps' => (object) Steps::results( $import_id ) ];
+    }
+
+    /** Sources this site has pulled from, for catch-up pulls. */
+    function import_last_pulls( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        return Pull::last_pulls();
     }
 
     /** Cancel a move: action=stop, then action=cleanup (see Import::cancel()). */

@@ -617,6 +617,38 @@ class Import {
             }
         }
 
+        // A catch-up pull removes files that were brought by the last pull
+        // and are gone from the source now. Each is backed up first, so a
+        // rollback puts it back.
+        $removed   = 0;
+        $delete    = $this->import_path . '/delete-list.json';
+        if ( is_file( $delete ) && ! $this->cancelled() ) {
+            foreach ( (array) json_decode( (string) file_get_contents( $delete ), true ) as $relative_path ) {
+                $relative_path = (string) $relative_path;
+                if ( ! self::is_safe_relative_path( $relative_path ) || basename( $relative_path ) === 'wp-config.php' || self::never_deploy( $relative_path ) ) {
+                    continue;
+                }
+                if ( $keep_host_files && self::host_file( $relative_path, $web_root ) !== '' ) {
+                    continue;
+                }
+                $dest = $web_root . '/' . $relative_path;
+                if ( ! is_file( $dest ) ) {
+                    continue;
+                }
+                $backup_dest = $this->rollback_path . '/files/' . $relative_path;
+                if ( ! is_dir( dirname( $backup_dest ) ) ) {
+                    mkdir( dirname( $backup_dest ), 0755, true );
+                }
+                if ( ! in_array( $relative_path, $backed_up, true ) && copy( $dest, $backup_dest ) ) {
+                    $backed_up[] = $relative_path;
+                }
+                if ( in_array( $relative_path, $backed_up, true ) && @unlink( $dest ) ) {
+                    $removed++;
+                }
+            }
+            @unlink( $delete );
+        }
+
         // Update rollback metadata with deployed files
         $meta_file = $this->rollback_path . '/meta.json';
         if ( file_exists( $meta_file ) ) {
@@ -631,6 +663,7 @@ class Import {
             'errors'          => $errors,
             'host_files_kept' => array_keys( $kept ),
             'loaders_disabled' => self::disable_missing_prepends( $web_root, $deployed ),
+            'removed'         => $removed,
         ];
     }
 
@@ -1573,6 +1606,9 @@ class Import {
             wp_cache_flush();
         }
 
+        // A catch-up pull's memory goes back to what it was before this move.
+        Pull::restore_memory( $this->rollback_path );
+
         // 2. Restore backed-up files
         $web_root    = dirname( WP_CONTENT_DIR );
         $backed_up   = $meta['backed_up_files'] ?? [];
@@ -1663,7 +1699,7 @@ class Import {
         if ( is_dir( $this->staging_path ) ) {
             self::delete_directory_recursive( $this->staging_path );
         }
-        foreach ( [ 'pull.json', 'token-guard.json', 'skip-rows.json', 'cancel' ] as $name ) {
+        foreach ( [ 'pull.json', 'token-guard.json', 'skip-rows.json', 'unchanged.json', 'delete-list.json', 'cancel' ] as $name ) {
             @unlink( $this->import_path . '/' . $name );
         }
         $has_point = is_file( $this->rollback_path . '/meta.json' );
@@ -1675,6 +1711,9 @@ class Import {
     }
 
     public function finalize() {
+        // Remember the source's files now on this site, for a catch-up pull.
+        ( new Pull( $this->import_id ) )->remember_files();
+
         // Remove staging directory
         if ( is_dir( $this->staging_path ) ) {
             self::delete_directory_recursive( $this->staging_path );
@@ -1690,6 +1729,7 @@ class Import {
         // is only needed while the import is in flight.
         @unlink( $this->import_path . '/pull.json' );
         @unlink( $this->import_path . '/token-guard.json' );
+        @unlink( $this->import_path . '/unchanged.json' );
 
         // Flush rewrite rules
         flush_rewrite_rules();

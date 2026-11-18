@@ -243,7 +243,13 @@ class Pull {
      * Verifies the source is reachable and records the connection. Detects the
      * source's permalink style and captures its home URL / prefix / tables.
      */
-    public function connect( $source_url, $source_token ) {
+    /**
+     * $move: how the move was started, kept so it can be resumed the same
+     * way: [ client => dashboard|cli, quiet, label, args (cli) ].
+     * $catch_up: copy only files that changed since the last pull from this
+     * source (see cache_file_list()).
+     */
+    public function connect( $source_url, $source_token, $move = [], $catch_up = false ) {
         $source_url = rtrim( $source_url, '/' );
         if ( ! preg_match( '#^https?://#', $source_url ) ) {
             $source_url = 'https://' . $source_url;
@@ -275,6 +281,9 @@ class Pull {
             'source_token' => $source_token,
             'rest_style'   => $style,
             'backup_token' => substr( bin2hex( random_bytes( 12 ) ), 0, 12 ),
+            'started'      => time(),
+            'move'         => is_array( $move ) ? $move : [],
+            'catch_up'     => (bool) $catch_up,
         ] );
 
         // Source metadata (v2.8 sources expose /import/preflight).
@@ -368,18 +377,201 @@ class Pull {
             if ( is_array( $list ) ) {
                 foreach ( $list as $f ) {
                     if ( is_object( $f ) && ! empty( $f->name ) ) {
-                        $files[] = [ 'name' => $f->name, 'size' => $f->size ?? 0 ];
+                        $entry = [ 'name' => $f->name, 'size' => $f->size ?? 0 ];
+                        if ( isset( $f->mtime ) ) {
+                            $entry['mtime'] = (int) $f->mtime;
+                        }
+                        $files[] = $entry;
                     }
                 }
             }
         }
         $this->source_request( '/cleanup-file', [ 'file_name' => 'manifest.json' ], 'POST', 30 );
-        $state = $this->state();
+        $state  = $this->state();
+        $result = [ 'status' => 'ready', 'source_files' => count( $files ) ];
+
+        // Catch-up: keep only files that are new or changed since the last
+        // pull from this source; files that were brought then and are gone
+        // from the source now are removed here (deploy_files, with a backup
+        // for rollback).
+        $last = ! empty( $state['catch_up'] ) ? self::last_pull( $state['source_home'] ?? $state['source_url'] ) : null;
+        if ( $last ) {
+            $before  = (array) $last['files'];
+            $changed = [];
+            $kept    = [];
+            $approx  = false;
+            foreach ( $files as $f ) {
+                $old = $before[ $f['name'] ] ?? null;
+                if ( $old === null || (int) $old[0] !== (int) $f['size'] ) {
+                    $changed[] = $f;
+                    continue;
+                }
+                if ( isset( $f['mtime'], $old[1] ) && (int) $old[1] !== (int) $f['mtime'] ) {
+                    $changed[] = $f;
+                    continue;
+                }
+                if ( ! isset( $f['mtime'], $old[1] ) ) {
+                    $approx = true; // an older source sends no times: compared by size only
+                }
+                $kept[ $f['name'] ] = $old;
+            }
+            $now     = array_flip( array_column( $files, 'name' ) );
+            $removed = array_values( array_filter( array_keys( $before ), function ( $name ) use ( $now ) { return ! isset( $now[ $name ] ); } ) );
+            file_put_contents( dirname( $this->state_file ) . '/unchanged.json', wp_json_encode( $kept ) );
+            file_put_contents( dirname( $this->state_file ) . '/delete-list.json', wp_json_encode( $removed ) );
+            $state['catch_up_info'] = [ 'since' => (int) $last['at'], 'changed' => count( $changed ), 'unchanged' => count( $kept ), 'removed' => count( $removed ), 'approx' => $approx ];
+            $result['catch_up']     = $state['catch_up_info'];
+            $files                  = $changed;
+        } elseif ( ! empty( $state['catch_up'] ) ) {
+            $result['catch_up'] = false; // nothing remembered for this source: everything comes across
+        }
+
         $state['file_list'] = $this->staging_dir() . '/file-list.json';
         file_put_contents( $state['file_list'], wp_json_encode( $files ) );
         $state['total_files'] = count( $files );
         $this->save_state( $state );
-        return [ 'status' => 'ready', 'total_files' => count( $files ) ];
+        $result['total_files'] = count( $files );
+        return $result;
+    }
+
+    /* ------------------------------------------------------------------
+     * What this site remembers about past pulls, per source address: the
+     * source's files that are on this site, with size and modification
+     * time, so the next pull can copy only what changed. Kept as files in
+     * uploads/disembark/pulls (a pull replaces the database).
+     * ------------------------------------------------------------------ */
+
+    private static function pulls_dir() {
+        return Storage::base_dir() . '/pulls';
+    }
+
+    private static function pull_file( $source ) {
+        return self::pulls_dir() . '/' . md5( Quiet::address( $source ) ) . '.php';
+    }
+
+    /** [ source, at, files: { name: [size, mtime|null] } ] or null. */
+    public static function last_pull( $source ) {
+        $file = self::pull_file( $source );
+        if ( ! is_file( $file ) ) {
+            return null;
+        }
+        $raw  = (string) file_get_contents( $file );
+        $nl   = strpos( $raw, "\n" );
+        $data = $nl === false ? null : json_decode( substr( $raw, $nl + 1 ), true );
+        return is_array( $data ) && isset( $data['files'] ) ? $data : null;
+    }
+
+    /** Sources this site has pulled from: [ { source, at, files } ], newest first. */
+    public static function last_pulls() {
+        $out = [];
+        foreach ( (array) glob( self::pulls_dir() . '/*.php' ) as $file ) {
+            if ( basename( $file ) === 'index.php' ) {
+                continue;
+            }
+            $raw  = (string) file_get_contents( $file );
+            $nl   = strpos( $raw, "\n" );
+            $data = $nl === false ? null : json_decode( substr( $raw, $nl + 1 ), true );
+            if ( is_array( $data ) && ! empty( $data['source'] ) ) {
+                $out[] = [ 'source' => (string) $data['source'], 'at' => (int) $data['at'], 'files' => count( (array) $data['files'] ) ];
+            }
+        }
+        usort( $out, function ( $a, $b ) { return $b['at'] - $a['at']; } );
+        return $out;
+    }
+
+    /**
+     * Called by finalize: remembers the source's files now on this site
+     * (unchanged ones from a catch-up, plus what this pull brought).
+     */
+    public function remember_files() {
+        $state = $this->state();
+        if ( empty( $state['file_list'] ) || ! is_file( $state['file_list'] ) ) {
+            return false;
+        }
+        $source = (string) ( $state['source_home'] ?? '' ) ?: (string) ( $state['source_url'] ?? '' );
+        if ( $source === '' ) {
+            return false;
+        }
+        $files     = [];
+        $unchanged = dirname( $this->state_file ) . '/unchanged.json';
+        if ( is_file( $unchanged ) ) {
+            $files = (array) json_decode( (string) file_get_contents( $unchanged ), true );
+        }
+        foreach ( (array) json_decode( (string) file_get_contents( $state['file_list'] ), true ) as $f ) {
+            $files[ $f['name'] ] = [ (int) $f['size'], isset( $f['mtime'] ) ? (int) $f['mtime'] : null ];
+        }
+        Storage::ensure_dir( self::pulls_dir() );
+        // A rollback of this move puts the previous memory back (see
+        // restore_memory()), so a later catch-up doesn't skip files the
+        // rollback returned to their old versions.
+        $rollback = dirname( $this->state_file ) . '/rollback';
+        if ( is_dir( $rollback ) ) {
+            $previous = is_file( self::pull_file( $source ) ) ? (string) file_get_contents( self::pull_file( $source ) ) : null;
+            file_put_contents( $rollback . '/pull-memory.json', wp_json_encode( [ 'file' => self::pull_file( $source ), 'previous' => $previous ] ) );
+        }
+        $body = wp_json_encode( [ 'source' => untrailingslashit( $source ), 'at' => time(), 'files' => $files ] );
+        $tmp  = self::pull_file( $source ) . '.tmp';
+        if ( ! is_string( $body ) || @file_put_contents( $tmp, "<?php exit; ?>\n" . $body ) === false ) {
+            return false;
+        }
+        return @rename( $tmp, self::pull_file( $source ) );
+    }
+
+    /** Called by a rollback: puts back what this site remembered before the move. */
+    public static function restore_memory( $rollback_path ) {
+        $saved = $rollback_path . '/pull-memory.json';
+        if ( ! is_file( $saved ) ) {
+            return;
+        }
+        $memory = json_decode( (string) file_get_contents( $saved ), true );
+        $file   = (string) ( $memory['file'] ?? '' );
+        if ( $file === '' || strpos( wp_normalize_path( $file ), wp_normalize_path( self::pulls_dir() ) . '/' ) !== 0 ) {
+            return;
+        }
+        if ( $memory['previous'] === null ) {
+            @unlink( $file );
+        } else {
+            file_put_contents( $file, (string) $memory['previous'] );
+        }
+        @unlink( $saved );
+    }
+
+    /**
+     * Moves that stopped before finishing (their pull state is still on
+     * disk): what they were, how far they got, whether a rollback point was
+     * saved. Moves abandoned for a week with no rollback point are removed.
+     */
+    public static function unfinished() {
+        $out = [];
+        foreach ( (array) glob( Storage::base_dir() . '/_import_*', GLOB_ONLYDIR ) as $dir ) {
+            $id         = substr( basename( $dir ), strlen( '_import_' ) );
+            $state_file = $dir . '/pull.json';
+            $has_point  = is_file( $dir . '/rollback/meta.json' );
+            $touched    = max( (int) @filemtime( $dir ), (int) @filemtime( $dir . '/steps' ), (int) @filemtime( $state_file ) );
+            if ( ! is_file( $state_file ) ) {
+                continue;
+            }
+            if ( ! $has_point && $touched < time() - WEEK_IN_SECONDS ) {
+                ( new Import( $id ) )->cancel( 'cleanup' );
+                continue;
+            }
+            $state = json_decode( (string) file_get_contents( $state_file ), true );
+            $state = is_array( $state ) ? $state : [];
+            $out[] = [
+                'id'             => $id,
+                'source'         => (string) ( $state['source_home'] ?? '' ) ?: (string) ( $state['source_url'] ?? '' ),
+                'started'        => (int) ( $state['started'] ?? 0 ),
+                'touched'        => $touched,
+                'move'           => (array) ( $state['move'] ?? [] ),
+                'catch_up'       => ! empty( $state['catch_up'] ),
+                'files_total'    => (int) ( $state['total_files'] ?? 0 ),
+                'files_fetched'  => (int) ( $state['fetched'] ?? 0 ),
+                'database'       => ! empty( $state['db_done'] ),
+                'rollback_point' => $has_point,
+            ];
+        }
+        usort( $out, function ( $a, $b ) { return $b['touched'] - $a['touched']; } );
+        return $out;
     }
 
     private function staging_dir() {
@@ -426,6 +618,9 @@ class Pull {
         }
 
         $fetched = min( $offset + $count, $total );
+        $state   = $this->state();
+        $state['fetched'] = $fetched;
+        $this->save_state( $state );
         return [ 'fetched' => $fetched, 'total' => $total, 'done' => $fetched >= $total ];
     }
 
@@ -462,6 +657,7 @@ class Pull {
         $this->cleanup_source();
         $state = $this->state();
         unset( $state['source_token'] );
+        $state['db_done'] = true;
         $this->save_state( $state );
         return [ 'ok' => true, 'tables' => count( $tables ), 'bytes' => filesize( $dest ) ];
     }

@@ -85,7 +85,13 @@
    * }
    */
   D.runMove = function (view, opts) {
-    var importId = D.randomHex(24), rollbackId = '', codeMentions = null, quietOn = false, quietSource = '';
+    var importId = opts.resume ? opts.resume.id : D.randomHex(24), rollbackId = '', codeMentions = null, quietOn = false, quietSource = '';
+    // Request ids follow the import id and the step's place in the move, so
+    // the same move asks for the same ids. Resuming replays the steps the
+    // server already finished (opts.resume.steps) and carries on from the
+    // first one it didn't.
+    var catchUpInfo = null, seq = 0, replay = (opts.resume && opts.resume.steps) || {}, replaying = Object.keys(replay).length > 0;
+    function ridAt(n) { return importId.slice(0, 24) + ('00000000' + n.toString(16)).slice(-8); }
     var log = h('div', { class: 'dsk-log', hidden: true });
     var stepEls = {}, current = null, line = h('div', { class: 'muted', style: { minHeight: '20px', marginTop: '10px', fontFamily: 'var(--mono)', fontSize: '12.5px' } });
     var steps = h('div', { class: 'dsk-steps' }, STEPS.map(function (s, i) {
@@ -229,7 +235,9 @@
     var api = {
       post: async function (endpoint, body) {
         if (cancelled) throw Cancelled();
-        var rid = D.randomHex(24);
+        var rid = ridAt(++seq);
+        if (Object.prototype.hasOwnProperty.call(replay, rid)) return replay[rid];
+        if (replaying) { replaying = false; rlog('Picked up where it stopped.', 'ok'); }
         try {
           var r = await retrying(function () { return opts.api.post(endpoint, Object.assign({ request_id: rid }, body || {})); });
         } catch (e) { if (cancelled) throw Cancelled(); throw e; }
@@ -244,7 +252,8 @@
 
     async function stageFromSite() {
       rlog('Connecting to ' + opts.site + '…');
-      var c = await api.post('import/pull/connect', t({ source_url: opts.site, source_token: opts.token }));
+      var c = await api.post('import/pull/connect', t({ source_url: opts.site, source_token: opts.token, catch_up: !!opts.catchUp,
+        move: { kind: opts.local ? 'pull' : 'push', quiet: !!opts.quiet, label: opts.label || '' } }));
       rlog('Connected. Source: ' + c.source_home + ' (' + c.table_count + ' tables).');
       var scan = function (s, chunk) { return api.post('import/pull/scan', t({ step: s, chunk: chunk || 0 })); };
       await scan('initiate');
@@ -261,7 +270,15 @@
       }
       progress('Reading the file list\u2026');
       var fin = await scan('finalize');
-      rlog(D.fmt.plural(fin.total_files || 0, 'file') + ' found.');
+      catchUpInfo = fin.catch_up || null;
+      if (fin.catch_up) {
+        var cu = fin.catch_up;
+        rlog('Catching up: ' + D.fmt.plural(cu.changed, 'file') + ' new or changed since the last pull (' + D.fmt.date(cu.since) + '), ' + D.fmt.plural(cu.removed, 'file') + ' removed on the source. ' + D.fmt.plural(cu.unchanged, 'unchanged file') + ' stay as they are.');
+        if (cu.approx) rlog('The source runs an older Disembark that doesn\u2019t report file times, so files were compared by size only.', 'dim');
+      } else {
+        if (fin.catch_up === false) rlog('Nothing is remembered from an earlier pull of this source, so everything comes across.', 'dim');
+        rlog(D.fmt.plural(fin.total_files || 0, 'file') + ' found.');
+      }
       await choose();
       var done = false, fetched = 0;
       while (!done) {
@@ -287,8 +304,12 @@
         if (e.status === 404) { rlog(D.host(opts.targetHome) + ' runs an older Disembark, so everything comes across.', 'dim'); return; }
         throw e;
       }
-      progress('Choose what to bring\u2026');
-      var choice = await D.whatToBring(chooser, contents, { source: opts.site, quiet: opts.quiet });
+      // Resuming after the choice was made: replay it rather than asking again.
+      var choice = {};
+      if (!Object.prototype.hasOwnProperty.call(replay, ridAt(seq + 1))) {
+        progress('Choose what to bring\u2026');
+        choice = await D.whatToBring(chooser, contents, { source: opts.site, quiet: opts.quiet, catchUp: catchUpInfo });
+      }
       if (!choice) { cancelled = true; throw Cancelled(); }
       if (cancelled) throw Cancelled();
       var sel = await api.post('import/pull/select', t(choice));
@@ -336,6 +357,7 @@
     (async function () {
       try {
         step('pre');
+        if (opts.resume) rlog('Resuming the move started ' + D.fmt.date(opts.resume.started) + ': replaying ' + D.fmt.plural(Object.keys(replay).length, 'finished step') + '\u2026', 'dim');
         var pre = await api.post('import/preflight', t());
         resumable = !!pre.resumable;
         var destPrefix = pre.db_prefix || '', destHome = String(pre.home_url || opts.targetHome).replace(/\/$/, '');
@@ -380,6 +402,8 @@
         step('files');
         var dep = await api.post('import/deploy-files', t({ files: ['*'] }));
         rlog('Placed ' + D.fmt.plural(dep.deployed || 0, 'file') + '.');
+        if (dep.removed) rlog('Removed ' + D.fmt.plural(dep.removed, 'file') + ' that are gone from the source (kept in the rollback point).');
+        (dep.loaders_disabled || []).forEach(function (l) { rlog('Disabled a firewall loader that points at a file not on this server: ' + l, 'dim'); });
         if (dep.host_files_kept && dep.host_files_kept.length) rlog('Left out host files (this site keeps its own): ' + dep.host_files_kept.join(', ') + '.', 'dim');
         stepEls.files.meta.textContent = D.fmt.num(dep.deployed || 0);
         if (dep.errors && dep.errors.length) {

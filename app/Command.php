@@ -64,7 +64,7 @@ class Command {
      *
      * ## OPTIONS
      *
-     * <source>...
+     * [<source>...]
      * : The source's URL and token, or its whole connect line
      * ("disembark connect <url> <token>"), from its Tools → Disembark → Settings
      * or `wp disembark connect-line`.
@@ -74,6 +74,17 @@ class Command {
      *
      * [--bring-host-files]
      * : Also deploy the source's host files (mu-plugins and cache drop-ins).
+     *
+     * [--catch-up]
+     * : Copy only files that are new or changed since this site's last pull
+     * from the same source (files removed there are removed here; the
+     * database is copied in full). Falls back to everything when there was
+     * no earlier pull.
+     *
+     * [--resume=<id>]
+     * : Resume a pull that stopped (see `wp disembark unfinished`), or
+     * `latest`. Finished steps are replayed; it carries on from where it
+     * stopped with the options it started with.
      *
      * [--skip=<paths>]
      * : Folders or files to leave behind, comma-separated, relative to the web
@@ -118,57 +129,90 @@ class Command {
      */
     public function pull( $args, $assoc_args ) {
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
-        $source     = self::parse_connect( $args );
-        if ( ! $source ) {
-            $this->fail( 'Pass the source URL and token, or its connect line: wp disembark pull https://old-site.com <token>' );
-        }
         @set_time_limit( 0 );
 
-        $import_id = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
-        $import    = new Import( $import_id );
-        $pull      = new Pull( $import_id );
-        $summary   = [ 'ok' => false, 'source' => $source['url'] ];
+        $resuming = ! empty( $assoc_args['resume'] );
+        if ( $resuming ) {
+            $move = $this->find_unfinished( (string) $assoc_args['resume'] );
+            if ( ( $move['move']['client'] ?? '' ) !== 'cli' ) {
+                $this->fail( 'That move was started in the dashboard. Resume it from Tools → Disembark → Pull, or discard it with: wp disembark discard ' . $move['id'] );
+            }
+            $import_id  = $move['id'];
+            // The same options as the first run, so its steps line up.
+            $assoc_args = array_merge( (array) ( $move['move']['args'] ?? [] ), [ 'yes' => true, 'format' => $assoc_args['format'] ?? 'text' ] );
+            $source     = [ 'url' => $move['source'], 'token' => '' ];
+            @unlink( Storage::base_dir() . "/_import_{$import_id}/cancel" );
+        } else {
+            $source = self::parse_connect( $args );
+            if ( ! $source ) {
+                $this->fail( 'Pass the source URL and token, or its connect line: wp disembark pull https://old-site.com <token>' );
+            }
+            $import_id = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
+        }
+        $import  = new Import( $import_id );
+        $pull    = new Pull( $import_id );
+        $summary = [ 'ok' => false, 'source' => $source['url'], 'import_id' => $import_id ];
 
         $this->say( '[1/8] Checking this site' );
-        $pre         = $import->preflight();
+        if ( ! $resuming ) {
+            $pre = $import->preflight();
+            $this->confirm( $assoc_args, 'Replace ' . untrailingslashit( (string) $pre['home_url'] ) . " with {$source['url']}? A rollback point is saved first, and afterwards you log in with the source site's credentials." );
+        } else {
+            $this->say( "      Resuming {$import_id} (a pull from {$source['url']}): finished steps are replayed." );
+        }
+        // From here every step is recorded: a pull that stops can be resumed.
+        $this->steps_import = $import_id;
+        $this->resume_hint  = $import_id;
+        $pre         = $this->check( $this->step( function () use ( $import ) { return $import->preflight(); } ), 'preflight' );
         $dest_prefix = (string) ( $pre['db_prefix'] ?? '' );
         $dest_home   = untrailingslashit( (string) ( $pre['home_url'] ?? home_url() ) );
         $summary['destination'] = $dest_home;
 
-        $this->confirm( $assoc_args, "Replace {$dest_home} with {$source['url']}? A rollback point is saved first, and afterwards you log in with the source site's credentials." );
-
         $this->say( '[2/8] Bringing the site over' );
-        $c = $this->check( $pull->connect( $source['url'], $source['token'] ), 'connect' );
+        $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'skip-quiet-mode', 'bring-host-files', 'catch-up' ] ) );
+        $c = $this->check( $this->step( function () use ( $pull, $source, $move_args ) {
+            return $pull->connect( $source['url'], $source['token'], [ 'client' => 'cli', 'kind' => 'pull', 'args' => $move_args ], ! empty( $move_args['catch-up'] ) );
+        } ), 'connect' );
         $src_home = untrailingslashit( (string) ( $c['source_home'] ?? '' ) );
         $this->say( '      Connected to ' . ( $src_home ?: $source['url'] ) . ' (' . (int) ( $c['table_count'] ?? 0 ) . ' tables).' );
-        $this->check( $pull->scan_step( 'initiate' ), 'scan' );
+        $scan = function ( $step, $chunk = 0 ) use ( $pull ) {
+            return $this->check( $this->step( function () use ( $pull, $step, $chunk ) { return $pull->scan_step( $step, $chunk ); } ), 'scan' );
+        };
+        $scan( 'initiate' );
         for ( $i = 0; $i < 100000; $i++ ) {
-            $s = $this->check( $pull->scan_step( 'scan' ), 'scan' );
+            $s = $scan( 'scan' );
             if ( ( $s['status'] ?? '' ) === 'scan_complete' ) {
                 break;
             }
         }
-        $chunks = $this->check( $pull->scan_step( 'chunkify' ), 'scan' );
+        $chunks = $scan( 'chunkify' );
         for ( $n = 1; $n <= (int) ( $chunks['total_chunks'] ?? 0 ); $n++ ) {
-            $this->check( $pull->scan_step( 'process_chunk', $n ), 'scan' );
+            $scan( 'process_chunk', $n );
         }
-        $fin = $this->check( $pull->scan_step( 'finalize' ), 'scan' );
+        $fin = $scan( 'finalize' );
+        if ( ! empty( $fin['catch_up'] ) ) {
+            $cu = $fin['catch_up'];
+            $summary['catch_up'] = $cu;
+            $this->say( '      Catching up: ' . number_format( (int) $cu['changed'] ) . ' files new or changed since the last pull (' . wp_date( 'Y-m-d H:i', (int) $cu['since'] ) . '), ' . number_format( (int) $cu['removed'] ) . ' removed on the source, ' . number_format( (int) $cu['unchanged'] ) . ' unchanged.' . ( ! empty( $cu['approx'] ) ? ' (The source sends no file times, so files were compared by size.)' : '' ) );
+        } elseif ( isset( $fin['catch_up'] ) ) {
+            $this->say( '      Nothing is remembered from an earlier pull of this source, so everything comes across.' );
+        }
         $this->choose( $pull, $assoc_args, $summary );
         $fetched = 0;
         do {
-            $r       = $this->check( $pull->fetch_files( $fetched, 1000 ), 'files' );
+            $r       = $this->check( $this->step( function () use ( $pull, $fetched ) { return $pull->fetch_files( $fetched, 1000 ); } ), 'files' );
             $fetched = (int) $r['fetched'];
             $this->say( '      Copied ' . number_format( $fetched ) . ' of ' . number_format( (int) $r['total'] ) . ' files' );
         } while ( empty( $r['done'] ) );
         $this->say( '      Copying the database' );
-        $db = $this->check( $pull->fetch_database(), 'database' );
+        $db = $this->check( $this->step( function () use ( $pull ) { return $pull->fetch_database(); } ), 'database' );
         $this->say( '      Database copied (' . (int) ( $db['tables'] ?? 0 ) . ' tables, ' . size_format( (int) ( $db['bytes'] ?? 0 ) ) . ').' );
 
         $this->say( '[3/8] Reading the backup' );
-        $info       = $import->staged_info();
-        $src_prefix = (string) ( $info['source']->db_prefix ?? '' );
+        $info       = $this->check( $this->step( function () use ( $import ) { return $import->staged_info(); } ), 'read' );
+        $src_prefix = (string) ( $info['source']['db_prefix'] ?? '' );
         if ( $src_home === '' ) {
-            $src_home = untrailingslashit( (string) ( $info['source']->home_url ?? '' ) );
+            $src_home = untrailingslashit( (string) ( $info['source']['home_url'] ?? '' ) );
         }
         if ( ! empty( $info['multisite'] ) ) {
             $summary['multisite_constants'] = $info['multisite'];
@@ -179,7 +223,8 @@ class Command {
         }
 
         $this->say( '[4/8] Saving a rollback point' );
-        $this->check( $import->snapshot( 'Before pull from ' . wp_parse_url( $source['url'], PHP_URL_HOST ) ), 'snapshot' );
+        $label = ( ! empty( $summary['catch_up'] ) ? 'Before catch-up from ' : 'Before pull from ' ) . wp_parse_url( $source['url'], PHP_URL_HOST );
+        $this->check( $this->step( function () use ( $import, $label ) { return $import->snapshot( $label ); } ), 'snapshot' );
         $summary['rollback_id'] = $import_id;
         $summary['undo']        = "wp disembark rollback {$import_id}";
         $this->say( "      Saved. Undo any time with: wp disembark rollback {$import_id}" );
@@ -188,13 +233,18 @@ class Command {
         // request in between can run the source's jobs or send its emails.
         $quiet = empty( $assoc_args['skip-quiet-mode'] ) && $src_home !== '' && Quiet::address( $src_home ) !== Quiet::address( $dest_home );
         if ( $quiet ) {
-            $this->check( Quiet::enable( $src_home, $import_id ), 'quiet-mode', $import_id );
+            $this->check( $this->step( function () use ( $src_home, $import_id ) { return Quiet::enable( $src_home, $import_id ); } ), 'quiet-mode', $import_id );
             $summary['quiet_mode'] = [ 'on' => true, 'off' => 'wp disembark quiet-mode off' ];
             $this->say( '      Quiet mode on: emails held, scheduled jobs paused, checkout closed, payment and marketing APIs blocked.' );
         }
 
         $this->say( '[5/8] Putting files in place' );
-        $dep = $this->check( $import->deploy_files( [ '*' ], empty( $assoc_args['bring-host-files'] ) ), 'files', $import_id );
+        $keep = empty( $assoc_args['bring-host-files'] );
+        $dep  = $this->check( $this->step( function () use ( $import, $keep ) { return $import->deploy_files( [ '*' ], $keep ); } ), 'files', $import_id );
+        if ( ! empty( $dep['removed'] ) ) {
+            $summary['files_removed'] = (int) $dep['removed'];
+            $this->say( '      Removed ' . self::plural( (int) $dep['removed'], 'file' ) . ' that ' . ( (int) $dep['removed'] === 1 ? 'is' : 'are' ) . ' gone from the source (kept in the rollback point).' );
+        }
         $summary['files_deployed']  = (int) $dep['deployed'];
         $summary['host_files_kept'] = $dep['host_files_kept'];
         if ( ! empty( $dep['loaders_disabled'] ) ) {
@@ -211,22 +261,25 @@ class Command {
 
         if ( ! empty( $info['sql_file'] ) ) {
             $this->say( '[6/8] Importing the database' );
-            $sq = $this->check( $import->import_staged_sql( $info['sql_file'], $src_prefix, $dest_prefix ), 'database', $import_id );
+            $sql_file = $info['sql_file'];
+            $sq = $this->check( $this->step( function () use ( $import, $sql_file, $src_prefix, $dest_prefix ) { return $import->import_staged_sql( $sql_file, $src_prefix, $dest_prefix ); } ), 'database', $import_id );
             $summary['statements'] = (int) $sq['statements_executed'];
             if ( ! empty( $sq['errors'] ) ) {
                 $this->fail( 'The database import reported ' . count( $sq['errors'] ) . ' errors (first: ' . $sq['errors'][0] . '). Stopped before rewriting URLs.', 'database', $import_id );
             }
             $this->say( '      ' . number_format( (int) $sq['statements_executed'] ) . ' statements executed.' );
             if ( $src_prefix !== '' && $dest_prefix !== '' && $src_prefix !== $dest_prefix ) {
-                $rp = $this->check( $import->remap_table_prefix( $src_prefix, $dest_prefix ), 'prefix', $import_id );
+                $rp = $this->check( $this->step( function () use ( $import, $src_prefix, $dest_prefix ) { return $import->remap_table_prefix( $src_prefix, $dest_prefix ); } ), 'prefix', $import_id );
                 $summary['prefix'] = [ 'from' => $src_prefix, 'to' => $dest_prefix ];
                 $this->say( "      Table prefix remapped {$src_prefix} → {$dest_prefix} (" . (int) ( $rp['keys_changed'] ?? 0 ) . ' keys).' );
             }
 
             $this->say( '[7/8] Rewriting URLs' );
             if ( $src_home !== '' && $src_home !== $dest_home ) {
-                $sr = $this->check( $import->search_replace( $src_home, $dest_home ), 'urls', $import_id );
-                $sr = array_merge( $sr, $import->rewrite_files( Import::replacement_pairs( $src_home, $dest_home ) ) );
+                $sr = $this->check( $this->step( function () use ( $import, $src_home, $dest_home ) {
+                    $result = $import->search_replace( $src_home, $dest_home );
+                    return is_wp_error( $result ) ? $result : array_merge( $result, $import->rewrite_files( Import::replacement_pairs( $src_home, $dest_home ) ) );
+                } ), 'urls', $import_id );
                 $summary['urls'] = [
                     'from'            => $src_home,
                     'to'              => $dest_home,
@@ -249,7 +302,8 @@ class Command {
         }
 
         $this->say( '[8/8] Finishing up' );
-        $this->check( $import->finalize(), 'finalize', $import_id );
+        $this->check( $this->step( function () use ( $import ) { return $import->finalize(); } ), 'finalize', $import_id );
+        $this->resume_hint = '';
 
         $summary['ok']   = true;
         $summary['note'] = "User accounts are now the source's: log in with the source site's credentials.";
@@ -542,7 +596,7 @@ class Command {
      * nothing with --bring-everything), plus --skip and --skip-rows.
      */
     private function choose( $pull, $assoc_args, &$summary ) {
-        $contents = $this->check( $pull->contents(), 'scan' );
+        $contents = $this->check( $this->step( function () use ( $pull ) { return $pull->contents(); } ), 'scan' );
         $prefix   = strtolower( (string) $contents['prefix'] );
         $split    = function ( $key ) use ( $assoc_args ) {
             return array_values( array_filter( array_map( 'trim', explode( ',', (string) ( $assoc_args[ $key ] ?? '' ) ) ) ) );
@@ -566,12 +620,12 @@ class Command {
             $ids = [];
         }
         $choice = Skips::resolve( $contents, $ids, $paths, $rows );
-        $sel    = $this->check( $pull->select( $choice['skip_paths'], $choice['skip_names'], $choice['skip_rows'] ), 'scan' );
+        $sel    = $this->check( $this->step( function () use ( $pull, $choice ) { return $pull->select( $choice['skip_paths'], $choice['skip_names'], $choice['skip_rows'] ); } ), 'scan' );
 
-        $this->say( '      ' . number_format( (int) $sel['files'] ) . ' files to copy (' . size_format( (int) $sel['bytes'] ) . ').' );
+        $this->say( '      ' . self::plural( (int) $sel['files'], 'file' ) . ' to copy (' . size_format( (int) $sel['bytes'] ) . ').' );
         $left = $sel['left_out'];
         if ( $left['files'] || $left['rows'] ) {
-            $this->say( '      Leaving behind ' . number_format( (int) $left['files'] ) . ' files (' . size_format( (int) $left['bytes'] ) . ')' . ( $left['rows'] ? ' and the rows of ' . count( $left['rows'] ) . ' tables' : '' ) . ':' );
+            $this->say( '      Leaving behind ' . self::plural( (int) $left['files'], 'file' ) . ' (' . size_format( (int) $left['bytes'] ) . ')' . ( $left['rows'] ? ' and the rows of ' . self::plural( count( $left['rows'] ), 'table' ) : '' ) . ':' );
             foreach ( $contents['suggestions'] as $s ) {
                 if ( $ids === null ? $s['default'] : in_array( $s['id'], (array) $ids, true ) ) {
                     $this->say( '        ' . $s['label'] . ' (' . size_format( $s['bytes'] + $s['table_bytes'] ) . ')' );
@@ -665,6 +719,124 @@ class Command {
     }
 
     /** Returns $result, or stops with its message when it's a WP_Error. */
+    /** The import whose steps are recorded (see step()), and the next step's number. */
+    private $steps_import = '';
+    private $steps_seq    = 0;
+    /** Set while a pull can be resumed: failures say how. */
+    private $resume_hint  = '';
+
+    /**
+     * Runs one step of a move through Steps, so it's recorded: a resumed
+     * move replays finished steps instead of running them again. Results
+     * come back as plain arrays either way.
+     */
+    private function step( $work ) {
+        if ( $this->steps_import === '' ) {
+            $result = $work();
+        } else {
+            $rid    = substr( $this->steps_import, 0, 24 ) . sprintf( '%08x', ++$this->steps_seq );
+            $result = Steps::run( $this->steps_import, $rid, $work );
+        }
+        if ( is_wp_error( $result ) ) {
+            return $result;
+        }
+        if ( $result instanceof \WP_REST_Response ) {
+            $result = $result->get_data();
+        }
+        return json_decode( (string) wp_json_encode( $result ), true );
+    }
+
+    private static function plural( $n, $word ) {
+        return number_format( $n ) . ' ' . $word . ( $n === 1 ? '' : 's' );
+    }
+
+    private function find_unfinished( $id ) {
+        $list = Pull::unfinished();
+        if ( $id === 'latest' ) {
+            $list = array_values( array_filter( $list, function ( $m ) { return ( $m['move']['client'] ?? '' ) === 'cli'; } ) );
+            if ( $list ) {
+                return $list[0];
+            }
+        }
+        foreach ( $list as $m ) {
+            if ( $m['id'] === $id ) {
+                return $m;
+            }
+        }
+        $this->fail( "No unfinished move {$id}. List them with: wp disembark unfinished" );
+    }
+
+    /**
+     * Lists moves that stopped before finishing.
+     *
+     * A pull or push that stopped (a dropped SSH session, a closed tab, an
+     * error) keeps its progress. Resume one started here with
+     * `wp disembark pull --resume=<id>`, one started in the dashboard from
+     * Tools → Disembark → Pull, or throw one away with `wp disembark discard <id>`.
+     *
+     * ## OPTIONS
+     *
+     * [--format=<format>]
+     * : Output format.
+     * ---
+     * default: table
+     * options:
+     *   - table
+     *   - json
+     * ---
+     */
+    public function unfinished( $args, $assoc_args ) {
+        $list = Pull::unfinished();
+        if ( ( $assoc_args['format'] ?? 'table' ) === 'json' ) {
+            \WP_CLI::line( wp_json_encode( $list, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT ) );
+            return;
+        }
+        if ( ! $list ) {
+            \WP_CLI::log( 'No unfinished moves.' );
+            return;
+        }
+        $rows = array_map( function ( $m ) {
+            $where = $m['rollback_point'] ? 'after rollback point (site may be partly changed)' : ( $m['database'] ? 'files and database copied' : "{$m['files_fetched']}/{$m['files_total']} files" );
+            $cli   = ( $m['move']['client'] ?? '' ) === 'cli';
+            return [
+                'id'      => $m['id'],
+                'source'  => $m['source'],
+                'started' => $m['started'] ? wp_date( 'Y-m-d H:i', $m['started'] ) : '',
+                'stopped' => $where,
+                'resume'  => $cli ? "wp disembark pull --resume={$m['id']}" : 'dashboard: Tools → Disembark → Pull',
+            ];
+        }, $list );
+        \WP_CLI\Utils\format_items( 'table', $rows, [ 'id', 'source', 'started', 'stopped', 'resume' ] );
+    }
+
+    /**
+     * Throws away an unfinished move: rolls the site back first if it got
+     * past its rollback point, then deletes what it copied.
+     *
+     * ## OPTIONS
+     *
+     * <id>
+     * : The move's id, from `wp disembark unfinished`.
+     *
+     * [--yes]
+     * : Don't ask for confirmation.
+     */
+    public function discard( $args, $assoc_args ) {
+        $move = $this->find_unfinished( (string) ( $args[0] ?? '' ) );
+        $this->confirm( $assoc_args, $move['rollback_point'] ? 'Roll this site back to before the move, then delete what it copied and its rollback point?' : 'Delete what this move copied so far? Nothing on this site has changed.' );
+        $import      = new Import( $move['id'] );
+        $rolled_back = false;
+        if ( $move['rollback_point'] ) {
+            $r = $import->rollback();
+            if ( is_wp_error( $r ) || ! empty( $r['errors'] ) ) {
+                \WP_CLI::error( 'The rollback reported errors; the rollback point is kept. Try: wp disembark rollback ' . $move['id'] );
+            }
+            $rolled_back = true;
+        }
+        $import->cancel( 'cleanup', $rolled_back );
+        \WP_CLI::success( $rolled_back ? 'Rolled back and cleaned up.' : 'Discarded.' );
+    }
+
     private function check( $result, $step, $rollback_id = '' ) {
         if ( is_wp_error( $result ) ) {
             $this->fail( $result->get_error_message(), $step, $rollback_id );
@@ -676,6 +848,9 @@ class Command {
         if ( $rollback_id !== '' ) {
             $message .= " This site may be partly changed. Undo with: wp disembark rollback {$rollback_id}";
         }
+        if ( $this->resume_hint !== '' ) {
+            $message .= " Resume with: wp disembark pull --resume={$this->resume_hint}";
+        }
         if ( $this->json ) {
             \WP_CLI::line( wp_json_encode( array_filter( [
                 'ok'          => false,
@@ -683,6 +858,7 @@ class Command {
                 'error'       => $message,
                 'rollback_id' => $rollback_id,
                 'undo'        => $rollback_id !== '' ? "wp disembark rollback {$rollback_id}" : '',
+                'resume'      => $this->resume_hint !== '' ? "wp disembark pull --resume={$this->resume_hint}" : '',
             ] ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
         }
         \WP_CLI::error( $message );

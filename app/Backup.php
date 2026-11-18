@@ -168,9 +168,10 @@ class Backup {
                     }
                 } elseif ( is_file( $full_path ) ) {
                     $file_info = [
-                        'name' => $relative_path,
-                        'size' => filesize( $full_path ),
-                        'type' => 'file'
+                        'name'  => $relative_path,
+                        'size'  => filesize( $full_path ),
+                        'mtime' => filemtime( $full_path ), // lets a catch-up pull find changed files
+                        'type'  => 'file'
                     ];
                     if ( $include_checksums ) {
                         $file_info['checksum'] = md5_file( $full_path );
