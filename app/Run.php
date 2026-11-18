@@ -171,10 +171,11 @@ class Run {
             'disembark-backup'   => [ 'js/backup.js', [ 'disembark-tree' ] ],
             'disembark-restore'  => [ 'js/restore.js', [ 'disembark-core' ] ],
             'disembark-push'     => [ 'js/push.js', [ 'disembark-restore' ] ],
+            'disembark-pull'     => [ 'js/pull.js', [ 'disembark-restore' ] ],
             'disembark-files'    => [ 'js/files.js', [ 'disembark-tree' ] ],
             'disembark-database' => [ 'js/database.js', [ 'disembark-core' ] ],
             'disembark-settings' => [ 'js/settings.js', [ 'disembark-core' ] ],
-            'disembark-app'      => [ 'js/app.js', [ 'disembark-backup', 'disembark-restore', 'disembark-push', 'disembark-files', 'disembark-database', 'disembark-settings' ] ],
+            'disembark-app'      => [ 'js/app.js', [ 'disembark-backup', 'disembark-restore', 'disembark-push', 'disembark-pull', 'disembark-files', 'disembark-database', 'disembark-settings' ] ],
         ];
         foreach ( $scripts as $handle => list( $file, $deps ) ) {
             wp_register_script( $handle, $base . $file, $deps, $ver( $file ), true );

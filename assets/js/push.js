@@ -26,7 +26,7 @@
           body: JSON.stringify(Object.assign({ token: token }, body || {}))
         });
       } catch (e) {
-        throw new D.api.Error('Couldn’t reach ' + host + ' from this browser. Its server may block cross-site requests, or one site is http and the other https. You can pull from the destination instead: on ' + host + ', open Tools → Disembark → Restore → From a live site, and paste this site’s connect line.', 0);
+        throw new D.api.Error('Couldn’t reach ' + host + ' from this browser. Its server may block cross-site requests, or one site is http and the other https. You can pull from the destination instead: on ' + host + ', open Tools → Disembark → Pull, and paste this site’s connect line.', 0);
       }
       var text = await res.text(), data = text;
       try { data = text === '' ? null : JSON.parse(text); } catch (e) { /* not JSON */ }

@@ -223,7 +223,7 @@
       return h('div', { class: 'dsk-card dsk-card-pad dsk-row', style: { gap: '18px', alignItems: 'center' } },
         h('div', { style: { flex: 1, minWidth: '260px' } },
           h('h3', { style: { display: 'flex', gap: '9px', alignItems: 'center', marginBottom: '4px' } }, D.icon('zip'), 'Back up in the browser'),
-          h('p', { class: 'muted' }, 'Builds a zip of your choices on the server, then downloads it. No CLI needed. Restores from Restore → From a backup file, or with the CLI. For very large sites the CLI is faster and never stores a copy on the server.')),
+          h('p', { class: 'muted' }, 'Builds a zip of your choices on the server, then downloads it. No CLI needed. Bring it back with Restore, or with the CLI. For very large sites the CLI is faster and never stores a copy on the server.')),
         btn);
     }
 

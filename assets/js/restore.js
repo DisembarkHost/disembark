@@ -1,9 +1,10 @@
 /**
- * Restore: bring a backup into this site, from another live Disembark site or
- * from a backup zip. A rollback point is saved before anything changes.
+ * Restore: bring a backup zip into this site. A rollback point is saved
+ * before anything changes. (Copying from a live site is Pull, in pull.js.)
  *
- * Also defines D.runMove(), the step runner shared with Push: it drives any
- * site's import API (this one, or a destination's) through the same steps.
+ * Also defines D.runMove(), the step runner shared with Pull and Push: it
+ * drives any site's import API (this one, or a destination's) through the
+ * same steps.
  */
 (function () {
   'use strict';
@@ -224,7 +225,7 @@
           if (srcHome && D.address(srcHome) !== D.address(destHome)) {
             try { await api.post('quiet-mode', t({ action: 'on', source: srcHome })); }
             catch (e) {
-              if (e.status === 404) throw new Error(D.host(destHome) + ' runs an older Disembark without quiet mode. Update Disembark there, or turn off “Keep the copy quiet”.');
+              if (e.status === 404) throw new Error(D.host(destHome) + ' runs an older Disembark without quiet mode. Update Disembark there, or turn quiet mode off for this move.');
               throw e;
             }
             quietOn = true; quietSource = srcHome;
@@ -316,7 +317,7 @@
           title.textContent = 'Rolled back';
           D.mount(into || outcome, h('div', { class: 'dsk-stack' },
             D.note('ok', [h('strong', null, 'Rolled back. '), D.host(opts.targetHome) + ' is back to how it was before.']),
-            h('div', null, h('button', { class: 'dsk-btn', onclick: opts.back }, D.icon(opts.local ? 'restore' : 'upload'), opts.againLabel || 'Start another restore'))));
+            h('div', null, h('button', { class: 'dsk-btn', onclick: opts.back }, D.icon(opts.icon || (opts.local ? 'restore' : 'upload')), opts.againLabel || 'Start another restore'))));
         } catch (e) {
           rlog('ERROR: ' + D.errorText(e), 'err');
           D.toast('Rollback failed: ' + D.errorText(e), 'error');
@@ -333,7 +334,7 @@
     var body = h('div');
     var card = h('div', { class: 'dsk-card' },
       h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('anchor'), 'Restore points'), h('span', { class: 'grow' }),
-        h('span', { class: 'muted', style: { fontSize: '12.5px' } }, 'Saved before every restore and search & replace.')),
+        h('span', { class: 'muted', style: { fontSize: '12.5px' } }, 'Saved before every pull, restore and search & replace.')),
       body);
     async function load() {
       D.mount(body, h('div', { class: 'dsk-card-pad muted' }, h('span', { class: 'dsk-spin' }), ' Loading…'));
@@ -381,20 +382,31 @@
     return card;
   };
 
+  /** The "Safely ashore." card after a move into this site (Restore and Pull). */
+  D.arrivedView = function (outcome, ctx, undoLabel) {
+    D.mount(outcome, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '14px' } },
+      h('div', { class: 'dsk-row' }, D.icon('checkCircle'), h('h2', { style: { fontSize: '30px' } }, 'Safely ashore.')),
+      h('p', null, D.host(D.config.homeUrl) + ' now holds the copied site.'),
+      D.note('warn', ['User accounts came over with it, so your current login no longer applies. ', h('strong', null, 'Log in with the source site’s credentials.')]),
+      h('div', { class: 'dsk-row' },
+        h('a', { class: 'dsk-btn primary', href: D.config.loginUrl }, 'Log in again'),
+        h('button', { class: 'dsk-btn', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
+      h('div', null, h('div', { class: 'caps', style: { marginBottom: '6px' } }, 'Undo from the CLI'), ctx.cliUndo())));
+  };
+
   /* ---------------------------------------------------------- Restore */
   function mount(root) {
-    var st = { mode: 'site', file: null, site: '', token: '', sourceUrl: '', quiet: true };
+    var st = { file: null, sourceUrl: '', quiet: true };
     var view = h('div');
     D.mount(root,
       h('div', { class: 'dsk-head' }, h('div', null, h('h1', null, 'Restore'),
-        h('p', null, 'Bring a site into this one: pull it straight from another live site running Disembark, or upload a backup zip. A rollback point is saved first, so you can always go back.'))),
+        h('p', null, 'Bring a backup zip into this site. A rollback point is saved first, so you can always go back. To copy straight from another live site, use ', h('a', { href: '#pull' }, 'Pull'), '.'))),
       view);
     renderForm();
 
     function renderForm() {
       var startBtn = h('button', { class: 'dsk-btn primary lg', disabled: true, onclick: confirmStart }, D.icon('restore'), 'Restore into this site');
-      function sync() { startBtn.disabled = st.mode === 'site' ? !(st.site && st.token) : !st.file; }
-      var sitePane = D.connectFields(st, sync);
+      function sync() { startBtn.disabled = !st.file; }
 
       var fileName = h('strong', null, st.file ? st.file.name : 'Choose a backup zip');
       var fileMeta = h('div', { class: 'muted', style: { marginTop: '4px' } }, st.file ? D.fmt.size(st.file.size) : 'or drop it here · from “disembark backup” or Back up → Download');
@@ -409,14 +421,9 @@
       var filePane = h('div', null, drop,
         h('div', { class: 'dsk-field', style: { marginTop: '14px' } }, h('label', null, 'Source URL to rewrite (optional)'), srcUrl,
           h('span', { class: 'hint' }, 'Defaults to the address recorded in the backup. It’s rewritten to ' + D.config.homeUrl + '.')));
-
-      var panes = h('div', null, st.mode === 'site' ? sitePane : filePane);
-      var seg = D.seg([{ value: 'site', label: 'From a live site', icon: 'globe' }, { value: 'file', label: 'From a backup file', icon: 'zip' }], st.mode, function (v) {
-        st.mode = v; D.mount(panes, v === 'site' ? sitePane : filePane); sync();
-      });
       sync();
       D.mount(view, h('div', { class: 'dsk-stack' }, h('div', { class: 'dsk-grid two', style: { alignItems: 'start' } },
-        h('div', { class: 'dsk-card dsk-card-pad dsk-stack' }, seg, panes, D.quietToggle(st, 'Keep the copy quiet', 'For a staging or dev copy: emails are held, scheduled jobs paused, checkout closed, and payment and marketing APIs blocked, so the copy can’t reach real customers. Only applies when the address changes, and stands down by itself if this site later moves to the real domain.'), h('div', null, startBtn)),
+        h('div', { class: 'dsk-card dsk-card-pad dsk-stack' }, filePane, D.quietToggle(st, 'Keep this copy quiet', 'For a staging or dev copy: emails are held, scheduled jobs paused, checkout closed, and payment and marketing APIs blocked, so the copy can’t reach real customers. Only applies when the address changes, and stands down by itself if this site later moves to the real domain.'), h('div', null, startBtn)),
         h('div', { class: 'dsk-stack' },
           D.note('warn', [h('strong', null, 'This replaces this site.'), ' Its files and database are overwritten with the backup. User accounts come from the backup too, so afterwards you log in with the source site’s credentials.']),
           D.note('', ['A rollback point is saved before anything changes. If something goes wrong, or you change your mind, ', h('strong', null, 'Roll back'), ' puts this site back exactly as it was.'], 'anchor'),
@@ -425,25 +432,16 @@
     }
 
     async function confirmStart() {
-      var what = st.mode === 'site' ? D.host(st.site) : st.file.name;
+      var what = st.file.name;
       var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
         h('p', null, 'Replace ', h('strong', null, D.host(D.config.homeUrl)), ' with ', h('strong', null, what), '?'),
         h('p', { class: 'muted' }, 'A rollback point is saved first. You’ll need to log in again afterwards.')), { title: 'Restore this site?', confirmLabel: 'Restore', danger: true });
       if (!ok) return;
       D.runMove(view, {
-        api: D.api, local: true, mode: st.mode, site: st.site, token: st.token, file: st.file, sourceUrl: st.sourceUrl, quiet: st.quiet,
+        api: D.api, local: true, mode: 'file', file: st.file, sourceUrl: st.sourceUrl, quiet: st.quiet,
         targetHome: D.config.homeUrl, label: 'Before restore from ' + what, title: 'Restoring', doneTitle: 'Restored',
         back: renderForm,
-        done: function (outcome, ctx) {
-          D.mount(outcome, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '14px' } },
-            h('div', { class: 'dsk-row' }, D.icon('checkCircle'), h('h2', { style: { fontSize: '30px' } }, 'Safely ashore.')),
-            h('p', null, D.host(D.config.homeUrl) + ' now holds the restored site.'),
-            D.note('warn', ['User accounts came from the backup, so your current login no longer applies. ', h('strong', null, 'Log in with the source site’s credentials.')]),
-            h('div', { class: 'dsk-row' },
-              h('a', { class: 'dsk-btn primary', href: D.config.loginUrl }, 'Log in again'),
-              h('button', { class: 'dsk-btn', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), 'Undo restore')),
-            h('div', null, h('div', { class: 'caps', style: { marginBottom: '6px' } }, 'Undo from the CLI'), ctx.cliUndo())));
-        }
+        done: function (outcome, ctx) { D.arrivedView(outcome, ctx, 'Undo restore'); }
       });
     }
   }

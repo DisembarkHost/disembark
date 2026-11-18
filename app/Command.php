@@ -52,7 +52,7 @@ class Command {
     /**
      * Pulls another site running Disembark into this one, server to server.
      *
-     * Runs the same steps as Tools → Disembark → Restore → From a live site:
+     * Runs the same steps as Tools → Disembark → Pull:
      * saves a rollback point, copies files and database across, remaps the
      * table prefix and rewrites the old address. This site's wp-config.php,
      * its own Disembark, and its host setup (mu-plugins it already has, mu-plugins
