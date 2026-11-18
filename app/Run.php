@@ -173,10 +173,11 @@ class Run {
             'disembark-restore'  => [ 'js/restore.js', [ 'disembark-core' ] ],
             'disembark-push'     => [ 'js/push.js', [ 'disembark-restore' ] ],
             'disembark-pull'     => [ 'js/pull.js', [ 'disembark-restore' ] ],
+            'disembark-bring'    => [ 'js/bring.js', [ 'disembark-tree' ] ],
             'disembark-files'    => [ 'js/files.js', [ 'disembark-tree' ] ],
             'disembark-database' => [ 'js/database.js', [ 'disembark-core' ] ],
             'disembark-settings' => [ 'js/settings.js', [ 'disembark-core' ] ],
-            'disembark-app'      => [ 'js/app.js', [ 'disembark-backup', 'disembark-restore', 'disembark-push', 'disembark-pull', 'disembark-files', 'disembark-database', 'disembark-settings' ] ],
+            'disembark-app'      => [ 'js/app.js', [ 'disembark-backup', 'disembark-restore', 'disembark-push', 'disembark-pull', 'disembark-bring', 'disembark-files', 'disembark-database', 'disembark-settings' ] ],
         ];
         foreach ( $scripts as $handle => list( $file, $deps ) ) {
             wp_register_script( $handle, $base . $file, $deps, $ver( $file ), true );
@@ -317,6 +318,22 @@ class Run {
         register_rest_route('disembark/v1', '/import/pull/fetch-database', [
             'methods'  => 'POST',
             'callback' => [ $this, 'import_pull_fetch_database' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/pull/contents', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_contents' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/pull/select', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_select' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/cancel', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_cancel' ]
+        ]);
+        register_rest_route('disembark/v1', '/templates', [
+            'methods'  => 'GET, POST',
+            'callback' => [ $this, 'templates' ]
         ]);
         register_rest_route('disembark/v1', '/import/snapshot', [
             'methods'  => 'POST',
@@ -873,7 +890,8 @@ class Run {
             return new \WP_Error( 'missing_params', 'Missing tables array.', [ 'status' => 400 ] );
         }
 
-        return ( new Backup( $backup_token ) )->database_export_batch( $tables );
+        $schema_only = is_array( $request['schema_only'] ) ? array_values( array_filter( $request['schema_only'], 'is_string' ) ) : [];
+        return ( new Backup( $backup_token ) )->database_export_batch( $tables, $schema_only );
     }
 
     function get_manifest( $request ) {
@@ -1291,6 +1309,71 @@ class Run {
             return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
         }
         return ( new Pull( $import_id ) )->fetch_database();
+    }
+
+    /** Cancel a move: action=stop, then action=cleanup (see Import::cancel()). */
+    function import_cancel( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) ( $request['import_id'] ?? '' ) ) );
+        if ( $import_id === '' ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        $action = (string) ( $request['action'] ?? 'stop' ) === 'cleanup' ? 'cleanup' : 'stop';
+        return ( new Import( $import_id ) )->cancel( $action, ! empty( $request['delete_restore_point'] ) );
+    }
+
+    function import_pull_contents( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $import_id = (string) ( $request['import_id'] ?? '' );
+        if ( $import_id === '' ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        $contents = ( new Pull( $import_id ) )->contents();
+        if ( is_array( $contents ) ) {
+            $contents['templates'] = Templates::all();
+        }
+        return $contents;
+    }
+
+    function import_pull_select( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $import_id = (string) ( $request['import_id'] ?? '' );
+        if ( $import_id === '' ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        $list = function ( $key ) use ( $request ) {
+            return is_array( $request[ $key ] ) ? array_values( array_filter( $request[ $key ], 'is_string' ) ) : [];
+        };
+        return ( new Pull( $import_id ) )->select( $list( 'skip_paths' ), $list( 'skip_names' ), $list( 'skip_rows' ) );
+    }
+
+    /**
+     * Saved "What to bring" templates on this site. GET lists them; POST
+     * action=save (name, suggestions, paths, rows) or action=delete (name).
+     */
+    function templates( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $action = (string) ( $request['action'] ?? '' );
+        if ( $action === 'save' ) {
+            return Templates::save( [
+                'name'        => $request['name'] ?? '',
+                'suggestions' => (array) ( $request['suggestions'] ?? [] ),
+                'paths'       => (array) ( $request['paths'] ?? [] ),
+                'rows'        => (array) ( $request['rows'] ?? [] ),
+            ] );
+        }
+        if ( $action === 'delete' ) {
+            return Templates::delete( (string) ( $request['name'] ?? '' ) );
+        }
+        return Templates::all();
     }
 
     function import_staged_info( $request ) {

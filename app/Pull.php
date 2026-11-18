@@ -287,15 +287,20 @@ class Pull {
         }
         // Table sizes (for a size estimate) from /database.
         $db = $this->source_request( '/database', [], 'GET' );
+        $table_info = [];
         if ( is_array( $db ) ) {
             foreach ( $db as $row ) {
                 $db_size += isset( $row->size ) ? (int) $row->size : 0;
+                if ( ! empty( $row->table ) ) {
+                    $table_info[] = [ 'name' => (string) $row->table, 'size' => (int) ( $row->size ?? 0 ), 'rows' => (int) ( $row->row_count ?? 0 ) ];
+                }
             }
         }
 
         $state = $this->state();
         $state['source_home']   = $home;
         $state['source_prefix'] = $prefix;
+        $state['tables']        = $table_info;
         $this->save_state( $state );
 
         // Stamp source metadata into staging so the import reads it like a backup.
@@ -386,6 +391,9 @@ class Pull {
      * and extracts into staging. Returns cumulative progress.
      */
     public function fetch_files( $offset, $count ) {
+        if ( $this->import->cancelled() ) {
+            return new \WP_Error( 'cancelled', 'Cancelled.', [ 'status' => 409 ] );
+        }
         $state = $this->state();
         if ( empty( $state['file_list'] ) || ! file_exists( $state['file_list'] ) ) {
             return new \WP_Error( 'no_file_list', 'Run the scan step first.', [ 'status' => 400 ] );
@@ -431,7 +439,11 @@ class Pull {
         if ( empty( $tables ) ) {
             return new \WP_Error( 'no_tables', 'Source returned no tables to export.', [ 'status' => 502 ] );
         }
-        $url = $this->source_request( '/export-database-batch', [ 'tables' => $tables ], 'POST', 1800 );
+        // Tables whose rows stay behind (see select()). A source that predates
+        // schema_only sends the rows anyway; the import drops them then.
+        $state       = $this->state();
+        $schema_only = array_values( (array) ( $state['skip_rows'] ?? [] ) );
+        $url = $this->source_request( '/export-database-batch', [ 'tables' => $tables, 'schema_only' => $schema_only ], 'POST', 1800 );
         if ( is_wp_error( $url ) ) {
             return $url;
         }
@@ -444,12 +456,79 @@ class Pull {
         if ( is_wp_error( $dl ) ) {
             return $dl;
         }
-        // The database is the last thing pulled; the source's full-access
-        // token isn't needed from here on, so don't leave it on disk.
+        // The database is the last thing pulled: clear this pull's working
+        // folder on the source, then drop the source's full-access token,
+        // which isn't needed from here on.
+        $this->cleanup_source();
         $state = $this->state();
         unset( $state['source_token'] );
         $this->save_state( $state );
         return [ 'ok' => true, 'tables' => count( $tables ), 'bytes' => filesize( $dest ) ];
+    }
+
+    /** The scanned file list, before any choices were applied. */
+    private function all_files() {
+        $state = $this->state();
+        if ( empty( $state['file_list'] ) || ! file_exists( $state['file_list'] ) ) {
+            return new \WP_Error( 'no_file_list', 'Run the scan step first.', [ 'status' => 400 ] );
+        }
+        $all = $state['file_list'] . '.all';
+        if ( ! file_exists( $all ) ) {
+            copy( $state['file_list'], $all );
+        }
+        $files = json_decode( (string) file_get_contents( $all ), true );
+        return is_array( $files ) ? $files : [];
+    }
+
+    /**
+     * What the source holds, for "What to bring": totals, folders, tables,
+     * and the suggested skips that match it (see Skips).
+     */
+    public function contents() {
+        $files = $this->all_files();
+        if ( is_wp_error( $files ) ) {
+            return $files;
+        }
+        $state = $this->state();
+        return Skips::analyze( $files, (array) ( $state['tables'] ?? [] ), (string) ( $state['source_prefix'] ?? '' ) );
+    }
+
+    /**
+     * Applies "What to bring": leaves out skip_paths (folders or files),
+     * files named one of skip_names anywhere, and the rows of skip_rows
+     * (those tables still come across, empty). Safe to call again: it always
+     * starts from the full scan.
+     */
+    public function select( $skip_paths = [], $skip_names = [], $skip_rows = [] ) {
+        $files = $this->all_files();
+        if ( is_wp_error( $files ) ) {
+            return $files;
+        }
+        $state  = $this->state();
+        $known  = array_column( (array) ( $state['tables'] ?? [] ), 'name' );
+        $rows   = array_values( array_intersect( array_map( 'strval', (array) $skip_rows ), $known ) );
+        list( $kept, $left_files, $left_bytes ) = Skips::filter_files( $files, $skip_paths, $skip_names );
+
+        file_put_contents( $state['file_list'], wp_json_encode( $kept ) );
+        $state['total_files'] = count( $kept );
+        $state['skip_rows']   = $rows;
+        $state['left_out']    = [
+            'paths'  => Skips::topmost( array_values( array_filter( array_map( function ( $p ) { return trim( (string) $p, '/' ); }, (array) $skip_paths ) ) ) ),
+            'names'  => array_values( array_map( 'strval', (array) $skip_names ) ),
+            'files'  => $left_files,
+            'bytes'  => $left_bytes,
+            'rows'   => $rows,
+        ];
+        $this->save_state( $state );
+        // The import reads this to drop those tables' rows (a source that
+        // predates schema_only sends them anyway).
+        file_put_contents( dirname( $this->state_file ) . '/skip-rows.json', wp_json_encode( $rows ) );
+
+        $bytes = 0;
+        foreach ( $kept as $f ) {
+            $bytes += (int) ( $f['size'] ?? 0 );
+        }
+        return [ 'files' => count( $kept ), 'bytes' => $bytes, 'left_out' => $state['left_out'] ];
     }
 
     /**
@@ -489,6 +568,20 @@ class Pull {
     /**
      * Cleans up pull scratch state (file list, source token) after finalize.
      */
+    /**
+     * Asks the source to delete this pull's temporary files (its manifest
+     * and export session). Best effort: the source's token is only kept
+     * until the database has been pulled.
+     */
+    public function cleanup_source() {
+        $state = $this->state();
+        if ( empty( $state['source_token'] ) || empty( $state['backup_token'] ) ) {
+            return false;
+        }
+        $this->source_request( '/cleanup', [ 'backup_token' => $state['backup_token'] ], 'GET', 30 );
+        return true;
+    }
+
     public function cleanup_pull_state() {
         @unlink( $this->state_file );
         $list = $this->staging_dir() . '/file-list.json';

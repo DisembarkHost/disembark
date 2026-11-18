@@ -75,6 +75,25 @@ class Command {
      * [--bring-host-files]
      * : Also deploy the source's host files (mu-plugins and cache drop-ins).
      *
+     * [--skip=<paths>]
+     * : Folders or files to leave behind, comma-separated, relative to the web
+     * root (for example wp-content/uploads/2014,wp-content/big-export.csv).
+     *
+     * [--skip-rows=<tables>]
+     * : Tables to bring empty, comma-separated (with or without the table
+     * prefix). Their structure comes across; their rows stay behind.
+     *
+     * [--template=<name>]
+     * : Start from a saved "What to bring" template (made in Tools → Disembark
+     * → Pull) instead of the suggested skips.
+     *
+     * [--bring-everything]
+     * : Leave nothing behind. By default the suggested skips that match the
+     * source are left out: old backup archives (UpdraftPlus and others),
+     * caches, error logs, email/redirect/WooCommerce logs, Wordfence's
+     * firewall files and traffic data. Logs and data tables come across
+     * empty rather than missing.
+     *
      * [--skip-quiet-mode]
      * : Don't turn on quiet mode. By default a pull from another address turns
      * it on, so the copy can't email customers, run the source's scheduled
@@ -134,7 +153,7 @@ class Command {
             $this->check( $pull->scan_step( 'process_chunk', $n ), 'scan' );
         }
         $fin = $this->check( $pull->scan_step( 'finalize' ), 'scan' );
-        $this->say( '      ' . number_format( (int) ( $fin['total_files'] ?? 0 ) ) . ' files to copy.' );
+        $this->choose( $pull, $assoc_args, $summary );
         $fetched = 0;
         do {
             $r       = $this->check( $pull->fetch_files( $fetched, 1000 ), 'files' );
@@ -178,6 +197,10 @@ class Command {
         $dep = $this->check( $import->deploy_files( [ '*' ], empty( $assoc_args['bring-host-files'] ) ), 'files', $import_id );
         $summary['files_deployed']  = (int) $dep['deployed'];
         $summary['host_files_kept'] = $dep['host_files_kept'];
+        if ( ! empty( $dep['loaders_disabled'] ) ) {
+            $summary['loaders_disabled'] = $dep['loaders_disabled'];
+            $this->say( '      Disabled firewall loaders that point at files not on this server: ' . implode( ', ', $dep['loaders_disabled'] ) );
+        }
         $this->say( '      Placed ' . number_format( (int) $dep['deployed'] ) . ' files.' );
         if ( ! empty( $dep['host_files_kept'] ) ) {
             $this->say( '      Left out (host files; this site keeps its own): ' . implode( ', ', $dep['host_files_kept'] ) );
@@ -514,6 +537,73 @@ class Command {
     // ------------------------------------------------------------------ helpers
 
     /** Parses "<url> <token>" or "disembark connect <url> <token>". */
+    /**
+     * "What to bring" for the CLI: the suggested skips (or a template, or
+     * nothing with --bring-everything), plus --skip and --skip-rows.
+     */
+    private function choose( $pull, $assoc_args, &$summary ) {
+        $contents = $this->check( $pull->contents(), 'scan' );
+        $prefix   = strtolower( (string) $contents['prefix'] );
+        $split    = function ( $key ) use ( $assoc_args ) {
+            return array_values( array_filter( array_map( 'trim', explode( ',', (string) ( $assoc_args[ $key ] ?? '' ) ) ) ) );
+        };
+        $paths = $split( 'skip' );
+        $rows  = array_map( function ( $t ) use ( $prefix ) {
+            return ( $prefix !== '' && stripos( $t, $prefix ) === 0 ) ? substr( $t, strlen( $prefix ) ) : $t;
+        }, $split( 'skip-rows' ) );
+        $ids = null;
+        if ( ! empty( $assoc_args['template'] ) ) {
+            $template = Templates::find( $assoc_args['template'] );
+            if ( ! $template ) {
+                $names = array_column( Templates::all(), 'name' );
+                $this->fail( "No template named \"{$assoc_args['template']}\"." . ( $names ? ' Saved: ' . implode( ', ', $names ) . '.' : ' None are saved yet.' ), 'scan' );
+            }
+            $ids   = $template['suggestions'];
+            $paths = array_merge( $template['paths'], $paths );
+            $rows  = array_merge( $template['rows'], $rows );
+        }
+        if ( ! empty( $assoc_args['bring-everything'] ) ) {
+            $ids = [];
+        }
+        $choice = Skips::resolve( $contents, $ids, $paths, $rows );
+        $sel    = $this->check( $pull->select( $choice['skip_paths'], $choice['skip_names'], $choice['skip_rows'] ), 'scan' );
+
+        $this->say( '      ' . number_format( (int) $sel['files'] ) . ' files to copy (' . size_format( (int) $sel['bytes'] ) . ').' );
+        $left = $sel['left_out'];
+        if ( $left['files'] || $left['rows'] ) {
+            $this->say( '      Leaving behind ' . number_format( (int) $left['files'] ) . ' files (' . size_format( (int) $left['bytes'] ) . ')' . ( $left['rows'] ? ' and the rows of ' . count( $left['rows'] ) . ' tables' : '' ) . ':' );
+            foreach ( $contents['suggestions'] as $s ) {
+                if ( $ids === null ? $s['default'] : in_array( $s['id'], (array) $ids, true ) ) {
+                    $this->say( '        ' . $s['label'] . ' (' . size_format( $s['bytes'] + $s['table_bytes'] ) . ')' );
+                }
+            }
+            foreach ( $paths as $p ) {
+                $this->say( '        ' . $p );
+            }
+            $matched = array_map( 'strtolower', (array) $left['rows'] );
+            foreach ( $rows as $r ) {
+                if ( in_array( strtolower( $prefix . $r ), $matched, true ) ) {
+                    $this->say( '        rows of ' . $prefix . $r );
+                }
+            }
+        }
+        $off = array_filter( $contents['suggestions'], function ( $s ) use ( $ids ) {
+            return ! ( $ids === null ? $s['default'] : in_array( $s['id'], (array) $ids, true ) );
+        } );
+        if ( $off ) {
+            $this->say( '      Also could leave behind (pass --skip / --skip-rows): ' . implode( '; ', array_map( function ( $s ) {
+                return $s['label'] . ' (' . implode( ', ', array_merge( $s['paths'], $s['tables'] ) ) . ')';
+            }, $off ) ) );
+        }
+        $summary['left_out'] = [
+            'files'      => (int) $left['files'],
+            'bytes'      => (int) $left['bytes'],
+            'paths'      => $left['paths'],
+            'names'      => $left['names'],
+            'empty_tables' => $left['rows'],
+        ];
+    }
+
     private static function parse_connect( $args ) {
         $parts = array_values( array_filter( preg_split( '/\s+/', trim( implode( ' ', (array) $args ) ) ) ) );
         if ( count( $parts ) >= 2 && strtolower( $parts[0] ) === 'disembark' && strtolower( $parts[1] ) === 'connect' ) {

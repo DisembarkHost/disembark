@@ -97,11 +97,66 @@
     var outcome = h('div');
     var title = h('h2', { style: { fontSize: '28px', flex: 1 } }, opts.title || 'Restoring');
     var detailsBtn = h('button', { class: 'dsk-btn ghost sm', onclick: function () { log.hidden = !log.hidden; detailsBtn.lastChild.textContent = log.hidden ? 'Show details' : 'Hide details'; } }, D.icon('terminal'), h('span', null, 'Show details'));
-    D.mount(view, h('div', { class: 'dsk-grid two', style: { alignItems: 'start' } },
+    var cancelBtn = h('button', { class: 'dsk-btn ghost sm', onclick: askCancel }, D.icon('x'), 'Cancel');
+    var chooser = h('div');
+    D.mount(view, h('div', { class: 'dsk-stack' }, h('div', { class: 'dsk-grid two', style: { alignItems: 'start' } },
       h('div', { class: 'dsk-card dsk-card-pad' },
-        h('div', { class: 'dsk-row', style: { marginBottom: '16px' } }, title, detailsBtn),
+        h('div', { class: 'dsk-row', style: { marginBottom: '16px' } }, title, detailsBtn, cancelBtn),
         steps, line, h('div', { style: { marginTop: '12px' } }, log)),
-      outcome));
+      outcome), chooser));
+
+    // Cancel: the next request isn't sent (and a long step on a current
+    // Disembark stops early). Before the rollback point nothing here has
+    // changed, so the copied files are just deleted; after it, the site is
+    // rolled back first.
+    var cancelled = false;
+    function Cancelled() { var e = new Error('Cancelled.'); e.cancelled = true; return e; }
+    async function askCancel() {
+      if (cancelled) return;
+      var after = !!rollbackId;
+      var ok = await D.confirm(after
+        ? h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, D.host(opts.targetHome) + ' is partly changed by now.'), h('p', { class: 'muted' }, 'Cancelling stops the move and rolls it back to the rollback point, then deletes the copied files and the rollback point.'))
+        : h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, 'Nothing on ' + D.host(opts.targetHome) + ' has changed yet.'), h('p', { class: 'muted' }, 'Cancelling stops the move and deletes what was copied so far.')),
+        { title: after ? 'Cancel and roll back?' : 'Cancel this move?', confirmLabel: after ? 'Cancel and roll back' : 'Cancel the move', cancelLabel: 'Keep going', danger: true });
+      if (!ok || cancelled) return;
+      cancelled = true;
+      cancelBtn.disabled = true;
+      rlog('Cancelling after the current step\u2026', 'dim');
+      progress('Cancelling after the current step\u2026');
+      if (chooser.cancelChoice) { chooser.cancelChoice(); return; }
+      opts.api.post('import/cancel', t({ action: 'stop' })).catch(function () { /* older Disembark: it stops between steps */ });
+    }
+    async function cleanUp() {
+      cancelBtn.hidden = true;
+      title.textContent = 'Cancelling';
+      var rolledBack = false;
+      if (rollbackId) {
+        rlog('Rolling back to the snapshot\u2026');
+        try {
+          var r = await opts.api.post('import/rollback', { import_id: rollbackId, request_id: D.randomHex(24) });
+          rolledBack = !(r.errors && r.errors.length);
+          (r.errors || []).slice(0, 5).forEach(function (e) { rlog('  ' + e, 'err'); });
+          if (r.quiet_mode_lifted) rlog('Quiet mode lifted with it.', 'dim');
+        } catch (e) { rlog('ERROR: ' + D.errorText(e), 'err'); }
+      }
+      var kept = !!rollbackId && !rolledBack;
+      try {
+        await opts.api.post('import/cancel', t({ action: 'cleanup', delete_restore_point: rolledBack }));
+        rlog('Cleaned up the copied files' + (rolledBack ? ' and the rollback point.' : '.'), 'ok');
+      } catch (e) {
+        if (e.status === 404) rlog('This Disembark can\u2019t clean up on cancel; the copied files stay in uploads/disembark until you delete them (Settings \u2192 clean up).', 'dim');
+        else rlog('Cleanup: ' + D.errorText(e), 'err');
+      }
+      title.textContent = 'Cancelled';
+      progress('');
+      if (current) { stepEls[current].el.classList.remove('active'); stepEls[current].meta.textContent = 'cancelled'; }
+      D.mount(chooser);
+      D.mount(outcome, h('div', { class: 'dsk-stack' },
+        kept
+          ? D.note('error', [h('strong', null, 'Cancelled, but the rollback didn\u2019t finish. '), 'The rollback point is kept: roll back from Restore \u2192 Restore points or with ', h('code', null, 'wp disembark rollback ' + rollbackId), '.'])
+          : D.note('ok', [h('strong', null, 'Cancelled. '), rollbackId ? D.host(opts.targetHome) + ' is back to how it was, and the copied files are gone.' : 'Nothing on ' + D.host(opts.targetHome) + ' changed, and the copied files are gone.']),
+        h('div', null, h('button', { class: 'dsk-btn', onclick: opts.back }, 'Back to the form'))));
+    }
 
     function rlog(msg, cls) { log.appendChild(h('div', { class: cls || '' }, msg)); log.scrollTop = log.scrollHeight; }
     function step(key, meta) {
@@ -152,12 +207,12 @@
           return r;
         } catch (e) {
           if (!resumable) {
-            if (e.status !== 0 || attempt >= 3) throw e;
+            if (cancelled || e.status !== 0 || attempt >= 3) throw e;
             rlog('Connection dropped, retrying in ' + (attempt + 1) * 3 + 's\u2026', 'dim');
             await D.sleep((attempt + 1) * 3000);
             continue;
           }
-          if (TRANSIENT.indexOf(e.status) === -1) throw e;
+          if (cancelled || TRANSIENT.indexOf(e.status) === -1) throw e;
           if (!outage) {
             outage = Date.now();
             rlog(e.status === 0 ? 'Lost the connection. The server keeps working; waiting to reconnect\u2026' : 'The site answered ' + e.status + '. Trying again\u2026', 'dim');
@@ -172,9 +227,14 @@
       }
     }
     var api = {
-      post: function (endpoint, body) {
+      post: async function (endpoint, body) {
+        if (cancelled) throw Cancelled();
         var rid = D.randomHex(24);
-        return retrying(function () { return opts.api.post(endpoint, Object.assign({ request_id: rid }, body || {})); });
+        try {
+          var r = await retrying(function () { return opts.api.post(endpoint, Object.assign({ request_id: rid }, body || {})); });
+        } catch (e) { if (cancelled) throw Cancelled(); throw e; }
+        if (cancelled) throw Cancelled();
+        return r;
       },
       upload: function (endpoint, form) {
         form.append('request_id', D.randomHex(24));
@@ -193,10 +253,16 @@
         if (s.scanned_dirs && s.total_dirs) progress('Scanning source folders… ' + D.fmt.num(s.scanned_dirs) + ' of ' + D.fmt.num(s.total_dirs));
         if (s.status === 'scan_complete') break;
       }
+      progress('Listing the source\u2019s files\u2026');
       var ch = await scan('chunkify');
-      for (var c2 = 1; c2 <= (ch.total_chunks || 0); c2++) await scan('process_chunk', c2);
+      for (var c2 = 1; c2 <= (ch.total_chunks || 0); c2++) {
+        progress('Listing the source\u2019s files\u2026 part ' + c2 + ' of ' + ch.total_chunks);
+        await scan('process_chunk', c2);
+      }
+      progress('Reading the file list\u2026');
       var fin = await scan('finalize');
-      rlog(D.fmt.plural(fin.total_files || 0, 'file') + ' to pull.');
+      rlog(D.fmt.plural(fin.total_files || 0, 'file') + ' found.');
+      await choose();
       var done = false, fetched = 0;
       while (!done) {
         var r = await api.post('import/pull/fetch-files', t({ offset: fetched, count: 1000 }));
@@ -210,6 +276,32 @@
       rlog('Database pulled (' + (db.tables || 0) + ' tables).');
       return String(c.source_home || '').replace(/\/$/, '');
     }
+    // "What to bring" (bring.js): pause after the scan so old backups,
+    // caches and logs can stay behind. Skipped by a destination that
+    // predates it.
+    async function choose() {
+      var contents;
+      progress('Sizing up the source\u2026');
+      try { contents = await api.post('import/pull/contents', t()); }
+      catch (e) {
+        if (e.status === 404) { rlog(D.host(opts.targetHome) + ' runs an older Disembark, so everything comes across.', 'dim'); return; }
+        throw e;
+      }
+      progress('Choose what to bring\u2026');
+      var choice = await D.whatToBring(chooser, contents, { source: opts.site, quiet: opts.quiet });
+      if (!choice) { cancelled = true; throw Cancelled(); }
+      if (cancelled) throw Cancelled();
+      var sel = await api.post('import/pull/select', t(choice));
+      var left = sel.left_out || {};
+      if (left.files || (left.rows && left.rows.length)) {
+        rlog('Leaving behind ' + D.fmt.plural(left.files || 0, 'file') + ' (' + D.fmt.size(left.bytes || 0) + ')' + (left.rows && left.rows.length ? ' and the rows of ' + D.fmt.plural(left.rows.length, 'table') : '') + '.', 'dim');
+        (left.paths || []).slice(0, 8).forEach(function (p) { rlog('  ' + p, 'dim'); });
+        if ((left.paths || []).length > 8) rlog('  \u2026 and ' + (left.paths.length - 8) + ' more', 'dim');
+      }
+      rlog(D.fmt.plural(sel.files || 0, 'file') + ' to pull (' + D.fmt.size(sel.bytes || 0) + ').');
+      progress('');
+    }
+
     async function upload(file, chunkBytes) {
       var size = chunkBytes > 0 ? chunkBytes : 20 * 1024 * 1024;
       var total = Math.max(1, Math.ceil(file.size / size));
@@ -330,6 +422,7 @@
         progress('');
         rlog('Done.', 'ok');
         title.textContent = opts.doneTitle || 'Restored';
+        cancelBtn.hidden = true;
         opts.done(outcome, ctx);
         if (quietOn) outcome.appendChild(h('div', { style: { marginTop: '14px' } }, D.quietNote(destHome, quietSource)));
         if (codeMentions) {
@@ -340,6 +433,8 @@
               codeMentions.total > codeMentions.list.length ? h('li', null, '\u2026 and ' + (codeMentions.total - codeMentions.list.length) + ' more') : null)])));
         }
       } catch (e) {
+        if (e.cancelled || cancelled) { await cleanUp(); return; }
+        cancelBtn.hidden = true;
         var msg = D.errorText(e);
         rlog('ERROR: ' + msg, 'err');
         title.textContent = 'Stopped';

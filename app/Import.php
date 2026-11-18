@@ -368,8 +368,24 @@ class Import {
         // Streamed statement by statement: reading the whole dump (and every
         // split statement) into memory needs a multiple of its size and runs
         // out of memory on large sites.
-        $run  = $this->begin_statements();
-        $read = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, $old_prefix, $new_prefix ) {
+        // Tables whose rows a pull left behind ("What to bring"). The source
+        // normally sends them structure-only; an older source sends the rows,
+        // and they're dropped here.
+        $skip_rows = [];
+        $skip_file = $this->import_path . '/skip-rows.json';
+        if ( is_file( $skip_file ) ) {
+            $skip_rows = array_flip( array_map( 'strtolower', (array) json_decode( (string) file_get_contents( $skip_file ), true ) ) );
+        }
+        $run   = $this->begin_statements();
+        $count = 0;
+        $read  = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, $old_prefix, $new_prefix, $skip_rows ) {
+            if ( ++$count % 500 === 0 && $this->cancelled() ) {
+                $run['errors'][] = 'Cancelled.';
+                return false;
+            }
+            if ( $skip_rows && preg_match( '/^\s*INSERT\s+INTO\s+`([^`]+)`/i', $statement, $m ) && isset( $skip_rows[ strtolower( $m[1] ) ] ) ) {
+                return true;
+            }
             foreach ( self::transform_statements( [ $statement ], $old_prefix, $new_prefix ) as $transformed ) {
                 if ( ! $this->run_statement( $transformed, $run ) ) {
                     return false;
@@ -530,7 +546,14 @@ class Import {
             $files = $this->list_staged_files( $staging_root );
         }
 
+        $count = 0;
         foreach ( $files as $relative_path ) {
+            // Cancel stops here, but still records what was placed so far
+            // (below), so the rollback removes it.
+            if ( ++$count % 1000 === 0 && $this->cancelled() ) {
+                $errors[] = 'Cancelled.';
+                break;
+            }
             if ( ! self::is_safe_relative_path( $relative_path ) ) {
                 $errors[] = "Unsafe path skipped: {$relative_path}";
                 continue;
@@ -607,7 +630,45 @@ class Import {
             'deployed'        => count( $deployed ),
             'errors'          => $errors,
             'host_files_kept' => array_keys( $kept ),
+            'loaders_disabled' => self::disable_missing_prepends( $web_root, $deployed ),
         ];
+    }
+
+    /**
+     * A firewall loader (Wordfence, NinjaFirewall, Sucuri…) is wired in with
+     * auto_prepend_file in .user.ini, php.ini or .htaccess, as an absolute
+     * path on the old server. Brought over as is, PHP fails to open that file
+     * on every request and the whole site is down. In the root config files
+     * this move deployed, a prepend whose file doesn't exist here is
+     * commented out. Returns "file: path" for each one.
+     */
+    private static function disable_missing_prepends( $web_root, $deployed ) {
+        $done = [];
+        foreach ( [ '.user.ini', 'php.ini', '.htaccess' ] as $name ) {
+            $file = $web_root . '/' . $name;
+            if ( ! in_array( $name, (array) $deployed, true ) || ! is_file( $file ) ) {
+                continue;
+            }
+            $lines   = file( $file );
+            $comment = $name === '.htaccess' ? '# ' : '; ';
+            $changed = false;
+            foreach ( (array) $lines as $i => $line ) {
+                if ( ! preg_match( '/^\s*(?:php_value\s+)?auto_prepend_file\s*=?\s*["\']?([^"\'\s]+)["\']?/i', $line, $m ) ) {
+                    continue;
+                }
+                $path = $m[1];
+                if ( strtolower( $path ) === 'none' || is_file( $path ) ) {
+                    continue;
+                }
+                $lines[ $i ] = $comment . 'Disabled by Disembark (file not on this server): ' . ltrim( $line );
+                $changed     = true;
+                $done[]      = "{$name}: {$path}";
+            }
+            if ( $changed ) {
+                file_put_contents( $file, implode( '', $lines ) );
+            }
+        }
+        return $done;
     }
 
     /**
@@ -1578,6 +1639,41 @@ class Import {
     /**
      * Cleans up staging directory. Keeps rollback data.
      */
+    /** Whether Cancel was pressed for this import (see cancel()). */
+    public function cancelled() {
+        clearstatcache( true, $this->import_path . '/cancel' );
+        return is_file( $this->import_path . '/cancel' );
+    }
+
+    /**
+     * Cancel. 'stop' leaves a marker the long steps check, so the step that's
+     * running ends early. 'cleanup' removes everything the move left: the
+     * staging folder, its working files, the source's temporary files when
+     * it can still reach them, and the whole import folder when no rollback
+     * point was saved. With $delete_restore_point (after a successful
+     * rollback) the rollback point goes too.
+     */
+    public function cancel( $action, $delete_restore_point = false ) {
+        if ( $action === 'stop' ) {
+            Storage::ensure_dir( $this->import_path );
+            file_put_contents( $this->import_path . '/cancel', (string) time() );
+            return [ 'ok' => true, 'stopping' => true ];
+        }
+        ( new Pull( $this->import_id ) )->cleanup_source();
+        if ( is_dir( $this->staging_path ) ) {
+            self::delete_directory_recursive( $this->staging_path );
+        }
+        foreach ( [ 'pull.json', 'token-guard.json', 'skip-rows.json', 'cancel' ] as $name ) {
+            @unlink( $this->import_path . '/' . $name );
+        }
+        $has_point = is_file( $this->rollback_path . '/meta.json' );
+        if ( ! $has_point || $delete_restore_point ) {
+            self::delete_directory_recursive( $this->import_path );
+            $has_point = false;
+        }
+        return [ 'ok' => true, 'restore_point_kept' => $has_point ];
+    }
+
     public function finalize() {
         // Remove staging directory
         if ( is_dir( $this->staging_path ) ) {

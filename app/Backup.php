@@ -444,8 +444,10 @@ class Backup {
      * (no OFFSET drift while the site keeps writing). The dump ends with
      * EXPORT_COMPLETE_MARKER so a reader can tell it is whole.
      */
-    public function database_export_batch( $tables = [] ) {
+    public function database_export_batch( $tables = [], $schema_only = [] ) {
         global $wpdb;
+        // Tables exported as structure only: a move leaving their rows behind.
+        $schema_only = array_flip( array_map( 'strval', (array) $schema_only ) );
 
         if ( empty( $tables ) ) {
             return new \WP_Error( 'missing_tables', 'No tables to export.', [ 'status' => 400 ] );
@@ -493,6 +495,13 @@ class Backup {
             }
             if ( ! $write( str_replace( "\n", '', $create_table[0][1] ) . ";\n/*!40000 ALTER TABLE `{$table}` DISABLE KEYS */;\n" ) ) {
                 return $fail( 'Could not write the database export (disk full?).' );
+            }
+
+            if ( isset( $schema_only[ $table ] ) ) {
+                if ( ! $write( "/*!40000 ALTER TABLE `{$table}` ENABLE KEYS */;\n" ) ) {
+                    return $fail( 'Could not write the database export (disk full?).' );
+                }
+                continue;
             }
 
             $keys     = self::primary_key_columns( $table );
