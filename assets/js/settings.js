@@ -1,6 +1,6 @@
 /**
- * Settings: connect the CLI, manage the connection token, clean up working
- * files, and pick light or dark.
+ * Settings: quiet mode, connect the CLI, manage the connection token, clean up
+ * working files, and pick light or dark.
  */
 (function () {
   'use strict';
@@ -63,6 +63,7 @@
                 h('button', { class: 'dsk-btn sm', onclick: function () { D.copy(S.token); } }, D.icon('copy'), 'Copy')),
               h('div', null, h('button', { class: 'dsk-btn danger sm', onclick: regenerate }, D.icon('refresh'), 'Regenerate token'))))),
         h('div', { class: 'dsk-stack' },
+          quietCard(),
           h('div', { class: 'dsk-card' },
             h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('trash'), 'Storage')),
             h('div', { class: 'dsk-card-pad dsk-stack', style: { gap: '14px' } },
@@ -78,6 +79,81 @@
             h('div', { class: 'dsk-row' },
               h('a', { class: 'dsk-btn sm', href: 'https://github.com/DisembarkHost/disembark/blob/main/changelog.md', target: '_blank', rel: 'noopener' }, 'Changelog'),
               h('a', { class: 'dsk-btn sm', href: 'https://github.com/DisembarkHost/disembark', target: '_blank', rel: 'noopener' }, 'GitHub'))))));
+
+    /**
+     * Quiet mode: what it's holding back, and the switch. A restore from
+     * another address turns it on; it can be turned on by hand for any copy.
+     */
+    function quietCard() {
+      var body = h('div', { class: 'dsk-card-pad dsk-stack', style: { gap: '14px' } });
+      var badge = h('span');
+      var card = h('div', { class: 'dsk-card' },
+        h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('moon'), 'Quiet mode'), h('span', { class: 'grow' }), badge),
+        body);
+      var held = h('div');
+
+      async function load() {
+        var q;
+        try { q = await D.api.get('quiet-mode'); }
+        catch (e) { D.mount(body, D.note('error', 'Could not read quiet mode: ' + D.errorText(e))); return; }
+        render(q);
+      }
+      function render(q) {
+        D.mount(badge, q.on ? h('span', { class: 'dsk-badge ' + (q.active ? 'accent' : '') }, q.active ? 'on' : 'standing down') : h('span', { class: 'dsk-badge' }, 'off'));
+        if (!q.on) {
+          D.mount(body,
+            h('p', { class: 'muted' }, 'For a staging or dev copy of a live site: holds every email, pauses WP-Cron and Action Scheduler, closes WooCommerce checkout and its webhooks, and blocks payment, marketing, shipping-label and email APIs, so the copy can\u2019t reach real customers. A restore from another site turns it on by itself.'),
+            h('div', null, h('button', { class: 'dsk-btn', onclick: function (e) { toggle(e.currentTarget, 'on'); } }, D.icon('moon'), 'Turn on quiet mode')));
+          return;
+        }
+        var parts = [];
+        if (!q.active) {
+          parts.push(D.note('', ['It was turned on for ', h('strong', null, D.host(q.home)), ' and this site is now ', h('strong', null, D.host(D.config.homeUrl)), ', so it\u2019s standing down: emails, jobs and checkout run normally. Turn it off to remove it.'], 'info'));
+        } else {
+          parts.push(h('p', null, D.host(D.config.homeUrl) + ' is ' + (q.source ? 'a copy of ' + D.host(q.source) : 'a copy') + (q.since ? ', quiet since ' + D.fmt.date(q.since) : '') + '. Emails are held, scheduled jobs paused, checkout closed, and payment, marketing and shipping APIs blocked.'));
+        }
+        parts.push(h('div', { class: 'dsk-grid two' },
+          h('div', { class: 'dsk-stat' }, h('div', { class: 'caps' }, 'Emails held'), h('div', { class: 'v' }, D.fmt.num(q.held_total || 0)), h('div', { class: 's' }, 'Never sent; the newest 50 are kept')),
+          h('div', { class: 'dsk-stat' }, h('div', { class: 'caps' }, 'API calls blocked'), h('div', { class: 'v' }, D.fmt.num((q.blocked || []).reduce(function (n, b) { return n + b.count; }, 0))),
+            h('div', { class: 's' }, (q.blocked || []).length ? q.blocked.map(function (b) { return b.label; }).filter(function (v, i, a) { return a.indexOf(v) === i; }).join(', ') : 'None so far'))));
+        if (q.held && q.held.length) {
+          parts.push(h('ul', { class: 'dsk-list', style: { border: '1px solid var(--line)', borderRadius: '10px', maxHeight: '280px', overflow: 'auto' } }, q.held.map(function (m) {
+            return h('li', { style: { cursor: 'pointer' }, tabindex: '0', role: 'button', onclick: function () { open(m); }, onkeydown: function (e) { if (e.key === 'Enter') open(m); } },
+              h('div', { class: 'grow', style: { minWidth: 0 } },
+                h('div', { style: { fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, m.subject || '(no subject)'),
+                h('div', { class: 'muted', style: { fontSize: '12.5px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, 'To ' + m.to + ' \u00b7 ' + D.fmt.ago(m.time))));
+          })));
+        }
+        parts.push(h('div', { class: 'dsk-row' },
+          h('button', { class: 'dsk-btn' + (q.active ? ' danger' : ''), onclick: function (e) { toggle(e.currentTarget, 'off'); } }, D.icon('sun'), 'Turn off quiet mode'),
+          h('button', { class: 'dsk-btn ghost sm', onclick: function (e) { D.busy(e.currentTarget, load); } }, D.icon('refresh'), 'Refresh')));
+        D.mount(body, parts);
+      }
+      async function open(m) {
+        var full;
+        try { full = await D.api.get('quiet-mode', { message: m.index }); }
+        catch (e) { D.toast(D.errorText(e), 'error'); return; }
+        var isHtml = /<\/?(html|body|p|div|table|br)\b/i.test(full.message || '');
+        var view = isHtml
+          ? h('iframe', { sandbox: '', style: { width: '100%', height: '420px', border: '1px solid var(--line)', borderRadius: '8px', background: '#fff' } })
+          : h('pre', { class: 'mono', style: { whiteSpace: 'pre-wrap', maxHeight: '420px', overflow: 'auto', fontSize: '12.5px' } }, full.message || '');
+        if (isHtml) view.srcdoc = full.message;
+        D.modal({ title: full.subject || '(no subject)', wide: true, body: h('div', { class: 'dsk-stack', style: { gap: '10px' } },
+          h('div', { class: 'muted', style: { fontSize: '13px' } }, 'To ' + full.to + ' \u00b7 held ' + D.fmt.date(full.time)), view) });
+      }
+      async function toggle(btn, action) {
+        if (action === 'off') {
+          var ok = await D.confirm('Emails send again, scheduled jobs resume (overdue ones run right away), checkout opens and API calls go through. Held emails are discarded.', { title: 'Turn off quiet mode?', confirmLabel: 'Turn off', danger: true });
+          if (!ok) return;
+        }
+        await D.busy(btn, async function () {
+          try { render(await D.api.post('quiet-mode', { action: action })); load(); D.toast(action === 'on' ? 'Quiet mode is on.' : 'Quiet mode is off.'); }
+          catch (e) { D.toast('Could not change quiet mode: ' + D.errorText(e), 'error'); }
+        });
+      }
+      load();
+      return card;
+    }
 
     async function regenerate(e) {
       var btn = e.currentTarget;

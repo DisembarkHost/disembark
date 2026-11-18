@@ -297,6 +297,11 @@ class Import {
         if ( strpos( $rel, '/' ) === false && preg_match( '#\.sql$#i', $rel ) ) {
             return true;
         }
+        // A quiet mode file belongs to the site it was turned on for: never
+        // carry one from a backup onto another site (it would silence it).
+        if ( $base === Quiet::FILE && strpos( $rel, 'mu-plugins/' ) !== false ) {
+            return true;
+        }
         foreach ( [ '_chunks/', '.disembark-db-parts/', '.disembark-manifests/' ] as $dir ) {
             if ( strpos( $rel, $dir ) === 0 ) {
                 return true;
@@ -1534,8 +1539,20 @@ class Import {
             }
         }
 
+        // Plugins the restore brought in are gone now, but they loaded at the
+        // start of this request: their shutdown hooks would autoload classes
+        // from deleted files and fatal (into the JSON response where errors
+        // are displayed). Only core's output flush still belongs here.
+        if ( array_diff( $deployed, $backed_up ) ) {
+            remove_all_actions( 'shutdown' );
+            add_action( 'shutdown', 'wp_ob_end_flush_all', 1 );
+        }
+
         @unlink( $this->import_path . '/token-guard.json' );
         @unlink( $this->import_path . '/pull.json' );
+
+        // Quiet mode turned on by this restore goes with it.
+        $quiet_lifted = empty( $errors ) && Quiet::lift_for_rollback( (string) $this->import_id );
 
         // Remember the rollback so the restore points list can show it.
         if ( empty( $errors ) && is_file( $this->rollback_path . '/meta.json' ) ) {
@@ -1551,6 +1568,7 @@ class Import {
             'tables_restored'  => count( $sql_files ),
             'files_restored'   => count( $backed_up ),
             'files_removed'    => count( array_diff( $deployed, $backed_up ) ),
+            'quiet_mode_lifted' => $quiet_lifted,
             'errors'           => $errors,
         ];
     }
@@ -1580,6 +1598,10 @@ class Import {
 
         // Flush object cache
         wp_cache_flush();
+
+        // A quiet mode turned on for this restore now binds to the address
+        // the site ended with.
+        Quiet::bind();
 
         return [
             'success'     => true,

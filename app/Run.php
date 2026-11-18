@@ -32,6 +32,7 @@ class Run {
             \WP_CLI::add_command( 'disembark rollback', [ 'Disembark\Command', 'rollback' ] );
             \WP_CLI::add_command( 'disembark delete-restore-point', [ 'Disembark\Command', 'delete_restore_point' ] );
             \WP_CLI::add_command( 'disembark search-replace', [ 'Disembark\Command', 'search_replace' ] );
+            \WP_CLI::add_command( 'disembark quiet-mode', [ 'Disembark\Command', 'quiet_mode' ] );
         }
     }
 
@@ -378,6 +379,10 @@ class Run {
         register_rest_route('disembark/v1', '/search-replace', [
             'methods'  => 'POST',
             'callback' => [ $this, 'search_replace' ]
+        ]);
+        register_rest_route('disembark/v1', '/quiet-mode', [
+            'methods'  => 'GET, POST',
+            'callback' => [ $this, 'quiet_mode' ]
         ]);
     }
 
@@ -1086,6 +1091,29 @@ class Run {
             return new \WP_Error( 'missing_from', 'Enter the text to search for.', [ 'status' => 400 ] );
         }
         return ( new Import() )->search_replace( $from, $to, $tables, ! empty( $request['dry_run'] ) );
+    }
+
+    /**
+     * Quiet mode. GET (or POST without action): status with the held emails'
+     * list; ?message=<index> returns one held email. POST action=on (source,
+     * import_id) or action=off.
+     */
+    function quiet_mode( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $action = (string) ( $request['action'] ?? '' );
+        if ( $action === 'on' ) {
+            $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) ( $request['import_id'] ?? '' ) ) );
+            return Quiet::enable( esc_url_raw( (string) ( $request['source'] ?? '' ) ), $import_id );
+        }
+        if ( $action === 'off' ) {
+            return Quiet::disable();
+        }
+        if ( isset( $request['message'] ) && $request['message'] !== '' ) {
+            return Quiet::held_message( (int) $request['message'] );
+        }
+        return Quiet::status( true );
     }
 
     function import_upload_zip( $request ) {

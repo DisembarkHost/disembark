@@ -43,6 +43,25 @@
         h('span', { class: 'hint' }, labels.hint || 'On that site, open Tools → Disembark → Settings and copy the connect line. Paste it into either field to fill both.')));
   };
 
+  /** "example.com/path": scheme, www. and trailing slash don't count (matches Quiet::address). */
+  D.address = function (url) {
+    return String(url || '').trim().toLowerCase().replace(/^[a-z]+:\/\//, '').replace(/^www\./, '').replace(/\/+$/, '');
+  };
+
+  /** The "Keep the copy quiet" switch for a move form; writes st.quiet. */
+  D.quietToggle = function (st, label, hint) {
+    return h('div', { class: 'dsk-field' },
+      D.toggle(label, st.quiet, function (v) { st.quiet = v; }),
+      h('span', { class: 'hint' }, hint));
+  };
+
+  /** Shown after a move that turned quiet mode on. */
+  D.quietNote = function (home, source) {
+    return D.note('warn', [h('strong', null, 'Quiet mode is on. '),
+      D.host(home) + ' is a copy' + (source ? ' of ' + D.host(source) : '') + ': emails are held, scheduled jobs paused, checkout closed, and payment and marketing APIs blocked. ',
+      'Lift it in Tools \u2192 Disembark \u2192 Settings there, or with ', h('code', null, 'wp disembark quiet-mode off'), '.'], 'moon');
+  };
+
   var STEPS = [
     { key: 'pre', label: 'Checking the destination' },
     { key: 'stage', label: 'Bringing the backup over' },
@@ -60,11 +79,12 @@
    *   api: { post(endpoint, body), upload(endpoint, form) },
    *   mode: 'site' | 'file', site, token (source), file, sourceUrl,
    *   targetHome, label (snapshot label), title ('Restoring' / 'Pushing'),
+   *   quiet (turn on quiet mode when the address changes),
    *   done(outcome, ctx), back()   // renders the finished / form view
    * }
    */
   D.runMove = function (view, opts) {
-    var importId = D.randomHex(24), rollbackId = '', codeMentions = null;
+    var importId = D.randomHex(24), rollbackId = '', codeMentions = null, quietOn = false, quietSource = '';
     var log = h('div', { class: 'dsk-log', hidden: true });
     var stepEls = {}, current = null, line = h('div', { class: 'muted', style: { minHeight: '20px', marginTop: '10px', fontFamily: 'var(--mono)', fontSize: '12.5px' } });
     var steps = h('div', { class: 'dsk-steps' }, STEPS.map(function (s, i) {
@@ -165,7 +185,8 @@
       rollbackId: function () { return rollbackId; },
       cliUndo: function () { return D.cmd('disembark restore ' + opts.targetHome + ' --rollback=' + rollbackId); },
       rollback: rollback,
-      log: rlog
+      log: rlog,
+      quietOn: function () { return quietOn; }
     };
 
     (async function () {
@@ -196,6 +217,20 @@
         D.mount(outcome, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '12px' } },
           h('h3', null, 'Rollback point saved'),
           h('p', { class: 'muted' }, 'Whatever happens next, this puts ' + D.host(destHome) + ' back as it was:'), ctx.cliUndo()));
+
+        // Quiet mode goes on before the files and database arrive, so no
+        // request in between can run the source's jobs or send its emails.
+        if (opts.quiet) {
+          if (srcHome && D.address(srcHome) !== D.address(destHome)) {
+            try { await api.post('quiet-mode', t({ action: 'on', source: srcHome })); }
+            catch (e) {
+              if (e.status === 404) throw new Error(D.host(destHome) + ' runs an older Disembark without quiet mode. Update Disembark there, or turn off “Keep the copy quiet”.');
+              throw e;
+            }
+            quietOn = true; quietSource = srcHome;
+            rlog('Quiet mode on: emails held, scheduled jobs paused, checkout closed, payment and marketing APIs blocked.', 'ok');
+          } else rlog('Same address as the source, so quiet mode isn\u2019t needed.', 'dim');
+        }
 
         step('files');
         var dep = await api.post('import/deploy-files', t({ files: ['*'] }));
@@ -243,6 +278,7 @@
         rlog('Done.', 'ok');
         title.textContent = opts.doneTitle || 'Restored';
         opts.done(outcome, ctx);
+        if (quietOn) outcome.appendChild(h('div', { style: { marginTop: '14px' } }, D.quietNote(destHome, quietSource)));
         if (codeMentions) {
           outcome.appendChild(h('div', { style: { marginTop: '14px' } }, D.note('warn', [
             h('strong', null, D.fmt.plural(codeMentions.total, 'theme or plugin file') + (codeMentions.total === 1 ? ' still mentions ' : ' still mention ') + D.host(codeMentions.from) + '. '),
@@ -276,6 +312,7 @@
             throw new Error('Rollback reported ' + D.fmt.plural(r.errors.length, 'error') + '. It can be run again from the CLI.');
           }
           rlog('Rolled back.', 'ok');
+          if (r.quiet_mode_lifted) rlog('Quiet mode lifted with it.', 'dim');
           title.textContent = 'Rolled back';
           D.mount(into || outcome, h('div', { class: 'dsk-stack' },
             D.note('ok', [h('strong', null, 'Rolled back. '), D.host(opts.targetHome) + ' is back to how it was before.']),
@@ -346,7 +383,7 @@
 
   /* ---------------------------------------------------------- Restore */
   function mount(root) {
-    var st = { mode: 'site', file: null, site: '', token: '', sourceUrl: '' };
+    var st = { mode: 'site', file: null, site: '', token: '', sourceUrl: '', quiet: true };
     var view = h('div');
     D.mount(root,
       h('div', { class: 'dsk-head' }, h('div', null, h('h1', null, 'Restore'),
@@ -379,7 +416,7 @@
       });
       sync();
       D.mount(view, h('div', { class: 'dsk-stack' }, h('div', { class: 'dsk-grid two', style: { alignItems: 'start' } },
-        h('div', { class: 'dsk-card dsk-card-pad dsk-stack' }, seg, panes, h('div', null, startBtn)),
+        h('div', { class: 'dsk-card dsk-card-pad dsk-stack' }, seg, panes, D.quietToggle(st, 'Keep the copy quiet', 'For a staging or dev copy: emails are held, scheduled jobs paused, checkout closed, and payment and marketing APIs blocked, so the copy can’t reach real customers. Only applies when the address changes, and stands down by itself if this site later moves to the real domain.'), h('div', null, startBtn)),
         h('div', { class: 'dsk-stack' },
           D.note('warn', [h('strong', null, 'This replaces this site.'), ' Its files and database are overwritten with the backup. User accounts come from the backup too, so afterwards you log in with the source site’s credentials.']),
           D.note('', ['A rollback point is saved before anything changes. If something goes wrong, or you change your mind, ', h('strong', null, 'Roll back'), ' puts this site back exactly as it was.'], 'anchor'),
@@ -394,7 +431,7 @@
         h('p', { class: 'muted' }, 'A rollback point is saved first. You’ll need to log in again afterwards.')), { title: 'Restore this site?', confirmLabel: 'Restore', danger: true });
       if (!ok) return;
       D.runMove(view, {
-        api: D.api, local: true, mode: st.mode, site: st.site, token: st.token, file: st.file, sourceUrl: st.sourceUrl,
+        api: D.api, local: true, mode: st.mode, site: st.site, token: st.token, file: st.file, sourceUrl: st.sourceUrl, quiet: st.quiet,
         targetHome: D.config.homeUrl, label: 'Before restore from ' + what, title: 'Restoring', doneTitle: 'Restored',
         back: renderForm,
         done: function (outcome, ctx) {

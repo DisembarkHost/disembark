@@ -474,6 +474,17 @@ class Backup {
 
         $select_row_limit = 1000;
 
+        // Read every table from one consistent snapshot (InnoDB), so a site
+        // that keeps writing during the export (a store taking orders) can't
+        // leave an order in one table and its items missing from another.
+        // Reads only; nothing is held locked.
+        $wpdb->query( 'SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ' );
+        $wpdb->query( 'START TRANSACTION WITH CONSISTENT SNAPSHOT' );
+        $fail = function ( $message ) use ( $fail, $wpdb ) {
+            $wpdb->query( 'COMMIT' );
+            return $fail( $message );
+        };
+
         foreach ( $tables as $table ) {
             $table        = (string) $table;
             $create_table = $wpdb->get_results( "SHOW CREATE TABLE `" . str_replace( '`', '``', $table ) . "`", ARRAY_N );
@@ -541,6 +552,7 @@ class Backup {
             }
         }
 
+        $wpdb->query( 'COMMIT' );
         if ( ! $write( "SET FOREIGN_KEY_CHECKS = 1;\nSET UNIQUE_CHECKS = 1;\n" . self::EXPORT_COMPLETE_MARKER . "\n" ) ) {
             return $fail( 'Could not write the database export (disk full?).' );
         }

@@ -55,7 +55,7 @@
   };
 
   function mount(root) {
-    var st = { site: '', token: '' };
+    var st = { site: '', token: '', quiet: false };
     var view = h('div');
     D.mount(root,
       h('div', { class: 'dsk-head' }, h('div', null, h('h1', null, 'Push'),
@@ -74,7 +74,7 @@
       D.mount(view, h('div', { class: 'dsk-grid two', style: { alignItems: 'start' } },
         h('div', { class: 'dsk-card dsk-card-pad dsk-stack' },
           h('div', { class: 'dsk-row' }, h('span', { class: 'dsk-badge accent' }, D.host(D.config.homeUrl)), D.icon('chevron'), h('span', { class: 'dsk-badge' }, st.site ? D.host(st.site) : 'destination')),
-          fields, h('div', null, btn)),
+          fields, D.quietToggle(st, 'Keep the destination quiet', 'Turn this on when the destination is a staging or dev copy: its emails are held, scheduled jobs paused, checkout closed, and payment and marketing APIs blocked. Leave it off when pushing to a live site.'), h('div', null, btn)),
         h('div', { class: 'dsk-stack' },
           D.note('warn', [h('strong', null, 'This replaces the destination.'), ' Its files and database are overwritten with this site, including its user accounts: afterwards you log in there with this site’s credentials.']),
           D.note('', ['The destination saves a rollback point before anything changes, so the push can be undone from here, from its own dashboard, or with the CLI.'], 'anchor'),
@@ -92,7 +92,7 @@
       catch (err) { D.toast(D.errorText(err), 'error'); return; }
       if (!api) return;
       D.runMove(view, {
-        api: api, mode: 'site', site: D.config.homeUrl, token: S.token,
+        api: api, mode: 'site', site: D.config.homeUrl, token: S.token, quiet: st.quiet,
         targetHome: api.preflight.home_url || st.site, label: 'Before push from ' + D.host(D.config.homeUrl),
         title: 'Pushing', doneTitle: 'Pushed', againLabel: 'Start another push',
         back: renderForm,

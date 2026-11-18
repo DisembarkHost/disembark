@@ -75,6 +75,13 @@ class Command {
      * [--bring-host-files]
      * : Also deploy the source's host files (mu-plugins and cache drop-ins).
      *
+     * [--skip-quiet-mode]
+     * : Don't turn on quiet mode. By default a pull from another address turns
+     * it on, so the copy can't email customers, run the source's scheduled
+     * jobs, take orders or call payment and marketing APIs. It stands down
+     * by itself if this site later moves to another address (such as going
+     * live on the real domain); `wp disembark quiet-mode off` lifts it sooner.
+     *
      * [--format=<format>]
      * : Output format.
      * ---
@@ -88,6 +95,7 @@ class Command {
      *
      *     $ wp disembark pull https://old-site.com 9fXc... --yes
      *     $ wp disembark pull disembark connect https://old-site.com 9fXc... --yes --format=json
+     *     $ wp disembark pull https://staging.example.com 9fXc... --yes --skip-quiet-mode
      */
     public function pull( $args, $assoc_args ) {
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
@@ -157,6 +165,15 @@ class Command {
         $summary['undo']        = "wp disembark rollback {$import_id}";
         $this->say( "      Saved. Undo any time with: wp disembark rollback {$import_id}" );
 
+        // Quiet mode goes on before the files and database arrive, so no
+        // request in between can run the source's jobs or send its emails.
+        $quiet = empty( $assoc_args['skip-quiet-mode'] ) && $src_home !== '' && Quiet::address( $src_home ) !== Quiet::address( $dest_home );
+        if ( $quiet ) {
+            $this->check( Quiet::enable( $src_home, $import_id ), 'quiet-mode', $import_id );
+            $summary['quiet_mode'] = [ 'on' => true, 'off' => 'wp disembark quiet-mode off' ];
+            $this->say( '      Quiet mode on: emails held, scheduled jobs paused, checkout closed, payment and marketing APIs blocked.' );
+        }
+
         $this->say( '[5/8] Putting files in place' );
         $dep = $this->check( $import->deploy_files( [ '*' ], empty( $assoc_args['bring-host-files'] ) ), 'files', $import_id );
         $summary['files_deployed']  = (int) $dep['deployed'];
@@ -219,6 +236,96 @@ class Command {
         }
         \WP_CLI::success( "Pulled {$source['url']} into {$dest_home}. Log in with the source site's credentials." );
         \WP_CLI::log( "Undo: wp disembark rollback {$import_id}" );
+        if ( $quiet ) {
+            \WP_CLI::log( 'Quiet mode is on (this is a copy). Lift it with: wp disembark quiet-mode off' );
+        }
+    }
+
+    /**
+     * Shows, turns on or turns off quiet mode.
+     *
+     * Quiet mode keeps a copy of a site from reaching the real world: emails
+     * are held (and listed here), WP-Cron and Action Scheduler are paused,
+     * WooCommerce checkout is closed and its webhooks paused, and payment,
+     * marketing, shipping-label and email APIs are blocked. A pull from
+     * another address turns it on. It's bound to the address it was turned on
+     * for, and stands down by itself if the site moves to another one.
+     *
+     * ## OPTIONS
+     *
+     * [<action>]
+     * : What to do.
+     * ---
+     * default: status
+     * options:
+     *   - status
+     *   - on
+     *   - off
+     *   - emails
+     * ---
+     *
+     * [--source=<url>]
+     * : With "on": the site this one is a copy of, shown in notices.
+     *
+     * [--format=<format>]
+     * : Output format.
+     * ---
+     * default: text
+     * options:
+     *   - text
+     *   - json
+     * ---
+     *
+     * ## EXAMPLES
+     *
+     *     $ wp disembark quiet-mode
+     *     $ wp disembark quiet-mode emails
+     *     $ wp disembark quiet-mode off
+     *
+     * @subcommand quiet-mode
+     */
+    public function quiet_mode( $args, $assoc_args ) {
+        $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
+        $action     = $args[0] ?? 'status';
+        if ( $action === 'on' ) {
+            $status = $this->check( Quiet::enable( (string) ( $assoc_args['source'] ?? '' ) ), 'quiet-mode' );
+        } elseif ( $action === 'off' ) {
+            $status = $this->check( Quiet::disable(), 'quiet-mode' );
+        } else {
+            $status = Quiet::status( true );
+        }
+        if ( $this->json ) {
+            \WP_CLI::line( wp_json_encode( $status, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
+            return;
+        }
+        if ( $action === 'emails' ) {
+            if ( empty( $status['held'] ) ) {
+                \WP_CLI::log( 'No held emails.' );
+                return;
+            }
+            $rows = array_map( function ( $m ) {
+                return [ 'time' => wp_date( 'Y-m-d H:i', $m['time'] ), 'to' => $m['to'], 'subject' => $m['subject'] ];
+            }, $status['held'] );
+            \WP_CLI\Utils\format_items( 'table', $rows, [ 'time', 'to', 'subject' ] );
+            if ( $status['held_total'] > count( $rows ) ) {
+                \WP_CLI::log( number_format( $status['held_total'] ) . ' held in all; the newest ' . count( $rows ) . ' are kept.' );
+            }
+            return;
+        }
+        if ( ! $status['on'] ) {
+            \WP_CLI::log( $action === 'off' ? 'Quiet mode is off.' : 'Quiet mode is off. Turn it on with: wp disembark quiet-mode on' );
+            return;
+        }
+        if ( ! $status['active'] ) {
+            \WP_CLI::log( 'Quiet mode is standing down: it was turned on for ' . $status['home'] . ' and this site has moved to ' . home_url() . '. Remove it with: wp disembark quiet-mode off' );
+            return;
+        }
+        \WP_CLI::log( 'Quiet mode is on' . ( $status['source'] ? ' (a copy of ' . $status['source'] . ')' : '' ) . ': emails held, scheduled jobs paused, checkout closed, payment and marketing APIs blocked.' );
+        \WP_CLI::log( number_format( $status['held_total'] ) . ( $status['held_total'] === 1 ? ' email' : ' emails' ) . ' held so far (list them: wp disembark quiet-mode emails).' );
+        foreach ( $status['blocked'] as $b ) {
+            \WP_CLI::log( "Blocked {$b['count']} " . ( $b['count'] === 1 ? 'call' : 'calls' ) . " to {$b['label']} ({$b['host']})." );
+        }
+        \WP_CLI::log( 'Lift it with: wp disembark quiet-mode off' );
     }
 
     /**
