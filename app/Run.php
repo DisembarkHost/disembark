@@ -36,6 +36,7 @@ class Run {
             \WP_CLI::add_command( 'disembark quiet-mode', [ 'Disembark\Command', 'quiet_mode' ] );
             \WP_CLI::add_command( 'disembark unfinished', [ 'Disembark\Command', 'unfinished' ] );
             \WP_CLI::add_command( 'disembark discard', [ 'Disembark\Command', 'discard' ] );
+            \WP_CLI::add_command( 'disembark verify', [ 'Disembark\Command', 'verify' ] );
         }
     }
 
@@ -192,6 +193,7 @@ class Run {
             'token'     => Token::get(),
             'homeUrl'   => home_url(),
             'loginUrl'  => wp_login_url( admin_url( 'tools.php?page=disembark' ) ),
+            'userEmail' => (string) wp_get_current_user()->user_email,
             'version'   => $plugin['Version'],
             'fileEdits' => User::file_edits_allowed(),
             'multisite' => is_multisite(),
@@ -344,6 +346,18 @@ class Run {
         register_rest_route('disembark/v1', '/import/cancel', [
             'methods'  => 'POST',
             'callback' => [ $this, 'import_cancel' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/checks', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_checks' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/verify', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_verify' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/notify', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_notify' ]
         ]);
         register_rest_route('disembark/v1', '/templates', [
             'methods'  => 'GET, POST',
@@ -1381,6 +1395,40 @@ class Run {
         }
         $action = (string) ( $request['action'] ?? 'stop' ) === 'cleanup' ? 'cleanup' : 'stop';
         return ( new Import( $import_id ) )->cancel( $action, ! empty( $request['delete_restore_point'] ) );
+    }
+
+    /** Checks before the move changes anything (see Checks). */
+    function import_checks( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) ( $request['import_id'] ?? '' ) ) );
+        if ( $import_id === '' ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        return Checks::before_move( $import_id );
+    }
+
+    /** Checks after the move: rows, pages, leftover addresses (see Verify). */
+    function import_verify( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        @set_time_limit( 300 );
+        return Verify::run( (string) ( $request['import_id'] ?? '' ) );
+    }
+
+    /** Who to tell when the move ends (action=set), and telling them (action=send). */
+    function import_notify( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $import_id = (string) ( $request['import_id'] ?? '' );
+        if ( (string) ( $request['action'] ?? '' ) === 'send' ) {
+            $details = $request['details'] ?? [];
+            return Notify::send( $import_id, (string) ( $request['event'] ?? 'finished' ), is_array( $details ) ? $details : [] );
+        }
+        return Notify::set( $import_id, (string) ( $request['to'] ?? '' ) );
     }
 
     function import_pull_contents( $request ) {

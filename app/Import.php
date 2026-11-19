@@ -120,9 +120,38 @@ class Import {
             'resumable'          => true,
             'max_execution_time' => ini_get( 'max_execution_time' ),
             'tables'             => $tables,
+            'profile'            => self::site_profile(),
             'php_version'        => phpversion(),
             'mysql_version'      => $mysql_version,
             'disembark_token'    => Token::read(),
+        ];
+    }
+
+    /**
+     * What a move's checks compare between two sites: versions, plugins and
+     * theme. Sent by the source in preflight and kept in backup zips.
+     */
+    public static function site_profile() {
+        global $wpdb;
+        if ( ! function_exists( 'get_plugins' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+        $active = (array) get_option( 'active_plugins', [] );
+        if ( is_multisite() ) {
+            $active = array_merge( $active, array_keys( (array) get_site_option( 'active_sitewide_plugins', [] ) ) );
+        }
+        $plugins = [];
+        foreach ( (array) get_plugins() as $file => $data ) {
+            $plugins[ $file ] = [ 'name' => (string) ( $data['Name'] ?? $file ), 'version' => (string) ( $data['Version'] ?? '' ), 'active' => in_array( $file, $active, true ) ];
+        }
+        $theme = wp_get_theme();
+        return [
+            'wp_version'    => (string) get_bloginfo( 'version' ),
+            'php_version'   => PHP_VERSION,
+            'mysql_version' => (string) $wpdb->get_var( 'SELECT VERSION()' ),
+            'plugins'       => $plugins,
+            'theme'         => [ 'stylesheet' => $theme->get_stylesheet(), 'name' => (string) $theme->get( 'Name' ), 'version' => (string) $theme->get( 'Version' ) ],
+            'multisite'     => is_multisite(),
         ];
     }
 
@@ -379,12 +408,25 @@ class Import {
         }
         $run    = $this->begin_statements();
         $count  = 0;
-        $swap   = self::swap_start();
-        $compat = self::db_compat();
-        $read   = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, &$swap, &$compat, $old_prefix, $new_prefix, $skip_rows ) {
+        $swap     = self::swap_start();
+        $compat   = self::db_compat();
+        $expected = [];
+        $read     = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, &$swap, &$compat, &$expected, $old_prefix, $new_prefix, $skip_rows ) {
             if ( ++$count % 500 === 0 && $this->cancelled() ) {
                 $run['errors'][] = 'Cancelled.';
                 return false;
+            }
+            // The source's row count for the table just exported (see
+            // Backup::database_export_batch()), checked after the swap.
+            if ( preg_match( "/^SET\\s+@disembark_rows\\s*=\\s*'(.+):(\\d+)'\\s*$/s", trim( $statement ), $m ) ) {
+                $table = stripslashes( $m[1] );
+                if ( $old_prefix !== '' && $new_prefix !== '' && strpos( $table, $old_prefix ) === 0 ) {
+                    $table = $new_prefix . substr( $table, strlen( $old_prefix ) );
+                }
+                if ( ! isset( $skip_rows[ strtolower( $m[1] ) ] ) ) {
+                    $expected[ $table ] = (int) $m[2];
+                }
+                return true;
             }
             if ( $skip_rows && preg_match( '/^\s*INSERT\s+INTO\s+`([^`]+)`/i', $statement, $m ) && isset( $skip_rows[ strtolower( $m[1] ) ] ) ) {
                 return true;
@@ -416,7 +458,33 @@ class Import {
         $result['database_unchanged'] = ! empty( $result['errors'] ) && empty( $swap['direct'] );
         $result['converted']          = $compat['converted'];
         $result['definers_removed']   = $compat['definers_removed'];
+        if ( empty( $result['errors'] ) ) {
+            $result['rows'] = $this->check_rows( $expected );
+        }
         return $result;
+    }
+
+    /**
+     * Counts each imported table's rows against the count the source wrote
+     * into its export, right after the swap (before anything on this site
+     * writes to them). Saved for the checks after the move. A source that
+     * predates row counts sends none, and nothing is checked.
+     */
+    private function check_rows( $expected ) {
+        global $wpdb;
+        $missing = [];
+        foreach ( $expected as $table => $rows ) {
+            $actual = $wpdb->get_var( 'SELECT COUNT(*) FROM `' . str_replace( '`', '``', $table ) . '`' );
+            if ( $actual === null ) {
+                $missing[] = [ 'table' => $table, 'expected' => $rows, 'actual' => null ];
+            } elseif ( (int) $actual !== $rows ) {
+                $missing[] = [ 'table' => $table, 'expected' => $rows, 'actual' => (int) $actual ];
+            }
+        }
+        $check = [ 'checked' => count( $expected ), 'rows' => array_sum( $expected ), 'mismatched' => $missing ];
+        $this->prepare_import_dir();
+        file_put_contents( $this->import_path . '/rows-check.json', wp_json_encode( $check ) );
+        return $check;
     }
 
     /* ------------------------------------------------------------------
@@ -2206,7 +2274,9 @@ class Import {
         ( new Pull( $this->import_id ) )->remember_files();
 
         // Read before staging (which holds the source's details) goes.
-        $tidy = $this->tidy( $this->staged_source() );
+        $source = $this->staged_source();
+        $tidy   = $this->tidy( $source );
+        Verify::save_context( $this->import_path, (string) ( is_object( $source ) ? ( $source->home_url ?? '' ) : '' ), (string) ( $tidy['login_url']['url'] ?? '' ) );
 
         // Remove staging directory
         if ( is_dir( $this->staging_path ) ) {

@@ -8,7 +8,7 @@
 
   var D = window.Disembark = window.Disembark || {};
   var cfg = D.config = Object.assign({
-    apiRoot: '', nonce: '', token: '', homeUrl: '', loginUrl: '', version: '', fileEdits: true, multisite: false
+    apiRoot: '', nonce: '', token: '', homeUrl: '', loginUrl: '', userEmail: '', version: '', fileEdits: true, multisite: false
   }, window.DisembarkConfig || {});
 
   /* ------------------------------------------------------------------ DOM */
@@ -74,6 +74,7 @@
     copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
     check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
     checkCircle: '<circle cx="12" cy="12" r="9"/><path d="m8 12.5 3 3 5-6"/>',
+    mail: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3.5 6.5 8.5 6 8.5-6"/>',
     xCircle: '<circle cx="12" cy="12" r="9"/><path d="m9 9 6 6M15 9l-6 6"/>',
     x: '<path d="M6 6l12 12M18 6 6 18"/>',
     search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/>',

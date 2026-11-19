@@ -307,8 +307,9 @@ class Pull {
         }
 
         $state = $this->state();
-        $state['source_home']   = $home;
-        $state['source_prefix'] = $prefix;
+        $state['source_home']    = $home;
+        $state['source_prefix']  = $prefix;
+        $state['source_profile'] = is_object( $pre ) && isset( $pre->profile ) ? json_decode( (string) wp_json_encode( $pre->profile ), true ) : null;
         $state['tables']        = $table_info;
         $this->save_state( $state );
 
@@ -318,7 +319,7 @@ class Pull {
         }
         file_put_contents(
             $this->staging_public . '/disembark-source.json',
-            wp_json_encode( [ 'home_url' => $home, 'site_url' => $home, 'db_prefix' => $prefix, 'abspath' => (string) ( $pre->abspath ?? '' ), 'content_dir' => (string) ( $pre->content_dir ?? '' ) ] )
+            wp_json_encode( [ 'home_url' => $home, 'site_url' => $home, 'db_prefix' => $prefix, 'abspath' => (string) ( $pre->abspath ?? '' ), 'content_dir' => (string) ( $pre->content_dir ?? '' ), 'profile' => $state['source_profile'] ] )
         );
 
         return [

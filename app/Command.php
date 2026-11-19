@@ -105,6 +105,20 @@ class Command {
      * firewall files and traffic data. Logs and data tables come across
      * empty rather than missing.
      *
+     * [--skip-checks]
+     * : Go ahead even when the checks before the move find a problem that
+     * would stop it (not enough disk space, a database user that can't create
+     * tables, table names that would be too long).
+     *
+     * [--notify=<to>]
+     * : Email address(es) and/or https:// webhook URLs (Slack, Discord or any
+     * URL that takes JSON), comma-separated, told when the pull finishes or
+     * stops. Sent even from a copy in quiet mode.
+     *
+     * [--skip-verify]
+     * : Don't run the checks after the move (row counts, loading a few pages,
+     * looking for the old address).
+     *
      * [--skip-quiet-mode]
      * : Don't turn on quiet mode. By default a pull from another address turns
      * it on, so the copy can't email customers, run the source's scheduled
@@ -139,7 +153,9 @@ class Command {
             }
             $import_id  = $move['id'];
             // The same options as the first run, so its steps line up.
-            $assoc_args = array_merge( (array) ( $move['move']['args'] ?? [] ), [ 'yes' => true, 'format' => $assoc_args['format'] ?? 'text' ] );
+            // Flags about how this run reports or checks may change on a resume.
+            $now        = array_intersect_key( $assoc_args, array_flip( [ 'skip-checks', 'skip-verify', 'notify' ] ) );
+            $assoc_args = array_merge( (array) ( $move['move']['args'] ?? [] ), $now, [ 'yes' => true, 'format' => $assoc_args['format'] ?? 'text' ] );
             $source     = [ 'url' => $move['source'], 'token' => '' ];
             @unlink( Storage::base_dir() . "/_import_{$import_id}/cancel" );
         } else {
@@ -152,8 +168,16 @@ class Command {
         $import  = new Import( $import_id );
         $pull    = new Pull( $import_id );
         $summary = [ 'ok' => false, 'source' => $source['url'], 'import_id' => $import_id ];
+        $started = time();
+        if ( ! empty( $assoc_args['notify'] ) ) {
+            $set = Notify::set( $import_id, (string) $assoc_args['notify'] );
+            if ( is_wp_error( $set ) ) {
+                $this->fail( $set->get_error_message() );
+            }
+        }
+        $this->notify = [ 'import' => $import_id, 'kind' => 'pull', 'source' => $source['url'], 'destination' => home_url(), 'started' => $started ];
 
-        $this->say( '[1/8] Checking this site' );
+        $this->say( '[1/9] Checking this site' );
         if ( ! $resuming ) {
             $pre = $import->preflight();
             $this->confirm( $assoc_args, 'Replace ' . untrailingslashit( (string) $pre['home_url'] ) . " with {$source['url']}? A rollback point is saved first, and afterwards you log in with the source site's credentials." );
@@ -168,7 +192,7 @@ class Command {
         $dest_home   = untrailingslashit( (string) ( $pre['home_url'] ?? home_url() ) );
         $summary['destination'] = $dest_home;
 
-        $this->say( '[2/8] Bringing the site over' );
+        $this->say( '[2/9] Bringing the site over' );
         $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'skip-quiet-mode', 'bring-host-files', 'catch-up' ] ) );
         $c = $this->check( $this->step( function () use ( $pull, $source, $move_args ) {
             return $pull->connect( $source['url'], $source['token'], [ 'client' => 'cli', 'kind' => 'pull', 'args' => $move_args ], ! empty( $move_args['catch-up'] ) );
@@ -198,6 +222,7 @@ class Command {
             $this->say( '      Nothing is remembered from an earlier pull of this source, so everything comes across.' );
         }
         $this->choose( $pull, $assoc_args, $summary );
+        $this->report_checks( Checks::before_move( $import_id ), $summary, ! empty( $assoc_args['skip-checks'] ) );
         $fetched = 0;
         do {
             $r       = $this->check( $this->step( function () use ( $pull, $fetched ) { return $pull->fetch_files( $fetched, 1000 ); } ), 'files' );
@@ -208,7 +233,7 @@ class Command {
         $db = $this->check( $this->step( function () use ( $pull ) { return $pull->fetch_database(); } ), 'database' );
         $this->say( '      Database copied (' . (int) ( $db['tables'] ?? 0 ) . ' tables, ' . size_format( (int) ( $db['bytes'] ?? 0 ) ) . ').' );
 
-        $this->say( '[3/8] Reading the backup' );
+        $this->say( '[3/9] Reading the backup' );
         $info       = $this->check( $this->step( function () use ( $import ) { return $import->staged_info(); } ), 'read' );
         $src_prefix = (string) ( $info['source']['db_prefix'] ?? '' );
         if ( $src_home === '' ) {
@@ -222,7 +247,7 @@ class Command {
             }
         }
 
-        $this->say( '[4/8] Saving a rollback point' );
+        $this->say( '[4/9] Saving a rollback point' );
         $label = ( ! empty( $summary['catch_up'] ) ? 'Before catch-up from ' : 'Before pull from ' ) . wp_parse_url( $source['url'], PHP_URL_HOST );
         $this->check( $this->step( function () use ( $import, $label ) { return $import->snapshot( $label ); } ), 'snapshot' );
         $summary['rollback_id'] = $import_id;
@@ -238,7 +263,7 @@ class Command {
             $this->say( '      Quiet mode on: emails held, scheduled jobs paused, checkout closed, payment and marketing APIs blocked.' );
         }
 
-        $this->say( '[5/8] Putting files in place' );
+        $this->say( '[5/9] Putting files in place' );
         $keep = empty( $assoc_args['bring-host-files'] );
         $dep  = $this->check( $this->step( function () use ( $import, $keep ) { return $import->deploy_files( [ '*' ], $keep ); } ), 'files', $import_id );
         if ( ! empty( $dep['removed'] ) ) {
@@ -260,7 +285,7 @@ class Command {
         }
 
         if ( ! empty( $info['sql_file'] ) ) {
-            $this->say( '[6/8] Importing the database' );
+            $this->say( '[6/9] Importing the database' );
             $sql_file = $info['sql_file'];
             $sq = $this->check( $this->step( function () use ( $import, $sql_file, $src_prefix, $dest_prefix ) { return $import->import_staged_sql( $sql_file, $src_prefix, $dest_prefix ); } ), 'database', $import_id );
             $summary['statements'] = (int) $sq['statements_executed'];
@@ -282,7 +307,7 @@ class Command {
                 $this->say( "      Table prefix remapped {$src_prefix} → {$dest_prefix} (" . (int) ( $rp['keys_changed'] ?? 0 ) . ' keys).' );
             }
 
-            $this->say( '[7/8] Rewriting URLs' );
+            $this->say( '[7/9] Rewriting URLs' );
             $paths = Import::path_pairs( $info['source'] ?? null );
             if ( ( $src_home !== '' && $src_home !== $dest_home ) || $paths ) {
                 $from = $src_home !== '' ? $src_home : $dest_home;
@@ -311,10 +336,10 @@ class Command {
                 $this->say( '      Same address, nothing to rewrite.' );
             }
         } else {
-            $this->say( '[6/8] No database in the backup' );
+            $this->say( '[6/9] No database in the backup' );
         }
 
-        $this->say( '[8/8] Finishing up' );
+        $this->say( '[8/9] Finishing up' );
         $fin  = $this->check( $this->step( function () use ( $import ) { return $import->finalize(); } ), 'finalize', $import_id );
         $tidy = (array) ( $fin['tidy'] ?? [] );
         if ( ! empty( $tidy['caches_cleared'] ) ) {
@@ -330,6 +355,21 @@ class Command {
             $this->say( "      The login page is moved by {$tidy['login_url']['plugin']}: {$tidy['login_url']['url']}" );
         }
         $this->resume_hint = '';
+
+        $lines = [ number_format( (int) ( $summary['files_deployed'] ?? 0 ) ) . ' files placed, ' . number_format( (int) ( $summary['statements'] ?? 0 ) ) . ' database statements run.' ];
+        if ( empty( $assoc_args['skip-verify'] ) ) {
+            $this->say( '[9/9] Checking the result' );
+            $verify = Verify::run( $import_id );
+            if ( ! is_wp_error( $verify ) ) {
+                $summary['verify'] = $this->report_verify( $verify );
+                $lines[]           = $verify['ok'] ? 'Checks after the move: all good.' : 'Checks after the move found ' . self::plural( (int) $verify['problems'], 'problem' ) . ': run wp disembark verify ' . $import_id . ' on the site for details.';
+            }
+        }
+        if ( ! empty( $summary['login_url'] ) ) {
+            $lines[] = 'Log in at ' . $summary['login_url'];
+        }
+        Notify::send( $import_id, 'finished', [ 'kind' => 'pull', 'source' => $source['url'], 'destination' => $dest_home, 'rollback_id' => $import_id, 'seconds' => time() - $started, 'lines' => $lines ] );
+        $this->notify = [];
 
         $summary['ok']   = true;
         $summary['note'] = "User accounts are now the source's: log in with the source site's credentials.";
@@ -750,6 +790,135 @@ class Command {
     private $steps_seq    = 0;
     /** Set while a pull can be resumed: failures say how. */
     private $resume_hint  = '';
+    /** The running move, for the notice a failure sends (see Notify). */
+    private $notify       = [];
+
+    /**
+     * Prints the checks before a move; stops on a blocking one unless
+     * $go_anyway.
+     */
+    private function report_checks( $result, &$summary, $go_anyway ) {
+        $marks = [ 'block' => '✗', 'warn' => '!', 'info' => '·' ];
+        foreach ( (array) ( $result['checks'] ?? [] ) as $check ) {
+            $summary['checks'][] = [ 'level' => $check['level'], 'id' => $check['id'], 'title' => $check['title'] ];
+            $this->say( '      ' . $marks[ $check['level'] ] . ' ' . $check['title'] . ( $check['detail'] !== '' ? ': ' . $check['detail'] : '' ) );
+        }
+        if ( empty( $result['blocked'] ) ) {
+            return;
+        }
+        if ( $go_anyway ) {
+            $this->say( '      Going ahead anyway (--skip-checks).' );
+            return;
+        }
+        $blocks = array_filter( (array) $result['checks'], function ( $c ) { return $c['level'] === 'block'; } );
+        $this->fail( 'Checks before the move found ' . self::plural( count( $blocks ), 'problem' ) . ' that would stop it: ' . implode( '; ', array_column( $blocks, 'title' ) ) . '. Nothing on this site has changed. Fix it and resume, or resume with --skip-checks to go ahead anyway.', 'checks' );
+    }
+
+    /** Prints the checks after a move; returns their JSON summary. */
+    private function report_verify( $v ) {
+        $rows = $v['rows'] ?? null;
+        if ( is_array( $rows ) ) {
+            if ( empty( $rows['mismatched'] ) ) {
+                $this->say( '      ✓ ' . self::plural( (int) $rows['checked'], 'table' ) . ' hold every row the source exported (' . number_format( (int) $rows['rows'] ) . ' rows).' );
+            }
+            foreach ( (array) $rows['mismatched'] as $m ) {
+                $this->say( "      ✗ {$m['table']} has " . ( $m['actual'] === null ? 'gone missing' : number_format( (int) $m['actual'] ) . ' rows' ) . '; the source exported ' . number_format( (int) $m['expected'] ) . '.' );
+            }
+        } else {
+            $this->say( '      · The source doesn\'t report row counts (an older Disembark), so rows weren\'t compared.' );
+        }
+        $pages = (array) ( $v['pages'] ?? [] );
+        if ( ! empty( $pages['note'] ) ) {
+            $this->say( '      · ' . $pages['note'] );
+        } else {
+            $fine = 0;
+            foreach ( (array) ( $pages['list'] ?? [] ) as $p ) {
+                if ( ! empty( $p['problem'] ) ) {
+                    $this->say( "      ✗ {$p['label']} ({$p['url']}): {$p['problem']}" );
+                } else {
+                    $fine++;
+                }
+                if ( ! empty( $p['old_address'] ) ) {
+                    $this->say( "      ! {$p['label']} still mentions the old address " . self::plural( (int) $p['old_address'], 'time' ) . '.' );
+                }
+            }
+            foreach ( (array) ( $pages['culprits'] ?? [] ) as $c ) {
+                $this->say( '        PHP error' . ( $c['component'] !== '' ? " in {$c['component']}" : '' ) . ": {$c['message']}" );
+            }
+            if ( $fine ) {
+                $this->say( '      ✓ ' . self::plural( $fine, 'page' ) . ' loaded fine.' );
+            }
+        }
+        $left = $v['leftovers'] ?? null;
+        if ( is_array( $left ) && ! empty( $left['rows'] ) ) {
+            $tables = [];
+            foreach ( (array) $left['tables'] as $table => $info ) {
+                $tables[] = $table . ' (' . number_format( (int) $info['rows'] ) . ( $info['no_primary_key'] ? ', no primary key, so the rewrite skipped it' : '' ) . ')';
+            }
+            $this->say( '      ! The old address is still in ' . self::plural( (int) $left['rows'], 'row' ) . ': ' . implode( ', ', array_slice( $tables, 0, 6 ) ) . '.' );
+            foreach ( array_slice( (array) $left['samples'], 0, 3 ) as $sample ) {
+                $this->say( "        {$sample['table']}.{$sample['column']}" . ( $sample['key'] !== '' ? " ({$sample['key']})" : '' ) . ": {$sample['excerpt']}" );
+            }
+        } elseif ( is_array( $left ) && empty( $left['note'] ) ) {
+            $this->say( '      ✓ The old address is gone from the database.' );
+        }
+        return [
+            'ok'        => (bool) $v['ok'],
+            'problems'  => (int) $v['problems'],
+            'rows'      => $rows ? [ 'checked' => (int) $rows['checked'], 'mismatched' => $rows['mismatched'] ] : null,
+            'pages'     => array_map( function ( $p ) { return array_intersect_key( $p, array_flip( [ 'label', 'url', 'status', 'ms', 'problem', 'old_address' ] ) ); }, (array) ( $pages['list'] ?? [] ) ),
+            'culprits'  => $pages['culprits'] ?? [],
+            'leftovers' => is_array( $left ) ? [ 'rows' => (int) $left['rows'], 'tables' => $left['tables'] ] : null,
+        ];
+    }
+
+    /**
+     * Checks a finished move: row counts against the source's, a few pages
+     * loaded (home, login, the newest post of each type, an archive of each
+     * taxonomy) for PHP errors and redirects, and the database searched for
+     * the old address.
+     *
+     * ## OPTIONS
+     *
+     * [<id>]
+     * : The move (its rollback id). Defaults to the latest.
+     *
+     * [--format=<format>]
+     * : Output format.
+     * ---
+     * default: text
+     * options:
+     *   - text
+     *   - json
+     * ---
+     *
+     * ## EXAMPLES
+     *
+     *     $ wp disembark verify
+     *     $ wp disembark verify 62bcb2c4539c63e4d8c82629 --format=json
+     */
+    public function verify( $args, $assoc_args ) {
+        $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
+        $id         = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) ( $args[0] ?? '' ) ) );
+        if ( $id === '' ) {
+            $id = Verify::latest();
+            if ( $id === '' ) {
+                $this->fail( 'No finished move to check on this site (rolled-back moves don\'t count).' );
+            }
+        }
+        $this->say( "Checking move {$id}" );
+        $v = $this->check( Verify::run( $id ), 'verify' );
+        $summary = $this->report_verify( $v );
+        if ( $this->json ) {
+            \WP_CLI::line( wp_json_encode( $summary, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
+            return;
+        }
+        if ( $v['ok'] ) {
+            \WP_CLI::success( 'No problems found.' );
+        } else {
+            \WP_CLI::warning( 'Found ' . self::plural( (int) $v['problems'], 'problem' ) . '.' );
+        }
+    }
 
     /**
      * Runs one step of a move through Steps, so it's recorded: a resumed
@@ -871,6 +1040,19 @@ class Command {
     }
 
     private function fail( $message, $step = '', $rollback_id = '' ) {
+        if ( $this->notify ) {
+            Notify::send( $this->notify['import'], $message === 'Cancelled.' ? 'cancelled' : 'failed', [
+                'kind'        => $this->notify['kind'],
+                'source'      => $this->notify['source'],
+                'destination' => $this->notify['destination'],
+                'step'        => $step,
+                'error'       => $message,
+                'rollback_id' => $rollback_id,
+                'resume'      => $this->resume_hint !== '' ? "wp disembark pull --resume={$this->resume_hint}" : '',
+                'seconds'     => time() - (int) $this->notify['started'],
+            ] );
+            $this->notify = [];
+        }
         if ( $rollback_id !== '' ) {
             $message .= " This site may be partly changed. Undo with: wp disembark rollback {$rollback_id}";
         }

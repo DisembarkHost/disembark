@@ -524,6 +524,7 @@ class Backup {
             $offset   = 0;
             $last_key = null;
             $key_pos  = null;
+            $exported = 0;
 
             while ( true ) {
                 if ( $keyset && $last_key !== null ) {
@@ -560,6 +561,7 @@ class Backup {
                 if ( ! $write( $insert_sql ) ) {
                     return $fail( 'Could not write the database export (disk full?).' );
                 }
+                $exported += count( $rows );
 
                 if ( count( $rows ) < $select_row_limit ) {
                     break;
@@ -570,7 +572,10 @@ class Backup {
                 }
             }
 
-            if ( ! $write( "/*!40000 ALTER TABLE `{$table}` ENABLE KEYS */;\n" ) ) {
+            // How many rows the table had, so the import can check they all
+            // arrived. A harmless statement (a user variable) rather than a
+            // comment: older importers simply run it.
+            if ( ! $write( "/*!40000 ALTER TABLE `{$table}` ENABLE KEYS */;\nSET @disembark_rows = '" . self::db_escape( $table ) . ':' . $exported . "';\n" ) ) {
                 return $fail( 'Could not write the database export (disk full?).' );
             }
         }
@@ -847,6 +852,7 @@ class Backup {
             'db_prefix' => $wpdb->prefix,
             'abspath'   => ABSPATH,
             'content_dir' => WP_CONTENT_DIR,
+            'profile'   => Import::site_profile(),
             'captured'  => gmdate( 'c' ),
         ], JSON_PRETTY_PRINT ) );
         if ( ! $zip->close() ) {

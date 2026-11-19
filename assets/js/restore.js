@@ -71,7 +71,8 @@
     { key: 'files', label: 'Putting files in place' },
     { key: 'db', label: 'Importing the database' },
     { key: 'urls', label: 'Rewriting URLs' },
-    { key: 'fin', label: 'Finishing up' }
+    { key: 'fin', label: 'Finishing up' },
+    { key: 'check', label: 'Checking the result' }
   ];
 
   /**
@@ -104,10 +105,11 @@
     var title = h('h2', { style: { fontSize: '28px', flex: 1 } }, opts.title || 'Restoring');
     var detailsBtn = h('button', { class: 'dsk-btn ghost sm', onclick: function () { log.hidden = !log.hidden; detailsBtn.lastChild.textContent = log.hidden ? 'Show details' : 'Hide details'; } }, D.icon('terminal'), h('span', null, 'Show details'));
     var cancelBtn = h('button', { class: 'dsk-btn ghost sm', onclick: askCancel }, D.icon('x'), 'Cancel');
+    var notifyBtn = h('button', { class: 'dsk-btn ghost sm', title: 'Get an email or a Slack/Discord message when this finishes or stops', onclick: askNotify }, D.icon('mail'), h('span', null, 'Notify me'));
     var chooser = h('div');
     D.mount(view, h('div', { class: 'dsk-stack' }, h('div', { class: 'dsk-grid two', style: { alignItems: 'start' } },
       h('div', { class: 'dsk-card dsk-card-pad' },
-        h('div', { class: 'dsk-row', style: { marginBottom: '16px' } }, title, detailsBtn, cancelBtn),
+        h('div', { class: 'dsk-row', style: { marginBottom: '16px' } }, title, notifyBtn, detailsBtn, cancelBtn),
         steps, line, h('div', { style: { marginTop: '12px' } }, log)),
       outcome), chooser));
 
@@ -162,6 +164,87 @@
           ? D.note('error', [h('strong', null, 'Cancelled, but the rollback didn\u2019t finish. '), 'The rollback point is kept: roll back from Restore \u2192 Restore points or with ', h('code', null, 'wp disembark rollback ' + rollbackId), '.'])
           : D.note('ok', [h('strong', null, 'Cancelled. '), rollbackId ? D.host(opts.targetHome) + ' is back to how it was, and the copied files are gone.' : 'Nothing on ' + D.host(opts.targetHome) + ' changed, and the copied files are gone.']),
         h('div', null, h('button', { class: 'dsk-btn', onclick: opts.back }, 'Back to the form'))));
+    }
+
+    // Calls outside the numbered steps (checks, notifications): they run
+    // again on a resume rather than being replayed, and a button press
+    // between steps doesn't shift the step numbers a resume relies on. One
+    // request id per call, so a retry is still answered once. An older
+    // Disembark without the endpoint answers 404, which counts as "no".
+    async function side(endpoint, body) {
+      var rid = D.randomHex(24);
+      try { return await retrying(function () { return opts.api.post(endpoint, Object.assign({ request_id: rid }, t(body))); }); }
+      catch (e) { if (e.status === 404) return null; throw e; }
+    }
+    var startedAt = Date.now(), notifyTo = '';
+    var moveKind = !opts.local ? 'push' : (opts.mode === 'site' ? 'pull' : 'restore');
+    async function askNotify() {
+      var to = await D.prompt({ title: 'Tell me when it\u2019s done', label: 'Email address, or a Slack, Discord or other https:// webhook URL (comma-separated for more than one)', value: notifyTo || D.config.userEmail || '', confirmLabel: 'Notify me' });
+      if (to === null) return;
+      try {
+        var r = await side('import/notify', { action: 'set', to: to });
+        if (!r) { D.toast(D.host(opts.targetHome) + ' runs an older Disembark without notifications.', 'error'); return; }
+        notifyTo = to.trim();
+        notifyBtn.lastChild.textContent = notifyTo ? 'Notifying' : 'Notify me';
+        D.toast(notifyTo ? 'You\u2019ll hear when it finishes or stops.' : 'Notifications off.');
+      } catch (e) { D.toast(D.errorText(e), 'error'); }
+    }
+    function sendNotice(event, details) {
+      if (!notifyTo) return Promise.resolve();
+      return side('import/notify', { action: 'send', event: event, details: Object.assign({
+        kind: moveKind, source: opts.site || opts.sourceUrl || (opts.file && opts.file.name) || '', destination: opts.targetHome,
+        rollback_id: rollbackId, seconds: Math.round((Date.now() - startedAt) / 1000)
+      }, details || {}) }).catch(function () { /* the move's own result matters more */ });
+    }
+
+    // Checks before anything changes (app/Checks.php). Problems that would
+    // stop the move halfway ask before going on.
+    var checked = false;
+    async function runChecks() {
+      if (checked) return;
+      checked = true;
+      progress('Checking that the move fits\u2026');
+      var r = await side('import/checks', {});
+      progress('');
+      if (!r) return;
+      var marks = { block: '\u2717 ', warn: '! ', info: '\u00b7 ' };
+      (r.checks || []).forEach(function (c) { rlog(marks[c.level] + c.title + (c.detail ? ': ' + c.detail : ''), c.level === 'block' ? 'err' : (c.level === 'info' ? 'dim' : '')); });
+      if (!(r.checks || []).length) rlog('Checks before the move: nothing in the way.', 'dim');
+      if (!r.blocked) return;
+      var blocks = r.checks.filter(function (c) { return c.level === 'block'; });
+      var go = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
+        h('p', null, 'These would most likely stop the move partway. Nothing on ' + D.host(opts.targetHome) + ' has changed yet.'),
+        h('ul', { style: { margin: 0, paddingLeft: '18px' } }, blocks.map(function (c) { return h('li', { style: { marginBottom: '6px' } }, h('strong', null, c.title + '. '), c.detail); }))),
+        { title: 'Checks found ' + (blocks.length === 1 ? 'a problem' : blocks.length + ' problems'), confirmLabel: 'Continue anyway', cancelLabel: 'Cancel the move', danger: true });
+      if (!go) { cancelled = true; throw Cancelled(); }
+      rlog('Going ahead anyway.', 'dim');
+    }
+
+    // Checks after the move (app/Verify.php), shown under the result.
+    function verifyCard(v) {
+      var items = [], good = [];
+      var rows = v.rows;
+      if (rows) {
+        if (!(rows.mismatched || []).length) good.push(D.fmt.plural(rows.checked, 'table') + ' hold every row the source exported');
+        (rows.mismatched || []).forEach(function (m) { items.push(h('li', null, h('strong', null, m.table), m.actual === null ? ' is missing.' : ' has ' + D.fmt.num(m.actual) + ' rows; the source exported ' + D.fmt.num(m.expected) + '.')); });
+      }
+      var pages = v.pages || {}, fine = 0;
+      (pages.list || []).forEach(function (p) {
+        if (p.problem) items.push(h('li', null, h('strong', null, p.label), ' (', h('a', { href: p.url, target: '_blank', rel: 'noopener' }, p.url), '): ' + p.problem));
+        else fine++;
+        if (p.old_address) items.push(h('li', null, h('strong', null, p.label), ' still mentions the old address ' + D.fmt.plural(p.old_address, 'time') + '.'));
+      });
+      (pages.culprits || []).forEach(function (c) { items.push(h('li', null, 'PHP error' + (c.component ? ' in ' + c.component : '') + ': ', h('code', null, c.message))); });
+      if (fine && !pages.note) good.push(D.fmt.plural(fine, 'page') + ' loaded fine');
+      var left = v.leftovers;
+      if (left && left.rows) {
+        items.push(h('li', null, 'The old address is still in ' + D.fmt.plural(left.rows, 'database row') + ': ' + Object.keys(left.tables).slice(0, 5).map(function (t) { return t + ' (' + D.fmt.num(left.tables[t].rows) + (left.tables[t].no_primary_key ? ', no primary key, so the rewrite skipped it' : '') + ')'; }).join(', ') + '.'));
+      } else if (left && !left.note) good.push('the old address is gone from the database');
+      var body = [h('strong', null, v.ok ? 'Checks after the move: all good. ' : 'Checks after the move found ' + D.fmt.plural(v.problems, 'problem') + '. ')];
+      if (good.length) body.push(good.join(', ').replace(/^./, function (c) { return c.toUpperCase(); }) + '.');
+      if (pages.note) body.push(' ' + pages.note);
+      if (items.length) body.push(h('ul', { style: { margin: '8px 0 0', paddingLeft: '18px' } }, items));
+      return D.note(v.ok ? 'ok' : 'warn', body, v.ok ? 'checkCircle' : null);
     }
 
     function rlog(msg, cls) { log.appendChild(h('div', { class: cls || '' }, msg)); log.scrollTop = log.scrollHeight; }
@@ -280,6 +363,7 @@
         rlog(D.fmt.plural(fin.total_files || 0, 'file') + ' found.');
       }
       await choose();
+      await runChecks();
       var done = false, fetched = 0;
       while (!done) {
         var r = await api.post('import/pull/fetch-files', t({ offset: fetched, count: 1000 }));
@@ -367,7 +451,7 @@
         step('stage');
         var siteHome = '';
         if (opts.mode === 'site') siteHome = await stageFromSite();
-        else { rlog('Uploading ' + opts.file.name + '…'); await upload(opts.file, pre.upload_chunk_bytes); }
+        else { rlog('Uploading ' + opts.file.name + '…'); await upload(opts.file, pre.upload_chunk_bytes); await runChecks(); }
 
         step('read'); progress('');
         var info = await api.post('import/staged-info', t());
@@ -452,12 +536,24 @@
         if (caches.length) rlog('Cleared page caches so nothing serves the old site: ' + caches.join(', ') + '.', 'dim');
         (tidy.plugins_turned_off || []).forEach(function (p) { rlog('Turned off ' + p.name + ': ' + p.why + '. Turn it back on once this site has its own keys or certificate.', 'dim'); });
         if (tidy.login_url) { ctx.loginUrl = tidy.login_url.url; rlog('The login page is moved by ' + tidy.login_url.plugin + ': log in at ' + tidy.login_url.url, 'ok'); }
-        stepEls.fin.el.classList.remove('active'); stepEls.fin.el.classList.add('done');
+
+        step('check');
+        cancelBtn.hidden = true;
+        progress('Loading a few pages and looking for the old address\u2026');
+        var verify = null;
+        try { verify = await side('import/verify', {}); } catch (e) { rlog('The checks after the move didn\u2019t run: ' + D.errorText(e), 'dim'); }
         progress('');
+        if (verify) {
+          stepEls.check.meta.textContent = verify.ok ? 'all good' : D.fmt.plural(verify.problems, 'problem');
+          rlog(verify.ok ? 'Checks after the move: all good.' : 'Checks after the move found ' + D.fmt.plural(verify.problems, 'problem') + '.', verify.ok ? 'ok' : 'err');
+        } else skip('check', 'not available');
+        stepEls.check.el.classList.remove('active'); stepEls.check.el.classList.add('done');
         rlog('Done.', 'ok');
         title.textContent = opts.doneTitle || 'Restored';
-        cancelBtn.hidden = true;
+        notifyBtn.hidden = true;
+        sendNotice('finished', { lines: [verify ? (verify.ok ? 'Checks after the move: all good.' : 'Checks after the move found ' + D.fmt.plural(verify.problems, 'problem') + ': see Tools \u2192 Disembark on ' + D.host(opts.targetHome) + ', or run wp disembark verify ' + importId + '.') : ''].concat(ctx.loginUrl ? ['Log in at ' + ctx.loginUrl] : []).filter(Boolean) });
         opts.done(outcome, ctx);
+        if (verify) outcome.appendChild(h('div', { style: { marginTop: '14px' } }, verifyCard(verify)));
         if (quietOn) outcome.appendChild(h('div', { style: { marginTop: '14px' } }, D.quietNote(destHome, quietSource)));
         if (codeMentions) {
           outcome.appendChild(h('div', { style: { marginTop: '14px' } }, D.note('warn', [
@@ -467,9 +563,11 @@
               codeMentions.total > codeMentions.list.length ? h('li', null, '\u2026 and ' + (codeMentions.total - codeMentions.list.length) + ' more') : null)])));
         }
       } catch (e) {
-        if (e.cancelled || cancelled) { await cleanUp(); return; }
+        notifyBtn.hidden = true;
+        if (e.cancelled || cancelled) { sendNotice('cancelled'); await cleanUp(); return; }
         cancelBtn.hidden = true;
         var msg = D.errorText(e);
+        sendNotice('failed', { error: msg, step: current ? (STEPS.filter(function (s) { return s.key === current; })[0] || {}).label : '' });
         rlog('ERROR: ' + msg, 'err');
         title.textContent = 'Stopped';
         progress('');
