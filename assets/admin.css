@@ -41,7 +41,10 @@ body.tools_page_disembark #wpfooter { display: none; }
 body.tools_page_disembark .disembark-wrap { margin: 0; }
 body.tools_page_disembark { background: #f6f1e7; }
 body.tools_page_disembark.dsk-dark { background: #0e181d; }
-body.tools_page_disembark .notice, body.tools_page_disembark .update-nag { margin: 12px 20px 0; }
+body.tools_page_disembark .disembark-wrap > .wp-header-end { display: none; }
+/* Admin notices wait out of sight until the dashboard gathers them into its tray. */
+body.tools_page_disembark #wpbody-content > :is(.notice, div.updated, div.error, .update-nag),
+body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error, .update-nag) { display: none; }
 
 /* Base */
 .dsk { background: var(--bg); color: var(--ink); font: 400 14px/1.55 var(--sans); -webkit-font-smoothing: antialiased; min-height: calc(100vh - 32px); }
@@ -74,6 +77,20 @@ body.tools_page_disembark .notice, body.tools_page_disembark .update-nag { margi
 .dsk-site i { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); flex: none; }
 .dsk-top-tools { margin-left: auto; display: flex; gap: 8px; align-items: center; }
 .dsk-ver { font: 500 11.5px/1 var(--mono); color: var(--ink-3); }
+
+/* Notices tray: admin notices from WordPress and other plugins */
+.dsk-top-tools { position: relative; }
+.dsk-tray-btn { gap: 6px; }
+.dsk-tray-btn svg.i { width: 16px; height: 16px; }
+.dsk-btn.dsk-tray-btn.has-error svg.i { color: var(--danger); }
+.dsk-tray { position: absolute; top: calc(100% + 12px); right: 0; z-index: 30; width: min(560px, calc(100vw - 32px)); max-height: min(70vh, 640px); overflow: auto; background: var(--surface); border: 1px solid var(--line-2); border-radius: 14px; box-shadow: var(--shadow); padding: 10px 12px 12px; }
+.dsk-tray-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 0 8px 4px; }
+.dsk-tray-list > :is(.notice, div.updated, div.error, .update-nag) { margin: 0 0 8px; max-width: none; border-radius: 0 8px 8px 0; box-shadow: none; }
+.dsk-tray-list > :is(.notice, div.updated, div.error, .update-nag):last-child { margin-bottom: 0; }
+.dsk-tray-list > .update-nag:not(.hidden) { display: block; font-size: 13px; }
+.dsk-tray-list .notice p { margin: .5em 0; font-size: 13px; }
+.dsk-tray-list > * { color: #1d2327; }
+.dsk-tray-list .notice a:not(.button), .dsk-tray-list .update-nag a { color: #2271b1; }
 .dsk-nav { padding: 18px 14px; border-right: 1px solid var(--line); position: sticky; top: 95px; align-self: start; height: calc(100vh - 95px); display: flex; flex-direction: column; gap: 2px; }
 .dsk-nav a { display: flex; align-items: center; gap: 11px; padding: 9px 12px; border-radius: 10px; color: var(--ink-2); text-decoration: none; font-weight: 500; font-size: 14px; }
 .dsk-nav a:hover { background: var(--surface-2); color: var(--ink); }
@@ -150,7 +167,7 @@ body.tools_page_disembark .notice, body.tools_page_disembark .update-nag { margi
 .dsk-grid { display: grid; gap: 18px; }
 .dsk-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .dsk-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.dsk-stack { display: grid; gap: 18px; }
+.dsk-stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
 .dsk-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .dsk-stat { padding: 16px 18px; border-radius: var(--radius); background: var(--surface-2); }
 .dsk-stat .v { font: 400 28px/1.1 var(--serif); margin-top: 6px; color: var(--ink); }

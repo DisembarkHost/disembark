@@ -96,10 +96,13 @@ class Run {
     
     /**
      * Renders the Disembark admin page. The dashboard draws its own header, so
-     * the page is just the app's mount point (via the shortcode).
+     * the page is just the app's mount point (via the shortcode). The
+     * wp-header-end marker tells WordPress where to put admin notices, so they
+     * land above the app instead of under its first heading. The dashboard
+     * then gathers them into its notices tray.
      */
     public function render_admin_page() {
-        echo '<div class="wrap disembark-wrap">' . do_shortcode( '[disembark_ui]' ) . '</div>';
+        echo '<div class="wrap disembark-wrap"><hr class="wp-header-end">' . do_shortcode( '[disembark_ui]' ) . '</div>';
     }
 
     /**

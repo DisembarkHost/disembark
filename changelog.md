@@ -4,6 +4,7 @@
 
 ### Changed
 * **A new dashboard, without Vue or Vuetify:** Tools → Disembark is rebuilt as plain JavaScript with a custom design. Nothing loads from a CDN any more (Vue, Vuetify, axios, Prism, Material icons and Google Fonts are gone); every script, style and font ships with the plugin. Dialogs became sections: **Back up**, **Restore**, **Push**, **Pull**, **Files**, **Database** and **Settings**, with light and dark themes. The REST API is unchanged, so the CLI works as before.
+* **Notices from other plugins stay out of the way:** WordPress moves every admin notice (update nags, "rate us" and usage-tracking prompts, license warnings) under the first heading on the page, which was the middle of the dashboard. Tools → Disembark now gathers them into a **notices** button in the header that opens a tray; their buttons and dismiss links still work there, and the bell turns red when one of them is an error.
 
 ### Added
 * **Restore points:** Restore lists every saved rollback point (what it was for, when, how big, whether it's been rolled back to) with **Roll back** and **Delete**. New endpoints: `GET /restore-points` and `POST /restore-points/delete`; snapshots take an optional `label`.

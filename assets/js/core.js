@@ -98,6 +98,7 @@
     play: '<path d="M7 5v14l11-7z"/>',
     ship: '<path d="M3 15h18l-2.4 5.2Q12 22.4 5.4 20.2Z"/><path d="M6 15V9h12v6"/><path d="M12 9V4"/>',
     anchor: '<circle cx="12" cy="5" r="2"/><path d="M12 7v14M8 11h8"/><path d="M5 14c0 4 3 7 7 7s7-3 7-7"/>',
+    bell: '<path d="M6 16v-5a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/>',
     sparkle: '<path d="M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1L5 10.5l5.1-1.9z"/><path d="M18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/>'
   };
   D.icon = function (name, cls) {
