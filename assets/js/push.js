@@ -17,7 +17,9 @@
   D.remoteApi = async function (siteUrl, token) {
     var base = String(siteUrl).replace(/\/+$/, '');
     var host = D.host(base);
+    var usePlain = false;
     async function call(root, endpoint, body) {
+      if (usePlain) root = base + '/?rest_route=/disembark/v1/';
       var res;
       try {
         res = await fetch(root + endpoint, {
@@ -30,6 +32,12 @@
       }
       var text = await res.text(), data = text;
       try { data = text === '' ? null : JSON.parse(text); } catch (e) { /* not JSON */ }
+      // The destination took a database with plain permalinks mid-push, so
+      // /wp-json/ now answers with a page: carry on through ?rest_route=.
+      if (res.ok && root.indexOf('/wp-json/') !== -1 && typeof data === 'string' && /<html|<!doctype/i.test(data.slice(0, 500))) {
+        usePlain = true;
+        return call(root, endpoint, body);
+      }
       if (!res.ok) throw new D.api.Error((data && data.message) || (host + ' responded ' + res.status + '.'), res.status, data);
       return data;
     }
@@ -80,7 +88,20 @@
         h('div', { class: 'dsk-stack' },
           D.note('warn', [h('strong', null, 'This replaces the destination.'), ' Its files and database are overwritten with this site, including its user accounts: afterwards you log in there with this site’s credentials.']),
           D.note('', ['The destination saves a rollback point before anything changes, so the push can be undone from here, from its own dashboard, or with the CLI.'], 'anchor'),
-          D.note('', ['The destination downloads from ', h('code', null, D.host(D.config.homeUrl)), ', so this site has to be reachable from it (not a local-only address).'], 'globe'))));
+          D.note('', ['The destination downloads from ', h('code', null, D.host(D.config.homeUrl)), ', so this site has to be reachable from it (not a local-only address).'], 'globe'),
+          sharedNote())));
+    }
+
+    // One site of a network or WP Freighter install goes as a standalone
+    // site. A Freighter tenant without its own domain answers only at the
+    // main site's address, which takes the main site's token.
+    function sharedNote() {
+      var inst = D.config.install;
+      if (!inst) return null;
+      var kind = inst.kind === 'multisite' ? 'network' : 'WP Freighter install';
+      if (inst.current === inst.main) return D.note('', ['This is the main site of a ' + kind + '. The destination asks whether to bring the whole ' + kind + ' or one of its sites.'], 'globe');
+      if (inst.kind === 'freighter' && D.address(D.config.homeUrl) === D.address(inst.home)) return D.note('warn', ['This tenant has no domain of its own, so the destination can\u2019t reach it directly. Push it from the main site\u2019s Disembark instead and choose tenant ' + inst.current + '.'], 'alert');
+      return D.note('', ['This site goes as a standalone site: its own tables, its users, its uploads, and the plugins and themes it uses. The rest of the ' + kind + ' stays here.'], 'globe');
     }
 
     async function start(e) {

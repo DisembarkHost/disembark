@@ -146,6 +146,7 @@
     state: {
       token: cfg.token,
       backupToken: '',
+      site: '',              // one site of a network or WP Freighter install ('' = all of it)
       database: [],          // [{ table, size, row_count }]
       included: new Set(),   // table names included in a backup
       includeDb: true,
@@ -186,8 +187,13 @@
 
   /* ------------------------------------------------------------------ API */
 
+  // A restore can bring a database with plain permalinks, after which
+  // /wp-json/ no longer reaches the REST API (it answers with a page): the
+  // ?rest_route= form always does, so requests switch to it.
+  var apiRoot = cfg.apiRoot;
+  function plainRoot() { return String(cfg.homeUrl).replace(/\/+$/, '') + '/?rest_route=/disembark/v1/'; }
   function apiUrl(path, query) {
-    var root = cfg.apiRoot;
+    var root = apiRoot;
     var url = root + String(path).replace(/^\//, '');
     if (query) {
       var qs = Object.keys(query).filter(function (k) { return query[k] !== undefined && query[k] !== null; })
@@ -227,6 +233,10 @@
     if (opts.blob) {
       if (!res.ok) throw new ApiError((await res.text()).slice(0, 200) || ('HTTP ' + res.status), res.status);
       return { blob: await res.blob(), type: res.headers.get('content-type') };
+    }
+    if (!opts.url && !opts.retried && apiRoot.indexOf('rest_route=') === -1 && /text\/html/i.test(res.headers.get('content-type') || '')) {
+      apiRoot = plainRoot();
+      return request(method, path, Object.assign({}, opts, { retried: true }));
     }
     var text = await res.text(), data = text;
     try { data = text === '' ? null : JSON.parse(text); } catch (e) { /* plain text */ }
@@ -523,7 +533,7 @@
 
   D.loadDatabase = async function (force) {
     if (D.store.state.database.length && !force) return D.store.state.database;
-    var tables = await D.api.get('database');
+    var tables = await D.api.get('database', D.store.state.site ? { site: D.store.state.site } : undefined);
     if (!Array.isArray(tables)) throw new Error('Could not read the database tables.');
     tables.forEach(function (t) { t.size = Number(t.size) || 0; t.row_count = Number(t.row_count) || 0; });
     D.store.set({ database: tables, included: new Set(tables.map(function (t) { return t.table; })) });
@@ -554,7 +564,8 @@
    */
   D.scanSite = async function (onProgress) {
     var token = D.randomHex(12);
-    var step = function (name, extra) { return D.api.post('regenerate-manifest', Object.assign({ backup_token: token, step: name }, extra || {})); };
+    var site = D.store.state.site;
+    var step = function (name, extra) { return D.api.post('regenerate-manifest', Object.assign({ backup_token: token, step: name }, site ? { site: site } : {}, extra || {})); };
     onProgress = onProgress || function () {};
     await step('initiate');
     for (var guard = 0; guard < 100000; guard++) {
@@ -573,6 +584,29 @@
     setFiles(files, token);
     D.loadStatus();
     return files;
+  };
+
+  /**
+   * A network or WP Freighter install: which site the Backup section works
+   * on. Files and Database always show the whole install, so they stand
+   * aside while one site is chosen (its file and table names are the ones
+   * a standalone copy uses, not where they live here).
+   */
+  D.siteName = function (id) {
+    var inst = cfg.install;
+    if (!inst || !id) return '';
+    var s = (inst.sites || []).find(function (x) { return x.id === id; });
+    return s ? D.host(s.url) + (s.name ? ' (' + s.name + ')' : '') + (id === 'main' ? ', main site' : ', ' + (inst.kind === 'multisite' ? 'site ' : 'tenant ') + id) : id;
+  };
+  D.setSite = function (id) {
+    D.store.set({ site: id || '', scanned: false, files: [], index: null, database: [], included: new Set(), excluded: new Set(), backupToken: '' });
+  };
+  D.oneSiteNote = function (what) {
+    return h('div', { class: 'dsk-card dsk-card-pad' }, D.note('', [
+      h('strong', null, 'Back up is set to one site: ' + D.siteName(D.store.state.site) + '. '),
+      what + ' show the whole install, so they wait until Back up is set back to it. ',
+      h('div', { style: { marginTop: '10px' } }, h('button', { class: 'dsk-btn sm', onclick: function () { D.setSite(''); } }, 'Show the whole install'))
+    ], 'alert'));
   };
 
   /** Reloads the file list from an earlier scan session. */

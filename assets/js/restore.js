@@ -85,6 +85,29 @@
    *   done(outcome, ctx), back()   // renders the finished / form view
    * }
    */
+  /**
+   * "Which site?" for a source that is a multisite network or a WP Freighter
+   * install. Resolves with a site ID, "all", or null when cancelled.
+   */
+  D.chooseSite = function (box, install) {
+    var kind = install.kind === 'multisite' ? 'network' : 'WP Freighter install';
+    return new Promise(function (resolve) {
+      var sel = h('select', { class: 'dsk-select' },
+        h('option', { value: 'all' }, 'The whole ' + kind + ' (' + D.fmt.plural(install.total || (install.sites || []).length, 'site') + ')'),
+        (install.sites || []).map(function (s) {
+          return h('option', { value: s.id }, D.host(s.url) + (s.name ? ' \u2014 ' + s.name : '') + ' (' + (s.id === 'main' ? 'main site' : (install.kind === 'multisite' ? 'site ' : 'tenant ') + s.id) + ')');
+        }));
+      function done(v) { D.mount(box); resolve(v); }
+      D.mount(box, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '12px', marginTop: '16px' } },
+        h('h3', null, 'Which site?'),
+        h('p', { class: 'muted' }, D.host(install.home) + ' is a ' + kind + '. Bring one of its sites as a standalone site (its own tables, its users, its uploads, and the plugins and themes it uses), or the whole ' + kind + '.'),
+        sel,
+        h('div', { class: 'dsk-row' },
+          h('button', { class: 'dsk-btn primary', onclick: function () { done(sel.value); } }, 'Continue'),
+          h('button', { class: 'dsk-btn ghost', onclick: function () { done(null); } }, 'Cancel the move'))));
+    });
+  };
+
   D.runMove = function (view, opts) {
     var importId = opts.resume ? opts.resume.id : D.randomHex(24), rollbackId = '', codeMentions = null, quietOn = false, quietSource = '';
     // Request ids follow the import id and the step's place in the move, so
@@ -335,9 +358,28 @@
 
     async function stageFromSite() {
       rlog('Connecting to ' + opts.site + '…');
-      var c = await api.post('import/pull/connect', t({ source_url: opts.site, source_token: opts.token, catch_up: !!opts.catchUp,
+      var c = await api.post('import/pull/connect', t({ source_url: opts.site, source_token: opts.token, catch_up: !!opts.catchUp, site: opts.sourceSite || null,
         move: { kind: opts.local ? 'pull' : 'push', quiet: !!opts.quiet, label: opts.label || '' } }));
+      // A network or WP Freighter install reached at its main address: ask
+      // which site to bring (replayed rather than asked again on a resume).
+      if (c.install && !c.scope && (c.install.sites || []).length > 1 && !opts.sourceSite) {
+        var pick = 'all';
+        if (!Object.prototype.hasOwnProperty.call(replay, ridAt(seq + 1))) {
+          progress('Choose which site to bring\u2026');
+          pick = await D.chooseSite(chooser, c.install);
+          if (!pick) { cancelled = true; throw Cancelled(); }
+        }
+        c = await api.post('import/pull/site', t({ site: pick }));
+        progress('');
+      }
       rlog('Connected. Source: ' + c.source_home + ' (' + c.table_count + ' tables).');
+      if (c.scope) {
+        rlog('Bringing one site: ' + c.scope.label + '. It arrives as a standalone site.', 'ok');
+        if (c.scope.users !== null && c.scope.users !== undefined) rlog(D.fmt.plural(c.scope.users, 'user') + (c.scope.users === 1 ? ' comes' : ' come') + ' across: its members, the authors of its posts, and the network\u2019s super admins (as administrators).', 'dim');
+        var lo = c.scope.left_out || {};
+        if ((lo.plugins || []).length || (lo.themes || []).length) rlog('Leaving out ' + D.fmt.plural((lo.plugins || []).length, 'plugin') + ' and ' + D.fmt.plural((lo.themes || []).length, 'theme') + ' that this site doesn\u2019t use.', 'dim');
+        if ((c.scope.shared_tables || []).length) rlog(D.fmt.plural(c.scope.shared_tables.length, 'network-wide table') + (c.scope.shared_tables.length === 1 ? ' comes' : ' come') + ' across empty, since ' + (c.scope.shared_tables.length === 1 ? 'it holds' : 'they hold') + ' every site\u2019s data: ' + c.scope.shared_tables.slice(0, 6).join(', ') + (c.scope.shared_tables.length > 6 ? ', \u2026' : '') + '.', 'dim');
+      } else if (c.install) rlog('Bringing the whole ' + (c.install.kind === 'multisite' ? 'network' : 'WP Freighter install') + ' (' + D.fmt.plural(c.install.total || 0, 'site') + ').', 'dim');
       var scan = function (s, chunk) { return api.post('import/pull/scan', t({ step: s, chunk: chunk || 0 })); };
       await scan('initiate');
       for (var i = 0; i < 100000; i++) {
@@ -514,7 +556,7 @@
           }
           step('urls'); progress('');
           var paths = info.paths || {};
-          if ((srcHome && destHome && srcHome !== destHome) || Object.keys(paths).length) {
+          if ((srcHome && destHome && srcHome !== destHome) || Object.keys(paths).length || Object.keys(info.moved || {}).length) {
             if (srcHome && srcHome !== destHome) rlog('Rewriting ' + srcHome + ' → ' + destHome + ' (and its http, https and www spellings)…');
             Object.keys(paths).forEach(function (p) { rlog('Rewriting the old server\u2019s path ' + p + ' → ' + paths[p] + '…'); });
             var sr = await api.post('import/search-replace', t({ from: srcHome || destHome, to: destHome }));

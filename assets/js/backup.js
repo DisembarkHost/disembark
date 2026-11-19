@@ -31,9 +31,23 @@
     function render() {
       fresh();
       root.querySelector('#dsk-rescan').hidden = !S.scanned;
-      D.mount(view, S.scanned ? ready() : start());
+      D.mount(view, h('div', { class: 'dsk-stack' }, sitePicker(), S.scanned ? ready() : start()));
     }
-    D.store.on(['scanned', 'index'], render);
+    D.store.on(['scanned', 'index', 'site'], render);
+
+    // A network or WP Freighter install: back up all of it or one site, as
+    // a standalone site (restores into any single site).
+    function sitePicker() {
+      var inst = D.config.install;
+      if (!inst || !(inst.sites || []).length) return null;
+      var kind = inst.kind === 'multisite' ? 'network' : 'WP Freighter install';
+      var sel = h('select', { class: 'dsk-select', style: { width: 'auto', minWidth: '280px' }, onchange: function () { D.setSite(sel.value); } },
+        h('option', { value: '' }, 'The whole ' + kind + ' (' + D.fmt.plural(inst.total || inst.sites.length, 'site') + ')'),
+        inst.sites.map(function (s) { return h('option', { value: s.id, selected: s.id === S.site }, D.siteName(s.id)); }));
+      return h('div', { class: 'dsk-card dsk-card-pad dsk-row', style: { gap: '12px', flexWrap: 'wrap' } },
+        h('strong', null, 'Back up'), sel,
+        h('span', { class: 'muted', style: { flex: '1 1 260px' } }, S.site ? 'This site alone, as a standalone site: its tables, its users, its uploads, and the plugins and themes it uses. Restore it into any single WordPress site.' : 'Every site of the ' + kind + ', exactly as it is here.'));
+    }
     D.store.on(['sessions', 'lastScan'], function () { if (!S.scanned) render(); });
     render();
 
@@ -242,7 +256,7 @@
       var dbJobs = D.planDbExport(tables);
       var total = batches.reduce(function (a, b) { return a + b.size; }, 0) + dbJobs.reduce(function (a, j) { return a + (j.size || 0); }, 0) || 1;
       var stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 13);
-      var archive = D.host(D.config.homeUrl).replace(/[^a-z0-9.-]/gi, '_') + '-' + stamp + '.zip';
+      var archive = (S.site ? D.siteName(S.site).split(' ')[0] + '-' + (S.site === 'main' ? 'main' : 'site' + S.site) : D.host(D.config.homeUrl)).replace(/[^a-z0-9.-]/gi, '_') + '-' + stamp + '.zip';
       var token = S.backupToken, done = 0, cancelled = false, close = null;
 
       var bar = D.progress(), line = h('div', { class: 'muted mono', style: { fontSize: '12.5px', minHeight: '18px' } });
@@ -256,7 +270,7 @@
       }).then(function (v) { if (v === 'cancel') cancelled = true; });
 
       function tick(size, text) { done += size || 0; bar.set((done / total) * 100); if (text) line.textContent = text; }
-      async function step(body) { if (cancelled) throw new Error('cancelled'); return D.api.post('backup/archive', Object.assign({ backup_token: token, archive: archive }, body)); }
+      async function step(body) { if (cancelled) throw new Error('cancelled'); return D.api.post('backup/archive', Object.assign({ backup_token: token, archive: archive }, S.site ? { site: S.site } : {}, body)); }
       try {
         for (var i = 0; i < batches.length; i++) {
           line.textContent = 'Adding files\u2026 batch ' + (i + 1) + ' of ' + batches.length;
@@ -298,6 +312,7 @@
 
     /* CLI commands */
     function cliCard(withChoices) {
+      if (S.site) return D.note('', ['The Disembark CLI backs up the whole install. For this one site, use Back up in the browser above, or pull it straight into another site with ', h('code', null, 'wp disembark pull <connect line> --site=' + S.site), '.'], 'terminal');
       var home = D.config.homeUrl;
       var blocks = {
         runner: D.cmd('', { label: 'Back up now', hint: 'Downloads the CLI if needed and runs the backup with your choices.' }),

@@ -48,10 +48,20 @@ class Backup {
         }
     }
 
+    /**
+     * The folder file names are relative to. One site of a WP Freighter
+     * install names its files from the install's folder (its content folder
+     * may be content/<id>).
+     */
+    public static function web_root() {
+        $scope = Scope::active();
+        return $scope ? $scope->root : dirname( WP_CONTENT_DIR );
+    }
+
     public function initiate_scan_state() {
         $state_file = "{$this->backup_path}/_scan_state.json";
         
-        $web_root = dirname( WP_CONTENT_DIR );
+        $web_root = self::web_root();
         $core_root = rtrim( ABSPATH, '/' );
         $dirs_to_scan = [ $web_root ];
         
@@ -121,8 +131,9 @@ class Backup {
 
             // We have items to process (either new or from a previous run)
             // --- This logic was moved outside the loop ---
-            $web_root = dirname( WP_CONTENT_DIR );
+            $web_root = self::web_root();
             $core_root = rtrim( ABSPATH, '/' );
+            $scope     = Scope::active();
             // Determine the home_path for the *current* directory
             $home_path = $web_root;
             if ( !empty($state['current_directory_path']) && $web_root !== $core_root && str_starts_with( $state['current_directory_path'], $core_root ) ) {
@@ -160,6 +171,26 @@ class Backup {
                     }
                 }
                 if ($is_excluded) continue;
+                // One site of a shared install: its own folders only, under
+                // the names a standalone site uses.
+                $name = $relative_path;
+                if ( $scope ) {
+                    if ( is_dir( $full_path ) ) {
+                        if ( $scope->skip_dir( $relative_path ) ) {
+                            continue;
+                        }
+                    } else {
+                        $name = $scope->file_out( $relative_path );
+                        if ( $name === null ) {
+                            continue;
+                        }
+                        foreach ( $exclude_paths as $exclude_path ) {
+                            if ( $name === $exclude_path || str_starts_with( $name, $exclude_path . '/' ) ) {
+                                continue 2;
+                            }
+                        }
+                    }
+                }
                 if ( is_dir( $full_path ) ) {
                     if (is_readable($full_path)) {
                         // Add new directory to the *main* list, not the current batch
@@ -168,7 +199,7 @@ class Backup {
                     }
                 } elseif ( is_file( $full_path ) ) {
                     $file_info = [
-                        'name'  => $relative_path,
+                        'name'  => $name,
                         'size'  => filesize( $full_path ),
                         'mtime' => filemtime( $full_path ), // lets a catch-up pull find changed files
                         'type'  => 'file'
@@ -364,9 +395,17 @@ class Backup {
         if ( false === ( $file_handle = fopen( $backup_file, 'a' ) ) ) {
             return false;
         }
+        $scope = Scope::active();
+        $real  = $scope ? $scope->real( $table ) : $table;
+        if ( $real === null ) {
+            @fclose( $file_handle );
+            return false;
+        }
+        $where = $scope ? $scope->where( $table ) : '';
+        $empty = $scope && in_array( $table, $scope->shared_tables(), true );
 
         if ( 0 == $rows_start ) {
-            $create_table = $wpdb->get_results( "SHOW CREATE TABLE `{$table}`", ARRAY_N );
+            $create_table = $wpdb->get_results( "SHOW CREATE TABLE `{$real}`", ARRAY_N );
             if ( false === $create_table || ! isset( $create_table[0] ) ) {
                 return false;
             }
@@ -377,7 +416,7 @@ class Backup {
                 fclose( $file_handle );
                 return $backup_url;
             }
-            $insert_sql .= str_replace( "\n", '', $create_table_array[1] ) . ";\n";
+            $insert_sql .= str_replace( "\n", '', $scope ? $scope->create( $create_table_array[1], $table, $real ) : $create_table_array[1] ) . ";\n";
             unset( $create_table_array );
             $insert_sql .= "/*!40000 ALTER TABLE `{$table}` DISABLE KEYS */;\n";
             $insert_sql .= "SET FOREIGN_KEY_CHECKS = 0;\n";
@@ -385,7 +424,8 @@ class Backup {
         }
 
         $query_count = 0;
-        $rows_remain = true;
+        $rows_remain = ! $empty;
+        $cols        = null;
         while ( true === $rows_remain ) {
             if ( $rows_per_part > 0 && ( $query_count + $select_row_limit ) >= $rows_per_part ) {
                 $select_row_limit = $rows_per_part - $query_count;
@@ -393,7 +433,7 @@ class Backup {
             }
             // ORDER BY the primary key: without it MySQL may return pages in
             // any order, so separate LIMIT/OFFSET requests can skip or repeat rows.
-            $query       = "SELECT * FROM `$table`" . self::order_by_primary_key( $table ) . " LIMIT " . (int) $rows_start . ',' . (int) $select_row_limit;
+            $query       = "SELECT * FROM `$real`" . ( $where !== '' ? " WHERE {$where}" : '' ) . self::order_by_primary_key( $real ) . " LIMIT " . (int) $rows_start . ',' . (int) $select_row_limit;
             $table_query = $wpdb->get_results( $query, ARRAY_N );
             $rows_start += $select_row_limit;
             if ( $wpdb->last_error ) {
@@ -403,11 +443,19 @@ class Backup {
             $table_count = count( $table_query );
             if ( 0 == $table_count || $table_count < $select_row_limit ) {
                 $rows_remain = false;
+                $at_end      = true;
             }
             $query_count += $table_count;
             $columns    = $wpdb->get_col_info();
             $num_fields = count( $columns );
+            $cols       = (array) $wpdb->get_col_info( 'name' );
             foreach ( $table_query as $fetch_row ) {
+                if ( $scope ) {
+                    $fetch_row = $scope->row( $table, $cols, $fetch_row );
+                    if ( $fetch_row === null ) {
+                        continue;
+                    }
+                }
                 $insert_sql .= "INSERT INTO `$table` VALUES(";
                 for ( $n = 1; $n <= $num_fields; $n++ ) {
                     $m = $n - 1;
@@ -428,6 +476,11 @@ class Backup {
             }
         }
 
+        if ( $scope && ! empty( $at_end ) && $cols ) {
+            foreach ( $scope->extra_rows( $table, $cols ) as $row ) {
+                $insert_sql .= self::insert_line( $table, $row );
+            }
+        }
         $insert_sql  .= "/*!40000 ALTER TABLE `{$table}` ENABLE KEYS */;\n";
         $insert_sql  .= "SET FOREIGN_KEY_CHECKS = 1;\n";
         $insert_sql  .= "SET UNIQUE_CHECKS = 1;\n";
@@ -450,10 +503,20 @@ class Backup {
      * (no OFFSET drift while the site keeps writing). The dump ends with
      * EXPORT_COMPLETE_MARKER so a reader can tell it is whole.
      */
-    public function database_export_batch( $tables = [], $schema_only = [] ) {
+    public function database_export_batch( $tables = [], $schema_only = [], $shared_rows = false ) {
         global $wpdb;
         // Tables exported as structure only: a move leaving their rows behind.
         $schema_only = array_flip( array_map( 'strval', (array) $schema_only ) );
+        // One site of a shared install: tables by the names it exports them
+        // under, network-wide tables empty unless asked for.
+        $scope = Scope::active();
+        if ( $scope ) {
+            $own    = $scope->tables();
+            $tables = array_values( array_filter( array_map( 'strval', (array) $tables ), function ( $t ) use ( $own ) { return isset( $own[ $t ] ); } ) );
+            if ( ! $shared_rows ) {
+                $schema_only += array_flip( $scope->shared_tables() );
+            }
+        }
 
         if ( empty( $tables ) ) {
             return new \WP_Error( 'missing_tables', 'No tables to export.', [ 'status' => 400 ] );
@@ -495,9 +558,13 @@ class Backup {
 
         foreach ( $tables as $table ) {
             $table        = (string) $table;
-            $create_table = $wpdb->get_results( "SHOW CREATE TABLE `" . str_replace( '`', '``', $table ) . "`", ARRAY_N );
+            $real         = $scope ? (string) $scope->real( $table ) : $table;
+            $create_table = $wpdb->get_results( "SHOW CREATE TABLE `" . str_replace( '`', '``', $real ) . "`", ARRAY_N );
             if ( empty( $create_table[0][1] ) ) {
                 return $fail( "Could not read the structure of table {$table}." );
+            }
+            if ( $scope ) {
+                $create_table[0][1] = $scope->create( $create_table[0][1], $table, $real );
             }
             // A view has a definition, not rows of its own: its rows belong
             // to the tables it reads, and inserting them would write there.
@@ -518,19 +585,21 @@ class Backup {
                 continue;
             }
 
-            $keys     = self::primary_key_columns( $table );
+            $keys     = self::primary_key_columns( $real );
             $keyset   = count( $keys ) === 1;
-            $order_by = self::order_by_primary_key( $table );
+            $order_by = self::order_by_primary_key( $real );
             $offset   = 0;
             $last_key = null;
             $key_pos  = null;
             $exported = 0;
+            $where    = $scope ? $scope->where( $table ) : '';
+            $cols     = null;
 
             while ( true ) {
                 if ( $keyset && $last_key !== null ) {
-                    $query = $wpdb->prepare( "SELECT * FROM `{$table}` WHERE `{$keys[0]}` > %s{$order_by} LIMIT %d", $last_key, $select_row_limit );
+                    $query = $wpdb->prepare( "SELECT * FROM `{$real}` WHERE `{$keys[0]}` > %s" . ( $where !== '' ? " AND ({$where})" : '' ) . "{$order_by} LIMIT %d", $last_key, $select_row_limit );
                 } else {
-                    $query = "SELECT * FROM `{$table}`{$order_by} LIMIT " . (int) $offset . ',' . (int) $select_row_limit;
+                    $query = "SELECT * FROM `{$real}`" . ( $where !== '' ? " WHERE {$where}" : '' ) . "{$order_by} LIMIT " . (int) $offset . ',' . (int) $select_row_limit;
                 }
                 $rows = $wpdb->get_results( $query, ARRAY_N );
                 if ( $wpdb->last_error ) {
@@ -550,25 +619,42 @@ class Backup {
                     }
                 }
 
+                if ( $cols === null ) {
+                    $cols = (array) $wpdb->get_col_info( 'name' );
+                }
                 $insert_sql = '';
+                $fetched    = count( $rows );
+                $next_key   = $keyset ? $rows[ $fetched - 1 ][ $key_pos ] : null;
                 foreach ( $rows as $fetch_row ) {
-                    $values = [];
-                    foreach ( $fetch_row as $value ) {
-                        $values[] = ( null === $value ) ? 'NULL' : "'" . self::db_escape( $value ) . "'";
+                    if ( $scope ) {
+                        $fetch_row = $scope->row( $table, $cols, $fetch_row );
+                        if ( $fetch_row === null ) {
+                            continue;
+                        }
                     }
-                    $insert_sql .= "INSERT INTO `{$table}` VALUES(" . implode( ', ', $values ) . ");\n";
+                    $insert_sql .= self::insert_line( $table, $fetch_row );
+                    $exported++;
                 }
                 if ( ! $write( $insert_sql ) ) {
                     return $fail( 'Could not write the database export (disk full?).' );
                 }
-                $exported += count( $rows );
 
-                if ( count( $rows ) < $select_row_limit ) {
+                if ( $fetched < $select_row_limit ) {
                     break;
                 }
                 $offset += $select_row_limit;
                 if ( $keyset ) {
-                    $last_key = $rows[ count( $rows ) - 1 ][ $key_pos ];
+                    $last_key = $next_key;
+                }
+            }
+            if ( $scope ) {
+                $extra = '';
+                foreach ( $scope->extra_rows( $table, $cols ?? (array) $wpdb->get_col( 'SHOW COLUMNS FROM `' . str_replace( '`', '``', $real ) . '`' ) ) as $row ) {
+                    $extra .= self::insert_line( $table, $row );
+                    $exported++;
+                }
+                if ( ! $write( $extra ) ) {
+                    return $fail( 'Could not write the database export (disk full?).' );
                 }
             }
 
@@ -765,8 +851,9 @@ class Backup {
         if ( is_wp_error( $paths ) ) {
             return $paths;
         }
-        $web_root  = dirname( WP_CONTENT_DIR );
+        $web_root  = self::web_root();
         $core_root = rtrim( ABSPATH, '/' );
+        $scope     = Scope::active();
         $zip       = new \ZipArchive();
         if ( $zip->open( $paths['zip'], \ZipArchive::CREATE ) !== true ) {
             return new \WP_Error( 'zip_open_failed', 'Could not open the backup zip.', [ 'status' => 500 ] );
@@ -779,9 +866,10 @@ class Backup {
             if ( $relative === '' || strpos( '/' . $relative . '/', '/../' ) !== false ) {
                 continue;
             }
-            $full = "{$web_root}/{$relative}";
-            if ( $web_root !== $core_root && ! file_exists( $full ) && file_exists( "{$core_root}/{$relative}" ) ) {
-                $full = "{$core_root}/{$relative}";
+            $real = $scope ? $scope->file_in( $relative ) : $relative;
+            $full = "{$web_root}/{$real}";
+            if ( $web_root !== $core_root && ! file_exists( $full ) && file_exists( "{$core_root}/{$real}" ) ) {
+                $full = "{$core_root}/{$real}";
             }
             if ( is_file( $full ) && is_readable( $full ) && $zip->addFile( $full, 'public/' . $relative ) ) {
                 $added++;
@@ -846,13 +934,15 @@ class Backup {
         if ( file_exists( $paths['sql'] ) ) {
             $zip->addFile( $paths['sql'], 'public/database-' . $paths['base'] . '.sql' );
         }
+        $scope = Scope::active();
         $zip->addFromString( 'public/disembark-source.json', wp_json_encode( [
-            'home_url'  => home_url(),
-            'site_url'  => site_url(),
-            'db_prefix' => $wpdb->prefix,
+            'home_url'  => $scope ? $scope->home : home_url(),
+            'site_url'  => $scope ? $scope->siteurl : site_url(),
+            'db_prefix' => $scope ? $scope->prefix : $wpdb->prefix,
             'abspath'   => ABSPATH,
             'content_dir' => WP_CONTENT_DIR,
-            'profile'   => Import::site_profile(),
+            'profile'   => $scope ? $scope->profile() : Import::site_profile(),
+            'scope'     => $scope ? $scope->info() : null,
             'captured'  => gmdate( 'c' ),
         ], JSON_PRETTY_PRINT ) );
         if ( ! $zip->close() ) {
@@ -876,8 +966,12 @@ class Backup {
         }
 
         $zip_name  = "{$this->backup_path}/{$file_name}.zip";
-        $web_root  = dirname( WP_CONTENT_DIR );
+        $web_root  = self::web_root();
         $core_root = rtrim( ABSPATH, '/' );
+        $scope     = Scope::active();
+        if ( $scope && $this->archiver_type !== 'ZipArchive' ) {
+            return new \WP_Error( 'no_zip', 'Exporting one site of a shared install needs PHP\'s ZipArchive on the source.', [ 'status' => 501 ] );
+        }
         
         // CHECK: Did the zip exist before we started this specific chunk?
         $zip_existed_before = file_exists( $zip_name );
@@ -889,10 +983,14 @@ class Backup {
                 foreach( $files as $file_obj ) {
                     if ( !is_array($file_obj) || empty($file_obj['name']) ) continue;
                     $file_relative_path = $file_obj['name'];
+                    $real               = $scope ? $scope->file_in( $file_relative_path ) : $file_relative_path;
+                    if ( strpos( '/' . $real . '/', '/../' ) !== false ) {
+                        continue;
+                    }
 
-                    $full_file_path = "{$web_root}/{$file_relative_path}";
-                    if ( $web_root !== $core_root && ! file_exists( $full_file_path ) && file_exists( "{$core_root}/{$file_relative_path}" ) ) {
-                        $full_file_path = "{$core_root}/{$file_relative_path}";
+                    $full_file_path = "{$web_root}/{$real}";
+                    if ( $web_root !== $core_root && ! file_exists( $full_file_path ) && file_exists( "{$core_root}/{$real}" ) ) {
+                        $full_file_path = "{$core_root}/{$real}";
                     }
 
                     if ( file_exists( $full_file_path ) && is_readable( $full_file_path ) ) {
@@ -989,6 +1087,14 @@ class Backup {
 
         // Return the public URL
         return "{$this->backup_url}/database.zip";
+    }
+
+    private static function insert_line( $table, $row ) {
+        $values = [];
+        foreach ( $row as $value ) {
+            $values[] = ( null === $value ) ? 'NULL' : "'" . self::db_escape( $value ) . "'";
+        }
+        return "INSERT INTO `{$table}` VALUES(" . implode( ', ', $values ) . ");\n";
     }
 
     public static function db_escape( $sql ) {

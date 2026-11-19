@@ -214,14 +214,17 @@ class Verify {
             return [];
         }
         $hosts   = [ $host, stripos( $host, 'www.' ) === 0 ? substr( $host, 4 ) : 'www.' . $host ];
+        // A site in a subfolder (a network's subsite) shares its host with
+        // other sites, whose links are fine: look for the folder too.
+        $path    = rtrim( (string) wp_parse_url( $old_home, PHP_URL_PATH ), '/' );
         $needles = [];
         foreach ( $hosts as $h ) {
             // The new address can contain the old one (old-site.com moving to
             // old-site.com.staging.dev): those spellings can't tell them apart.
-            if ( stripos( home_url(), '//' . $h ) !== false ) {
+            if ( stripos( home_url(), '//' . $h . $path ) !== false ) {
                 continue;
             }
-            array_push( $needles, '//' . $h, '\/\/' . $h, '%2F%2F' . $h, '%2f%2f' . $h );
+            array_push( $needles, '//' . $h . $path, '\/\/' . $h . str_replace( '/', '\/', $path ), '%2F%2F' . $h . str_replace( '/', '%2F', $path ), '%2f%2f' . $h . str_replace( '/', '%2f', $path ) );
         }
         return array_values( array_unique( $needles ) );
     }

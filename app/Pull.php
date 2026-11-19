@@ -79,6 +79,8 @@ class Pull {
 
         $body = array_merge(
             [ 'token' => $state['source_token'] ?? '', 'backup_token' => $state['backup_token'] ?? '' ],
+            // One site of a network or WP Freighter install (see Scope).
+            isset( $state['site'] ) && $state['site'] !== '' ? [ 'site' => (string) $state['site'] ] : [],
             $payload
         );
         $verify = $this->sslverify();
@@ -249,7 +251,7 @@ class Pull {
      * $catch_up: copy only files that changed since the last pull from this
      * source (see cache_file_list()).
      */
-    public function connect( $source_url, $source_token, $move = [], $catch_up = false ) {
+    public function connect( $source_url, $source_token, $move = [], $catch_up = false, $site = null, $shared_rows = false ) {
         $source_url = rtrim( $source_url, '/' );
         if ( ! preg_match( '#^https?://#', $source_url ) ) {
             $source_url = 'https://' . $source_url;
@@ -284,10 +286,86 @@ class Pull {
             'started'      => time(),
             'move'         => is_array( $move ) ? $move : [],
             'catch_up'     => (bool) $catch_up,
+            'shared_rows'  => (bool) $shared_rows,
         ] );
 
         // Source metadata (v2.8 sources expose /import/preflight).
         $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->import_id ], 'POST' );
+
+        // A network or WP Freighter install: bring one site of it when one
+        // was named, or when the address reached one site (a subsite, a
+        // tenant). The install's main address brings the whole install.
+        $install = is_object( $pre ) && ! empty( $pre->install ) ? json_decode( (string) wp_json_encode( $pre->install ), true ) : null;
+        $state   = $this->state();
+        $state['install'] = $install;
+        $this->save_state( $state );
+        $site = $site === null ? null : trim( (string) $site );
+        if ( $site === null && $install && (string) $install['current'] !== (string) $install['main'] ) {
+            $site = (string) $install['current'];
+        }
+        if ( $site !== null && $site !== '' && strtolower( $site ) !== 'all' ) {
+            if ( ! $install ) {
+                return new \WP_Error( 'not_shared', 'The source is a single site, so there is no site to choose (--site).', [ 'status' => 400 ] );
+            }
+            $pre = $this->use_site( $site );
+            if ( is_wp_error( $pre ) ) {
+                return $pre;
+            }
+        }
+        return $this->load_source( $pre );
+    }
+
+    /**
+     * Narrows the pull to one site of the source's install. Returns the
+     * source's preflight for that site, or WP_Error.
+     */
+    private function use_site( $site ) {
+        $state         = $this->state();
+        $state['site'] = (string) $site;
+        $this->save_state( $state );
+        $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->import_id ], 'POST' );
+        if ( is_wp_error( $pre ) || ! is_object( $pre ) || empty( $pre->scope->site ) ) {
+            $state = $this->state();
+            unset( $state['site'] );
+            $this->save_state( $state );
+            if ( is_wp_error( $pre ) && $pre->get_error_code() !== 'source_error' ) {
+                return $pre;
+            }
+            return new \WP_Error( 'site_unavailable', is_wp_error( $pre )
+                ? 'The source could not export site ' . $site . '. Check the site ID (Tools → Disembark on the source lists them).'
+                : 'The source runs an older Disembark that can only export the whole install. Update Disembark there to bring one site.', [ 'status' => 400 ] );
+        }
+        $state         = $this->state();
+        $state['site'] = (string) $pre->scope->site;
+        $this->save_state( $state );
+        return $pre;
+    }
+
+    /**
+     * Picks which site of a network or WP Freighter install to bring ("all"
+     * for the whole install), after connect and before the scan.
+     */
+    public function choose_site( $site ) {
+        $state = $this->state();
+        if ( empty( $state['source_token'] ) ) {
+            return new \WP_Error( 'not_connected', 'Connect to the source first.', [ 'status' => 400 ] );
+        }
+        if ( ! empty( $state['file_list'] ) ) {
+            return new \WP_Error( 'already_scanned', 'The site can only be chosen before the source is scanned.', [ 'status' => 409 ] );
+        }
+        $site = trim( (string) $site );
+        if ( $site === '' || strtolower( $site ) === 'all' ) {
+            unset( $state['site'] );
+            $this->save_state( $state );
+            $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->import_id ], 'POST' );
+        } else {
+            $pre = $this->use_site( $site );
+        }
+        return is_wp_error( $pre ) ? $pre : $this->load_source( $pre );
+    }
+
+    /** Records what the source's preflight and /database said, and stamps staging. */
+    private function load_source( $pre ) {
         $home = $prefix = ''; $tables = []; $db_size = 0;
         if ( is_object( $pre ) ) {
             $home   = rtrim( $pre->home_url ?? '', '/' );
@@ -307,9 +385,11 @@ class Pull {
         }
 
         $state = $this->state();
+        $scope = is_object( $pre ) && ! empty( $pre->scope ) ? json_decode( (string) wp_json_encode( $pre->scope ), true ) : null;
         $state['source_home']    = $home;
         $state['source_prefix']  = $prefix;
         $state['source_profile'] = is_object( $pre ) && isset( $pre->profile ) ? json_decode( (string) wp_json_encode( $pre->profile ), true ) : null;
+        $state['scope']          = $scope;
         $state['tables']        = $table_info;
         $this->save_state( $state );
 
@@ -319,9 +399,10 @@ class Pull {
         }
         file_put_contents(
             $this->staging_public . '/disembark-source.json',
-            wp_json_encode( [ 'home_url' => $home, 'site_url' => $home, 'db_prefix' => $prefix, 'abspath' => (string) ( $pre->abspath ?? '' ), 'content_dir' => (string) ( $pre->content_dir ?? '' ), 'profile' => $state['source_profile'] ] )
+            wp_json_encode( [ 'home_url' => $home, 'site_url' => $home, 'db_prefix' => $prefix, 'abspath' => (string) ( $pre->abspath ?? '' ), 'content_dir' => (string) ( $pre->content_dir ?? '' ), 'profile' => $state['source_profile'], 'scope' => $scope ] )
         );
 
+        $install = $state['install'] ?? null;
         return [
             'ok'          => true,
             'import_id'   => $this->import_id,
@@ -329,7 +410,23 @@ class Pull {
             'db_prefix'   => $prefix,
             'table_count' => is_array( $tables ) ? count( $tables ) : 0,
             'db_size'     => $db_size,
+            'install'     => $install,
+            'scope'       => $scope,
         ];
+    }
+
+    /**
+     * The address a pull is remembered under (for catch-up pulls). Sites of a
+     * WP Freighter install without domain mapping share one address, so the
+     * site's ID tells them apart.
+     */
+    private static function memory_source( $state ) {
+        $source = (string) ( $state['source_home'] ?? '' ) ?: (string) ( $state['source_url'] ?? '' );
+        $scope  = (array) ( $state['scope'] ?? [] );
+        if ( ! empty( $scope['site'] ) && Quiet::address( $source ) === Quiet::address( (string) ( $scope['install_home'] ?? '' ) ) && ! in_array( (string) $scope['site'], [ 'main', (string) ( $state['install']['main'] ?? '' ) ], true ) ) {
+            $source .= ' (site ' . $scope['site'] . ')';
+        }
+        return $source;
     }
 
     /**
@@ -395,7 +492,7 @@ class Pull {
         // pull from this source; files that were brought then and are gone
         // from the source now are removed here (deploy_files, with a backup
         // for rollback).
-        $last = ! empty( $state['catch_up'] ) ? self::last_pull( $state['source_home'] ?? $state['source_url'] ) : null;
+        $last = ! empty( $state['catch_up'] ) ? self::last_pull( self::memory_source( $state ) ) : null;
         if ( $last ) {
             $before  = (array) $last['files'];
             $changed = [];
@@ -489,7 +586,7 @@ class Pull {
         if ( empty( $state['file_list'] ) || ! is_file( $state['file_list'] ) ) {
             return false;
         }
-        $source = (string) ( $state['source_home'] ?? '' ) ?: (string) ( $state['source_url'] ?? '' );
+        $source = self::memory_source( $state );
         if ( $source === '' ) {
             return false;
         }
@@ -639,7 +736,7 @@ class Pull {
         // schema_only sends the rows anyway; the import drops them then.
         $state       = $this->state();
         $schema_only = array_values( (array) ( $state['skip_rows'] ?? [] ) );
-        $url = $this->source_request( '/export-database-batch', [ 'tables' => $tables, 'schema_only' => $schema_only ], 'POST', 1800 );
+        $url = $this->source_request( '/export-database-batch', [ 'tables' => $tables, 'schema_only' => $schema_only, 'shared_rows' => ! empty( $state['shared_rows'] ) ], 'POST', 1800 );
         if ( is_wp_error( $url ) ) {
             return $url;
         }

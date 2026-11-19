@@ -86,6 +86,20 @@ class Command {
      * `latest`. Finished steps are replayed; it carries on from where it
      * stopped with the options it started with.
      *
+     * [--site=<site>]
+     * : Bring one site of a multisite network or a WP Freighter install: a
+     * blog ID, a Freighter tenant ID or "main", or the site's address. The
+     * site arrives as a standalone site: its own tables, its members (and the
+     * network's super admins, as administrators), its uploads moved to
+     * wp-content/uploads, and only the plugins and themes it uses. A source
+     * address that reaches one site (a subsite, a mapped tenant domain)
+     * brings that site without this; `--site=all` brings the whole install.
+     *
+     * [--shared-tables]
+     * : With --site on a network: bring the rows of network-wide tables
+     * (plugin tables with no copy per site) too. By default they come across
+     * empty, since they hold every site's data.
+     *
      * [--skip=<paths>]
      * : Folders or files to leave behind, comma-separated, relative to the web
      * root (for example wp-content/uploads/2014,wp-content/big-export.csv).
@@ -140,6 +154,7 @@ class Command {
      *     $ wp disembark pull https://old-site.com 9fXc... --yes
      *     $ wp disembark pull disembark connect https://old-site.com 9fXc... --yes --format=json
      *     $ wp disembark pull https://staging.example.com 9fXc... --yes --skip-quiet-mode
+     *     $ wp disembark pull https://network.example.com 9fXc... --site=shop.network.example.com --yes
      */
     public function pull( $args, $assoc_args ) {
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
@@ -193,12 +208,13 @@ class Command {
         $summary['destination'] = $dest_home;
 
         $this->say( '[2/9] Bringing the site over' );
-        $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'skip-quiet-mode', 'bring-host-files', 'catch-up' ] ) );
+        $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'skip-quiet-mode', 'bring-host-files', 'catch-up', 'site', 'shared-tables' ] ) );
         $c = $this->check( $this->step( function () use ( $pull, $source, $move_args ) {
-            return $pull->connect( $source['url'], $source['token'], [ 'client' => 'cli', 'kind' => 'pull', 'args' => $move_args ], ! empty( $move_args['catch-up'] ) );
+            return $pull->connect( $source['url'], $source['token'], [ 'client' => 'cli', 'kind' => 'pull', 'args' => $move_args ], ! empty( $move_args['catch-up'] ), isset( $move_args['site'] ) ? (string) $move_args['site'] : null, ! empty( $move_args['shared-tables'] ) );
         } ), 'connect' );
         $src_home = untrailingslashit( (string) ( $c['source_home'] ?? '' ) );
         $this->say( '      Connected to ' . ( $src_home ?: $source['url'] ) . ' (' . (int) ( $c['table_count'] ?? 0 ) . ' tables).' );
+        $this->report_scope( $c, $summary, ! empty( $move_args['shared-tables'] ) );
         $scan = function ( $step, $chunk = 0 ) use ( $pull ) {
             return $this->check( $this->step( function () use ( $pull, $step, $chunk ) { return $pull->scan_step( $step, $chunk ); } ), 'scan' );
         };
@@ -308,7 +324,7 @@ class Command {
             }
 
             $this->say( '[7/9] Rewriting URLs' );
-            $paths = Import::path_pairs( $info['source'] ?? null );
+            $paths = Import::path_pairs( $info['source'] ?? null ) + Import::scope_pairs( $info['source'] ?? null );
             if ( ( $src_home !== '' && $src_home !== $dest_home ) || $paths ) {
                 $from = $src_home !== '' ? $src_home : $dest_home;
                 $sr   = $this->check( $this->step( function () use ( $import, $from, $dest_home ) {
@@ -657,6 +673,36 @@ class Command {
     // ------------------------------------------------------------------ helpers
 
     /** Parses "<url> <token>" or "disembark connect <url> <token>". */
+    /** Says which site of a network or WP Freighter install comes across. */
+    private function report_scope( $c, &$summary, $shared_rows = false ) {
+        $install = (array) ( $c['install'] ?? [] );
+        $scope   = (array) ( $c['scope'] ?? [] );
+        if ( $scope ) {
+            $summary['site'] = [ 'id' => $scope['site'], 'kind' => $scope['kind'], 'home' => $scope['home'], 'prefix' => $scope['prefix'] ];
+            $this->say( '      Bringing one site: ' . $scope['label'] . '. It arrives as a standalone site.' );
+            if ( isset( $scope['users'] ) && $scope['users'] !== null ) {
+                $this->say( '      ' . self::plural( (int) $scope['users'], 'user' ) . ( (int) $scope['users'] === 1 ? ' comes' : ' come' ) . ' across: its members, the authors of its posts, and the network\'s super admins (as administrators).' );
+            }
+            $left = (array) ( $scope['left_out'] ?? [] );
+            if ( ! empty( $left['plugins'] ) || ! empty( $left['themes'] ) ) {
+                $this->say( '      Left out ' . self::plural( count( (array) ( $left['plugins'] ?? [] ) ), 'plugin' ) . ' and ' . self::plural( count( (array) ( $left['themes'] ?? [] ) ), 'theme' ) . ' that this site doesn\'t use.' );
+            }
+            if ( ! empty( $scope['shared_tables'] ) ) {
+                $summary['site']['shared_tables'] = $scope['shared_tables'];
+                $this->say( '      ' . self::plural( count( $scope['shared_tables'] ), 'network-wide table' ) . ' ' . ( count( $scope['shared_tables'] ) === 1 ? 'comes' : 'come' ) . ' across ' . ( $shared_rows ? 'with every site\'s rows' : 'empty (--shared-tables brings their rows)' ) . ': ' . implode( ', ', array_slice( $scope['shared_tables'], 0, 8 ) ) . ( count( $scope['shared_tables'] ) > 8 ? ', …' : '' ) );
+            }
+            return;
+        }
+        if ( $install ) {
+            $kind = $install['kind'] === 'multisite' ? 'a multisite network' : 'a WP Freighter install';
+            $summary['install'] = [ 'kind' => $install['kind'], 'sites' => (int) ( $install['total'] ?? 0 ) ];
+            $this->say( "      The source is {$kind} with " . self::plural( (int) ( $install['total'] ?? 0 ), 'site' ) . '. Bringing all of it. To bring one site, run again with --site=<id or address>:' );
+            foreach ( array_slice( (array) $install['sites'], 0, 10 ) as $site ) {
+                $this->say( '        ' . str_pad( (string) $site['id'], 6 ) . ' ' . $site['url'] . ( $site['name'] !== '' ? ' (' . $site['name'] . ')' : '' ) );
+            }
+        }
+    }
+
     /**
      * "What to bring" for the CLI: the suggested skips (or a template, or
      * nothing with --bring-everything), plus --skip and --skip-rows.

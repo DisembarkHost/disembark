@@ -197,9 +197,23 @@ class Run {
             'version'   => $plugin['Version'],
             'fileEdits' => User::file_edits_allowed(),
             'multisite' => is_multisite(),
+            'install'   => self::install_summary(),
         ];
         wp_add_inline_script( 'disembark-core', 'window.DisembarkConfig = ' . wp_json_encode( $config ) . ';', 'before' );
         wp_enqueue_script( 'disembark-app' );
+    }
+
+    /**
+     * For the dashboard: whether this is a network or a WP Freighter install,
+     * which site this is, and the sites (so Backup and Push can bring one).
+     */
+    private static function install_summary() {
+        $install = Scope::install();
+        if ( ! $install ) {
+            return null;
+        }
+        $install['sites'] = array_slice( $install['sites'], 0, 200 );
+        return $install;
     }
 
     /**
@@ -310,6 +324,10 @@ class Run {
         register_rest_route('disembark/v1', '/import/pull/connect', [
             'methods'  => 'POST',
             'callback' => [ $this, 'import_pull_connect' ]
+        ]);
+        register_rest_route('disembark/v1', '/import/pull/site', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_site' ]
         ]);
         register_rest_route('disembark/v1', '/import/pull/scan', [
             'methods'  => 'POST',
@@ -500,6 +518,17 @@ class Run {
     public static function database( $request ) {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        // One site of a shared install (a pull that chose one): its tables,
+        // by the names it exports them under.
+        if ( (string) $request->get_param( 'site' ) !== '' ) {
+            $scope = Scope::from_request( $request );
+            if ( is_wp_error( $scope ) ) {
+                return $scope;
+            }
+            if ( $scope ) {
+                return $scope->table_info();
+            }
         }
         global $wpdb;
         $sql = "SELECT table_name AS \"table\", data_length + index_length AS \"size\" FROM information_schema.TABLES WHERE table_schema = '" . DB_NAME . "' ORDER BY (data_length + index_length) DESC;";
@@ -823,6 +852,10 @@ class Run {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
+        $scope = Scope::from_request( $request );
+        if ( is_wp_error( $scope ) ) {
+            return $scope;
+        }
         $backup_token     = $request['backup_token'];
         $backup_manager   = new Backup( $backup_token );
         $step             = $request['step'] ?? 'initiate';
@@ -864,6 +897,10 @@ class Run {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
+        $scope = Scope::from_request( $request );
+        if ( is_wp_error( $scope ) ) {
+            return $scope;
+        }
         $backup_token = $request['backup_token'];
         $files_list   = $request['files'];
         $archive_name = $request['archive_name'] ?? null;
@@ -899,6 +936,10 @@ class Run {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
+        $scope = Scope::from_request( $request );
+        if ( is_wp_error( $scope ) ) {
+            return $scope;
+        }
         $backup_token = $request['backup_token'];
         $table = empty( $request['table'] ) ? "" : $request['table'];
         if ( ! empty( $request['parts'] ) ) {
@@ -911,6 +952,10 @@ class Run {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
+        $scope = Scope::from_request( $request );
+        if ( is_wp_error( $scope ) ) {
+            return $scope;
+        }
         $backup_token = $request['backup_token'];
         $tables       = $request['tables'];
 
@@ -919,7 +964,7 @@ class Run {
         }
 
         $schema_only = is_array( $request['schema_only'] ) ? array_values( array_filter( $request['schema_only'], 'is_string' ) ) : [];
-        return ( new Backup( $backup_token ) )->database_export_batch( $tables, $schema_only );
+        return ( new Backup( $backup_token ) )->database_export_batch( $tables, $schema_only, ! empty( $request['shared_rows'] ) );
     }
 
     function get_manifest( $request ) {
@@ -1062,7 +1107,24 @@ class Run {
         $params    = $request->get_json_params();
         $import_id = $params['import_id'] ?? '';
         $import    = new Import( $import_id );
-        return $import->preflight();
+        $scope     = Scope::from_request( $request );
+        if ( is_wp_error( $scope ) ) {
+            return $scope;
+        }
+        $pre = $import->preflight();
+        // A network or a WP Freighter install says so, and which site this
+        // request reached, so a pull can bring just one site.
+        $pre['install'] = Scope::install();
+        if ( $scope ) {
+            $pre['home_url'] = $scope->home;
+            $pre['site_url'] = $scope->siteurl;
+            $pre['db_prefix'] = $scope->prefix;
+            $pre['tables']   = array_keys( $scope->tables() );
+            $pre['profile']  = $scope->profile();
+            $pre['scope']    = $scope->info();
+            unset( $pre['disembark_token'] );
+        }
+        return $pre;
     }
 
     function import_snapshot( $request ) {
@@ -1086,6 +1148,10 @@ class Run {
     function backup_archive( $request ) {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $scope = Scope::from_request( $request );
+        if ( is_wp_error( $scope ) ) {
+            return $scope;
         }
         $token = Storage::sanitize_session( (string) ( $request['backup_token'] ?? '' ) );
         if ( $token === '' ) {
@@ -1303,7 +1369,21 @@ class Run {
             'quiet'  => ! empty( $move['quiet'] ),
             'label'  => sanitize_text_field( (string) ( $move['label'] ?? '' ) ),
         ];
-        return ( new Pull( $import_id ) )->connect( $source_url, $source_token, $move, ! empty( $params['catch_up'] ) );
+        $site = isset( $params['site'] ) && $params['site'] !== '' && $params['site'] !== null ? (string) $params['site'] : null;
+        return ( new Pull( $import_id ) )->connect( $source_url, $source_token, $move, ! empty( $params['catch_up'] ), $site, ! empty( $params['shared_rows'] ) );
+    }
+
+    /** Picks one site of the source's network or WP Freighter install ("all" for every site). */
+    function import_pull_site( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        return ( new Pull( $import_id ) )->choose_site( (string) ( $params['site'] ?? '' ) );
     }
 
     function import_pull_scan( $request ) {

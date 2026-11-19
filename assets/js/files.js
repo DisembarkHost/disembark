@@ -24,11 +24,12 @@
 
     function render() {
       vs.dispose(); vs = D.scope();
+      if (S.site) { root.querySelector('#dsk-files-rescan').hidden = true; D.mount(view, D.oneSiteNote('Files')); return; }
       root.querySelector('#dsk-files-rescan').hidden = !S.scanned;
       D.mount(view, S.scanned ? explorer() : h('div', { class: 'dsk-card' }, D.empty('No file list yet', 'Scan the site to browse its files. It takes a moment on big sites.', 'files',
         h('button', { class: 'dsk-btn primary', onclick: function (e) { scan(e.currentTarget); } }, D.icon('scan'), 'Scan files'))));
     }
-    D.store.on(['scanned', 'index'], render);
+    D.store.on(['scanned', 'index', 'site'], render);
     render();
 
     async function scan(btn) {

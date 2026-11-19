@@ -6,7 +6,20 @@
   'use strict';
   var D = window.Disembark, h = D.h, S = D.store.state;
 
-  D.section({ id: 'database', title: 'Database', icon: 'database', mount: mount, onShow: function () { if (!S.database.length) D.loadDatabase().catch(function (e) { D.toast('Could not read the database: ' + D.errorText(e), 'error'); }); } });
+  D.section({ id: 'database', title: 'Database', icon: 'database', mount: guarded, onShow: function () { if (!S.site && !S.database.length) D.loadDatabase().catch(function (e) { D.toast('Could not read the database: ' + D.errorText(e), 'error'); }); } });
+
+  // While Back up works on one site of a shared install, the tables loaded
+  // are that site's export names: browsing or editing them here would be wrong.
+  function guarded(root) {
+    var box = h('div'), mounted = false;
+    D.mount(root, box);
+    function show() {
+      if (S.site) { mounted = false; D.mount(box, D.oneSiteNote('Database')); return; }
+      if (!mounted) { mounted = true; D.mount(box); mount(box); if (!S.database.length) D.loadDatabase().catch(function () {}); }
+    }
+    D.store.on(['site'], show);
+    show();
+  }
 
   function mount(root) {
     var st = { q: '', selected: [], anchor: null, tab: 'rows' };

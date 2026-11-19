@@ -452,14 +452,17 @@ class Import {
             self::swap_abandon( $swap );
             $swapped = 0;
         }
+        // Rows are counted right after the swap, before this site's own
+        // token is written back into the options table.
+        $rows   = empty( $run['errors'] ) ? $this->check_rows( $expected ) : null;
         $result = $this->end_statements( $run );
         $result['tables_swapped']     = $swapped;
         $result['tables_direct']      = array_keys( $swap['direct'] );
         $result['database_unchanged'] = ! empty( $result['errors'] ) && empty( $swap['direct'] );
         $result['converted']          = $compat['converted'];
         $result['definers_removed']   = $compat['definers_removed'];
-        if ( empty( $result['errors'] ) ) {
-            $result['rows'] = $this->check_rows( $expected );
+        if ( empty( $result['errors'] ) && $rows !== null ) {
+            $result['rows'] = $rows;
         }
         return $result;
     }
@@ -496,11 +499,13 @@ class Import {
      * then RENAME: milliseconds). An import that fails, runs out of disk or
      * is cancelled drops the copies and leaves the database untouched.
      *
-     * Tables that declare foreign keys are imported in place, as before:
-     * InnoDB constraint names are unique across a database, so a copy can't
-     * carry the same constraint while the live table exists. Other tables'
-     * keys that point at a swapped table resolve by name, so they keep
-     * working after the rename.
+     * Foreign key names are unique across a database, so a copy can't carry
+     * the live table's constraint names: the copy's foreign keys get
+     * temporary names, and after the swap each is put back under its own
+     * name (a metadata change with foreign key checks off, no table copy).
+     * Keys anywhere that point at a swapped table resolve by name, so they
+     * keep working after the rename. Only a table with a named CHECK
+     * constraint (rare in WordPress) is still imported in place.
      * ---------------------------------------------------------------- */
 
     const SHADOW_PREFIX = '_dsk_';
@@ -512,7 +517,32 @@ class Import {
             $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
             $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $row[0] ) . '`' );
         }
-        return [ 'map' => [], 'direct' => [], 'views' => [], 'deferred' => [] ];
+        return [ 'map' => [], 'direct' => [], 'views' => [], 'deferred' => [], 'keys' => [], 'tag' => substr( md5( uniqid( '', true ) ), 0, 4 ) ];
+    }
+
+    /** A temporary, unique name for a copy's foreign key. */
+    private static function shadow_constraint( $name, $tag ) {
+        $tmp = '_dsk' . $tag . '_' . $name;
+        return strlen( $tmp ) <= 64 ? $tmp : '_dsk' . $tag . '_' . substr( md5( $name ), 0, 24 );
+    }
+
+    /**
+     * Gives the copy's foreign keys temporary names. Returns the statement
+     * and [ temporary name => [ original name, definition ] ].
+     */
+    private static function rename_foreign_keys( $statement, $tag ) {
+        $keys = [];
+        $statement = preg_replace_callback(
+            '/\bCONSTRAINT\s+`((?:[^`]|``)+)`\s+(FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+(?:`(?:[^`]|``)+`\.)?`(?:[^`]|``)+`\s*\([^)]*\)(?:\s+ON\s+(?:DELETE|UPDATE)\s+(?:RESTRICT|CASCADE|SET\s+NULL|NO\s+ACTION|SET\s+DEFAULT))*)/i',
+            function ( $m ) use ( &$keys, $tag ) {
+                $name          = str_replace( '``', '`', $m[1] );
+                $tmp           = self::shadow_constraint( $name, $tag );
+                $keys[ $tmp ]  = [ $name, $m[2] ];
+                return 'CONSTRAINT `' . str_replace( '`', '``', $tmp ) . '` ' . $m[2];
+            },
+            $statement
+        );
+        return [ $statement, $keys ];
     }
 
     private static function shadow_name( $table ) {
@@ -550,9 +580,24 @@ class Import {
             }
             if ( preg_match( '/^(CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+)' . $ident . '/i', $statement, $m ) ) {
                 $table = str_replace( '``', '`', $m[2] !== '' ? $m[2] : $m[3] );
+                $keys = [];
                 if ( preg_match( '/\bFOREIGN\s+KEY\b|\bREFERENCES\s/i', $statement ) ) {
+                    list( $renamed, $keys ) = self::rename_foreign_keys( $statement, $swap['tag'] );
+                    // A foreign key this can't parse (or a named CHECK
+                    // constraint, unique per database on MySQL) means the
+                    // table goes in place, as before.
+                    $named = preg_match_all( '/\bCONSTRAINT\s+`/i', $statement );
+                    if ( ! $keys || $named !== count( $keys ) || preg_match( '/\bFOREIGN\s+KEY\b/i', preg_replace( '/\bCONSTRAINT\s+`_dsk[0-9a-f]{4}_(?:[^`]|``)*`\s+FOREIGN\s+KEY\b/i', '', $renamed ) ) ) {
+                        $swap['direct'][ $table ] = true;
+                        unset( $swap['map'][ $table ], $swap['keys'][ $table ] );
+                        $out[] = 'DROP TABLE IF EXISTS `' . str_replace( '`', '``', $table ) . '`';
+                        $out[] = $statement;
+                        continue;
+                    }
+                    $statement = $renamed; // the CREATE TABLE head is unchanged
+                } elseif ( preg_match( '/\bCONSTRAINT\s+`(?:[^`]|``)+`\s+CHECK\b/i', $statement ) ) {
                     $swap['direct'][ $table ] = true;
-                    unset( $swap['map'][ $table ] );
+                    unset( $swap['map'][ $table ], $swap['keys'][ $table ] );
                     $out[] = 'DROP TABLE IF EXISTS `' . str_replace( '`', '``', $table ) . '`';
                     $out[] = $statement;
                     continue;
@@ -560,6 +605,11 @@ class Import {
                 $shadow                = self::shadow_name( $table );
                 $swap['map'][ $table ] = $shadow;
                 unset( $swap['direct'][ $table ] );
+                if ( $keys ) {
+                    $swap['keys'][ $table ] = $keys;
+                } else {
+                    unset( $swap['keys'][ $table ] );
+                }
                 $out[] = 'DROP TABLE IF EXISTS `' . $shadow . '`';
                 $out[] = $m[1] . '`' . $shadow . '`' . substr( $statement, strlen( $m[0] ) );
                 continue;
@@ -587,6 +637,23 @@ class Import {
                 continue;
             }
             $done++;
+        }
+        // Foreign keys get their own names back (checks are off, so InnoDB
+        // changes only the metadata). If that fails the key still works
+        // under its temporary name, which is reported.
+        foreach ( $swap['keys'] as $table => $keys ) {
+            if ( ! isset( $swap['map'][ $table ] ) ) {
+                continue;
+            }
+            $live = '`' . str_replace( '`', '``', $table ) . '`';
+            foreach ( $keys as $tmp => list( $name, $definition ) ) {
+                $added = $wpdb->query( "ALTER TABLE {$live} ADD CONSTRAINT `" . str_replace( '`', '``', $name ) . "` {$definition}" ) !== false;
+                if ( $added ) {
+                    $wpdb->query( "ALTER TABLE {$live} DROP FOREIGN KEY `" . str_replace( '`', '``', $tmp ) . '`' );
+                } else {
+                    $run['warnings'][] = "The foreign key {$name} on {$table} works, but kept the temporary name {$tmp}: " . substr( $wpdb->last_error, 0, 160 );
+                }
+            }
         }
         wp_cache_flush();
         return $done;
@@ -726,8 +793,9 @@ class Import {
             'files'     => $this->count_staged_files(),
             'sql_file'  => $sql_rel,
             'source'    => $source,
-            'multisite' => $this->staged_multisite_constants(),
+            'multisite' => ! empty( $source->scope ) ? [] : $this->staged_multisite_constants(),
             'paths'     => self::path_pairs( $source ),
+            'moved'     => self::scope_pairs( $source ),
         ];
     }
 
@@ -747,12 +815,77 @@ class Import {
      * address in text files under uploads (rewrite_files()).
      */
     public function move_search_replace( $from, $to ) {
-        $result = $this->search_replace( $from, $to, [], false, [ 'variants' => true, 'extra' => self::path_pairs( $this->staged_source() ) ] );
+        $source = $this->staged_source();
+        $moved  = self::scope_pairs( $source, $to );
+        $result = $this->search_replace( $from, $to, [], false, [ 'variants' => true, 'extra' => self::path_pairs( $source ) + $moved ] );
         if ( is_wp_error( $result ) ) {
             return $result;
         }
-        $result['paths'] = self::path_pairs( $this->staged_source() );
-        return array_merge( $result, $this->rewrite_files( $from !== $to ? self::replacement_pairs( $from, $to, true ) : [] ) );
+        $result['paths'] = self::path_pairs( $source );
+        $result['moved'] = $moved;
+        $file_pairs = $from !== $to ? self::replacement_pairs( $from, $to, true ) : [];
+        foreach ( $moved as $f => $t ) {
+            $file_pairs += self::replacement_pairs( $f, $t );
+        }
+        return array_merge( $result, $this->rewrite_files( $file_pairs ) );
+    }
+
+    /**
+     * One site brought out of a network or WP Freighter install (the source's
+     * `scope`): its folders that moved (uploads/sites/5 → uploads, content/8
+     * → wp-content) at every address they were served from, root-relative,
+     * and on the old server's disk; and the domains a mapping plugin pointed
+     * at it. Empty for an ordinary source.
+     */
+    public static function scope_pairs( $source, $to = '' ) {
+        $scope = (array) ( ( (array) $source )['scope'] ?? [] );
+        if ( ! $scope ) {
+            return [];
+        }
+        // This site's folders, as URLs under its address ($to): content_url()
+        // can't be trusted mid-import (WP-CLI reports http, and the options
+        // table is the source's until the rewrite).
+        $uploads  = wp_upload_dir( null, false );
+        $web_root = wp_normalize_path( dirname( WP_CONTENT_DIR ) );
+        $to       = untrailingslashit( $to !== '' ? (string) $to : home_url() );
+        $dirs     = [ 'wp-content' => wp_normalize_path( WP_CONTENT_DIR ), 'wp-content/uploads' => wp_normalize_path( (string) $uploads['basedir'] ) ];
+        $urls     = [];
+        foreach ( $dirs as $key => $dir ) {
+            $urls[ $key ] = $to . '/' . ltrim( strpos( $dir, $web_root . '/' ) === 0 ? substr( $dir, strlen( $web_root ) + 1 ) : $key, '/' );
+        }
+        $pairs   = [];
+        foreach ( (array) ( $scope['url_pairs'] ?? [] ) as $from_url => $to ) {
+            if ( isset( $urls[ $to ] ) && preg_match( '#^https?://#i', (string) $from_url ) ) {
+                $pairs += self::url_variants( trailingslashit( (string) $from_url ), trailingslashit( $urls[ $to ] ) );
+            }
+        }
+        foreach ( (array) ( $scope['moves'] ?? [] ) as $move ) {
+            list( $from, $to ) = array_values( (array) $move ) + [ '', '' ];
+            $from = trim( (string) $from, '/' );
+            if ( $from === '' || ! isset( $urls[ $to ] ) ) {
+                continue;
+            }
+            foreach ( (array) ( $scope['bases'] ?? [] ) as $base ) {
+                if ( preg_match( '#^https?://#i', (string) $base ) ) {
+                    $pairs += self::url_variants( untrailingslashit( (string) $base ) . '/' . $from . '/', trailingslashit( $urls[ $to ] ) );
+                }
+            }
+            $pairs += [ '/' . $from . '/' => trailingslashit( (string) ( wp_parse_url( $urls[ $to ], PHP_URL_PATH ) ?: '/' . $to ) ) ];
+            if ( ! empty( $scope['abspath'] ) ) {
+                $pairs += [ trailingslashit( (string) $scope['abspath'] ) . $from . '/' => trailingslashit( wp_normalize_path( $dirs[ $to ] ) ) ];
+            }
+        }
+        foreach ( (array) ( $scope['aliases'] ?? [] ) as $alias ) {
+            if ( preg_match( '#^https?://#i', (string) $alias ) ) {
+                $pairs += self::url_variants( untrailingslashit( (string) $alias ), untrailingslashit( home_url() ) );
+            }
+        }
+        foreach ( $pairs as $f => $t ) {
+            if ( (string) $f === (string) $t ) {
+                unset( $pairs[ $f ] );
+            }
+        }
+        return $pairs;
     }
 
     /**
@@ -1324,6 +1457,7 @@ class Import {
         return [
             'statements_executed' => $run['statements_executed'],
             'errors'              => $run['errors'],
+            'warnings'            => $run['warnings'] ?? [],
         ];
     }
 
@@ -2188,11 +2322,17 @@ class Import {
             $emptied[ dirname( $relative_path ) ] = true;
         }
 
-        // Folders the move created (a plugin it brought) go too once empty.
-        // rmdir() never removes a folder that still holds anything.
+        // Folders the move created (a plugin it brought, a WP Freighter
+        // install's content/<id>) go too once empty. rmdir() never removes a
+        // folder that still holds anything; WordPress's own folders and the
+        // ones directly in wp-content stay even when empty.
+        $content = ltrim( substr( wp_normalize_path( WP_CONTENT_DIR ), strlen( wp_normalize_path( $web_root ) ) ), '/' );
+        $keep    = function ( $dir ) use ( $content ) {
+            return in_array( $dir, [ 'wp-admin', 'wp-includes', 'wp-content', $content ], true ) || dirname( $dir ) === $content || dirname( $dir ) === 'wp-content';
+        };
         krsort( $emptied );
         foreach ( array_keys( $emptied ) as $dir ) {
-            while ( $dir !== '.' && $dir !== '' && substr_count( $dir, '/' ) >= 2 && @rmdir( $web_root . '/' . $dir ) ) {
+            while ( $dir !== '.' && $dir !== '' && ! $keep( $dir ) && @rmdir( $web_root . '/' . $dir ) ) {
                 $dir = dirname( $dir );
             }
         }
