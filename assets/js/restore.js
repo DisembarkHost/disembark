@@ -417,18 +417,23 @@
           var sq = await api.post('import/import-staged-sql', t({ sql_file: info.sql_file, old_prefix: srcPrefix, new_prefix: destPrefix }));
           rlog(D.fmt.num(sq.statements_executed || 0) + ' statements executed.');
           stepEls.db.meta.textContent = D.fmt.num(sq.statements_executed || 0) + ' statements';
+          Object.keys(sq.converted || {}).forEach(function (c) { rlog('This database server doesn\u2019t support ' + c.split(' \u2192 ')[0] + ', so ' + D.fmt.plural(sq.converted[c], 'table') + ' use ' + c.split(' \u2192 ')[1] + ' instead.', 'dim'); });
+          if (sq.definers_removed) rlog('Removed the source server\u2019s DEFINER account from ' + D.fmt.plural(sq.definers_removed, 'view, trigger or routine', 'views, triggers or routines') + '.', 'dim');
           if (sq.errors && sq.errors.length) {
             sq.errors.slice(0, 5).forEach(function (e) { rlog('  ' + e, 'err'); });
-            throw new Error('The database import reported ' + D.fmt.plural(sq.errors.length, 'error') + '. Stopped before rewriting URLs.');
+            throw new Error('The database import reported ' + D.fmt.plural(sq.errors.length, 'error') + '. ' + (sq.database_unchanged ? 'This site\u2019s database wasn\u2019t changed: the import works on copies of the tables and only swaps them in when every statement succeeds.' : 'Stopped before rewriting URLs.'));
           }
+          if (sq.tables_swapped) rlog('Swapped in ' + D.fmt.plural(sq.tables_swapped, 'imported table') + '.', 'dim');
           if (srcPrefix && destPrefix && srcPrefix !== destPrefix) {
             var rp = await api.post('import/remap-prefix', t({ old_prefix: srcPrefix, new_prefix: destPrefix }));
             rlog('Table prefix remapped ' + srcPrefix + ' → ' + destPrefix + ' (' + (rp.keys_changed || 0) + ' keys).');
           }
           step('urls'); progress('');
-          if (srcHome && destHome && srcHome !== destHome) {
-            rlog('Rewriting ' + srcHome + ' → ' + destHome + '…');
-            var sr = await api.post('import/search-replace', t({ from: srcHome, to: destHome }));
+          var paths = info.paths || {};
+          if ((srcHome && destHome && srcHome !== destHome) || Object.keys(paths).length) {
+            if (srcHome && srcHome !== destHome) rlog('Rewriting ' + srcHome + ' → ' + destHome + ' (and its http, https and www spellings)…');
+            Object.keys(paths).forEach(function (p) { rlog('Rewriting the old server\u2019s path ' + p + ' → ' + paths[p] + '…'); });
+            var sr = await api.post('import/search-replace', t({ from: srcHome || destHome, to: destHome }));
             rlog(D.fmt.num(sr.cells_changed || 0) + ' cells updated.');
             stepEls.urls.meta.textContent = D.fmt.num(sr.cells_changed || 0) + ' cells' + (sr.files_rewritten ? ' · ' + D.fmt.plural(sr.files_rewritten, 'file') : '');
             if (sr.files_rewritten) rlog('Rewrote the old address in ' + D.fmt.plural(sr.files_rewritten, 'file') + ' under uploads (' + (sr.files_rewritten_list || []).slice(0, 3).join(', ') + (sr.files_rewritten > 3 ? ', \u2026' : '') + ').');
@@ -441,7 +446,12 @@
         } else { skip('db', 'none in backup'); skip('urls', 'not needed'); }
 
         step('fin');
-        await api.post('import/finalize', t());
+        var fin = await api.post('import/finalize', t());
+        var tidy = (fin && fin.tidy) || {};
+        var caches = Object.keys(tidy.caches_cleared || {});
+        if (caches.length) rlog('Cleared page caches so nothing serves the old site: ' + caches.join(', ') + '.', 'dim');
+        (tidy.plugins_turned_off || []).forEach(function (p) { rlog('Turned off ' + p.name + ': ' + p.why + '. Turn it back on once this site has its own keys or certificate.', 'dim'); });
+        if (tidy.login_url) { ctx.loginUrl = tidy.login_url.url; rlog('The login page is moved by ' + tidy.login_url.plugin + ': log in at ' + tidy.login_url.url, 'ok'); }
         stepEls.fin.el.classList.remove('active'); stepEls.fin.el.classList.add('done');
         progress('');
         rlog('Done.', 'ok');
@@ -560,7 +570,7 @@
       h('p', null, D.host(D.config.homeUrl) + ' now holds the copied site.'),
       D.note('warn', ['User accounts came over with it, so your current login no longer applies. ', h('strong', null, 'Log in with the source site’s credentials.')]),
       h('div', { class: 'dsk-row' },
-        h('a', { class: 'dsk-btn primary', href: D.config.loginUrl }, 'Log in again'),
+        h('a', { class: 'dsk-btn primary', href: ctx.loginUrl || D.config.loginUrl }, 'Log in again'),
         h('button', { class: 'dsk-btn', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
       h('div', null, h('div', { class: 'caps', style: { marginBottom: '6px' } }, 'Undo from the CLI'), ctx.cliUndo())));
   };

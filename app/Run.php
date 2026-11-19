@@ -1483,13 +1483,12 @@ class Run {
         }
 
         $import = new Import( $import_id );
-        $result = $import->search_replace( $from, $to, $tables );
-        // A restore also fixes the old address in the text files it brought
-        // in (uploads) and reports code that still mentions it.
-        if ( $import_id !== '' && is_array( $result ) ) {
-            $result = array_merge( $result, $import->rewrite_files( Import::replacement_pairs( $from, $to ) ) );
+        // A move rewrites every spelling of the old address and the old
+        // server's paths, and fixes the text files it brought in (uploads).
+        if ( $import_id !== '' && ! $tables ) {
+            return $import->move_search_replace( $from, $to );
         }
-        return $result;
+        return $import->search_replace( $from, $to, $tables );
     }
 
     function import_rollback( $request ) {

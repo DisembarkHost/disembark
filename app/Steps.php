@@ -15,7 +15,8 @@ namespace Disembark;
  * - keeps running when the browser goes away (ignore_user_abort).
  *
  * The lock is released by the OS if PHP dies, so a crashed step can be run
- * again. Failed steps aren't remembered: a retry runs them again.
+ * again. Failed steps aren't remembered, including ones that answer 200
+ * with an "errors" list: a retry runs them again.
  *
  * Records live with the import (uploads/disembark/_import_<id>/steps) as
  * .php files that exit before their JSON, so the web server never serves
@@ -90,7 +91,7 @@ class Steps {
 
         if ( ! is_wp_error( $response ) ) {
             $response = rest_ensure_response( $response );
-            if ( $response->get_status() < 400 ) {
+            if ( $response->get_status() < 400 && ! self::reported_errors( $response->get_data() ) ) {
                 $body = wp_json_encode( [ 'status' => $response->get_status(), 'data' => $response->get_data() ] );
                 if ( is_string( $body ) ) {
                     $tmp = $result_file . '.tmp';
@@ -130,6 +131,20 @@ class Steps {
         $raw   = (string) file_get_contents( $file );
         $start = strpos( $raw, "\n" );
         $saved = $start === false ? null : json_decode( substr( $raw, $start + 1 ), true );
-        return is_array( $saved ) && isset( $saved['status'] ) && array_key_exists( 'data', $saved ) ? $saved : null;
+        if ( ! is_array( $saved ) || ! isset( $saved['status'] ) || ! array_key_exists( 'data', $saved ) ) {
+            return null;
+        }
+        // Recorded by an earlier version, which also kept steps that
+        // answered 200 with errors: those have to run again.
+        return self::reported_errors( $saved['data'] ) ? null : $saved;
+    }
+
+    /**
+     * Steps such as the database import answer 200 with an "errors" list:
+     * the request worked, the step didn't. Those aren't remembered, so a
+     * retry or a resume runs the step again instead of replaying its failure.
+     */
+    private static function reported_errors( $data ) {
+        return is_array( $data ) && ! empty( $data['errors'] );
     }
 }

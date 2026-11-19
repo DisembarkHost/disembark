@@ -318,7 +318,7 @@ class Pull {
         }
         file_put_contents(
             $this->staging_public . '/disembark-source.json',
-            wp_json_encode( [ 'home_url' => $home, 'site_url' => $home, 'db_prefix' => $prefix ] )
+            wp_json_encode( [ 'home_url' => $home, 'site_url' => $home, 'db_prefix' => $prefix, 'abspath' => (string) ( $pre->abspath ?? '' ), 'content_dir' => (string) ( $pre->content_dir ?? '' ) ] )
         );
 
         return [

@@ -112,6 +112,7 @@ class Import {
             'home_url'           => home_url(),
             'site_url'           => site_url(),
             'abspath'            => ABSPATH,
+            'content_dir'        => WP_CONTENT_DIR,
             'upload_max_filesize' => ini_get( 'upload_max_filesize' ),
             'post_max_size'      => ini_get( 'post_max_size' ),
             'upload_chunk_bytes' => self::upload_chunk_bytes(),
@@ -376,9 +377,11 @@ class Import {
         if ( is_file( $skip_file ) ) {
             $skip_rows = array_flip( array_map( 'strtolower', (array) json_decode( (string) file_get_contents( $skip_file ), true ) ) );
         }
-        $run   = $this->begin_statements();
-        $count = 0;
-        $read  = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, $old_prefix, $new_prefix, $skip_rows ) {
+        $run    = $this->begin_statements();
+        $count  = 0;
+        $swap   = self::swap_start();
+        $compat = self::db_compat();
+        $read   = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, &$swap, &$compat, $old_prefix, $new_prefix, $skip_rows ) {
             if ( ++$count % 500 === 0 && $this->cancelled() ) {
                 $run['errors'][] = 'Cancelled.';
                 return false;
@@ -386,8 +389,8 @@ class Import {
             if ( $skip_rows && preg_match( '/^\s*INSERT\s+INTO\s+`([^`]+)`/i', $statement, $m ) && isset( $skip_rows[ strtolower( $m[1] ) ] ) ) {
                 return true;
             }
-            foreach ( self::transform_statements( [ $statement ], $old_prefix, $new_prefix ) as $transformed ) {
-                if ( ! $this->run_statement( $transformed, $run ) ) {
+            foreach ( self::swap_statements( self::transform_statements( [ $statement ], $old_prefix, $new_prefix ), $swap ) as $transformed ) {
+                if ( ! $this->run_statement( self::compat_statement( $transformed, $compat ), $run ) ) {
                     return false;
                 }
             }
@@ -396,7 +399,245 @@ class Import {
         if ( is_wp_error( $read ) ) {
             $run['errors'][] = $read->get_error_message();
         }
-        return $this->end_statements( $run );
+        // Only a clean import replaces this site's tables. Otherwise the copies
+        // go and the live tables stay exactly as they were.
+        if ( empty( $run['errors'] ) ) {
+            $swapped = self::swap_finish( $swap, $run );
+            foreach ( $swap['deferred'] as $statement ) {
+                $this->run_statement( self::compat_statement( $statement, $compat ), $run );
+            }
+        } else {
+            self::swap_abandon( $swap );
+            $swapped = 0;
+        }
+        $result = $this->end_statements( $run );
+        $result['tables_swapped']     = $swapped;
+        $result['tables_direct']      = array_keys( $swap['direct'] );
+        $result['database_unchanged'] = ! empty( $result['errors'] ) && empty( $swap['direct'] );
+        $result['converted']          = $compat['converted'];
+        $result['definers_removed']   = $compat['definers_removed'];
+        return $result;
+    }
+
+    /* ------------------------------------------------------------------
+     * Import into copies, then swap
+     *
+     * Each table of the dump is created and filled under a temporary name
+     * (_dsk_<table>) while the live table keeps serving the site. Only when
+     * every statement has run does each copy replace its live table (DROP,
+     * then RENAME: milliseconds). An import that fails, runs out of disk or
+     * is cancelled drops the copies and leaves the database untouched.
+     *
+     * Tables that declare foreign keys are imported in place, as before:
+     * InnoDB constraint names are unique across a database, so a copy can't
+     * carry the same constraint while the live table exists. Other tables'
+     * keys that point at a swapped table resolve by name, so they keep
+     * working after the rename.
+     * ---------------------------------------------------------------- */
+
+    const SHADOW_PREFIX = '_dsk_';
+
+    /** A fresh swap, with copies left by an earlier attempt dropped first. */
+    private static function swap_start() {
+        global $wpdb;
+        foreach ( (array) $wpdb->get_results( $wpdb->prepare( 'SHOW FULL TABLES WHERE `Tables_in_' . DB_NAME . '` LIKE %s', $wpdb->esc_like( self::SHADOW_PREFIX ) . '%' ), ARRAY_N ) as $row ) {
+            $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
+            $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $row[0] ) . '`' );
+        }
+        return [ 'map' => [], 'direct' => [], 'views' => [], 'deferred' => [] ];
+    }
+
+    private static function shadow_name( $table ) {
+        $name = self::SHADOW_PREFIX . $table;
+        return strlen( $name ) <= 64 ? $name : self::SHADOW_PREFIX . substr( md5( $table ), 0, 24 );
+    }
+
+    /**
+     * Points each statement at the table's copy. The dump's own DROP TABLE
+     * and LOCK/UNLOCK TABLES lines are left out: the copy is created fresh,
+     * and a lock on the live table would block writes to the copy.
+     */
+    private static function swap_statements( $statements, &$swap ) {
+        $ident = '(?:`((?:[^`]|``)+)`|([A-Za-z0-9_$]+))';
+        $out   = [];
+        foreach ( $statements as $statement ) {
+            if ( preg_match( '/^(?:DROP\s+TABLE\b|LOCK\s+TABLES\b|UNLOCK\s+TABLES\b)/i', $statement ) ) {
+                continue;
+            }
+            // Views wait for the swap: they read the live tables by name, and
+            // creating them earlier would change the site before the import
+            // has succeeded. Rows an older exporter wrote for a view would
+            // land in the table behind it, so they're dropped.
+            if ( preg_match( '/^(?:\/\*!\d+\s+)?(?:DROP\s+VIEW\b|CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW\s+' . $ident . ')/i', $statement, $m ) ) {
+                if ( stripos( $statement, 'DROP' ) !== 0 && isset( $m[1] ) ) {
+                    $view = str_replace( '``', '`', $m[1] !== '' ? $m[1] : ( $m[2] ?? '' ) );
+                    $swap['views'][ $view ] = true;
+                    $swap['deferred'][]     = 'DROP VIEW IF EXISTS `' . str_replace( '`', '``', $view ) . '`';
+                    $swap['deferred'][]     = $statement;
+                }
+                continue;
+            }
+            if ( $swap['views'] && preg_match( '/^(?:INSERT|REPLACE)\b[^`(]*?\bINTO\s+' . $ident . '/i', $statement, $m ) && isset( $swap['views'][ str_replace( '``', '`', $m[1] !== '' ? $m[1] : ( $m[2] ?? '' ) ) ] ) ) {
+                continue;
+            }
+            if ( preg_match( '/^(CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+)' . $ident . '/i', $statement, $m ) ) {
+                $table = str_replace( '``', '`', $m[2] !== '' ? $m[2] : $m[3] );
+                if ( preg_match( '/\bFOREIGN\s+KEY\b|\bREFERENCES\s/i', $statement ) ) {
+                    $swap['direct'][ $table ] = true;
+                    unset( $swap['map'][ $table ] );
+                    $out[] = 'DROP TABLE IF EXISTS `' . str_replace( '`', '``', $table ) . '`';
+                    $out[] = $statement;
+                    continue;
+                }
+                $shadow                = self::shadow_name( $table );
+                $swap['map'][ $table ] = $shadow;
+                unset( $swap['direct'][ $table ] );
+                $out[] = 'DROP TABLE IF EXISTS `' . $shadow . '`';
+                $out[] = $m[1] . '`' . $shadow . '`' . substr( $statement, strlen( $m[0] ) );
+                continue;
+            }
+            if ( $swap['map'] && preg_match( '/^((?:INSERT(?:\s+(?:IGNORE|DELAYED|LOW_PRIORITY|HIGH_PRIORITY))*\s+INTO|REPLACE(?:\s+(?:DELAYED|LOW_PRIORITY))*\s+INTO|ALTER\s+TABLE|TRUNCATE(?:\s+TABLE)?)\s+)' . $ident . '/i', $statement, $m ) ) {
+                $table = str_replace( '``', '`', $m[2] !== '' ? $m[2] : $m[3] );
+                if ( isset( $swap['map'][ $table ] ) ) {
+                    $statement = $m[1] . '`' . $swap['map'][ $table ] . '`' . substr( $statement, strlen( $m[0] ) );
+                }
+            }
+            $out[] = $statement;
+        }
+        return $out;
+    }
+
+    /** Puts every copy in place of its live table. Returns how many. */
+    private static function swap_finish( $swap, &$run ) {
+        global $wpdb;
+        $done = 0;
+        foreach ( $swap['map'] as $table => $shadow ) {
+            $live = '`' . str_replace( '`', '``', $table ) . '`';
+            $wpdb->query( "DROP TABLE IF EXISTS {$live}" );
+            if ( $wpdb->query( "RENAME TABLE `{$shadow}` TO {$live}" ) === false ) {
+                $run['errors'][] = "Could not put the imported {$table} in place: " . substr( $wpdb->last_error, 0, 200 );
+                continue;
+            }
+            $done++;
+        }
+        wp_cache_flush();
+        return $done;
+    }
+
+    private static function swap_abandon( $swap ) {
+        global $wpdb;
+        foreach ( $swap['map'] as $shadow ) {
+            $wpdb->query( "DROP TABLE IF EXISTS `{$shadow}`" );
+        }
+    }
+
+    /* ------------------------------------------------------------------
+     * Database compatibility
+     *
+     * A dump from MySQL 8 names collations (utf8mb4_0900_ai_ci) that older
+     * MariaDB and MySQL don't have, a MariaDB dump can name engines MySQL
+     * lacks (Aria), and views, triggers and routines carry a DEFINER account
+     * that doesn't exist on the new server. Each is rewritten to the closest
+     * thing this server has, and counted for the report.
+     * ---------------------------------------------------------------- */
+
+    private static function db_compat() {
+        global $wpdb;
+        $compat = [ 'collations' => [], 'charsets' => [], 'engines' => [], 'converted' => [], 'definers_removed' => 0, 'map' => [] ];
+        // MariaDB 11 lists some collations without a character set.
+        foreach ( (array) $wpdb->get_results( 'SHOW COLLATION', ARRAY_A ) as $row ) {
+            $compat['collations'][ strtolower( (string) $row['Collation'] ) ] = strtolower( (string) $row['Charset'] );
+        }
+        foreach ( (array) $wpdb->get_results( 'SHOW CHARACTER SET', ARRAY_A ) as $row ) {
+            $compat['charsets'][ strtolower( (string) $row['Charset'] ) ] = strtolower( (string) $row['Default collation'] );
+        }
+        foreach ( (array) $wpdb->get_results( 'SHOW ENGINES', ARRAY_A ) as $row ) {
+            if ( in_array( strtoupper( (string) $row['Support'] ), [ 'YES', 'DEFAULT' ], true ) ) {
+                $compat['engines'][ strtolower( (string) $row['Engine'] ) ] = true;
+            }
+        }
+        return $compat;
+    }
+
+    /** The collation this server should use for $collation, or null if it has it. */
+    private static function compat_collation( $collation, &$compat ) {
+        $c = strtolower( $collation );
+        if ( ! $compat['collations'] || isset( $compat['collations'][ $c ] ) ) {
+            return null;
+        }
+        if ( array_key_exists( $c, $compat['map'] ) ) {
+            return $compat['map'][ $c ];
+        }
+        $charset = strstr( $c, '_', true );
+        $charset = $charset === false ? $c : $charset;
+        $candidates = [];
+        if ( $charset === 'utf8mb3' ) {
+            $candidates[] = 'utf8' . substr( $c, 7 );
+            $charset      = isset( $compat['charsets']['utf8mb3'] ) ? 'utf8mb3' : 'utf8';
+        }
+        if ( substr( $c, -4 ) === '_bin' || substr( $c, -3 ) === '_cs' ) {
+            $candidates[] = $charset . '_bin';
+        }
+        if ( $charset === 'utf8mb4' ) {
+            array_push( $candidates, 'utf8mb4_unicode_520_ci', 'utf8mb4_unicode_ci', 'utf8mb4_general_ci' );
+        } elseif ( $charset === 'utf8' || $charset === 'utf8mb3' ) {
+            array_push( $candidates, $charset . '_unicode_520_ci', $charset . '_unicode_ci', $charset . '_general_ci' );
+        }
+        if ( isset( $compat['charsets'][ $charset ] ) ) {
+            $candidates[] = $compat['charsets'][ $charset ];
+        }
+        $pick = null;
+        foreach ( $candidates as $candidate ) {
+            if ( isset( $compat['collations'][ $candidate ] ) ) {
+                $pick = $candidate;
+                break;
+            }
+        }
+        $compat['map'][ $c ] = $pick;
+        return $pick;
+    }
+
+    private static function compat_statement( $statement, &$compat ) {
+        if ( ! preg_match( '/^(?:\/\*!\d+\s+)?CREATE\b/i', $statement ) ) {
+            return $statement;
+        }
+        if ( ! preg_match( '/^CREATE\s+TABLE\b/i', $statement ) ) {
+            // Views, triggers, routines: run them as whoever imports them.
+            $stripped = preg_replace( '/\bDEFINER\s*=\s*(?:`[^`]*`|\'[^\']*\'|[^\s@*]+)\s*@\s*(?:`[^`]*`|\'[^\']*\'|[^\s*]+)\s*/i', '', $statement, -1, $n );
+            if ( $n ) {
+                $compat['definers_removed'] += $n;
+                $statement = preg_replace( '/\bSQL\s+SECURITY\s+DEFINER\b/i', 'SQL SECURITY INVOKER', (string) $stripped );
+            }
+            return $statement;
+        }
+        $notes = [];
+        $statement = preg_replace_callback( '/\bCOLLATE(\s*=\s*|\s+)([A-Za-z0-9_]+)/i', function ( $m ) use ( &$compat, &$notes ) {
+            $to = self::compat_collation( $m[2], $compat );
+            if ( $to === null ) {
+                return $m[0];
+            }
+            $notes[ strtolower( $m[2] ) . ' → ' . $to ] = true;
+            return 'COLLATE' . $m[1] . $to;
+        }, $statement );
+        if ( $compat['charsets'] && ! isset( $compat['charsets']['utf8mb3'] ) && isset( $compat['charsets']['utf8'] ) ) {
+            $statement = preg_replace_callback( '/\b(CHARSET|CHARACTER\s+SET)(\s*=\s*|\s+)utf8mb3\b/i', function ( $m ) use ( &$notes ) {
+                $notes['utf8mb3 → utf8'] = true;
+                return $m[1] . $m[2] . 'utf8';
+            }, $statement );
+        }
+        if ( $compat['engines'] ) {
+            $statement = preg_replace_callback( '/\bENGINE(\s*=\s*|\s+)([A-Za-z0-9_]+)/i', function ( $m ) use ( &$compat, &$notes ) {
+                if ( isset( $compat['engines'][ strtolower( $m[2] ) ] ) || ! isset( $compat['engines']['innodb'] ) ) {
+                    return $m[0];
+                }
+                $notes[ $m[2] . ' → InnoDB' ] = true;
+                return 'ENGINE' . $m[1] . 'InnoDB';
+            }, $statement );
+        }
+        foreach ( array_keys( $notes ) as $note ) {
+            $compat['converted'][ $note ] = ( $compat['converted'][ $note ] ?? 0 ) + 1;
+        }
+        return $statement;
     }
 
     /**
@@ -412,19 +653,70 @@ class Import {
                 break;
             }
         }
-        $source = null;
-        foreach ( [ '/public/disembark-source.json', '/disembark-source.json' ] as $rel ) {
-            if ( file_exists( $this->staging_path . $rel ) ) {
-                $source = json_decode( file_get_contents( $this->staging_path . $rel ) );
-                break;
-            }
-        }
+        $source = $this->staged_source();
         return [
             'files'     => $this->count_staged_files(),
             'sql_file'  => $sql_rel,
             'source'    => $source,
             'multisite' => $this->staged_multisite_constants(),
+            'paths'     => self::path_pairs( $source ),
         ];
+    }
+
+    /** The source's metadata (disembark-source.json) from staging, or null. */
+    public function staged_source() {
+        foreach ( [ '/public/disembark-source.json', '/disembark-source.json' ] as $rel ) {
+            if ( file_exists( $this->staging_path . $rel ) ) {
+                return json_decode( (string) file_get_contents( $this->staging_path . $rel ) );
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The search & replace a move runs: the old address in all its spellings
+     * (url_variants()), plus the old server's paths. Also rewrites the old
+     * address in text files under uploads (rewrite_files()).
+     */
+    public function move_search_replace( $from, $to ) {
+        $result = $this->search_replace( $from, $to, [], false, [ 'variants' => true, 'extra' => self::path_pairs( $this->staged_source() ) ] );
+        if ( is_wp_error( $result ) ) {
+            return $result;
+        }
+        $result['paths'] = self::path_pairs( $this->staged_source() );
+        return array_merge( $result, $this->rewrite_files( $from !== $to ? self::replacement_pairs( $from, $to, true ) : [] ) );
+    }
+
+    /**
+     * The old server's folders mapped to this one's, when they differ: cache,
+     * security, backup and log plugins store absolute paths, which point at
+     * nothing after a move to a new host. Paths end in a slash, so only paths
+     * inside the folder match (/var/www/html/ never matches /var/www/html2).
+     * Empty for sources that don't report their paths.
+     */
+    public static function path_pairs( $source ) {
+        $source = (array) $source;
+        $pairs  = [];
+        foreach ( [ 'abspath' => ABSPATH, 'content_dir' => WP_CONTENT_DIR ] as $key => $here ) {
+            $there = trim( (string) ( $source[ $key ] ?? '' ) );
+            if ( strlen( $there ) < 4 || strpos( $there, '/' ) === false ) {
+                continue;
+            }
+            $there = rtrim( $there, '/' ) . '/';
+            $here  = rtrim( $here, '/' ) . '/';
+            if ( $there !== $here ) {
+                $pairs[ $there ] = $here;
+            }
+        }
+        // The content folder inside the web root moves with it.
+        foreach ( $pairs as $there => $here ) {
+            foreach ( $pairs as $outer => $outer_here ) {
+                if ( $outer !== $there && strpos( $there, $outer ) === 0 && $outer_here . substr( $there, strlen( $outer ) ) === $here ) {
+                    unset( $pairs[ $there ] );
+                }
+            }
+        }
+        return $pairs;
     }
 
     /**
@@ -664,7 +956,18 @@ class Import {
             'host_files_kept' => array_keys( $kept ),
             'loaders_disabled' => self::disable_missing_prepends( $web_root, $deployed ),
             'removed'         => $removed,
+            // The next steps run in new requests that load the files just
+            // placed; a host that never rechecks file times would otherwise
+            // keep running the old code.
+            'opcache_reset'   => self::reset_opcache(),
         ];
+    }
+
+    private static function reset_opcache() {
+        if ( ! function_exists( 'opcache_reset' ) || ! filter_var( ini_get( 'opcache.enable' ), FILTER_VALIDATE_BOOLEAN ) ) {
+            return false;
+        }
+        return (bool) @opcache_reset();
     }
 
     /**
@@ -835,13 +1138,16 @@ class Import {
      * Executes a list of individual SQL statements on the destination database.
      */
     private function execute_statements( $statements ) {
-        $run = $this->begin_statements();
+        $run    = $this->begin_statements();
+        $compat = self::db_compat();
         foreach ( $statements as $statement ) {
-            if ( ! $this->run_statement( $statement, $run ) ) {
+            if ( ! $this->run_statement( self::compat_statement( $statement, $compat ), $run ) ) {
                 break;
             }
         }
-        return $this->end_statements( $run );
+        $result              = $this->end_statements( $run );
+        $result['converted'] = $compat['converted'];
+        return $result;
     }
 
     /**
@@ -919,6 +1225,11 @@ class Import {
             if ( stripos( $statement, 'DROP TABLE' ) === 0 ) {
                 return true;
             }
+            // A full disk is the usual cause, and worth saying plainly.
+            if ( preg_match( '/\b(is full|No space left|Disk full|errno: 28)\b/i', $wpdb->last_error ) && empty( $run['disk_full'] ) ) {
+                $run['disk_full'] = true;
+                $run['errors'][]  = 'The database server ran out of disk space. The import needs room for a full copy of the incoming tables alongside the current ones.';
+            }
             $run['errors'][] = substr( $wpdb->last_error, 0, 200 ) . ' | SQL: ' . substr( $statement, 0, 100 );
             if ( count( $run['errors'] ) > 50 ) {
                 $run['errors'][] = '...truncated (too many errors)';
@@ -992,11 +1303,21 @@ class Import {
      * @param string   $from   String to search for (e.g. the source home URL).
      * @param string   $to     Replacement (e.g. the destination home URL).
      * @param string[] $tables Optional table allowlist; defaults to all tables.
+     * @param array    $options variants: also rewrite the old address's other
+     *                          spellings (see url_variants()), as a move does;
+     *                          extra: more plain from => to pairs (the old
+     *                          server's file paths).
      */
-    public function search_replace( $from, $to, $tables = [], $dry_run = false ) {
+    public function search_replace( $from, $to, $tables = [], $dry_run = false, $options = [] ) {
         global $wpdb;
 
-        if ( $from === '' || $from === $to ) {
+        $pairs = $from !== '' && $from !== $to ? self::replacement_pairs( $from, $to, ! empty( $options['variants'] ) ) : [];
+        foreach ( (array) ( $options['extra'] ?? [] ) as $f => $t ) {
+            if ( (string) $f !== '' && (string) $f !== (string) $t ) {
+                $pairs += self::replacement_pairs( (string) $f, (string) $t );
+            }
+        }
+        if ( ! $pairs ) {
             return [ 'tables' => 0, 'rows_changed' => 0, 'cells_changed' => 0, 'by_table' => [], 'samples' => [] ];
         }
         $by_table = [];
@@ -1006,7 +1327,8 @@ class Import {
             $tables = $wpdb->get_col( 'SHOW TABLES' );
         }
 
-        $pairs = self::replacement_pairs( $from, $to );
+        $needles = self::needles( $pairs );
+        self::$base64_needles = $from !== $to ? self::base64_needles_for( $from, ! empty( $options['variants'] ) ) : [];
 
         $rows_changed  = 0;
         $cells_changed = 0;
@@ -1053,7 +1375,7 @@ class Import {
                         if ( ! is_string( $value ) || $value === '' ) {
                             continue;
                         }
-                        if ( ! self::contains_any( $value, $pairs ) ) {
+                        if ( ! self::contains_any( $value, $needles ) && ! self::has_base64_needle( $value ) ) {
                             continue;
                         }
                         $replaced = self::replace_in_value( $value, $pairs );
@@ -1091,6 +1413,7 @@ class Import {
             }
         }
 
+        self::$base64_needles = [];
         arsort( $by_table );
         return [
             'tables'        => $tables_seen,
@@ -1264,6 +1587,89 @@ class Import {
     }
 
     /**
+     * The fewest search strings that still find every key of $pairs: a key
+     * that contains another key is found by that one (https://old-site.com
+     * by //old-site.com). Returned as keys, for contains_any().
+     */
+    private static function needles( $pairs ) {
+        $keys = array_map( 'strval', array_keys( $pairs ) );
+        usort( $keys, function ( $a, $b ) { return strlen( $a ) - strlen( $b ); } );
+        $kept = [];
+        foreach ( $keys as $key ) {
+            foreach ( $kept as $shorter ) {
+                if ( strpos( $key, $shorter ) !== false ) {
+                    continue 2;
+                }
+            }
+            $kept[] = $key;
+        }
+        return array_fill_keys( $kept, true );
+    }
+
+    /* ------------------------------------------------------------------
+     * Base64-wrapped content
+     *
+     * Some builders store markup base64-encoded, where a plain search never
+     * sees the address: WPBakery's [vc_raw_html] and [vc_raw_js] (base64 of
+     * URL-encoded HTML), Avada's [fusion_code], BeTheme's mfn-page-items,
+     * Brizy's editor data. A value (or a serialized string, or one of those
+     * shortcodes' bodies) that is base64 and whose decoded text holds the
+     * old address is decoded, rewritten like any other value and encoded
+     * again. The old address is spotted inside base64 without decoding, by
+     * its encoding at each of the three byte alignments.
+     * ---------------------------------------------------------------- */
+
+    /** Set by search_replace() for the run; empty means no base64 handling. */
+    private static $base64_needles = [];
+
+    private static function base64_needles_for( $from, $variants ) {
+        $host = (string) wp_parse_url( $from, PHP_URL_HOST );
+        if ( $host === '' ) {
+            return [];
+        }
+        $hosts = [ $host ];
+        if ( $variants ) {
+            $hosts[] = stripos( $host, 'www.' ) === 0 ? substr( $host, 4 ) : 'www.' . $host;
+        }
+        $needles = [];
+        foreach ( $hosts as $h ) {
+            foreach ( [ '//' . $h, '%2F%2F' . $h ] as $text ) {
+                for ( $k = 0; $k < 3; $k++ ) {
+                    // Each group of 4 base64 characters encodes 3 bytes. The
+                    // first group mixes in whatever precedes the address and
+                    // the last partial one whatever follows, so both go.
+                    $encoded = base64_encode( str_repeat( "\0", $k ) . $text );
+                    $start   = $k ? 4 : 0;
+                    $end     = intdiv( $k + strlen( $text ), 3 ) * 4;
+                    if ( $end - $start >= 8 ) {
+                        $needles[ substr( $encoded, $start, $end - $start ) ] = true;
+                    }
+                }
+            }
+        }
+        return $needles;
+    }
+
+    private static function has_base64_needle( $value ) {
+        return self::$base64_needles && self::contains_any( $value, self::$base64_needles );
+    }
+
+    private static function looks_base64( $value ) {
+        $len = strlen( $value );
+        return $len >= 16 && $len % 4 === 0 && preg_match( '/^[A-Za-z0-9+\/]+={0,2}$/', $value );
+    }
+
+    /** $encoded decoded, rewritten and encoded again; null when nothing changed. */
+    private static function replace_in_base64( $encoded, $pairs, $depth ) {
+        $decoded = base64_decode( $encoded, true );
+        if ( $decoded === false || $decoded === '' ) {
+            return null;
+        }
+        $new = self::replace_in_value( $decoded, $pairs, $depth + 1 );
+        return $new === $decoded ? null : base64_encode( $new );
+    }
+
+    /**
      * The spellings a URL takes in stored data, each mapped to its replacement.
      * The import screen and the CLI pass the plain home URLs, but JSON written
      * by PHP's default encoder escapes every slash (http:\/\/), JSON stored
@@ -1273,7 +1679,63 @@ class Import {
      *
      * @return array<string,string> search => replace, ready for strtr().
      */
-    public static function replacement_pairs( $from, $to ) {
+    public static function replacement_pairs( $from, $to, $variants = false ) {
+        $pairs = [];
+        foreach ( ( $variants ? self::url_variants( $from, $to ) : [ $from => $to ] ) as $f => $t ) {
+            $pairs += self::encoded_pairs( (string) $f, (string) $t );
+        }
+        // A spelling that maps to itself (a move from http to https keeps
+        // https://host as is) needs no work.
+        foreach ( $pairs as $f => $t ) {
+            if ( (string) $f === (string) $t ) {
+                unset( $pairs[ $f ] );
+            }
+        }
+        return $pairs;
+    }
+
+    /**
+     * Every address the old site was reachable at, mapped to the new one:
+     * both schemes, with and without www, scheme-relative (//host), and the
+     * international domain name in both its Unicode and xn-- spellings. Old
+     * content links to http://www.old-site.com long after the site moved to
+     * https://old-site.com; on the copy those links should point at the copy.
+     */
+    public static function url_variants( $from, $to ) {
+        $out = [ $from => $to ];
+        $f   = wp_parse_url( $from );
+        $t   = wp_parse_url( $to );
+        if ( empty( $f['host'] ) || empty( $f['scheme'] ) || empty( $t['host'] ) || ! in_array( strtolower( $f['scheme'] ), [ 'http', 'https' ], true ) ) {
+            return $out;
+        }
+        $rest  = substr( $from, strpos( $from, $f['host'] ) + strlen( $f['host'] ) );
+        $hosts = [ $f['host'] ];
+        $hosts[] = stripos( $f['host'], 'www.' ) === 0 ? substr( $f['host'], 4 ) : 'www.' . $f['host'];
+        foreach ( $hosts as $host ) {
+            if ( function_exists( 'idn_to_ascii' ) && preg_match( '/[^\x00-\x7F]/', $host ) ) {
+                $ascii = @idn_to_ascii( $host, 0, defined( 'INTL_IDNA_VARIANT_UTS46' ) ? INTL_IDNA_VARIANT_UTS46 : 0 );
+                if ( $ascii ) {
+                    $hosts[] = $ascii;
+                }
+            } elseif ( function_exists( 'idn_to_utf8' ) && stripos( $host, 'xn--' ) !== false ) {
+                $utf8 = @idn_to_utf8( $host, 0, defined( 'INTL_IDNA_VARIANT_UTS46' ) ? INTL_IDNA_VARIANT_UTS46 : 0 );
+                if ( $utf8 ) {
+                    $hosts[] = $utf8;
+                }
+            }
+        }
+        $to_relative = substr( $to, strpos( $to, '//' ) );
+        foreach ( array_unique( $hosts ) as $host ) {
+            foreach ( [ 'https', 'http' ] as $scheme ) {
+                $out += [ $scheme . '://' . $host . $rest => $to ];
+            }
+            $out += [ '//' . $host . $rest => $to_relative ];
+        }
+        return $out;
+    }
+
+    /** One address in each encoding stored data uses, mapped to its replacement. */
+    private static function encoded_pairs( $from, $to ) {
         $pairs = [ $from => $to ];
 
         // Percent-encoded spellings (#9): redirect and return-URL parameters,
@@ -1294,7 +1756,8 @@ class Import {
         if ( strpos( $from, '/' ) === false ) {
             return $pairs;
         }
-        $escapes = [ '\/', '\\\\\\/', '\u002F', '\u002f' ];
+        // JSON's escaped slashes, and the HTML entities some editors write.
+        $escapes = [ '\/', '\\\\\\/', '\u002F', '\u002f', '&#x2F;', '&#47;' ];
         foreach ( $escapes as $escape ) {
             $pairs[ str_replace( '/', $escape, $from ) ] = str_replace( '/', $escape, $to );
         }
@@ -1310,6 +1773,22 @@ class Import {
     public static function replace_in_value( $value, $pairs, $depth = 0 ) {
         if ( ! is_string( $value ) || $value === '' ) {
             return $value;
+        }
+
+        if ( $depth < 32 && self::has_base64_needle( $value ) ) {
+            if ( self::looks_base64( $value ) ) {
+                $new = self::replace_in_base64( $value, $pairs, $depth );
+                if ( $new !== null ) {
+                    return $new;
+                }
+            }
+            if ( preg_match( '/\[(?:vc_raw_html|vc_raw_js|fusion_code)\b/', $value ) ) {
+                $value = preg_replace_callback( '/(\[(vc_raw_html|vc_raw_js|fusion_code)\b[^\]]*\])([A-Za-z0-9+\/=\s]{16,}?)(\[\/\2\])/', function ( $m ) use ( $pairs, $depth ) {
+                    $body = preg_replace( '/\s+/', '', $m[3] );
+                    $new  = self::looks_base64( $body ) ? self::replace_in_base64( $body, $pairs, $depth ) : null;
+                    return $new === null ? $m[0] : $m[1] . $new . $m[4];
+                }, $value );
+            }
         }
 
         if ( $depth < 32 && self::looks_serialized( $value ) ) {
@@ -1596,9 +2075,10 @@ class Import {
             // once the snapshot is fully back.
             if ( empty( $errors ) && ! empty( $meta['tables'] ) ) {
                 $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
-                foreach ( $wpdb->get_col( 'SHOW TABLES' ) as $table ) {
-                    if ( ! in_array( $table, $meta['tables'], true ) ) {
-                        $wpdb->query( "DROP TABLE IF EXISTS `" . str_replace( '`', '``', $table ) . "`" );
+                foreach ( (array) $wpdb->get_results( 'SHOW FULL TABLES', ARRAY_N ) as $row ) {
+                    if ( ! in_array( $row[0], $meta['tables'], true ) ) {
+                        $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
+                        $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $row[0] ) . "`" );
                     }
                 }
                 $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
@@ -1628,6 +2108,7 @@ class Import {
 
         // 3. Delete newly deployed files that weren't overwriting originals
         $deployed = $meta['deployed_files'] ?? [];
+        $emptied  = [];
         foreach ( $deployed as $relative_path ) {
             if ( in_array( $relative_path, $backed_up, true ) ) {
                 continue; // Already restored from backup
@@ -1635,6 +2116,16 @@ class Import {
             $file = $web_root . '/' . $relative_path;
             if ( file_exists( $file ) ) {
                 @unlink( $file );
+            }
+            $emptied[ dirname( $relative_path ) ] = true;
+        }
+
+        // Folders the move created (a plugin it brought) go too once empty.
+        // rmdir() never removes a folder that still holds anything.
+        krsort( $emptied );
+        foreach ( array_keys( $emptied ) as $dir ) {
+            while ( $dir !== '.' && $dir !== '' && substr_count( $dir, '/' ) >= 2 && @rmdir( $web_root . '/' . $dir ) ) {
+                $dir = dirname( $dir );
             }
         }
 
@@ -1714,6 +2205,9 @@ class Import {
         // Remember the source's files now on this site, for a catch-up pull.
         ( new Pull( $this->import_id ) )->remember_files();
 
+        // Read before staging (which holds the source's details) goes.
+        $tidy = $this->tidy( $this->staged_source() );
+
         // Remove staging directory
         if ( is_dir( $this->staging_path ) ) {
             self::delete_directory_recursive( $this->staging_path );
@@ -1745,7 +2239,298 @@ class Import {
             'success'     => true,
             'rollback_id' => $this->import_id,
             'message'     => 'Import finalized. Rollback data retained.',
+            'tidy'        => $tidy,
         ];
+    }
+
+    /* ------------------------------------------------------------------
+     * After a move
+     *
+     * The things that make a finished move look broken even though every
+     * byte arrived: page caches still serving the site this one replaced, a
+     * login page moved by a hide-login plugin (so wp-login.php is a 404),
+     * force-SSL plugins redirecting a copy that has no certificate, and
+     * login captchas whose keys only work on the old domain.
+     * ---------------------------------------------------------------- */
+
+    private function tidy( $source ) {
+        $source = (array) $source;
+        $from   = rtrim( (string) ( $source['home_url'] ?? '' ), '/' );
+        $here   = rtrim( home_url(), '/' );
+        $moved  = $from !== '' && Quiet::address( $from ) !== Quiet::address( $here );
+        wp_cache_delete( 'alloptions', 'options' );
+
+        $out = [
+            'opcache_reset'      => self::reset_opcache(),
+            'caches_cleared'     => self::clear_page_caches(),
+            'plugins_turned_off' => [],
+            'login_url'          => null,
+        ];
+        if ( $moved && strtolower( (string) wp_parse_url( $here, PHP_URL_SCHEME ) ) === 'http' ) {
+            $out['plugins_turned_off'] = array_merge( $out['plugins_turned_off'], self::turn_off_plugins( self::FORCE_SSL_PLUGINS, 'it would redirect this http:// copy to https://' ) );
+            if ( get_option( 'woocommerce_force_ssl_checkout' ) === 'yes' ) {
+                update_option( 'woocommerce_force_ssl_checkout', 'no' );
+            }
+            self::remove_htaccess_https_blocks();
+        }
+        if ( $moved && Quiet::status()['on'] ) {
+            $out['plugins_turned_off'] = array_merge( $out['plugins_turned_off'], self::turn_off_plugins( self::LOGIN_CAPTCHA_PLUGINS, 'its captcha keys belong to ' . wp_parse_url( $from, PHP_URL_HOST ) . ', so the login form would refuse every login' ) );
+            if ( self::turn_off_wordfence_captcha() ) {
+                $out['plugins_turned_off'][] = [ 'plugin' => 'wordfence', 'name' => 'Wordfence login reCAPTCHA', 'why' => 'its reCAPTCHA keys belong to ' . wp_parse_url( $from, PHP_URL_HOST ) ];
+            }
+        }
+        $out['login_url'] = self::custom_login_url();
+        return $out;
+    }
+
+    /** Plugin folders that force https (redirects, or rewriting the site URL). */
+    const FORCE_SSL_PLUGINS = [
+        'really-simple-ssl'                => 'Really Simple Security',
+        'really-simple-ssl-pro'            => 'Really Simple Security Pro',
+        'really-simple-ssl-pro-multisite'  => 'Really Simple Security Pro',
+        'wp-force-ssl'                     => 'WP Force SSL',
+        'https-redirection'                => 'Easy HTTPS Redirection',
+        'easy-https-redirection'           => 'Easy HTTPS Redirection',
+        'one-click-ssl'                    => 'One Click SSL',
+        'wp-ssl-redirect'                  => 'WP SSL Redirect',
+    ];
+
+    /** Plugin folders that put a domain-bound captcha on the login form. */
+    const LOGIN_CAPTCHA_PLUGINS = [
+        'simple-cloudflare-turnstile'      => 'Simple Cloudflare Turnstile',
+        'advanced-google-recaptcha'        => 'Advanced Google reCAPTCHA',
+        'advanced-nocaptcha-recaptcha'     => 'CAPTCHA 4WP',
+        'login-recaptcha'                  => 'Login No Captcha reCAPTCHA',
+        'google-captcha'                   => 'reCaptcha by BestWebSoft',
+        'hcaptcha-for-forms-and-more'      => 'hCaptcha for WordPress',
+        'wp-recaptcha-integration'         => 'WordPress ReCaptcha Integration',
+        'invisible-recaptcha'              => 'Invisible reCaptcha',
+        'no-captcha-recaptcha'             => 'No CAPTCHA reCAPTCHA',
+    ];
+
+    /** Deactivates the active plugins whose folder is a key of $folders. */
+    private static function turn_off_plugins( $folders, $why ) {
+        $off    = [];
+        $active = (array) get_option( 'active_plugins', [] );
+        $keep   = [];
+        foreach ( $active as $plugin ) {
+            $folder = strtok( (string) $plugin, '/' );
+            if ( isset( $folders[ $folder ] ) ) {
+                $off[ $plugin ] = [ 'plugin' => $plugin, 'name' => $folders[ $folder ], 'why' => $why ];
+                continue;
+            }
+            $keep[] = $plugin;
+        }
+        if ( count( $keep ) !== count( $active ) ) {
+            update_option( 'active_plugins', $keep );
+        }
+        if ( is_multisite() ) {
+            $network = (array) get_site_option( 'active_sitewide_plugins', [] );
+            $changed = false;
+            foreach ( array_keys( $network ) as $plugin ) {
+                $folder = strtok( (string) $plugin, '/' );
+                if ( isset( $folders[ $folder ] ) ) {
+                    $off[ $plugin ] = [ 'plugin' => $plugin, 'name' => $folders[ $folder ], 'why' => $why ];
+                    unset( $network[ $plugin ] );
+                    $changed = true;
+                }
+            }
+            if ( $changed ) {
+                update_site_option( 'active_sitewide_plugins', $network );
+            }
+        }
+        return array_values( $off );
+    }
+
+    /** Wordfence keeps its login captcha switch in its own settings table. */
+    private static function turn_off_wordfence_captcha() {
+        global $wpdb;
+        $table = $wpdb->base_prefix . 'wfls_settings';
+        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) !== $table ) {
+            return false;
+        }
+        $value = $wpdb->get_var( $wpdb->prepare( "SELECT `value` FROM `{$table}` WHERE `name` = %s", 'enable-auth-captcha' ) );
+        if ( (string) $value !== '1' ) {
+            return false;
+        }
+        return (bool) $wpdb->update( $table, [ 'value' => '0' ], [ 'name' => 'enable-auth-captcha' ] );
+    }
+
+    /** Really Simple Security's https redirect blocks in the root .htaccess. */
+    private static function remove_htaccess_https_blocks() {
+        $file = dirname( WP_CONTENT_DIR ) . '/.htaccess';
+        if ( ! is_file( $file ) || ! is_writable( $file ) ) {
+            return false;
+        }
+        $code = (string) file_get_contents( $file );
+        $new  = preg_replace( '/^# BEGIN (rlrssl\w*|Really Simple (?:SSL|Security)[^\r\n]*)\R.*?^# END \1\R?/ms', '', $code );
+        return $new !== null && $new !== $code && file_put_contents( $file, $new ) !== false;
+    }
+
+    /**
+     * Where this site's login page is when a plugin moved it: after a move
+     * the user logs in with the source's account, and wp-login.php is a 404
+     * there. Null when the login page is the usual one.
+     */
+    private static function custom_login_url() {
+        $active = array_map( function ( $p ) { return strtok( (string) $p, '/' ); }, (array) get_option( 'active_plugins', [] ) );
+        if ( is_multisite() ) {
+            foreach ( array_keys( (array) get_site_option( 'active_sitewide_plugins', [] ) ) as $p ) {
+                $active[] = strtok( (string) $p, '/' );
+            }
+        }
+        $active = array_flip( $active );
+        $slug   = '';
+        $by     = '';
+        if ( isset( $active['wps-hide-login'] ) ) {
+            $slug = (string) ( is_multisite() ? get_site_option( 'whl_page', get_option( 'whl_page' ) ) : get_option( 'whl_page' ) );
+            $by   = 'WPS Hide Login';
+        } elseif ( isset( $active['rename-wp-login'] ) ) {
+            $slug = (string) get_option( 'rwl_page' );
+            $by   = 'Rename wp-login.php';
+        } elseif ( isset( $active['perfmatters'] ) ) {
+            $options = (array) get_option( 'perfmatters_options', [] );
+            $slug    = (string) ( $options['login_url'] ?? '' );
+            $by      = 'Perfmatters';
+        } elseif ( isset( $active['all-in-one-wp-security-and-firewall'] ) ) {
+            $options = (array) get_option( 'aio_wp_security_configs', [] );
+            $slug    = (string) ( $options['aiowps_enable_rename_login_page'] ?? '' ) === '1' ? (string) ( $options['aiowps_login_page_slug'] ?? '' ) : '';
+            $by      = 'All In One WP Security';
+        } elseif ( isset( $active['better-wp-security'] ) || isset( $active['ithemes-security-pro'] ) ) {
+            $storage = (array) get_site_option( 'itsec-storage', [] );
+            $hide    = (array) ( $storage['hide-backend'] ?? [] );
+            $slug    = ! empty( $hide['enabled'] ) ? (string) ( $hide['slug'] ?? '' ) : '';
+            $by      = 'Solid Security';
+        }
+        $slug = trim( $slug, '/ ' );
+        if ( $slug === '' || $slug === 'wp-login.php' ) {
+            return null;
+        }
+        $url = get_option( 'permalink_structure' ) ? trailingslashit( home_url( $slug ) ) : add_query_arg( $slug, '', home_url( '/' ) );
+        return [ 'url' => $url, 'plugin' => $by ];
+    }
+
+    /**
+     * Empties the page and asset caches cache plugins keep on disk, and asks
+     * the cache plugins and hosts that are running to purge. A copied or
+     * left-behind cache serves the site this one replaced: the destination
+     * keeps its own advanced-cache.php, which happily serves the old pages.
+     * Everything here is rebuilt on the next visit. Returns what was cleared.
+     */
+    private static function clear_page_caches() {
+        $content = wp_normalize_path( WP_CONTENT_DIR );
+        $uploads = wp_normalize_path( (string) ( wp_upload_dir( null, false )['basedir'] ?? '' ) );
+        $known   = [
+            'WP Rocket'         => [ '/cache/wp-rocket', '/cache/min', '/cache/busting', '/cache/critical-css', '/cache/background-css' ],
+            'WP Super Cache'    => [ '/cache/supercache', '/cache/blogs' ],
+            'W3 Total Cache'    => [ '/cache/page_enhanced', '/cache/minify', '/cache/pgcache' ],
+            'WP Fastest Cache'  => [ '/cache/all', '/cache/wpfc-minified', '/cache/wpfc-mobile-cache' ],
+            'Breeze'            => [ '/cache/breeze', '/cache/breeze-minification' ],
+            'Cache Enabler'     => [ '/cache/cache-enabler' ],
+            'Comet Cache'       => [ '/cache/comet-cache' ],
+            'FlyingPress'       => [ '/cache/flying-press' ],
+            'Swift Performance' => [ '/cache/swift-performance' ],
+            'Autoptimize'       => [ '/cache/autoptimize' ],
+            'Hummingbird'       => [ '/wphb-cache' ],
+            'LiteSpeed Cache'   => [ '/litespeed' ],
+            'Divi'              => [ '/et-cache' ],
+        ];
+        $cleared = [];
+        foreach ( $known as $name => $dirs ) {
+            $files = 0;
+            foreach ( $dirs as $dir ) {
+                $files += self::empty_directory( $content . $dir );
+            }
+            if ( $files ) {
+                $cleared[ $name ] = $files;
+            }
+        }
+        if ( $uploads !== '' ) {
+            $files = self::empty_directory( $uploads . '/bb-plugin/cache' );
+            if ( $files ) {
+                $cleared['Beaver Builder'] = $files;
+            }
+        }
+
+        // The cache plugins and hosts running on this site now.
+        $purges = [
+            'WP Rocket'       => function () { return function_exists( 'rocket_clean_domain' ) ? rocket_clean_domain() || true : false; },
+            'W3 Total Cache'  => function () { return function_exists( 'w3tc_flush_all' ) ? w3tc_flush_all() || true : false; },
+            'WP Super Cache'  => function () { return function_exists( 'wp_cache_clear_cache' ) ? wp_cache_clear_cache() || true : false; },
+            'WP Fastest Cache' => function () { return function_exists( 'wpfc_clear_all_cache' ) ? wpfc_clear_all_cache( true ) || true : false; },
+            'SiteGround'      => function () { return function_exists( 'sg_cachepress_purge_cache' ) ? sg_cachepress_purge_cache() || true : false; },
+            'Autoptimize'     => function () { return class_exists( 'autoptimizeCache' ) && method_exists( 'autoptimizeCache', 'clearall' ) ? \autoptimizeCache::clearall() || true : false; },
+            'LiteSpeed Cache' => function () { return has_action( 'litespeed_purge_all' ) ? ( do_action( 'litespeed_purge_all' ) || true ) : false; },
+            'Breeze'          => function () { return has_action( 'breeze_clear_all_cache' ) ? ( do_action( 'breeze_clear_all_cache' ) || true ) : false; },
+            'Nginx Helper'    => function () { return has_action( 'rt_nginx_helper_purge_all' ) ? ( do_action( 'rt_nginx_helper_purge_all' ) || true ) : false; },
+            'Kinsta'          => function () {
+                global $kinsta_cache;
+                if ( is_object( $kinsta_cache ) && isset( $kinsta_cache->kinsta_cache_purge ) && method_exists( $kinsta_cache->kinsta_cache_purge, 'purge_complete_caches' ) ) {
+                    $kinsta_cache->kinsta_cache_purge->purge_complete_caches();
+                    return true;
+                }
+                return false;
+            },
+            'WP Engine'       => function () {
+                if ( class_exists( 'WpeCommon' ) && method_exists( 'WpeCommon', 'purge_varnish_cache' ) ) {
+                    \WpeCommon::purge_varnish_cache();
+                    if ( method_exists( 'WpeCommon', 'purge_memcached' ) ) {
+                        \WpeCommon::purge_memcached();
+                    }
+                    return true;
+                }
+                return false;
+            },
+        ];
+        foreach ( $purges as $name => $purge ) {
+            try {
+                if ( $purge() && ! isset( $cleared[ $name ] ) ) {
+                    $cleared[ $name ] = 0;
+                }
+            } catch ( \Throwable $e ) {
+                // A cache plugin failing to purge doesn't fail the move.
+            }
+        }
+        return $cleared;
+    }
+
+    /**
+     * Deletes what's inside $dir (not $dir itself, nor its top-level
+     * .htaccess and index files, which some plugins rely on). Returns how many
+     * files went.
+     */
+    private static function empty_directory( $dir ) {
+        if ( ! is_dir( $dir ) || is_link( $dir ) ) {
+            return 0;
+        }
+        $count = 0;
+        foreach ( (array) scandir( $dir ) as $name ) {
+            if ( $name === '.' || $name === '..' || $name === '.htaccess' || preg_match( '/^index\.(php|html?)$/', $name ) ) {
+                continue;
+            }
+            $path = $dir . '/' . $name;
+            if ( is_dir( $path ) && ! is_link( $path ) ) {
+                $count += self::count_files( $path );
+                self::delete_directory_recursive( $path );
+            } elseif ( @unlink( $path ) ) {
+                $count++;
+            }
+        }
+        return $count;
+    }
+
+    private static function count_files( $dir ) {
+        $count = 0;
+        try {
+            foreach ( new \RecursiveIteratorIterator( new \RecursiveDirectoryIterator( $dir, \FilesystemIterator::SKIP_DOTS ) ) as $file ) {
+                if ( $file->isFile() ) {
+                    $count++;
+                }
+            }
+        } catch ( \Throwable $e ) {
+            return $count;
+        }
+        return $count;
     }
 
     /**
@@ -1995,7 +2780,8 @@ class Import {
         $last    = '';
         foreach ( $sql_files as $file ) {
             $summary = self::each_sql_statement_in_file( $file, function ( $statement ) use ( &$creates, &$last ) {
-                if ( preg_match( '/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`((?:[^`]|``)+)`/i', $statement, $m ) ) {
+                if ( preg_match( '/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`((?:[^`]|``)+)`/i', $statement, $m )
+                    || preg_match( '/^CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW\s+`((?:[^`]|``)+)`/i', $statement, $m ) ) {
                     $creates[ str_replace( '``', '`', $m[1] ) ] = true;
                 }
                 $last = $statement;

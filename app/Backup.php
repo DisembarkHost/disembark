@@ -372,6 +372,11 @@ class Backup {
             }
             $create_table_array = $create_table[0];
             unset( $create_table );
+            if ( self::is_view_definition( $create_table_array[1] ) ) {
+                fwrite( $file_handle, 'DROP VIEW IF EXISTS `' . $table . "`;\n" . str_replace( "\n", ' ', $create_table_array[1] ) . ";\n" );
+                fclose( $file_handle );
+                return $backup_url;
+            }
             $insert_sql .= str_replace( "\n", '', $create_table_array[1] ) . ";\n";
             unset( $create_table_array );
             $insert_sql .= "/*!40000 ALTER TABLE `{$table}` DISABLE KEYS */;\n";
@@ -493,6 +498,14 @@ class Backup {
             $create_table = $wpdb->get_results( "SHOW CREATE TABLE `" . str_replace( '`', '``', $table ) . "`", ARRAY_N );
             if ( empty( $create_table[0][1] ) ) {
                 return $fail( "Could not read the structure of table {$table}." );
+            }
+            // A view has a definition, not rows of its own: its rows belong
+            // to the tables it reads, and inserting them would write there.
+            if ( self::is_view_definition( $create_table[0][1] ) ) {
+                if ( ! $write( 'DROP VIEW IF EXISTS `' . str_replace( '`', '``', $table ) . "`;\n" . str_replace( "\n", ' ', $create_table[0][1] ) . ";\n" ) ) {
+                    return $fail( 'Could not write the database export (disk full?).' );
+                }
+                continue;
             }
             if ( ! $write( str_replace( "\n", '', $create_table[0][1] ) . ";\n/*!40000 ALTER TABLE `{$table}` DISABLE KEYS */;\n" ) ) {
                 return $fail( 'Could not write the database export (disk full?).' );
@@ -832,6 +845,8 @@ class Backup {
             'home_url'  => home_url(),
             'site_url'  => site_url(),
             'db_prefix' => $wpdb->prefix,
+            'abspath'   => ABSPATH,
+            'content_dir' => WP_CONTENT_DIR,
             'captured'  => gmdate( 'c' ),
         ], JSON_PRETTY_PRINT ) );
         if ( ! $zip->close() ) {
@@ -1000,5 +1015,10 @@ class Backup {
         }
         // Return success even if file not found, as the goal is for it to be gone
         return [ 'success' => true, 'message' => "File {$safe_file_name} not found or already deleted." ];
+    }
+
+    /** True when SHOW CREATE TABLE answered with a view's definition. */
+    public static function is_view_definition( $create ) {
+        return (bool) preg_match( '/^CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW\b/i', ltrim( (string) $create ) );
     }
 }

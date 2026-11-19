@@ -264,10 +264,18 @@ class Command {
             $sql_file = $info['sql_file'];
             $sq = $this->check( $this->step( function () use ( $import, $sql_file, $src_prefix, $dest_prefix ) { return $import->import_staged_sql( $sql_file, $src_prefix, $dest_prefix ); } ), 'database', $import_id );
             $summary['statements'] = (int) $sq['statements_executed'];
-            if ( ! empty( $sq['errors'] ) ) {
-                $this->fail( 'The database import reported ' . count( $sq['errors'] ) . ' errors (first: ' . $sq['errors'][0] . '). Stopped before rewriting URLs.', 'database', $import_id );
+            foreach ( (array) ( $sq['converted'] ?? [] ) as $conversion => $tables ) {
+                $summary['converted'][ $conversion ] = (int) $tables;
+                $this->say( "      This database server doesn't support all of the source's table settings, so {$conversion} in " . self::plural( (int) $tables, 'table' ) . '.' );
             }
-            $this->say( '      ' . number_format( (int) $sq['statements_executed'] ) . ' statements executed.' );
+            if ( ! empty( $sq['definers_removed'] ) ) {
+                $summary['definers_removed'] = (int) $sq['definers_removed'];
+                $this->say( '      Removed the source server\'s DEFINER account from ' . (int) $sq['definers_removed'] . ' views, triggers or routines.' );
+            }
+            if ( ! empty( $sq['errors'] ) ) {
+                $this->fail( 'The database import reported ' . count( $sq['errors'] ) . ' errors (first: ' . $sq['errors'][0] . '). ' . ( ! empty( $sq['database_unchanged'] ) ? 'This site\'s database was not changed: the import works on copies of the tables and only swaps them in when every statement succeeds.' : 'Stopped before rewriting URLs.' ), 'database', $import_id );
+            }
+            $this->say( '      ' . number_format( (int) $sq['statements_executed'] ) . ' statements executed, ' . self::plural( (int) ( $sq['tables_swapped'] ?? 0 ), 'table' ) . ' swapped in.' );
             if ( $src_prefix !== '' && $dest_prefix !== '' && $src_prefix !== $dest_prefix ) {
                 $rp = $this->check( $this->step( function () use ( $import, $src_prefix, $dest_prefix ) { return $import->remap_table_prefix( $src_prefix, $dest_prefix ); } ), 'prefix', $import_id );
                 $summary['prefix'] = [ 'from' => $src_prefix, 'to' => $dest_prefix ];
@@ -275,18 +283,23 @@ class Command {
             }
 
             $this->say( '[7/8] Rewriting URLs' );
-            if ( $src_home !== '' && $src_home !== $dest_home ) {
-                $sr = $this->check( $this->step( function () use ( $import, $src_home, $dest_home ) {
-                    $result = $import->search_replace( $src_home, $dest_home );
-                    return is_wp_error( $result ) ? $result : array_merge( $result, $import->rewrite_files( Import::replacement_pairs( $src_home, $dest_home ) ) );
+            $paths = Import::path_pairs( $info['source'] ?? null );
+            if ( ( $src_home !== '' && $src_home !== $dest_home ) || $paths ) {
+                $from = $src_home !== '' ? $src_home : $dest_home;
+                $sr   = $this->check( $this->step( function () use ( $import, $from, $dest_home ) {
+                    return $import->move_search_replace( $from, $dest_home );
                 } ), 'urls', $import_id );
+                foreach ( (array) ( $sr['paths'] ?? [] ) as $old_path => $new_path ) {
+                    $summary['paths'][ $old_path ] = $new_path;
+                    $this->say( "      Server path {$old_path} → {$new_path}" );
+                }
                 $summary['urls'] = [
                     'from'            => $src_home,
                     'to'              => $dest_home,
                     'cells_changed'   => (int) ( $sr['cells_changed'] ?? 0 ),
                     'files_rewritten' => (int) ( $sr['files_rewritten'] ?? 0 ),
                 ];
-                $this->say( "      {$src_home} → {$dest_home}: " . number_format( (int) ( $sr['cells_changed'] ?? 0 ) ) . ' cells, ' . (int) ( $sr['files_rewritten'] ?? 0 ) . ' files under uploads.' );
+                $this->say( '      ' . ( $from !== $dest_home ? "{$src_home} → {$dest_home} (every http, https and www spelling): " : 'Same address: ' ) . number_format( (int) ( $sr['cells_changed'] ?? 0 ) ) . ' cells, ' . (int) ( $sr['files_rewritten'] ?? 0 ) . ' files under uploads.' );
                 if ( ! empty( $sr['files_mentioning_total'] ) ) {
                     $summary['code_mentions'] = $sr['files_mentioning_source'] ?? [];
                     $this->say( '      ' . (int) $sr['files_mentioning_total'] . " theme or plugin files still mention {$src_home} (left as is):" );
@@ -302,7 +315,20 @@ class Command {
         }
 
         $this->say( '[8/8] Finishing up' );
-        $this->check( $this->step( function () use ( $import ) { return $import->finalize(); } ), 'finalize', $import_id );
+        $fin  = $this->check( $this->step( function () use ( $import ) { return $import->finalize(); } ), 'finalize', $import_id );
+        $tidy = (array) ( $fin['tidy'] ?? [] );
+        if ( ! empty( $tidy['caches_cleared'] ) ) {
+            $summary['caches_cleared'] = array_keys( (array) $tidy['caches_cleared'] );
+            $this->say( '      Cleared page caches so nothing serves the old site: ' . implode( ', ', $summary['caches_cleared'] ) . '.' );
+        }
+        foreach ( (array) ( $tidy['plugins_turned_off'] ?? [] ) as $plugin ) {
+            $summary['plugins_turned_off'][] = $plugin['plugin'];
+            $this->say( "      Turned off {$plugin['name']}: {$plugin['why']}." );
+        }
+        if ( ! empty( $tidy['login_url']['url'] ) ) {
+            $summary['login_url'] = $tidy['login_url']['url'];
+            $this->say( "      The login page is moved by {$tidy['login_url']['plugin']}: {$tidy['login_url']['url']}" );
+        }
         $this->resume_hint = '';
 
         $summary['ok']   = true;
@@ -859,7 +885,7 @@ class Command {
                 'rollback_id' => $rollback_id,
                 'undo'        => $rollback_id !== '' ? "wp disembark rollback {$rollback_id}" : '',
                 'resume'      => $this->resume_hint !== '' ? "wp disembark pull --resume={$this->resume_hint}" : '',
-            ] ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
+            ], function ( $value ) { return $value !== ''; } ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
         }
         \WP_CLI::error( $message );
     }
