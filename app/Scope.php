@@ -84,7 +84,7 @@ class Scope {
      * ---------------------------------------------------------------- */
 
     /** Freighter's main table prefix, or '' when this isn't a Freighter install. */
-    private static function freighter_primary() {
+    public static function freighter_primary() {
         global $wpdb;
         static $primary = null;
         if ( $primary !== null ) {
@@ -102,7 +102,7 @@ class Scope {
         return $primary;
     }
 
-    private static function freighter_option( $prefix, $name ) {
+    public static function freighter_option( $prefix, $name ) {
         global $wpdb;
         $value = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM `{$prefix}options` WHERE option_name = %s", $name ) );
         return $value === null ? null : maybe_unserialize( $value );

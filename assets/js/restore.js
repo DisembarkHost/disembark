@@ -108,13 +108,38 @@
     });
   };
 
+  /**
+   * "Where should it go?" when the destination is the main site of a
+   * network or a WP Freighter install. Resolves with "site" (replace the
+   * main site), "new", a subsite or tenant ID to replace, or null.
+   */
+  D.chooseInto = function (box, install, destHost) {
+    var net = install.kind === 'multisite', one = net ? 'subsite' : 'tenant';
+    return new Promise(function (resolve) {
+      var sel = h('select', { class: 'dsk-select' },
+        h('option', { value: 'new' }, 'A new ' + one),
+        (install.sites || []).filter(function (s) { return s.id !== install.main; }).map(function (s) {
+          return h('option', { value: s.id }, 'Replace ' + one + ' ' + s.id + ': ' + D.host(s.url) + (s.name ? ' (' + s.name + ')' : ''));
+        }),
+        h('option', { value: 'site' }, 'Replace the main site, ' + destHost + ' (the whole ' + (net ? 'network\u2019s users too' : 'install\u2019s main site') + ')'));
+      function done(v) { D.mount(box); resolve(v); }
+      D.mount(box, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '12px', marginTop: '16px' } },
+        h('h3', null, 'Where should it go?'),
+        h('p', { class: 'muted' }, destHost + ' is the main site of a ' + (net ? 'multisite network' : 'WP Freighter install') + '. Bring the site in as its own ' + one + ' (its tables, uploads and settings stay its own' + (net ? ', and its users join the network\u2019s' : '') + '), or replace one.'),
+        sel,
+        h('div', { class: 'dsk-row' },
+          h('button', { class: 'dsk-btn primary', onclick: function () { done(sel.value); } }, 'Continue'),
+          h('button', { class: 'dsk-btn ghost', onclick: function () { done(null); } }, 'Cancel the move'))));
+    });
+  };
+
   D.runMove = function (view, opts) {
     var importId = opts.resume ? opts.resume.id : D.randomHex(24), rollbackId = '', codeMentions = null, quietOn = false, quietSource = '';
     // Request ids follow the import id and the step's place in the move, so
     // the same move asks for the same ids. Resuming replays the steps the
     // server already finished (opts.resume.steps) and carries on from the
     // first one it didn't.
-    var catchUpInfo = null, seq = 0, replay = (opts.resume && opts.resume.steps) || {}, replaying = Object.keys(replay).length > 0;
+    var catchUpInfo = null, target = null, seq = 0, replay = (opts.resume && opts.resume.steps) || {}, replaying = Object.keys(replay).length > 0;
     function ridAt(n) { return importId.slice(0, 24) + ('00000000' + n.toString(16)).slice(-8); }
     var log = h('div', { class: 'dsk-log', hidden: true });
     var stepEls = {}, current = null, line = h('div', { class: 'muted', style: { minHeight: '20px', marginTop: '10px', fontFamily: 'var(--mono)', fontSize: '12.5px' } });
@@ -489,6 +514,21 @@
         var destPrefix = pre.db_prefix || '', destHome = String(pre.home_url || opts.targetHome).replace(/\/$/, '');
         opts.targetHome = destHome;
         rlog('Destination: ' + destHome + ' (prefix ' + destPrefix + ').', 'dim');
+        // The main site of a network or WP Freighter install: a new subsite
+        // or tenant, or one to replace (asked once; replayed on a resume).
+        var inst = pre.install;
+        if (inst && inst.current === inst.main && (inst.sites || []).length && opts.into !== 'site') {
+          var into = opts.into || 'site';
+          if (!opts.into && !Object.prototype.hasOwnProperty.call(replay, ridAt(seq + 1))) {
+            progress('Choose where it goes\u2026');
+            into = await D.chooseInto(chooser, inst, D.host(destHome));
+            if (!into) { cancelled = true; throw Cancelled(); }
+            progress('');
+          }
+          var tg = await api.post('import/target', t({ into: into }));
+          target = tg && tg.target;
+          if (target) { opts.catchUp = false; ctx.target = target; rlog('It goes into ' + target.label + '. The rest of ' + D.host(destHome) + ' stays as it is.', 'ok'); }
+        }
 
         step('stage');
         var siteHome = '';
@@ -504,16 +544,22 @@
         if (info.multisite && info.multisite.length) rlog('The source is a multisite network. This site keeps its own wp-config.php, so add: ' + info.multisite.join(' '), 'err');
 
         step('snap');
-        await api.post('import/snapshot', t({ label: opts.label || '' }));
+        var snap = await api.post('import/snapshot', t({ label: opts.label || '' }));
         rollbackId = importId;
         rlog('Rollback point saved (id ' + importId + ').', 'ok');
+        if (snap && snap.target) {
+          target = ctx.target = snap.target;
+          destHome = String(target.home).replace(/\/$/, ''); destPrefix = target.prefix;
+          rlog((target.created ? 'Created ' : 'Replacing ') + (target.kind === 'multisite' ? 'subsite ' : 'tenant ') + target.id + ' at ' + destHome + ' (tables ' + destPrefix + '*)' + (target.created ? '. Rolling back removes it.' : '.'), 'ok');
+        }
         D.mount(outcome, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '12px' } },
           h('h3', null, 'Rollback point saved'),
           h('p', { class: 'muted' }, 'Whatever happens next, this puts ' + D.host(destHome) + ' back as it was:'), ctx.cliUndo()));
 
         // Quiet mode goes on before the files and database arrive, so no
         // request in between can run the source's jobs or send its emails.
-        if (opts.quiet) {
+        if (opts.quiet && target) rlog('Quiet mode stays off: it would cover every site here, not just this ' + (target.kind === 'multisite' ? 'subsite' : 'tenant') + '.', 'dim');
+        else if (opts.quiet) {
           if (srcHome && D.address(srcHome) !== D.address(destHome)) {
             try { await api.post('quiet-mode', t({ action: 'on', source: srcHome })); }
             catch (e) {
@@ -531,6 +577,7 @@
         if (dep.removed) rlog('Removed ' + D.fmt.plural(dep.removed, 'file') + ' that are gone from the source (kept in the rollback point).');
         (dep.loaders_disabled || []).forEach(function (l) { rlog('Disabled a firewall loader that points at a file not on this server: ' + l, 'dim'); });
         if (dep.host_files_kept && dep.host_files_kept.length) rlog('Left out host files (this site keeps its own): ' + dep.host_files_kept.join(', ') + '.', 'dim');
+        if (dep.shared_kept && dep.shared_kept.length) rlog('Kept the versions already here of ' + D.fmt.plural(dep.shared_kept.length, 'shared plugin or theme folder') + ' (other sites run them): ' + dep.shared_kept.map(function (p) { return p.split('/').pop(); }).slice(0, 8).join(', ') + '.', 'dim');
         stepEls.files.meta.textContent = D.fmt.num(dep.deployed || 0);
         if (dep.errors && dep.errors.length) {
           dep.errors.slice(0, 5).forEach(function (e) { rlog('  ' + e, 'err'); });
@@ -550,6 +597,8 @@
             throw new Error('The database import reported ' + D.fmt.plural(sq.errors.length, 'error') + '. ' + (sq.database_unchanged ? 'This site\u2019s database wasn\u2019t changed: the import works on copies of the tables and only swaps them in when every statement succeeds.' : 'Stopped before rewriting URLs.'));
           }
           if (sq.tables_swapped) rlog('Swapped in ' + D.fmt.plural(sq.tables_swapped, 'imported table') + '.', 'dim');
+          if (sq.tables_left_out) rlog('Left out ' + D.fmt.plural(sq.tables_left_out, 'table') + ' without the source\u2019s prefix, so nothing else here is touched.', 'dim');
+          if (sq.users && (sq.users.created || sq.users.matched)) rlog('Users joined the network: ' + D.fmt.plural(sq.users.created, 'new account') + ', ' + D.fmt.plural(sq.users.matched, 'existing account') + ' matched by email' + (sq.users.renumbered ? ' (' + D.fmt.plural(sq.users.renumbered, 'row') + ' of posts, comments and orders renumbered)' : '') + '.');
           if (srcPrefix && destPrefix && srcPrefix !== destPrefix) {
             var rp = await api.post('import/remap-prefix', t({ old_prefix: srcPrefix, new_prefix: destPrefix }));
             rlog('Table prefix remapped ' + srcPrefix + ' → ' + destPrefix + ' (' + (rp.keys_changed || 0) + ' keys).');
@@ -705,6 +754,18 @@
 
   /** The "Safely ashore." card after a move into this site (Restore and Pull). */
   D.arrivedView = function (outcome, ctx, undoLabel) {
+    if (ctx.target) {
+      var tg = ctx.target, net = tg.kind === 'multisite';
+      D.mount(outcome, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '14px' } },
+        h('div', { class: 'dsk-row' }, D.icon('checkCircle'), h('h2', { style: { fontSize: '30px' } }, 'Safely ashore.')),
+        h('p', null, (net ? 'Subsite ' : 'Tenant ') + tg.id + ' (' + D.host(tg.home) + ') now holds the copied site. The rest of ' + D.host(D.config.homeUrl) + ' is as it was, and you\u2019re still logged in.'),
+        D.note('', net ? ['Its users joined the network: they log in with their own passwords, and an account that was already here keeps its own.'] : ['It has its own users: log in to it with the source site\u2019s credentials' + (D.address(tg.home) === D.address(D.config.homeUrl) ? ', from Tools \u2192 WP Freighter.' : '.')]),
+        h('div', { class: 'dsk-row' },
+          D.address(tg.home) !== D.address(D.config.homeUrl) ? h('a', { class: 'dsk-btn primary', href: tg.home, target: '_blank', rel: 'noopener' }, 'Open ' + D.host(tg.home) + (String(tg.home).replace(/^https?:\/\/[^/]+/, '') || '')) : null,
+          h('button', { class: 'dsk-btn', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
+        h('div', null, h('div', { class: 'caps', style: { marginBottom: '6px' } }, 'Undo from the CLI'), ctx.cliUndo())));
+      return;
+    }
     D.mount(outcome, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '14px' } },
       h('div', { class: 'dsk-row' }, D.icon('checkCircle'), h('h2', { style: { fontSize: '30px' } }, 'Safely ashore.')),
       h('p', null, D.host(D.config.homeUrl) + ' now holds the copied site.'),

@@ -40,6 +40,15 @@
   * plugins and themes from a folder the sites share come across only when this site uses them. Network-activated plugins become active plugins, and WP Freighter is switched off on the copy.
 
   WP Multi Network installs use the subsite's own network. New endpoint: `POST /import/pull/site`; source endpoints take `site`; `export-database-batch` takes `shared_rows`.
+* **Bring a site into a network or a WP Freighter install:** on the main site of a multisite network or a WP Freighter install, a pull, push or restore now asks **Where should it go?**: a new subsite or tenant, an existing one to replace, or the main site as before (`wp disembark pull … --into=new|<id>`, with `--slug` for a new subsite's path and `--domain` for a new tenant's domain). Any site can arrive this way: a standalone site, a backup zip, or one site brought out of another network or install, so a Freighter tenant can become a subsite and a subsite a tenant. What it does:
+  * the new site is created right after the rollback point is saved;
+  * the import touches only that site's tables (a table without the source's prefix is left out) and its folders (`uploads/sites/<id>`, `content/<id>`);
+  * plugins and themes are added to the shared folders when missing, never replacing a version other sites run. Core files, mu-plugins and drop-ins stay as they are;
+  * on a network, the incoming users join the network's users: matched by email, otherwise added with a free login. The site's posts, comments and WooCommerce orders are renumbered to match, and network-activated plugins stay network-wide;
+  * the address and folder rewrite and the checks after the move cover that site alone. Quiet mode stays off, since it would cover every site;
+  * the rollback point holds only that site's tables plus the network's users or Freighter's registry, so rolling back removes a new site completely (folders included) and puts a replaced one back.
+
+  New endpoint: `POST /import/target`.
 * **Notifications:** **Notify me** on a running move (or `--notify=<email or URL>` in the CLI) sends an email, a Slack or Discord message, or JSON to any https:// webhook when the move finishes, stops or is cancelled: with how long it took, the checks' result, and how to undo or resume. Emails go out even from a copy in quiet mode (through PHP's mail(), around the held wp_mail()). New endpoint: `POST /import/notify`.
 
 ### Improved

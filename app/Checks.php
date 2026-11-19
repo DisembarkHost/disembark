@@ -35,13 +35,20 @@ class Checks {
 
         $space = self::disk( $dir, $pull, $add );
         self::database_user( $add );
+        $target = Target::load( $dir );
         if ( $pull && ! empty( $pull['tables'] ) ) {
-            self::table_names( array_column( (array) $pull['tables'], 'name' ), (string) ( $pull['source_prefix'] ?? '' ), $wpdb->prefix, $add );
+            // Into a subsite or tenant: its prefix (a new one's, at its longest).
+            $prefix = $target ? ( $target->prefix !== '' ? $target->prefix : ( $target->kind === 'multisite' ? $wpdb->base_prefix . '9999_' : 'stacked_9999_' ) ) : $wpdb->prefix;
+            self::table_names( array_column( (array) $pull['tables'], 'name' ), (string) ( $pull['source_prefix'] ?? '' ), $prefix, $add );
         }
         self::writable( $add );
         if ( $profile ) {
             self::versions( $profile, $add, $import_id );
-            self::plugins( $profile, $add );
+            // Into a subsite or tenant, this site's own plugins say nothing
+            // about the site arriving (shared ones are kept, and reported).
+            if ( ! $target ) {
+                self::plugins( $profile, $add );
+            }
         }
         self::environment( $profile, $add );
         if ( ! empty( $source['captured'] ) && ( $age = time() - (int) strtotime( (string) $source['captured'] ) ) > 180 * DAY_IN_SECONDS ) {

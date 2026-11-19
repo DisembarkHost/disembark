@@ -95,6 +95,24 @@ class Command {
      * address that reaches one site (a subsite, a mapped tenant domain)
      * brings that site without this; `--site=all` brings the whole install.
      *
+     * [--into=<where>]
+     * : When this site is the main site of a multisite network or a WP
+     * Freighter install: bring the source in as a new subsite or tenant
+     * ("new"), or replace the subsite or tenant with this ID, instead of
+     * replacing this site. Its tables, uploads and settings stay its own;
+     * plugins and themes are added to the shared folders when missing (never
+     * replacing ones other sites run); on a network the incoming users join
+     * the network's (matched by email). Rolling back removes a new site
+     * completely. Quiet mode stays off, since it would cover every site.
+     *
+     * [--slug=<slug>]
+     * : With --into=new on a network: the new subsite's path or subdomain
+     * (defaults to the source's).
+     *
+     * [--domain=<domain>]
+     * : With --into=new on a WP Freighter install with domain mapping: the
+     * new tenant's domain (defaults to the source's).
+     *
      * [--shared-tables]
      * : With --site on a network: bring the rows of network-wide tables
      * (plugin tables with no copy per site) too. By default they come across
@@ -195,7 +213,9 @@ class Command {
         $this->say( '[1/9] Checking this site' );
         if ( ! $resuming ) {
             $pre = $import->preflight();
-            $this->confirm( $assoc_args, 'Replace ' . untrailingslashit( (string) $pre['home_url'] ) . " with {$source['url']}? A rollback point is saved first, and afterwards you log in with the source site's credentials." );
+            $this->confirm( $assoc_args, ! empty( $assoc_args['into'] )
+                ? "Bring {$source['url']} into " . ( $assoc_args['into'] === 'new' ? 'a new subsite or tenant' : 'subsite or tenant ' . $assoc_args['into'] . ' (replacing it)' ) . ' here? A rollback point is saved first.'
+                : 'Replace ' . untrailingslashit( (string) $pre['home_url'] ) . " with {$source['url']}? A rollback point is saved first, and afterwards you log in with the source site's credentials." );
         } else {
             $this->say( "      Resuming {$import_id} (a pull from {$source['url']}): finished steps are replayed." );
         }
@@ -206,9 +226,23 @@ class Command {
         $dest_prefix = (string) ( $pre['db_prefix'] ?? '' );
         $dest_home   = untrailingslashit( (string) ( $pre['home_url'] ?? home_url() ) );
         $summary['destination'] = $dest_home;
+        $into = (string) ( $assoc_args['into'] ?? '' );
+        if ( $into !== '' ) {
+            if ( ! empty( $assoc_args['catch-up'] ) ) {
+                $this->fail( '--catch-up works on this site\'s own files, so it can\'t be combined with --into.' );
+            }
+            $t = $this->check( $this->step( function () use ( $import, $into, $assoc_args ) {
+                return $import->set_target( $into, [ 'slug' => (string) ( $assoc_args['slug'] ?? '' ), 'domain' => (string) ( $assoc_args['domain'] ?? '' ) ] );
+            } ), 'preflight' );
+            if ( ! empty( $t['target'] ) ) {
+                $this->say( '      It goes into ' . $t['target']['label'] . '. The rest of this ' . ( $t['target']['kind'] === 'multisite' ? 'network' : 'install' ) . ' stays as it is.' );
+            }
+        } elseif ( ( $install = Scope::install() ) && ! $resuming ) {
+            $this->say( '      This is the main site of ' . ( $install['kind'] === 'multisite' ? 'a multisite network' : 'a WP Freighter install' ) . ', and the pull replaces it. To bring the source in as a new ' . ( $install['kind'] === 'multisite' ? 'subsite' : 'tenant' ) . ' instead, use --into=new.' );
+        }
 
         $this->say( '[2/9] Bringing the site over' );
-        $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'skip-quiet-mode', 'bring-host-files', 'catch-up', 'site', 'shared-tables' ] ) );
+        $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'skip-quiet-mode', 'bring-host-files', 'catch-up', 'site', 'shared-tables', 'into', 'slug', 'domain' ] ) );
         $c = $this->check( $this->step( function () use ( $pull, $source, $move_args ) {
             return $pull->connect( $source['url'], $source['token'], [ 'client' => 'cli', 'kind' => 'pull', 'args' => $move_args ], ! empty( $move_args['catch-up'] ), isset( $move_args['site'] ) ? (string) $move_args['site'] : null, ! empty( $move_args['shared-tables'] ) );
         } ), 'connect' );
@@ -265,14 +299,23 @@ class Command {
 
         $this->say( '[4/9] Saving a rollback point' );
         $label = ( ! empty( $summary['catch_up'] ) ? 'Before catch-up from ' : 'Before pull from ' ) . wp_parse_url( $source['url'], PHP_URL_HOST );
-        $this->check( $this->step( function () use ( $import, $label ) { return $import->snapshot( $label ); } ), 'snapshot' );
+        $snap = $this->check( $this->step( function () use ( $import, $label ) { return $import->snapshot( $label ); } ), 'snapshot' );
         $summary['rollback_id'] = $import_id;
         $summary['undo']        = "wp disembark rollback {$import_id}";
         $this->say( "      Saved. Undo any time with: wp disembark rollback {$import_id}" );
+        $target = (array) ( $snap['target'] ?? [] );
+        if ( $target ) {
+            $summary['into'] = $target;
+            $dest_home       = untrailingslashit( (string) $target['home'] );
+            $dest_prefix     = (string) $target['prefix'];
+            $summary['destination'] = $dest_home;
+            $this->say( '      ' . ( ! empty( $target['created'] ) ? 'Created ' : 'Replacing ' ) . ( $target['kind'] === 'multisite' ? 'subsite ' : 'tenant ' ) . $target['id'] . ' at ' . $dest_home . ' (tables ' . $dest_prefix . '*)' . ( ! empty( $target['created'] ) ? '; the rollback removes it.' : '.' ) );
+        }
 
         // Quiet mode goes on before the files and database arrive, so no
         // request in between can run the source's jobs or send its emails.
-        $quiet = empty( $assoc_args['skip-quiet-mode'] ) && $src_home !== '' && Quiet::address( $src_home ) !== Quiet::address( $dest_home );
+        // (Not for a subsite or tenant: it would cover every site here.)
+        $quiet = ! $target && empty( $assoc_args['skip-quiet-mode'] ) && $src_home !== '' && Quiet::address( $src_home ) !== Quiet::address( $dest_home );
         if ( $quiet ) {
             $this->check( $this->step( function () use ( $src_home, $import_id ) { return Quiet::enable( $src_home, $import_id ); } ), 'quiet-mode', $import_id );
             $summary['quiet_mode'] = [ 'on' => true, 'off' => 'wp disembark quiet-mode off' ];
@@ -293,6 +336,10 @@ class Command {
             $this->say( '      Disabled firewall loaders that point at files not on this server: ' . implode( ', ', $dep['loaders_disabled'] ) );
         }
         $this->say( '      Placed ' . number_format( (int) $dep['deployed'] ) . ' files.' );
+        if ( ! empty( $dep['shared_kept'] ) ) {
+            $summary['shared_kept'] = $dep['shared_kept'];
+            $this->say( '      Kept the versions already here of ' . self::plural( count( $dep['shared_kept'] ), 'shared plugin or theme folder' ) . ' (other sites run them): ' . implode( ', ', array_map( 'basename', array_slice( $dep['shared_kept'], 0, 8 ) ) ) . ( count( $dep['shared_kept'] ) > 8 ? ', …' : '' ) );
+        }
         if ( ! empty( $dep['host_files_kept'] ) ) {
             $this->say( '      Left out (host files; this site keeps its own): ' . implode( ', ', $dep['host_files_kept'] ) );
         }
@@ -317,6 +364,13 @@ class Command {
                 $this->fail( 'The database import reported ' . count( $sq['errors'] ) . ' errors (first: ' . $sq['errors'][0] . '). ' . ( ! empty( $sq['database_unchanged'] ) ? 'This site\'s database was not changed: the import works on copies of the tables and only swaps them in when every statement succeeds.' : 'Stopped before rewriting URLs.' ), 'database', $import_id );
             }
             $this->say( '      ' . number_format( (int) $sq['statements_executed'] ) . ' statements executed, ' . self::plural( (int) ( $sq['tables_swapped'] ?? 0 ), 'table' ) . ' swapped in.' );
+            if ( ! empty( $sq['tables_left_out'] ) ) {
+                $this->say( '      Left out ' . self::plural( (int) $sq['tables_left_out'], 'table' ) . ' without the source\'s prefix (' . $src_prefix . '), so nothing else here is touched.' );
+            }
+            if ( isset( $sq['users'] ) && ( $sq['users']['created'] || $sq['users']['matched'] ) ) {
+                $summary['users'] = $sq['users'];
+                $this->say( '      Users joined the network: ' . self::plural( (int) $sq['users']['created'], 'new account' ) . ', ' . self::plural( (int) $sq['users']['matched'], 'existing account' ) . ' matched by email' . ( $sq['users']['renumbered'] ? ' (' . self::plural( (int) $sq['users']['renumbered'], 'row' ) . ' of posts, comments and orders renumbered to match)' : '' ) . '.' );
+            }
             if ( $src_prefix !== '' && $dest_prefix !== '' && $src_prefix !== $dest_prefix ) {
                 $rp = $this->check( $this->step( function () use ( $import, $src_prefix, $dest_prefix ) { return $import->remap_table_prefix( $src_prefix, $dest_prefix ); } ), 'prefix', $import_id );
                 $summary['prefix'] = [ 'from' => $src_prefix, 'to' => $dest_prefix ];
@@ -393,7 +447,9 @@ class Command {
             \WP_CLI::line( wp_json_encode( $summary, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
             return;
         }
-        \WP_CLI::success( "Pulled {$source['url']} into {$dest_home}. Log in with the source site's credentials." );
+        \WP_CLI::success( ! empty( $target )
+            ? "Pulled {$source['url']} into " . ( $target['kind'] === 'multisite' ? 'subsite ' : 'tenant ' ) . "{$target['id']} at {$dest_home}." . ( $target['kind'] === 'multisite' ? ' Its users log in with their own passwords (an account that was already here keeps its own).' : " Log in to it with the source site's credentials." )
+            : "Pulled {$source['url']} into {$dest_home}. Log in with the source site's credentials." );
         \WP_CLI::log( "Undo: wp disembark rollback {$import_id}" );
         if ( $quiet ) {
             \WP_CLI::log( 'Quiet mode is on (this is a copy). Lift it with: wp disembark quiet-mode off' );

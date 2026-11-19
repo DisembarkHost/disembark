@@ -325,6 +325,10 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'import_pull_connect' ]
         ]);
+        register_rest_route('disembark/v1', '/import/target', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_target' ]
+        ]);
         register_rest_route('disembark/v1', '/import/pull/site', [
             'methods'  => 'POST',
             'callback' => [ $this, 'import_pull_site' ]
@@ -1219,6 +1223,11 @@ class Run {
         $action = (string) ( $request['action'] ?? '' );
         if ( $action === 'on' ) {
             $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) ( $request['import_id'] ?? '' ) ) );
+            // Quiet mode covers the whole install, so a move into one of its
+            // subsites or tenants doesn't turn it on.
+            if ( $import_id !== '' && ( new Import( $import_id ) )->target() ) {
+                return [ 'on' => false, 'skipped' => 'target', 'why' => 'Quiet mode would cover every site here, so it stays off for a move into one subsite or tenant.' ];
+            }
             return Quiet::enable( esc_url_raw( (string) ( $request['source'] ?? '' ) ), $import_id );
         }
         if ( $action === 'off' ) {
@@ -1371,6 +1380,22 @@ class Run {
         ];
         $site = isset( $params['site'] ) && $params['site'] !== '' && $params['site'] !== null ? (string) $params['site'] : null;
         return ( new Pull( $import_id ) )->connect( $source_url, $source_token, $move, ! empty( $params['catch_up'] ), $site, ! empty( $params['shared_rows'] ) );
+    }
+
+    /**
+     * Where a move lands on a network or WP Freighter install: "site" (this
+     * site), "new" (a new subsite or tenant), or the ID of one to replace.
+     */
+    function import_target( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) ( $params['import_id'] ?? '' ) ) );
+        if ( $import_id === '' ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        return ( new Import( $import_id ) )->set_target( (string) ( $params['into'] ?? '' ), [ 'slug' => (string) ( $params['slug'] ?? '' ), 'domain' => (string) ( $params['domain'] ?? '' ) ] );
     }
 
     /** Picks one site of the source's network or WP Freighter install ("all" for every site). */

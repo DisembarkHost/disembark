@@ -63,6 +63,21 @@ class Import {
         return $this->import_id;
     }
 
+    /** Where this move lands when it isn't this site itself (see Target), or null. */
+    public function target() {
+        return Target::load( $this->import_path );
+    }
+
+    /** Records where the move goes: '' (this site), "new", or a subsite or tenant ID. */
+    public function set_target( $into, $opts = [] ) {
+        $this->prepare_import_dir();
+        $t = Target::choose( $this->import_path, $into, $opts );
+        if ( is_wp_error( $t ) ) {
+            return $t;
+        }
+        return [ 'ok' => true, 'target' => $t ? $t->info() : null ];
+    }
+
     /**
      * Rejects a caller-supplied relative path that could climb out of the
      * staging / web-root tree (absolute paths, "..", or null bytes). Public
@@ -164,8 +179,10 @@ class Import {
         $this->prepare_import_dir();
         Storage::ensure_dir( $this->rollback_path );
 
-        // Export all tables
-        $all_tables = $wpdb->get_col( 'SHOW TABLES' );
+        // Export all tables (into a subsite or tenant: its own, and the shared
+        // ones the move changes).
+        $target     = $this->target();
+        $all_tables = $target ? $target->snapshot_tables() : $wpdb->get_col( 'SHOW TABLES' );
         if ( empty( $all_tables ) ) {
             return new \WP_Error( 'no_tables', 'No tables found to snapshot.', [ 'status' => 500 ] );
         }
@@ -211,9 +228,22 @@ class Import {
         ];
         file_put_contents( $this->rollback_path . '/meta.json', json_encode( $meta, JSON_PRETTY_PRINT ) );
 
+        // A new subsite or tenant is made now, once the rollback point can
+        // take it away again.
+        if ( $target ) {
+            $made = $target->create( $this->staged_source() );
+            $target->save( $this->import_path );
+            $meta['target'] = [ 'kind' => $target->kind, 'id' => $target->id, 'prefix' => $target->prefix, 'created' => $target->created ];
+            file_put_contents( $this->rollback_path . '/meta.json', json_encode( $meta, JSON_PRETTY_PRINT ) );
+            if ( is_wp_error( $made ) ) {
+                return $made;
+            }
+        }
+
         return [
             'rollback_id' => $this->import_id,
             'tables'      => count( $all_tables ),
+            'target'      => $target ? $target->info() : null,
         ];
     }
 
@@ -406,12 +436,23 @@ class Import {
         if ( is_file( $skip_file ) ) {
             $skip_rows = array_flip( array_map( 'strtolower', (array) json_decode( (string) file_get_contents( $skip_file ), true ) ) );
         }
+        // Into a subsite or tenant: its prefix, and none of the install's
+        // other tables can be touched (a table without the source's prefix
+        // is left out).
+        $target = $this->target();
+        if ( $target ) {
+            if ( $old_prefix === '' || $target->prefix === '' ) {
+                return new \WP_Error( 'no_prefix', 'This backup doesn\'t record its table prefix, so it can\'t go into a subsite or tenant.', [ 'status' => 400 ] );
+            }
+            $new_prefix = $target->prefix;
+        }
+        $foreign = 0;
         $run    = $this->begin_statements();
         $count  = 0;
         $swap     = self::swap_start();
         $compat   = self::db_compat();
         $expected = [];
-        $read     = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, &$swap, &$compat, &$expected, $old_prefix, $new_prefix, $skip_rows ) {
+        $read     = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, $old_prefix, $new_prefix, $skip_rows, $target ) {
             if ( ++$count % 500 === 0 && $this->cancelled() ) {
                 $run['errors'][] = 'Cancelled.';
                 return false;
@@ -420,6 +461,9 @@ class Import {
             // Backup::database_export_batch()), checked after the swap.
             if ( preg_match( "/^SET\\s+@disembark_rows\\s*=\\s*'(.+):(\\d+)'\\s*$/s", trim( $statement ), $m ) ) {
                 $table = stripslashes( $m[1] );
+                if ( $target && strpos( $table, $old_prefix ) !== 0 ) {
+                    return true; // a table left out (not the source's)
+                }
                 if ( $old_prefix !== '' && $new_prefix !== '' && strpos( $table, $old_prefix ) === 0 ) {
                     $table = $new_prefix . substr( $table, strlen( $old_prefix ) );
                 }
@@ -429,6 +473,12 @@ class Import {
                 return true;
             }
             if ( $skip_rows && preg_match( '/^\s*INSERT\s+INTO\s+`([^`]+)`/i', $statement, $m ) && isset( $skip_rows[ strtolower( $m[1] ) ] ) ) {
+                return true;
+            }
+            if ( $target && preg_match( '/^\s*(?:\/\*!\d+\s+)?(?:INSERT\s+INTO|REPLACE\s+INTO|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|ALTER\s+TABLE|LOCK\s+TABLES|DROP\s+VIEW(?:\s+IF\s+EXISTS)?|CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW)\s+`([^`]+)`/i', self::strip_leading_comments( $statement ), $m ) && strpos( $m[1], $old_prefix ) !== 0 ) {
+                if ( stripos( ltrim( self::strip_leading_comments( $statement ) ), 'CREATE' ) === 0 ) {
+                    $foreign++;
+                }
                 return true;
             }
             foreach ( self::swap_statements( self::transform_statements( [ $statement ], $old_prefix, $new_prefix ), $swap ) as $transformed ) {
@@ -461,6 +511,13 @@ class Import {
         $result['database_unchanged'] = ! empty( $result['errors'] ) && empty( $swap['direct'] );
         $result['converted']          = $compat['converted'];
         $result['definers_removed']   = $compat['definers_removed'];
+        if ( $target ) {
+            $result['target']         = $target->info();
+            $result['tables_left_out'] = $foreign;
+            if ( empty( $result['errors'] ) ) {
+                $result['users'] = $target->merge_users( $old_prefix );
+            }
+        }
         if ( empty( $result['errors'] ) && $rows !== null ) {
             $result['rows'] = $rows;
         }
@@ -816,8 +873,15 @@ class Import {
      */
     public function move_search_replace( $from, $to ) {
         $source = $this->staged_source();
-        $moved  = self::scope_pairs( $source, $to );
-        $result = $this->search_replace( $from, $to, [], false, [ 'variants' => true, 'extra' => self::path_pairs( $source ) + $moved ] );
+        $target = $this->target();
+        $tables = [];
+        if ( $target ) {
+            // The new site's address and folders, and its tables alone.
+            $to     = $target->home;
+            $tables = $target->tables();
+        }
+        $moved  = self::scope_pairs( $source, $to, $target ) + self::target_pairs( $source, $target );
+        $result = $this->search_replace( $from, $to, $tables, false, [ 'variants' => true, 'extra' => self::path_pairs( $source ) + $moved ] );
         if ( is_wp_error( $result ) ) {
             return $result;
         }
@@ -827,7 +891,46 @@ class Import {
         foreach ( $moved as $f => $t ) {
             $file_pairs += self::replacement_pairs( $f, $t );
         }
-        return array_merge( $result, $this->rewrite_files( $file_pairs ) );
+        return array_merge( $result, $this->rewrite_files( $file_pairs, $target ) );
+    }
+
+    /**
+     * Into a subsite or tenant: a standard site's wp-content/uploads (and,
+     * for a dedicated Freighter tenant, all of wp-content) now lives in the
+     * site's own folders. Root-relative links only count where markup
+     * starts them (a quote or a bracket), so other sites' paths are left be.
+     */
+    public static function target_pairs( $source, $target ) {
+        if ( ! $target ) {
+            return [];
+        }
+        $source = (array) $source;
+        $root   = rtrim( wp_normalize_path( dirname( WP_CONTENT_DIR ) ), '/' );
+        $moves  = [ 'wp-content/uploads' => $target->uploads ];
+        if ( $target->content !== '' ) {
+            $moves['wp-content'] = $target->content;
+        }
+        $bases = array_unique( array_filter( [ (string) ( $source['home_url'] ?? '' ), (string) ( $source['site_url'] ?? '' ) ] ) );
+        $pairs = [];
+        foreach ( $moves as $from => $to ) {
+            if ( $from === $to ) {
+                continue;
+            }
+            $url = untrailingslashit( $target->home ) . '/' . $to . '/';
+            foreach ( $bases as $base ) {
+                if ( preg_match( '#^https?://#i', $base ) ) {
+                    $pairs += self::url_variants( untrailingslashit( $base ) . '/' . $from . '/', $url );
+                }
+            }
+            $path = (string) wp_parse_url( $url, PHP_URL_PATH );
+            foreach ( [ '"', "'", '(' ] as $q ) {
+                $pairs += [ $q . '/' . $from . '/' => $q . $path ];
+            }
+            if ( ! empty( $source['content_dir'] ) ) {
+                $pairs += [ trailingslashit( (string) $source['content_dir'] ) . ( $from === 'wp-content' ? '' : substr( $from, strlen( 'wp-content/' ) ) . '/' ) => $root . '/' . $to . '/' ];
+            }
+        }
+        return $pairs;
     }
 
     /**
@@ -837,7 +940,7 @@ class Import {
      * and on the old server's disk; and the domains a mapping plugin pointed
      * at it. Empty for an ordinary source.
      */
-    public static function scope_pairs( $source, $to = '' ) {
+    public static function scope_pairs( $source, $to = '', $target = null ) {
         $scope = (array) ( ( (array) $source )['scope'] ?? [] );
         if ( ! $scope ) {
             return [];
@@ -852,6 +955,11 @@ class Import {
         $urls     = [];
         foreach ( $dirs as $key => $dir ) {
             $urls[ $key ] = $to . '/' . ltrim( strpos( $dir, $web_root . '/' ) === 0 ? substr( $dir, strlen( $web_root ) + 1 ) : $key, '/' );
+        }
+        if ( $target ) {
+            $to   = untrailingslashit( $target->home );
+            $urls = [ 'wp-content' => $to . '/' . ( $target->content !== '' ? $target->content : ltrim( substr( wp_normalize_path( WP_CONTENT_DIR ), strlen( $web_root ) ), '/' ) ), 'wp-content/uploads' => $to . '/' . $target->uploads ];
+            $dirs = [ 'wp-content' => $target->content !== '' ? $web_root . '/' . $target->content : wp_normalize_path( WP_CONTENT_DIR ), 'wp-content/uploads' => $web_root . '/' . $target->uploads ];
         }
         $pairs   = [];
         foreach ( (array) ( $scope['url_pairs'] ?? [] ) as $from_url => $to ) {
@@ -877,7 +985,7 @@ class Import {
         }
         foreach ( (array) ( $scope['aliases'] ?? [] ) as $alias ) {
             if ( preg_match( '#^https?://#i', (string) $alias ) ) {
-                $pairs += self::url_variants( untrailingslashit( (string) $alias ), untrailingslashit( home_url() ) );
+                $pairs += self::url_variants( untrailingslashit( (string) $alias ), untrailingslashit( $target ? $target->home : home_url() ) );
             }
         }
         foreach ( $pairs as $f => $t ) {
@@ -1039,6 +1147,12 @@ class Import {
             $files = $this->list_staged_files( $staging_root );
         }
 
+        // Into a subsite or tenant: each file goes to its folders, and a
+        // plugin or theme already in a folder the sites share stays as it is.
+        $target      = $this->target();
+        $shared_kept = [];
+        $pool_seen   = [];
+
         $count = 0;
         foreach ( $files as $relative_path ) {
             // Cancel stops here, but still records what was placed so far
@@ -1054,6 +1168,30 @@ class Import {
 
             $source = $staging_root . '/' . $relative_path;
             $dest   = $web_root . '/' . $relative_path;
+            if ( $target ) {
+                if ( self::never_deploy( $relative_path ) ) {
+                    continue;
+                }
+                $to = $target->dest( $relative_path );
+                if ( $to === null ) {
+                    continue;
+                }
+                list( $mapped, $may_replace ) = $to;
+                $pool = $target->pool_folder( $mapped );
+                if ( $pool !== '' ) {
+                    if ( ! isset( $pool_seen[ $pool ] ) ) {
+                        $pool_seen[ $pool ] = is_dir( $web_root . '/' . $pool );
+                    }
+                    if ( $pool_seen[ $pool ] ) {
+                        $shared_kept[ $pool ] = true;
+                        continue;
+                    }
+                } elseif ( ! $may_replace && file_exists( $web_root . '/' . $mapped ) ) {
+                    continue;
+                }
+                $relative_path = $mapped;
+                $dest          = $web_root . '/' . $mapped;
+            }
 
             if ( ! file_exists( $source ) ) {
                 $errors[] = "Source not found: {$relative_path}";
@@ -1115,7 +1253,7 @@ class Import {
         // rollback puts it back.
         $removed   = 0;
         $delete    = $this->import_path . '/delete-list.json';
-        if ( is_file( $delete ) && ! $this->cancelled() ) {
+        if ( is_file( $delete ) && ! $this->cancelled() && ! $target ) {
             foreach ( (array) json_decode( (string) file_get_contents( $delete ), true ) as $relative_path ) {
                 $relative_path = (string) $relative_path;
                 if ( ! self::is_safe_relative_path( $relative_path ) || basename( $relative_path ) === 'wp-config.php' || self::never_deploy( $relative_path ) ) {
@@ -1157,6 +1295,7 @@ class Import {
             'host_files_kept' => array_keys( $kept ),
             'loaders_disabled' => self::disable_missing_prepends( $web_root, $deployed ),
             'removed'         => $removed,
+            'shared_kept'     => array_keys( $shared_kept ),
             // The next steps run in new requests that load the files just
             // placed; a host that never rechecks file times would otherwise
             // keep running the old code.
@@ -1651,7 +1790,7 @@ class Import {
      * back: these files were deployed by this import, and rollback restores
      * whatever was there before.
      */
-    public function rewrite_files( $pairs ) {
+    public function rewrite_files( $pairs, $target = null ) {
         $report = [ 'files_rewritten' => 0, 'files_rewritten_list' => [], 'files_mentioning_source' => [], 'files_mentioning_total' => 0, 'elementor_css_cleared' => false ];
         // Deploying moves files out of staging, so the list of what this
         // import put in place comes from its rollback metadata.
@@ -1661,8 +1800,8 @@ class Import {
             return $report;
         }
         $web_root = wp_normalize_path( dirname( WP_CONTENT_DIR ) );
-        $uploads  = ltrim( substr( wp_normalize_path( wp_upload_dir()['basedir'] ), strlen( $web_root ) ), '/' ) . '/';
-        $content  = ltrim( substr( wp_normalize_path( WP_CONTENT_DIR ), strlen( $web_root ) ), '/' ) . '/';
+        $uploads  = $target ? $target->uploads . '/' : ltrim( substr( wp_normalize_path( wp_upload_dir()['basedir'] ), strlen( $web_root ) ), '/' ) . '/';
+        $content  = $target && $target->content !== '' ? $target->content . '/' : ltrim( substr( wp_normalize_path( WP_CONTENT_DIR ), strlen( $web_root ) ), '/' ) . '/';
         $code_dirs = [ $content . 'themes/', $content . 'plugins/', $content . 'mu-plugins/' ];
 
         foreach ( $deployed as $rel ) {
@@ -2177,6 +2316,10 @@ class Import {
      */
     public function remap_table_prefix( $old_prefix, $new_prefix ) {
         global $wpdb;
+        $target = $this->target();
+        if ( $target && $target->prefix !== '' ) {
+            $new_prefix = $target->prefix;
+        }
 
         if ( $old_prefix === '' || $old_prefix === $new_prefix ) {
             return [ 'keys_changed' => 0 ];
@@ -2275,10 +2418,15 @@ class Import {
 
             // Tables the restore added (the source's plugin tables) go only
             // once the snapshot is fully back.
-            if ( empty( $errors ) && ! empty( $meta['tables'] ) ) {
+            $only = ! empty( $meta['target']['prefix'] ) ? (string) $meta['target']['prefix'] : '';
+            if ( empty( $errors ) && ( ! empty( $meta['tables'] ) || $only !== '' ) ) {
                 $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
                 foreach ( (array) $wpdb->get_results( 'SHOW FULL TABLES', ARRAY_N ) as $row ) {
-                    if ( ! in_array( $row[0], $meta['tables'], true ) ) {
+                    // A move into a subsite or tenant only ever added its tables.
+                    if ( $only !== '' && ( strpos( $row[0], $only ) !== 0 || ( ( $meta['target']['kind'] ?? '' ) === 'multisite' && preg_match( '/^' . preg_quote( $only, '/' ) . '\d+_/', $row[0] ) ) ) ) {
+                        continue;
+                    }
+                    if ( ! in_array( $row[0], (array) $meta['tables'], true ) ) {
                         $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
                         $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $row[0] ) . "`" );
                     }
@@ -2290,6 +2438,7 @@ class Import {
 
         // A catch-up pull's memory goes back to what it was before this move.
         Pull::restore_memory( $this->rollback_path );
+        $target = ! empty( $meta['target'] ) ? $this->target() : null;
 
         // 2. Restore backed-up files
         $web_root    = dirname( WP_CONTENT_DIR );
@@ -2335,6 +2484,11 @@ class Import {
             while ( $dir !== '.' && $dir !== '' && ! $keep( $dir ) && @rmdir( $web_root . '/' . $dir ) ) {
                 $dir = dirname( $dir );
             }
+        }
+
+        // A subsite or tenant this move created goes completely.
+        if ( $target && ! empty( $meta['target']['created'] ) ) {
+            $target->undo();
         }
 
         // Plugins the restore brought in are gone now, but they loaded at the
@@ -2410,13 +2564,22 @@ class Import {
     }
 
     public function finalize() {
+        $target = $this->target();
         // Remember the source's files now on this site, for a catch-up pull.
-        ( new Pull( $this->import_id ) )->remember_files();
+        if ( ! $target ) {
+            ( new Pull( $this->import_id ) )->remember_files();
+        }
 
         // Read before staging (which holds the source's details) goes.
         $source = $this->staged_source();
-        $tidy   = $this->tidy( $source );
-        Verify::save_context( $this->import_path, (string) ( is_object( $source ) ? ( $source->home_url ?? '' ) : '' ), (string) ( $tidy['login_url']['url'] ?? '' ) );
+        if ( $target ) {
+            // A subsite or tenant: its own settings, and the page caches.
+            $target->finish();
+            $tidy = [ 'opcache_reset' => self::reset_opcache(), 'caches_cleared' => self::clear_page_caches(), 'plugins_turned_off' => [], 'login_url' => null, 'target' => $target->info() ];
+        } else {
+            $tidy = $this->tidy( $source );
+        }
+        Verify::save_context( $this->import_path, (string) ( is_object( $source ) ? ( $source->home_url ?? '' ) : '' ), (string) ( $tidy['login_url']['url'] ?? '' ), $target );
 
         // Remove staging directory
         if ( is_dir( $this->staging_path ) ) {
@@ -2435,8 +2598,10 @@ class Import {
         @unlink( $this->import_path . '/token-guard.json' );
         @unlink( $this->import_path . '/unchanged.json' );
 
-        // Flush rewrite rules
-        flush_rewrite_rules();
+        // Flush rewrite rules (a subsite or tenant had its own cleared)
+        if ( ! $target ) {
+            flush_rewrite_rules();
+        }
 
         // Flush object cache
         wp_cache_flush();

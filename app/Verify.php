@@ -23,15 +23,23 @@ class Verify {
     const MAX_PAGES = 14;
 
     /** Saved by Import::finalize(): what the checks need once staging is gone. */
-    public static function save_context( $import_path, $source_home, $login_url ) {
+    public static function save_context( $import_path, $source_home, $login_url, $target = null ) {
         Storage::ensure_dir( $import_path );
+        // Into a subsite or tenant: its address and its tables. A Freighter
+        // tenant without its own domain answers at the main address only
+        // with its cookie, so its pages can't be loaded from here.
+        $reachable = $target && ( $target->kind === 'multisite' || Quiet::address( $target->home ) !== Quiet::address( home_url() ) );
         file_put_contents( $import_path . '/verify.json', wp_json_encode( [
             'source_home' => untrailingslashit( (string) $source_home ),
-            'home'        => untrailingslashit( home_url() ),
-            'login_url'   => (string) $login_url,
+            'home'        => untrailingslashit( $target ? $target->home : home_url() ),
+            'login_url'   => $target ? ( $reachable ? untrailingslashit( $target->home ) . '/wp-login.php' : '' ) : (string) $login_url,
+            'target'      => $target ? [ 'prefix' => $target->prefix, 'kind' => $target->kind, 'reachable' => $reachable ] : null,
             'finished_at' => time(),
         ] ) );
     }
+
+    /** The move's target (prefix, kind, reachable), for the checks. */
+    private static $target = null;
 
     public static function run( $import_id ) {
         $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) );
@@ -46,10 +54,17 @@ class Verify {
         $context = is_array( $context ) ? $context : [ 'source_home' => '', 'home' => untrailingslashit( home_url() ), 'login_url' => '' ];
         $rows    = is_file( "{$dir}/rows-check.json" ) ? json_decode( (string) file_get_contents( "{$dir}/rows-check.json" ), true ) : null;
 
-        $old   = (string) ( $context['source_home'] ?? '' );
-        $moved = $old !== '' && Quiet::address( $old ) !== Quiet::address( home_url() );
-        $since = time();
-        $pages = self::pages( $moved ? $old : '', (string) ( $context['login_url'] ?? '' ) );
+        $old    = (string) ( $context['source_home'] ?? '' );
+        $here   = (string) ( $context['home'] ?? home_url() );
+        self::$target = ! empty( $context['target'] ) ? (array) $context['target'] : null;
+        self::$home   = untrailingslashit( $here );
+        $moved  = $old !== '' && Quiet::address( $old ) !== Quiet::address( $here );
+        $since  = time();
+        if ( self::$target && empty( self::$target['reachable'] ) ) {
+            $pages = [ 'list' => [], 'loopback' => false, 'note' => 'This tenant has no domain of its own, so its pages can only be opened with WP Freighter\'s switcher. Open it from Tools → WP Freighter to check it.' ];
+        } else {
+            $pages = self::pages( $moved ? $old : '', (string) ( $context['login_url'] ?? '' ) );
+        }
         if ( array_filter( (array) $pages['list'], function ( $p ) { return ! empty( $p['fatal'] ); } ) ) {
             $pages['culprits'] = self::fatal_culprits( $since - 2 );
         }
@@ -95,7 +110,14 @@ class Verify {
     /* ----------------------------------------------------------- Pages */
 
     /** The pages worth loading: home, login, one per post type and taxonomy. */
+    private static $home = '';
+
     private static function sample_urls( $login_url ) {
+        if ( self::$target ) {
+            // A subsite or tenant: its home and login pages (its posts are
+            // in tables this request doesn't read).
+            return [ 'Home page' => self::$home . '/', 'Login page' => $login_url !== '' ? $login_url : self::$home . '/wp-login.php' ];
+        }
         $urls = [ 'Home page' => home_url( '/' ), 'Login page' => $login_url !== '' ? $login_url : wp_login_url() ];
         foreach ( get_post_types( [ 'public' => true ], 'objects' ) as $type ) {
             if ( $type->name === 'attachment' || count( $urls ) >= self::MAX_PAGES - 3 ) {
@@ -127,7 +149,7 @@ class Verify {
     private static function pages( $old_home, $login_url ) {
         $list    = [];
         $reached = 0;
-        $host    = strtolower( (string) wp_parse_url( home_url(), PHP_URL_HOST ) );
+        $host    = strtolower( (string) wp_parse_url( self::$home !== '' ? self::$home : home_url(), PHP_URL_HOST ) );
         $verify  = ! ( defined( 'DISEMBARK_DEV_MODE' ) && DISEMBARK_DEV_MODE );
         foreach ( self::sample_urls( $login_url ) as $label => $url ) {
             $start = microtime( true );
@@ -221,7 +243,7 @@ class Verify {
         foreach ( $hosts as $h ) {
             // The new address can contain the old one (old-site.com moving to
             // old-site.com.staging.dev): those spellings can't tell them apart.
-            if ( stripos( home_url(), '//' . $h . $path ) !== false ) {
+            if ( stripos( self::$home !== '' ? self::$home : home_url(), '//' . $h . $path ) !== false ) {
                 continue;
             }
             array_push( $needles, '//' . $h . $path, '\/\/' . $h . str_replace( '/', '\/', $path ), '%2F%2F' . $h . str_replace( '/', '%2F', $path ), '%2f%2f' . $h . str_replace( '/', '%2f', $path ) );
@@ -292,6 +314,9 @@ class Verify {
                 continue;
             }
             $table   = $t[0];
+            if ( self::$target && strpos( $table, (string) self::$target['prefix'] ) !== 0 ) {
+                continue; // another site's table
+            }
             $q       = '`' . str_replace( '`', '``', $table ) . '`';
             $columns = (array) $wpdb->get_results( "SHOW COLUMNS FROM {$q}", ARRAY_A );
             $keys    = [];

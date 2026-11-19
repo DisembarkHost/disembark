@@ -1,0 +1,568 @@
+<?php
+
+namespace Disembark;
+
+/**
+ * Where a move lands when this site is the main site of a multisite network
+ * or a WP Freighter install: a new subsite or tenant, or an existing one it
+ * replaces, instead of this site itself. The incoming site is always shaped
+ * like a standalone site (any backup, pull or push, including one site
+ * brought out of another network or install, see Scope), so a tenant can
+ * become a subsite and a subsite a tenant.
+ *
+ * Chosen before the move starts (target.json in the move's folder), the new
+ * site is created right after the rollback point is saved, and the import
+ * steps then work on it alone:
+ * - tables under its prefix (wp_5_, stacked_8_), and only those;
+ * - files in its own folders (uploads/sites/5, content/8). Plugins and
+ *   themes in a folder the sites share are added when missing and never
+ *   overwritten, since other sites run them; core files, mu-plugins and
+ *   drop-ins stay as they are;
+ * - on a network, the incoming users are merged into the network's users:
+ *   matched by email, otherwise added (with a free login), and the site's
+ *   posts, comments and orders renumbered to match;
+ * - the address rewrite and the checks after the move cover that site.
+ *
+ * The rollback point holds the site's tables (none for a new one), the
+ * network's users or Freighter's registry, so rolling back removes a new
+ * site completely, folders included.
+ */
+class Target {
+
+    public $kind;          // multisite | freighter
+    public $into;          // "new" or the ID it replaces
+    public $id      = '';  // the site's ID once known
+    public $prefix  = '';
+    public $home    = '';
+    public $slug    = '';  // multisite: the new site's path or subdomain
+    public $domain  = '';  // freighter: the new tenant's mapped domain
+    public $files   = '';  // freighter files mode
+    public $created = false;
+    public $created_dirs = [];
+    public $uploads = '';  // the site's uploads folder, relative to the web root
+    public $content = '';  // its own content folder (dedicated Freighter tenants), or ''
+
+    /* ------------------------------------------------------------------
+     * Choosing and saving
+     * ---------------------------------------------------------------- */
+
+    private static function file( $import_path ) {
+        return rtrim( $import_path, '/' ) . '/target.json';
+    }
+
+    public static function load( $import_path ) {
+        $file = self::file( $import_path );
+        if ( ! is_file( $file ) ) {
+            return null;
+        }
+        $data = json_decode( (string) file_get_contents( $file ), true );
+        if ( ! is_array( $data ) || empty( $data['kind'] ) ) {
+            return null;
+        }
+        $t = new self();
+        foreach ( $data as $k => $v ) {
+            if ( property_exists( $t, $k ) ) {
+                $t->$k = $v;
+            }
+        }
+        return $t;
+    }
+
+    public function save( $import_path ) {
+        Storage::ensure_dir( $import_path );
+        file_put_contents( self::file( $import_path ), wp_json_encode( get_object_vars( $this ) ) );
+    }
+
+    /**
+     * Records where the move goes. $into: '' or "site" (this site, as
+     * before), "new", or the ID of a subsite or tenant to replace. Returns
+     * the target, null for this site, or WP_Error.
+     */
+    public static function choose( $import_path, $into, $opts = [] ) {
+        @unlink( self::file( $import_path ) );
+        $into = strtolower( trim( (string) $into ) );
+        if ( $into === '' || $into === 'site' ) {
+            return null;
+        }
+        $install = Scope::install();
+        if ( ! $install ) {
+            return new \WP_Error( 'not_shared', 'This site isn\'t a multisite network or a WP Freighter install, so there\'s nowhere else to put the site (--into).', [ 'status' => 400 ] );
+        }
+        if ( (string) $install['current'] !== (string) $install['main'] ) {
+            return new \WP_Error( 'not_main', 'Bring a site into the ' . ( $install['kind'] === 'multisite' ? 'network' : 'install' ) . ' from its main site\'s Disembark.', [ 'status' => 400 ] );
+        }
+        $t       = new self();
+        $t->kind = $install['kind'];
+        if ( $into === 'main' || $into === (string) $install['main'] ) {
+            return new \WP_Error( 'is_main', 'That\'s the main site. To replace it, leave out --into.', [ 'status' => 400 ] );
+        }
+        if ( $into !== 'new' ) {
+            $known = array_column( $install['sites'], 'id' );
+            if ( ! in_array( $into, $known, true ) && ! ( $t->kind === 'multisite' && ctype_digit( $into ) && get_site( (int) $into ) ) ) {
+                return new \WP_Error( 'unknown_site', 'No ' . ( $t->kind === 'multisite' ? 'subsite' : 'tenant' ) . ' ' . $into . ' here.', [ 'status' => 404 ] );
+            }
+        }
+        $t->into   = $into;
+        $t->slug   = sanitize_title( (string) ( $opts['slug'] ?? '' ) );
+        $t->domain = strtolower( preg_replace( '#^https?://|/.*$#i', '', trim( (string) ( $opts['domain'] ?? '' ) ) ) );
+        if ( $into !== 'new' ) {
+            $t->locate( $into );
+        }
+        $t->save( $import_path );
+        return $t;
+    }
+
+    /** Fills in an existing site's prefix, address and folders. */
+    private function locate( $id ) {
+        global $wpdb;
+        $this->id = (string) $id;
+        if ( $this->kind === 'multisite' ) {
+            $this->prefix  = $wpdb->get_blog_prefix( (int) $id );
+            $this->home    = untrailingslashit( get_home_url( (int) $id ) );
+            $this->uploads = self::rel( self::multisite_uploads( (int) $id ) );
+            return;
+        }
+        $primary      = Scope::freighter_primary();
+        $config       = (array) Scope::freighter_option( $primary, 'stacked_configurations' );
+        $this->files  = in_array( $config['files'] ?? '', [ 'shared', 'hybrid', 'dedicated' ], true ) ? $config['files'] : 'shared';
+        $this->prefix = 'stacked_' . (int) $id . '_';
+        $this->home   = untrailingslashit( (string) Scope::freighter_option( $primary, 'home' ) );
+        foreach ( (array) Scope::freighter_option( $primary, 'stacked_sites' ) as $site ) {
+            if ( (string) ( $site['stacked_site_id'] ?? '' ) === (string) $id && ( $config['domain_mapping'] ?? 'off' ) === 'on' && trim( (string) ( $site['domain'] ?? '' ) ) !== '' ) {
+                $this->home = 'https://' . trim( (string) $site['domain'] );
+            }
+        }
+        $this->content = $this->files === 'dedicated' ? 'content/' . (int) $id : '';
+        $this->uploads = $this->files === 'shared' ? self::rel( WP_CONTENT_DIR . '/uploads' ) : 'content/' . (int) $id . '/uploads';
+    }
+
+    private static function multisite_uploads( $id ) {
+        if ( get_site_option( 'ms_files_rewriting' ) ) {
+            return WP_CONTENT_DIR . '/blogs.dir/' . $id . '/files';
+        }
+        return WP_CONTENT_DIR . '/uploads/sites/' . $id;
+    }
+
+    private static function rel( $path ) {
+        $root = rtrim( wp_normalize_path( dirname( WP_CONTENT_DIR ) ), '/' );
+        $path = rtrim( wp_normalize_path( $path ), '/' );
+        return strpos( $path, $root . '/' ) === 0 ? substr( $path, strlen( $root ) + 1 ) : $path;
+    }
+
+    /* ------------------------------------------------------------------
+     * Creating a new site (after the rollback point)
+     * ---------------------------------------------------------------- */
+
+    /** $source: the staged disembark-source.json (for a name and a slug). */
+    public function create( $source ) {
+        if ( $this->into !== 'new' || $this->created ) {
+            return true;
+        }
+        $source = (array) $source;
+        $from   = (string) ( $source['home_url'] ?? '' );
+        $name   = (string) ( ( (array) ( $source['scope'] ?? [] ) )['name'] ?? '' );
+        if ( $name === '' ) {
+            $name = (string) wp_parse_url( $from, PHP_URL_HOST );
+        }
+        return $this->kind === 'multisite' ? $this->create_subsite( $from, $name ) : $this->create_tenant( $from, $name );
+    }
+
+    private function make_dir( $rel ) {
+        $abs = rtrim( wp_normalize_path( dirname( WP_CONTENT_DIR ) ), '/' ) . '/' . $rel;
+        if ( is_dir( $abs ) ) {
+            return;
+        }
+        // Remember the topmost folder this created, so a rollback removes it.
+        $top = $rel;
+        while ( dirname( $top ) !== '.' && ! is_dir( rtrim( wp_normalize_path( dirname( WP_CONTENT_DIR ) ), '/' ) . '/' . dirname( $top ) ) ) {
+            $top = dirname( $top );
+        }
+        wp_mkdir_p( $abs );
+        $this->created_dirs[] = $top;
+    }
+
+    private function create_subsite( $from, $name ) { // $name: the import brings the site's own
+        global $wpdb;
+        $network = get_network();
+        $slug    = $this->slug;
+        if ( $slug === '' ) {
+            $path = trim( (string) wp_parse_url( $from, PHP_URL_PATH ), '/' );
+            $slug = $path !== '' ? basename( $path ) : preg_replace( '/^www\./', '', (string) strtok( (string) wp_parse_url( $from, PHP_URL_HOST ), '.' ) );
+            $slug = sanitize_title( $slug ) ?: 'site';
+        }
+        $base = $slug;
+        for ( $n = 2; $n < 100; $n++ ) {
+            $domain = is_subdomain_install() ? $slug . '.' . preg_replace( '/^www\./', '', $network->domain ) : $network->domain;
+            $path   = is_subdomain_install() ? $network->path : $network->path . $slug . '/';
+            if ( ! domain_exists( $domain, $path, $network->id ) && ( is_subdomain_install() || ! in_array( $slug, get_subdirectory_reserved_names(), true ) ) ) {
+                break;
+            }
+            $slug = $base . '-' . $n;
+        }
+        // The import brings every table, so WordPress (and plugins hooked to
+        // a new site) mustn't install the default ones first.
+        global $wp_filter;
+        $saved = $wp_filter['wp_initialize_site'] ?? null;
+        unset( $wp_filter['wp_initialize_site'] );
+        $id = wp_insert_site( [ 'domain' => $domain, 'path' => $path, 'network_id' => $network->id ] );
+        if ( $saved ) {
+            $wp_filter['wp_initialize_site'] = $saved;
+        }
+        if ( is_wp_error( $id ) ) {
+            return $id;
+        }
+        $this->slug    = $slug;
+        $this->created = true;
+        $this->locate( (string) $id );
+        $scheme        = (string) wp_parse_url( get_home_url( get_main_site_id() ), PHP_URL_SCHEME );
+        $this->home    = untrailingslashit( ( $scheme !== '' ? $scheme : 'https' ) . '://' . $domain . $path );
+        $this->make_dir( $this->uploads );
+        return true;
+    }
+
+    private function create_tenant( $from, $name ) {
+        global $wpdb;
+        $primary = Scope::freighter_primary();
+        $sites   = (array) Scope::freighter_option( $primary, 'stacked_sites' );
+        $config  = (array) Scope::freighter_option( $primary, 'stacked_configurations' );
+        $ids     = array_map( 'intval', array_column( $sites, 'stacked_site_id' ) );
+        $id      = $ids ? max( $ids ) + 1 : 1;
+        $tables  = (array) $wpdb->get_col( 'SHOW TABLES' );
+        while ( true ) {
+            $prefix = "stacked_{$id}_";
+            $taken  = $prefix === $primary;
+            foreach ( $tables as $t ) {
+                if ( strpos( (string) $t, $prefix ) === 0 ) {
+                    $taken = true;
+                    break;
+                }
+            }
+            if ( ! $taken ) {
+                break;
+            }
+            $id++;
+        }
+        $mapping = ( $config['domain_mapping'] ?? 'off' ) === 'on';
+        $domain  = $this->domain;
+        if ( $mapping && $domain === '' ) {
+            $domain = strtolower( (string) wp_parse_url( $from, PHP_URL_HOST ) );
+        }
+        $sites[] = [ 'stacked_site_id' => $id, 'created_at' => time(), 'name' => sanitize_text_field( $name ), 'domain' => $mapping ? $domain : '' ];
+        $wpdb->update( $primary . 'options', [ 'option_value' => serialize( array_values( $sites ) ) ], [ 'option_name' => 'stacked_sites' ] );
+        wp_cache_delete( 'alloptions', 'options' );
+        wp_cache_delete( 'stacked_sites', 'options' );
+        $this->domain  = $mapping ? $domain : '';
+        $this->created = true;
+        $this->locate( (string) $id );
+        if ( $this->content !== '' ) {
+            $this->make_dir( $this->content );
+            foreach ( [ 'plugins', 'themes', 'uploads' ] as $sub ) {
+                $this->make_dir( $this->content . '/' . $sub );
+            }
+        } elseif ( $this->files === 'hybrid' ) {
+            $this->make_dir( $this->uploads );
+        }
+        self::refresh_freighter();
+        return true;
+    }
+
+    /** Rewrites Freighter's bootstrap (its domain mappings), when it's here to do it. */
+    private static function refresh_freighter() {
+        if ( class_exists( '\WPFreighter\Configurations' ) ) {
+            try {
+                ( new \WPFreighter\Configurations() )->refresh_configs();
+            } catch ( \Throwable $e ) {
+                // The registry is right; Freighter rewrites its bootstrap on its next admin load.
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------
+     * Files
+     * ---------------------------------------------------------------- */
+
+    /**
+     * Where a staged file goes (relative to the web root), and whether it
+     * may replace a file already there. Returns [ path, may_replace ] or
+     * null when it stays out: core files, mu-plugins and drop-ins belong to
+     * the whole install.
+     */
+    public function dest( $rel ) {
+        $rel = ltrim( (string) $rel, '/' );
+        if ( strpos( $rel, 'wp-content/' ) !== 0 ) {
+            return null;
+        }
+        $sub = substr( $rel, strlen( 'wp-content/' ) );
+        $top = (string) strtok( $sub, '/' );
+        if ( $top === 'uploads' ) {
+            return [ $this->uploads . substr( $sub, strlen( 'uploads' ) ), ! ( $this->kind === 'freighter' && $this->files === 'shared' ) ];
+        }
+        if ( $this->content !== '' ) {
+            return [ $this->content . '/' . $sub, true ];
+        }
+        $shared = self::rel( WP_CONTENT_DIR );
+        if ( in_array( $top, [ 'plugins', 'themes', 'languages' ], true ) && strpos( $sub, '/' ) !== false ) {
+            return [ $shared . '/' . $sub, false ];
+        }
+        return null;
+    }
+
+    /** The shared folder a file belongs to (wp-content/plugins/woocommerce), or ''. */
+    public function pool_folder( $dest ) {
+        if ( $this->content !== '' ) {
+            return '';
+        }
+        $shared = self::rel( WP_CONTENT_DIR );
+        foreach ( [ 'plugins', 'themes' ] as $pool ) {
+            $dir = $shared . '/' . $pool . '/';
+            if ( strpos( $dest, $dir ) === 0 ) {
+                $rest = substr( $dest, strlen( $dir ) );
+                return strpos( $rest, '/' ) === false ? '' : $dir . strtok( $rest, '/' );
+            }
+        }
+        return '';
+    }
+
+    /* ------------------------------------------------------------------
+     * Database
+     * ---------------------------------------------------------------- */
+
+    /** The site's tables now. */
+    public function tables() {
+        global $wpdb;
+        if ( $this->prefix === '' ) {
+            return [];
+        }
+        $out = [];
+        foreach ( (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $this->prefix ) . '%' ) ) as $t ) {
+            // On a network, wp_1_ doesn't exist and wp_10_ starts with wp_1.
+            if ( $this->kind === 'multisite' && preg_match( '/^' . preg_quote( $this->prefix, '/' ) . '\d+_/', (string) $t ) ) {
+                continue;
+            }
+            $out[] = (string) $t;
+        }
+        return $out;
+    }
+
+    /** Tables the rollback point holds: the site's, plus the shared ones the move changes. */
+    public function snapshot_tables() {
+        global $wpdb;
+        $tables = $this->tables();
+        if ( $this->kind === 'multisite' ) {
+            foreach ( [ 'users', 'usermeta', 'blogs', 'blogmeta' ] as $t ) {
+                $name = $wpdb->base_prefix . $t;
+                if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $name ) ) ) === $name ) {
+                    $tables[] = $name;
+                }
+            }
+        } else {
+            $tables[] = Scope::freighter_primary() . 'options';
+        }
+        return array_values( array_unique( $tables ) );
+    }
+
+    /**
+     * Merges the users a network subsite arrived with ({prefix}users and
+     * {prefix}usermeta, imported beside its other tables) into the network's
+     * users, renumbers the site's content to match, and drops the copies.
+     */
+    public function merge_users( $old_prefix ) {
+        global $wpdb;
+        $report = [ 'created' => 0, 'matched' => 0, 'renumbered' => 0 ];
+        if ( $this->kind !== 'multisite' ) {
+            return $report;
+        }
+        $in_users = $this->prefix . 'users';
+        $in_meta  = $this->prefix . 'usermeta';
+        $users    = $wpdb->base_prefix . 'users';
+        $meta     = $wpdb->base_prefix . 'usermeta';
+        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $in_users ) ) ) !== $in_users ) {
+            return $report;
+        }
+        // Replacing a subsite: its old roles go, the incoming ones replace them.
+        if ( $this->into !== 'new' ) {
+            $wpdb->query( $wpdb->prepare( "DELETE FROM `{$meta}` WHERE meta_key LIKE %s", $wpdb->esc_like( $this->prefix ) . '%' ) );
+        }
+        $map     = [];
+        $created = [];
+        foreach ( (array) $wpdb->get_results( "SELECT * FROM `{$in_users}` ORDER BY ID", ARRAY_A ) as $u ) {
+            $old   = (int) $u['ID'];
+            $email = (string) $u['user_email'];
+            $found = $email !== '' ? $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM `{$users}` WHERE user_email = %s ORDER BY ID LIMIT 1", $email ) ) : null;
+            if ( $found ) {
+                $map[ $old ] = (int) $found;
+                $report['matched']++;
+                continue;
+            }
+            unset( $u['ID'] );
+            foreach ( [ 'user_login' => 60, 'user_nicename' => 50 ] as $col => $max ) {
+                $base = (string) $u[ $col ];
+                for ( $n = 2; $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM `{$users}` WHERE `{$col}` = %s", $u[ $col ] ) ); $n++ ) {
+                    $u[ $col ] = substr( $base, 0, $max - 4 ) . '-' . $n;
+                }
+            }
+            if ( $wpdb->insert( $users, $u ) === false ) {
+                continue;
+            }
+            $map[ $old ]       = (int) $wpdb->insert_id;
+            $created[ $old ]   = true;
+            $report['created']++;
+        }
+
+        // Settings that belong to a site carry the site's prefix on a network.
+        $site_keys = [ 'capabilities', 'user_level', 'user-settings', 'user-settings-time', 'persisted_preferences' ];
+        $last      = 0;
+        do {
+            $rows = (array) $wpdb->get_results( $wpdb->prepare( "SELECT * FROM `{$in_meta}` WHERE umeta_id > %d ORDER BY umeta_id LIMIT 1000", $last ), ARRAY_A );
+            foreach ( $rows as $r ) {
+                $last = (int) $r['umeta_id'];
+                $old  = (int) $r['user_id'];
+                if ( ! isset( $map[ $old ] ) ) {
+                    continue;
+                }
+                $key = (string) $r['meta_key'];
+                if ( $old_prefix !== '' && strpos( $key, $old_prefix ) === 0 ) {
+                    $rest = substr( $key, strlen( $old_prefix ) );
+                    if ( in_array( $rest, $site_keys, true ) || strpos( $rest, 'dashboard_' ) === 0 ) {
+                        $key = $this->prefix . $rest;
+                    }
+                }
+                // A user who already had an account keeps their own profile:
+                // only their role and settings for this site come across.
+                if ( ! isset( $created[ $old ] ) && strpos( $key, $this->prefix ) !== 0 ) {
+                    continue;
+                }
+                $wpdb->insert( $meta, [ 'user_id' => $map[ $old ], 'meta_key' => $key, 'meta_value' => $r['meta_value'] ] );
+            }
+        } while ( count( $rows ) === 1000 );
+        foreach ( array_keys( $created ) as $old ) {
+            update_user_meta( $map[ $old ], 'primary_blog', (int) $this->id );
+        }
+
+        // The site's own tables point at users by ID.
+        $changes = array_filter( $map, function ( $new, $old ) { return (int) $new !== (int) $old; }, ARRAY_FILTER_USE_BOTH );
+        if ( $changes ) {
+            $p = $this->prefix;
+            $columns = [ [ "{$p}posts", 'post_author', '' ], [ "{$p}comments", 'user_id', '' ], [ "{$p}links", 'link_owner', '' ],
+                [ "{$p}postmeta", 'meta_value', "meta_key IN ('_edit_last','_customer_user')" ],
+                [ "{$p}wc_orders", 'customer_id', '' ], [ "{$p}wc_customer_lookup", 'user_id', '' ] ];
+            $offset = 1000000000000;
+            foreach ( $columns as list( $table, $col, $where ) ) {
+                if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) !== $table ) {
+                    continue;
+                }
+                $extra = $where !== '' ? " AND {$where}" : '';
+                // Two passes through a high offset, so 2→5 and 5→9 can't chain.
+                foreach ( array_chunk( $changes, 500, true ) as $chunk ) {
+                    $case = '';
+                    foreach ( $chunk as $old => $new ) {
+                        $case .= ' WHEN ' . (int) $old . ' THEN ' . ( (int) $new + $offset );
+                    }
+                    $in = implode( ',', array_map( 'intval', array_keys( $chunk ) ) );
+                    $report['renumbered'] += (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = CASE `{$col}`{$case} END WHERE `{$col}` IN ({$in}){$extra}" );
+                }
+                $wpdb->query( "UPDATE `{$table}` SET `{$col}` = `{$col}` - {$offset} WHERE `{$col}` >= {$offset}{$extra}" );
+            }
+        }
+        // The roles the site defines, under its prefix.
+        if ( $old_prefix !== '' && $old_prefix !== $this->prefix ) {
+            $wpdb->update( $this->prefix . 'options', [ 'option_name' => $this->prefix . 'user_roles' ], [ 'option_name' => $old_prefix . 'user_roles' ] );
+        }
+        $wpdb->query( "DROP TABLE IF EXISTS `{$in_users}`" );
+        $wpdb->query( "DROP TABLE IF EXISTS `{$in_meta}`" );
+        wp_cache_flush();
+        return $report;
+    }
+
+    /* ------------------------------------------------------------------
+     * After the move, and undoing it
+     * ---------------------------------------------------------------- */
+
+    /** Makes the site's own settings fit where it now lives. */
+    public function finish() {
+        global $wpdb;
+        $options = $this->prefix . 'options';
+        $wpdb->delete( $options, [ 'option_name' => 'rewrite_rules' ] );
+        $active = maybe_unserialize( (string) $wpdb->get_var( "SELECT option_value FROM `{$options}` WHERE option_name = 'active_plugins'" ) );
+        $active = is_array( $active ) ? $active : [];
+        if ( $this->kind === 'freighter' ) {
+            // A tenant runs WP Freighter (its switcher and login links).
+            if ( ! in_array( 'wp-freighter/wp-freighter.php', $active, true ) ) {
+                $active[] = 'wp-freighter/wp-freighter.php';
+                $wpdb->update( $options, [ 'option_value' => serialize( array_values( $active ) ) ], [ 'option_name' => 'active_plugins' ] );
+            }
+            if ( class_exists( '\WPFreighter\Site' ) && method_exists( '\WPFreighter\Site', 'ensure_freighter' ) ) {
+                try {
+                    \WPFreighter\Site::ensure_freighter( (int) $this->id );
+                } catch ( \Throwable $e ) {
+                    // It copies itself in on its next admin load.
+                }
+            }
+        } else {
+            // Plugins on for the whole network stay on there, not per site.
+            $network = array_keys( (array) get_site_option( 'active_sitewide_plugins', [] ) );
+            $kept    = array_values( array_diff( $active, $network ) );
+            if ( $kept !== $active ) {
+                $wpdb->update( $options, [ 'option_value' => serialize( $kept ) ], [ 'option_name' => 'active_plugins' ] );
+            }
+            $site = get_site( (int) $this->id );
+            if ( $site ) {
+                wp_update_site( (int) $this->id, [ 'last_updated' => current_time( 'mysql', true ) ] );
+                clean_blog_cache( $site );
+            }
+        }
+        wp_cache_flush();
+    }
+
+    /** After a rollback: a site this move created goes completely. */
+    public function undo() {
+        $root = rtrim( wp_normalize_path( dirname( WP_CONTENT_DIR ) ), '/' );
+        foreach ( (array) $this->created_dirs as $rel ) {
+            $rel = trim( (string) $rel, '/' );
+            if ( $rel === '' || ! Import::is_safe_relative_path( $rel ) || in_array( $rel, [ 'wp-content', 'wp-content/uploads', 'wp-content/plugins', 'wp-content/themes', 'content', 'wp-admin', 'wp-includes' ], true ) ) {
+                continue;
+            }
+            self::remove_dir( $root . '/' . $rel );
+        }
+        if ( $this->kind === 'freighter' ) {
+            wp_cache_flush();
+            self::refresh_freighter();
+        } elseif ( $this->id !== '' ) {
+            $site = get_site( (int) $this->id );
+            if ( $site ) {
+                clean_blog_cache( $site );
+            }
+            wp_cache_flush();
+        }
+    }
+
+    private static function remove_dir( $dir ) {
+        if ( ! is_dir( $dir ) || is_link( $dir ) ) {
+            return;
+        }
+        foreach ( (array) scandir( $dir ) as $item ) {
+            if ( $item === '.' || $item === '..' ) {
+                continue;
+            }
+            $path = $dir . '/' . $item;
+            is_dir( $path ) && ! is_link( $path ) ? self::remove_dir( $path ) : @unlink( $path );
+        }
+        @rmdir( $dir );
+    }
+
+    /** What the dashboard and the CLI show. */
+    public function info() {
+        $what = $this->kind === 'multisite' ? 'subsite' : 'tenant';
+        return [
+            'kind'    => $this->kind,
+            'into'    => $this->into,
+            'id'      => $this->id,
+            'prefix'  => $this->prefix,
+            'home'    => $this->home,
+            'created' => $this->created,
+            'label'   => $this->into === 'new'
+                ? ( $this->id !== '' ? "the new {$what} {$this->id} ({$this->home})" : "a new {$what}" )
+                : "{$what} {$this->id} ({$this->home}), replacing it",
+        ];
+    }
+}
