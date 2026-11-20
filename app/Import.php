@@ -2497,6 +2497,16 @@ class Import {
     /** Table names (after the prefix) that hosting platforms keep for themselves: never dropped by a move. */
     const HOST_TABLES = [ 'patchstack_', 'kinsta_', 'wpe_', 'wpengine_', 'sg_security_', 'gd_system_' ];
 
+    /**
+     * Options that belong to the host, not the site, by name prefix: Kinsta's
+     * Patchstack firewall keeps its settings and the site's API token under
+     * patchstack_. Like the host's mu-plugins and tables, they stay with the
+     * server: a move keeps the destination's own and leaves the source's
+     * behind (see keep_install_rows()), so a secret never travels to every
+     * copy.
+     */
+    const HOST_OPTIONS = [ 'patchstack_' ];
+
     const HOST_MU_PLUGINS = [
         'wpengine', 'wpe-', 'mu-plugin.php', 'slt-force-strong-passwords', 'force-strong-passwords', 'stop-long-comments',
         'kinsta-mu-plugins', 'gd-system-plugin', 'pantheon', 'wpcomsh', 'endurance-', 'flywheel', 'pressable',
@@ -3008,24 +3018,43 @@ class Import {
     }
 
     /**
-     * The main site of a WP Freighter install keeps the install's registry in
-     * its options table (stacked_sites: the tenants; stacked_configurations:
-     * files mode and domain mapping), and runs WP Freighter. A whole-site
-     * import replaces that table with the incoming site's, which has neither
-     * (one tenant arrives without them), so the install forgot its tenants
-     * and the next refresh of its bootstrap would have cut them off. Noted
-     * once, at the start of the import, in this move's folder.
+     * Rows of the options table that belong to this server or install, not
+     * to the site, noted once at the start of the import (in this move's
+     * folder) and put back over the incoming site's when it ends:
+     * - the host's own options (HOST_OPTIONS): the destination keeps its
+     *   own, and the source's are left behind, also in a subsite or tenant;
+     * - on the main site of a WP Freighter install, the install's registry
+     *   (stacked_sites: the tenants; stacked_configurations: files mode and
+     *   domain mapping) and WP Freighter itself. A whole-site import
+     *   replaces the options table with the incoming site's, which has
+     *   neither, so the install forgot its tenants and the next refresh of
+     *   its bootstrap would have cut them off.
      */
     private function keep_install_rows() {
         global $wpdb;
         $file = $this->import_path . '/install-keep.php';
-        if ( is_file( $file ) || $this->target() || Scope::freighter_primary() !== $wpdb->prefix ) {
+        if ( is_file( $file ) ) {
             return;
         }
-        $rows   = (array) $wpdb->get_results( "SELECT option_name, option_value, autoload FROM `{$wpdb->options}` WHERE option_name IN ( 'stacked_sites', 'stacked_configurations' )", ARRAY_A );
-        $active = maybe_unserialize( (string) $wpdb->get_var( "SELECT option_value FROM `{$wpdb->options}` WHERE option_name = 'active_plugins'" ) );
+        $target = $this->target();
+        $table  = $target ? ( $target->prefix !== '' ? $target->prefix . 'options' : '' ) : $wpdb->options;
+        $keep   = [ 'table' => $table, 'rows' => [], 'freighter' => false, 'host' => [] ];
+        if ( ! $target && Scope::freighter_primary() === $wpdb->prefix ) {
+            $keep['rows']      = (array) $wpdb->get_results( "SELECT option_name, option_value, autoload FROM `{$wpdb->options}` WHERE option_name IN ( 'stacked_sites', 'stacked_configurations' )", ARRAY_A );
+            $active            = maybe_unserialize( (string) $wpdb->get_var( "SELECT option_value FROM `{$wpdb->options}` WHERE option_name = 'active_plugins'" ) );
+            $keep['freighter'] = is_array( $active ) && in_array( 'wp-freighter/wp-freighter.php', $active, true );
+        }
+        if ( $table !== '' && $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) === $table ) {
+            $keep['host'] = (array) $wpdb->get_results( "SELECT option_name, option_value, autoload FROM `{$table}` WHERE " . self::host_options_where(), ARRAY_A );
+        }
         $this->prepare_import_dir();
-        self::write_protected( $file, (string) wp_json_encode( [ 'rows' => $rows, 'freighter' => is_array( $active ) && in_array( 'wp-freighter/wp-freighter.php', $active, true ) ] ) );
+        self::write_protected( $file, (string) wp_json_encode( $keep ) );
+    }
+
+    /** SQL matching the host's options (HOST_OPTIONS). */
+    private static function host_options_where() {
+        global $wpdb;
+        return implode( ' OR ', array_map( function ( $p ) use ( $wpdb ) { return $wpdb->prepare( 'option_name LIKE %s', $wpdb->esc_like( $p ) . '%' ); }, self::HOST_OPTIONS ) );
     }
 
     /** Puts the install's rows back after an import replaced the options table without them (see keep_install_rows()). */
@@ -3046,6 +3075,14 @@ class Import {
             if ( is_array( $active ) && ! in_array( 'wp-freighter/wp-freighter.php', $active, true ) ) {
                 $active[] = 'wp-freighter/wp-freighter.php';
                 $wpdb->update( $wpdb->options, [ 'option_value' => serialize( array_values( $active ) ) ], [ 'option_name' => 'active_plugins' ] );
+            }
+        }
+        // The host's options: this server's, never the incoming site's.
+        $table = (string) ( $keep['table'] ?? '' );
+        if ( array_key_exists( 'host', $keep ) && $table !== '' && $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) === $table ) {
+            $wpdb->query( "DELETE FROM `{$table}` WHERE " . self::host_options_where() );
+            foreach ( (array) $keep['host'] as $row ) {
+                $wpdb->insert( $table, [ 'option_name' => (string) $row['option_name'], 'option_value' => (string) $row['option_value'], 'autoload' => (string) ( $row['autoload'] ?? 'yes' ) ] );
             }
         }
         wp_cache_delete( 'alloptions', 'options' );
