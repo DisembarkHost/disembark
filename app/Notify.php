@@ -15,9 +15,20 @@ namespace Disembark;
  */
 class Notify {
 
-    private static function file( $import_id ) {
+    /**
+     * Who to notify, with the webhook URLs (a Slack or Discord webhook is a
+     * secret). A .php file that exits first, so a direct request for it under
+     * uploads shows nothing. $legacy: the notify.json older versions wrote.
+     */
+    private static function file( $import_id, $legacy = false ) {
         $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) );
-        return $import_id === '' ? '' : Storage::base_dir() . "/_import_{$import_id}/notify.json";
+        return $import_id === '' ? '' : Storage::base_dir() . "/_import_{$import_id}/notify." . ( $legacy ? 'json' : 'php' );
+    }
+
+    private static function write( $import_id, $data ) {
+        $file = self::file( $import_id );
+        file_put_contents( $file, "<?php exit; ?>\n" . wp_json_encode( $data ) );
+        @unlink( self::file( $import_id, true ) );
     }
 
     /** Parses "a@example.com, https://hooks.slack.com/…" into emails and webhook URLs. */
@@ -51,19 +62,26 @@ class Notify {
         Storage::ensure_dir( dirname( $file ) );
         if ( ! $targets['emails'] && ! $targets['webhooks'] ) {
             @unlink( $file );
+            @unlink( self::file( $import_id, true ) );
             return [ 'ok' => true, 'targets' => $targets ];
         }
-        file_put_contents( $file, "<?php exit; ?>\n" . wp_json_encode( [ 'targets' => $targets, 'sent' => [] ] ) );
+        self::write( $import_id, [ 'targets' => $targets, 'sent' => [] ] );
         return [ 'ok' => true, 'targets' => $targets ];
     }
 
     private static function read( $import_id ) {
         $file = self::file( $import_id );
+        if ( $file !== '' && ! is_file( $file ) ) {
+            $file = self::file( $import_id, true ); // set by an older version mid-move
+        }
         if ( $file === '' || ! is_file( $file ) ) {
             return null;
         }
         $raw  = (string) file_get_contents( $file );
-        $data = json_decode( (string) substr( $raw, (int) strpos( $raw, "\n" ) + 1 ), true );
+        if ( strpos( $raw, '<?php' ) === 0 ) {
+            $raw = (string) substr( $raw, (int) strpos( $raw, "\n" ) + 1 );
+        }
+        $data = json_decode( $raw, true );
         return is_array( $data ) ? $data : null;
     }
 
@@ -91,7 +109,7 @@ class Notify {
         }
         $data['sent'][]           = $event;
         $data['results'][ $event ] = $results;
-        file_put_contents( self::file( $import_id ), "<?php exit; ?>\n" . wp_json_encode( $data ) );
+        self::write( $import_id, $data );
         return [ 'sent' => true, 'results' => $results ];
     }
 
