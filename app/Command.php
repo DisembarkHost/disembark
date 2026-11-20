@@ -76,9 +76,10 @@ class Command {
      *
      * [--catch-up]
      * : Copy only files that are new or changed since this site's last pull
-     * from the same source (files removed there are removed here; the
-     * database is copied in full). Falls back to everything when there was
-     * no earlier pull.
+     * from the same source (files removed there are removed here), and only
+     * the tables that changed on either side since then (see
+     * --full-database). Falls back to everything when there was no earlier
+     * pull.
      *
      * [--resume=<id>]
      * : Resume a pull that stopped (see `wp disembark unfinished`), or

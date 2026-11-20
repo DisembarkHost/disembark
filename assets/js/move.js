@@ -232,7 +232,7 @@
     if (last) {
       body.push(h('div', { class: 'dsk-extra' },
         D.toggle('Only copy what changed since the last pull', S.catchUp, function (v) { S.catchUp = v; }),
-        h('p', { class: 'dsk-hint' }, 'This site pulled ' + D.host(last.source) + ' ' + D.fmt.ago(last.at) + '. New and changed files come across, files removed there are removed here, and the database is copied again in full.')));
+        h('p', { class: 'dsk-hint' }, 'This site pulled ' + D.host(last.source) + ' ' + D.fmt.ago(last.at) + '. New and changed files come across, files removed there are removed here, and only the tables that changed on either side are copied.')));
     }
 
     // The one warning that matters.
@@ -285,7 +285,7 @@
       var catchUp = S.to === 'this' && S.catchUp && !!D.pull.lastPullFor(S.connect.url);
       var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
         h('p', null, S.to === 'new' ? (S.into === 'new' ? 'Bring ' : 'Replace ' + intoLabel() + ' with ') : (catchUp ? 'Catch ' + here + ' up with ' : 'Replace ' + here + ' with a copy of '), h('strong', null, r), S.to === 'new' && S.into === 'new' ? ' in as a new ' + one + '?' : '?'),
-        h('p', { class: 'muted' }, (catchUp ? 'Only changed files come across; the database is replaced in full. ' : '') + (S.to === 'this' ? (S.quiet ? 'Quiet mode goes on before anything arrives. ' : 'Quiet mode is off: this copy will send emails and run scheduled jobs. ') : '') + 'A restore point is saved first.' + (S.to === 'this' ? ' You’ll need to log in again afterwards.' : ''))),
+        h('p', { class: 'muted' }, (catchUp ? 'Only changed files and tables come across. ' : '') + (S.to === 'this' ? (S.quiet ? 'Quiet mode goes on before anything arrives. ' : 'Quiet mode is off: this copy will send emails and run scheduled jobs. ') : '') + 'A restore point is saved first.' + (S.to === 'this' ? ' You’ll need to log in again afterwards.' : ''))),
         { title: (catchUp ? 'Catch up from ' : 'Pull ') + r + '?', confirmLabel: catchUp ? 'Catch up' : 'Pull', danger: S.into !== 'new' || S.to === 'this' });
       if (!ok) return;
       var o = { site: S.connect.url, token: S.connect.token, quiet: S.to === 'this' && S.quiet, catchUp: catchUp, into: into, scene: sc, label: (catchUp ? 'Before catch-up from ' : 'Before pull from ') + r };
