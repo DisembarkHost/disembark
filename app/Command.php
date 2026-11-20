@@ -1129,8 +1129,12 @@ class Command {
                 sleep( $secs );
                 $this->pace_busy = 0;
             }
-            if ( $on_fail && $on_fail( $result, $n ) === 'split' ) {
+            $what = $on_fail ? $on_fail( $result, $n ) : 'retry';
+            if ( $what === 'split' ) {
                 return [ 'split', 0, $n ];
+            }
+            if ( $what === 'stop' ) {
+                return [ $result, 0, $n ];
             }
             $wait = min( 30, pow( 2, $n - 1 ) ) * ( 0.7 + mt_rand( 0, 600 ) / 1000 );
             $this->say( '      ' . $result->get_error_message() . ' Trying again in ' . max( 1, (int) round( $wait ) ) . 's (attempt ' . ( $n + 1 ) . ').' );
@@ -1232,8 +1236,18 @@ class Command {
                     return $pull->fetch_files_paced( $task['offset'], $task['count'], $bytes, $this->pace['budget'] > 0 ? $this->pace['budget'] : Pace::default_budget() );
                 }, function ( $e, $n ) use ( $task, &$cut ) {
                     $cut = $cut || self::size_error( $e );
-                    return $n >= 2 && empty( $task['whole'] ) ? 'split' : 'retry';
+                    // One file the source keeps refusing (a firewall, a file
+                    // it can't read) stops the pull, resumable, instead of
+                    // being asked for again forever.
+                    if ( ! empty( $task['whole'] ) ) {
+                        return $n >= 6 ? 'stop' : 'retry';
+                    }
+                    return $n >= 2 ? 'split' : 'retry';
                 } );
+                if ( is_wp_error( $r ) && ! empty( $task['whole'] ) ) {
+                    $name = $pull->file_name( $task['offset'] );
+                    $this->fail( 'The source kept refusing file ' . number_format( $task['offset'] + 1 ) . ( $name !== '' ? " ({$name})" : '' ) . ': ' . $r->get_error_message() . ( $name !== '' ? " Resume to try again, or start over with --skip={$name} to leave it behind." : ' Resume to try again.' ), 'files' );
+                }
                 if ( $r === 'split' ) {
                     if ( $task['count'] > 1 ) {
                         $half = (int) ceil( $task['count'] / 2 );

@@ -612,6 +612,7 @@
           await noteFailure(e);
           var what = onFail ? onFail(e, n) : 'retry';
           if (what === 'split') { var se = new Error('split'); se.split = true; se.cause = e; throw se; }
+          if (what === 'stop') throw e;
           var ms = backoffMs(n, e);
           rlog((e.status ? 'The site answered ' + e.status : (e.timeout ? 'No answer in time' : 'The connection dropped')) + '. Trying again in ' + Math.max(1, Math.round(ms / 1000)) + 's (attempt ' + (n + 1) + ').', 'dim');
           await wait(ms);
@@ -729,9 +730,13 @@
         try {
           res = await pacedPost('import/pull/fetch-files', function () { return paceBody({ offset: task.offset, count: task.count, max_bytes: task.bytes || pace.bytes }); }, ridFor(s, ++k), function (e, n) {
             if (sizeError(e)) task.killed = true;
-            return n >= 2 && !task.whole ? 'split' : 'retry';
+            // One file the source keeps refusing stops the move (resumable)
+            // instead of being asked for again forever.
+            if (task.whole) return n >= 6 ? 'stop' : 'retry';
+            return n >= 2 ? 'split' : 'retry';
           });
         } catch (e) {
+          if (!e.split && task.whole) rlog('The source kept refusing file ' + D.fmt.num(task.offset + 1) + '.', 'err');
           if (!e.split) throw e;
           if (task.count > 1) {
             var half = Math.ceil(task.count / 2), bytes = Math.max(LIMIT.bytes[0], Math.round((task.bytes || pace.bytes) / 2));
