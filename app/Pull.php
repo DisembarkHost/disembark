@@ -67,8 +67,8 @@ class Pull {
      */
     private function source_session() {
         $state = $this->state();
-        if ( empty( $state['session'] ) || ! preg_match( '/^[a-f0-9]{24}$/', (string) $state['session'] ) ) {
-            $state['session'] = bin2hex( random_bytes( 12 ) );
+        if ( empty( $state['session'] ) || ! preg_match( '/^[a-f0-9]{24,64}$/', (string) $state['session'] ) ) {
+            $state['session'] = bin2hex( random_bytes( 16 ) );
             $this->save_state( $state );
         }
         return $state['session'];
@@ -101,7 +101,156 @@ class Pull {
     }
 
     /**
+     * A GET whose parameters (the token among them) ride in a JSON body: a
+     * POST the source's REST server routes as GET. Falls back to a plain GET
+     * with the query string when the override was lost on the way (the
+     * GET-only route then answers 404, or a proxy 405).
+     */
+    private function get_with_body( $url, $args ) {
+        $args['headers']['X-HTTP-Method-Override'] = 'GET';
+        $resp = $this->http( 'POST', $url, $args );
+        $code = is_wp_error( $resp ) ? 0 : (int) wp_remote_retrieve_response_code( $resp );
+        if ( $code !== 404 && $code !== 405 ) {
+            return $resp;
+        }
+        $query = (array) json_decode( (string) $args['body'], true );
+        unset( $args['body'], $args['headers']['X-HTTP-Method-Override'] );
+        return $this->http( 'GET', $url . ( strpos( $url, '?' ) !== false ? '&' : '?' ) . http_build_query( $query ), $args );
+    }
+
+    /** Largest answer the source's API may send (file downloads have their own limit). */
+    const MAX_RESPONSE_BYTES = 67108864;
+
+    /**
+     * Every request this pull makes to the source. With verification on
+     * (see sslverify()): TLS checked, and the address must be a public one,
+     * every hop. WordPress's own check misses link-local (169.254/16, cloud
+     * metadata) and shared (100.64/10) addresses, and resolves the name again
+     * when connecting, so a name that answers differently the second time
+     * (DNS rebinding) could still reach an internal service. So each host is
+     * resolved and checked here, cURL is pinned to the checked address, and
+     * every redirect is checked the same way. The answer is capped in size.
+     */
+    private function http( $method, $url, $args = [] ) {
+        $verify                     = $this->sslverify();
+        $args['method']             = $method;
+        $args['sslverify']          = $verify;
+        $args['reject_unsafe_urls'] = $verify;
+        if ( empty( $args['limit_response_size'] ) ) {
+            $args['limit_response_size'] = self::MAX_RESPONSE_BYTES;
+        }
+        if ( ! $verify ) {
+            return wp_remote_request( $url, $args );
+        }
+        $ip = self::public_address( $url );
+        if ( is_wp_error( $ip ) ) {
+            return $ip;
+        }
+        $current = [ 'url' => $url, 'ip' => $ip ];
+        $pin     = function ( $handle ) use ( &$current ) {
+            $parts = wp_parse_url( $current['url'] );
+            $port  = (int) ( $parts['port'] ?? ( strtolower( (string) ( $parts['scheme'] ?? '' ) ) === 'https' ? 443 : 80 ) );
+            $host  = trim( (string) ( $parts['host'] ?? '' ), '[]' );
+            if ( $host !== '' && defined( 'CURLOPT_RESOLVE' ) && ! filter_var( $host, FILTER_VALIDATE_IP ) ) {
+                curl_setopt( $handle, CURLOPT_RESOLVE, [ "{$host}:{$port}:" . ( strpos( $current['ip'], ':' ) !== false ? '[' . $current['ip'] . ']' : $current['ip'] ) ] );
+            }
+        };
+        $redirect = function ( &$location ) use ( &$current ) {
+            $ip = self::public_address( (string) $location );
+            if ( is_wp_error( $ip ) ) {
+                throw self::request_exception( $ip->get_error_message() );
+            }
+            $current = [ 'url' => (string) $location, 'ip' => $ip ];
+        };
+        add_action( 'http_api_curl', $pin, 99 );
+        add_action( 'requests-requests.before_redirect', $redirect, 10, 1 );
+        try {
+            $resp = wp_remote_request( $url, $args );
+        } finally {
+            remove_action( 'http_api_curl', $pin, 99 );
+            remove_action( 'requests-requests.before_redirect', $redirect, 10 );
+        }
+        return $resp;
+    }
+
+    /** The exception WordPress turns into a WP_Error when thrown inside a request. */
+    private static function request_exception( $message ) {
+        if ( class_exists( '\WpOrg\Requests\Exception' ) ) {
+            return new \WpOrg\Requests\Exception( $message, 'disembark_unsafe_url' );
+        }
+        return new \Requests_Exception( $message, 'disembark_unsafe_url' );
+    }
+
+    /**
+     * The address $url's host resolves to, when every address it resolves to
+     * is public; else WP_Error. A host a site allows with WordPress's
+     * http_request_host_is_external filter is let through as it is there.
+     */
+    private static function public_address( $url ) {
+        $host = trim( strtolower( (string) wp_parse_url( (string) $url, PHP_URL_HOST ) ), '[]' );
+        if ( $host === '' || ! preg_match( '#^https?://#i', (string) $url ) ) {
+            return new \WP_Error( 'unsafe_url', 'Refusing a non-http(s) address from the source.', [ 'status' => 502 ] );
+        }
+        if ( filter_var( $host, FILTER_VALIDATE_IP ) ) {
+            $ips = [ $host ];
+        } else {
+            $ips = (array) @gethostbynamel( $host );
+            if ( function_exists( 'dns_get_record' ) ) {
+                foreach ( (array) @dns_get_record( $host, DNS_AAAA ) as $record ) {
+                    if ( ! empty( $record['ipv6'] ) ) {
+                        $ips[] = $record['ipv6'];
+                    }
+                }
+            }
+            $ips = array_values( array_filter( $ips ) );
+        }
+        if ( ! $ips ) {
+            return new \WP_Error( 'unsafe_url', "Could not resolve {$host}.", [ 'status' => 502 ] );
+        }
+        if ( apply_filters( 'http_request_host_is_external', false, $host, $url ) ) {
+            return $ips[0];
+        }
+        foreach ( $ips as $ip ) {
+            if ( self::internal_ip( $ip ) ) {
+                return new \WP_Error( 'unsafe_url', "Refusing to connect to {$host}: it points at an internal address ({$ip}).", [ 'status' => 502 ] );
+            }
+        }
+        return $ips[0];
+    }
+
+    /** Whether $ip is private, loopback, link-local, shared (CGNAT), reserved or multicast. */
+    private static function internal_ip( $ip ) {
+        $ip = strtolower( (string) $ip );
+        if ( preg_match( '/^::ffff:(\d+\.\d+\.\d+\.\d+)$/', $ip, $m ) ) {
+            $ip = $m[1];
+        }
+        if ( filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) === false ) {
+            return true;
+        }
+        if ( filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 ) ) {
+            $long = ip2long( $ip );
+            foreach ( [ '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.168.0.0/16', '198.18.0.0/15', '224.0.0.0/3' ] as $cidr ) {
+                list( $net, $bits ) = explode( '/', $cidr );
+                $mask = -1 << ( 32 - (int) $bits );
+                if ( ( $long & $mask ) === ( ip2long( $net ) & $mask ) ) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // IPv6: loopback, unspecified, unique local, link-local, multicast.
+        return $ip === '::1' || $ip === '::' || (bool) preg_match( '/^(?:f[cd]|fe[89ab]|ff)/', $ip );
+    }
+
+    /**
      * Calls the source site's Disembark REST API, honoring its permalink style.
+     *
+     * The token always travels in the request body, never in a URL (where
+     * access logs, CDNs and proxies on both sides keep it). A GET-only route
+     * is reached with a POST that WordPress's REST server treats as a GET
+     * (X-HTTP-Method-Override, a core feature every source has). Only when
+     * something in between drops that header, the request is repeated the
+     * old way, with the token in the query string.
      */
     private function source_request( $endpoint, $payload = [], $method = 'POST', $timeout = 120 ) {
         $state = $this->state();
@@ -113,20 +262,16 @@ class Pull {
             isset( $state['site'] ) && $state['site'] !== '' ? [ 'site' => (string) $state['site'] ] : [],
             $payload
         );
-        $verify = $this->sslverify();
-        $args   = [
-            'timeout'            => $timeout,
-            'sslverify'          => $verify,
-            'reject_unsafe_urls' => $verify,
-            'headers'            => [ 'Content-Type' => 'application/json' ],
+        $args = [
+            'timeout' => $timeout,
+            'headers' => [ 'Content-Type' => 'application/json' ],
+            'body'    => wp_json_encode( $body ),
         ];
 
         if ( strtoupper( $method ) === 'GET' ) {
-            $sep  = ( strpos( $url, '?' ) !== false ) ? '&' : '?';
-            $resp = wp_remote_get( $url . $sep . http_build_query( $body ), $args );
+            $resp = $this->get_with_body( $url, $args );
         } else {
-            $args['body'] = wp_json_encode( $body );
-            $resp = wp_remote_post( $url, $args );
+            $resp = $this->http( 'POST', $url, $args );
         }
 
         if ( is_wp_error( $resp ) ) {
@@ -158,18 +303,42 @@ class Pull {
         if ( ! is_string( $url ) || ! preg_match( '#^https?://#i', $url ) ) {
             return new \WP_Error( 'invalid_url', 'Refusing to download a non-http(s) URL from the source.', [ 'status' => 502 ] );
         }
-        $verify = $this->sslverify();
-        if ( $verify && ! wp_http_validate_url( $url ) ) {
+        if ( $this->sslverify() && ( ! wp_http_validate_url( $url ) || is_wp_error( self::public_address( $url ) ) ) ) {
             return new \WP_Error( 'invalid_url', 'Refusing to download an unsafe URL from the source.', [ 'status' => 502 ] );
         }
-        if ( ! $verify ) {
-            add_filter( 'https_ssl_verify', '__return_false' );
-            add_filter( 'http_request_host_is_external', '__return_true' );
+        return $this->download( 'GET', $url, [] );
+    }
+
+    /**
+     * Streams an answer from the source to a temp file, never more than the
+     * disk here can take (the sizes the source declares aren't trusted).
+     * Returns the temp path or WP_Error.
+     */
+    private function download( $method, $url, $args ) {
+        $name = basename( (string) wp_parse_url( $url, PHP_URL_PATH ) );
+        $tmp  = wp_tempnam( $name !== '' ? $name : 'disembark-download' );
+        if ( ! $tmp ) {
+            return new \WP_Error( 'download_failed', 'Could not create a temporary file.', [ 'status' => 500 ] );
         }
-        $tmp = download_url( $url, 600 );
-        if ( ! $verify ) {
-            remove_filter( 'https_ssl_verify', '__return_false' );
-            remove_filter( 'http_request_host_is_external', '__return_true' );
+        $free  = function_exists( 'disk_free_space' ) ? @disk_free_space( dirname( $tmp ) ) : false;
+        $limit = $free === false ? 0 : (int) ( $free - 64 * MB_IN_BYTES );
+        if ( $free !== false && $limit <= 0 ) {
+            @unlink( $tmp );
+            return new \WP_Error( 'disk_full', 'Not enough disk space here for the next file from the source.', [ 'status' => 507 ] );
+        }
+        $args += [ 'timeout' => 600 ];
+        $args['stream']              = true;
+        $args['filename']            = $tmp;
+        $args['limit_response_size'] = $limit > 0 ? $limit : PHP_INT_MAX;
+        $resp = $this->http( $method, $url, $args );
+        if ( is_wp_error( $resp ) || (int) wp_remote_retrieve_response_code( $resp ) !== 200 ) {
+            @unlink( $tmp );
+            return is_wp_error( $resp ) ? $resp : new \WP_Error( 'download_failed', 'Source responded ' . wp_remote_retrieve_response_code( $resp ) . ' for ' . $name . '.', [ 'status' => 502 ] );
+        }
+        clearstatcache( true, $tmp );
+        if ( $limit > 0 && filesize( $tmp ) >= $limit ) {
+            @unlink( $tmp );
+            return new \WP_Error( 'disk_full', 'Not enough disk space here for ' . $name . ' from the source.', [ 'status' => 507 ] );
         }
         return $tmp;
     }
@@ -184,7 +353,7 @@ class Pull {
      */
     private function fetch_source_file( $url ) {
         $tmp = $this->guarded_download( $url );
-        if ( ! is_wp_error( $tmp ) || $tmp->get_error_code() === 'invalid_url' ) {
+        if ( ! is_wp_error( $tmp ) || in_array( $tmp->get_error_code(), [ 'invalid_url', 'unsafe_url', 'disk_full' ], true ) ) {
             return $tmp;
         }
         $streamed = $this->stream_from_source( $url );
@@ -214,24 +383,12 @@ class Pull {
             return new \WP_Error( 'invalid_url', 'Source file URL has no path.', [ 'status' => 502 ] );
         }
 
-        $tmp = wp_tempnam( basename( $relative ) );
-        if ( ! $tmp ) {
-            return new \WP_Error( 'download_failed', 'Could not create a temporary file.', [ 'status' => 500 ] );
-        }
-        $verify = $this->sslverify();
-        $resp   = wp_remote_post( $this->source_endpoint( '/stream-file' ), [
-            'timeout'            => 600,
-            'stream'             => true,
-            'filename'           => $tmp,
-            'sslverify'          => $verify,
-            'reject_unsafe_urls' => $verify,
-            'headers'            => [ 'Content-Type' => 'application/json' ],
-            'body'               => wp_json_encode( [ 'token' => $state['source_token'] ?? '', 'file' => $relative ] ),
+        $tmp = $this->download( 'POST', $this->source_endpoint( '/stream-file' ), [
+            'headers' => [ 'Content-Type' => 'application/json' ],
+            'body'    => wp_json_encode( [ 'token' => $state['source_token'] ?? '', 'file' => $relative ] ),
         ] );
-        if ( is_wp_error( $resp ) || wp_remote_retrieve_response_code( $resp ) !== 200 ) {
-            @unlink( $tmp );
-            $code = is_wp_error( $resp ) ? $resp->get_error_message() : wp_remote_retrieve_response_code( $resp );
-            return new \WP_Error( 'download_failed', "Source could not stream {$relative} ({$code}).", [ 'status' => 502 ] );
+        if ( is_wp_error( $tmp ) ) {
+            return $tmp->get_error_code() === 'disk_full' ? $tmp : new \WP_Error( 'download_failed', "Source could not stream {$relative} (" . $tmp->get_error_message() . ').', [ 'status' => 502 ] );
         }
         return $tmp;
     }
@@ -287,19 +444,23 @@ class Pull {
             $source_url = 'https://' . $source_url;
         }
 
-        // Probe pretty route, then plain-permalink form.
+        // Probe pretty route, then plain-permalink form, with the token in
+        // the body (see get_with_body()). Only if neither answers, the old
+        // way: a GET with the token in the query string, for a source behind
+        // something that drops the method override.
         $style = null;
-        foreach ( [ 'pretty', 'rest_route' ] as $candidate ) {
-            $path = ( $candidate === 'rest_route' )
-                ? '/?rest_route=/disembark/v1/database&token=' . rawurlencode( $source_token )
-                : '/wp-json/disembark/v1/database?token=' . rawurlencode( $source_token );
-            $verify = $this->sslverify();
-            $resp   = wp_remote_get( $source_url . $path, [ 'timeout' => 60, 'sslverify' => $verify, 'reject_unsafe_urls' => $verify ] );
-            if ( ! is_wp_error( $resp ) && wp_remote_retrieve_response_code( $resp ) === 200 ) {
-                $tables = json_decode( wp_remote_retrieve_body( $resp ) );
-                if ( ! empty( $tables ) ) {
-                    $style = $candidate;
-                    break;
+        foreach ( [ 'body', 'query' ] as $how ) {
+            foreach ( [ 'pretty', 'rest_route' ] as $candidate ) {
+                $url  = $source_url . ( $candidate === 'rest_route' ? '/?rest_route=/disembark/v1/database' : '/wp-json/disembark/v1/database' );
+                $resp = $how === 'body'
+                    ? $this->http( 'POST', $url, [ 'timeout' => 60, 'headers' => [ 'Content-Type' => 'application/json', 'X-HTTP-Method-Override' => 'GET' ], 'body' => wp_json_encode( [ 'token' => $source_token ] ) ] )
+                    : $this->http( 'GET', $url . ( $candidate === 'rest_route' ? '&' : '?' ) . 'token=' . rawurlencode( $source_token ), [ 'timeout' => 60 ] );
+                if ( ! is_wp_error( $resp ) && wp_remote_retrieve_response_code( $resp ) === 200 ) {
+                    $tables = json_decode( wp_remote_retrieve_body( $resp ) );
+                    if ( ! empty( $tables ) && is_array( $tables ) ) {
+                        $style = $candidate;
+                        break 2;
+                    }
                 }
             }
         }
@@ -312,8 +473,8 @@ class Pull {
             'source_url'   => $source_url,
             'source_token' => $source_token,
             'rest_style'   => $style,
-            'backup_token' => substr( bin2hex( random_bytes( 12 ) ), 0, 12 ),
-            'session'      => bin2hex( random_bytes( 12 ) ),
+            'backup_token' => bin2hex( random_bytes( 16 ) ),
+            'session'      => bin2hex( random_bytes( 16 ) ),
             'started'      => time(),
             'move'         => is_array( $move ) ? $move : [],
             'catch_up'     => (bool) $catch_up,
@@ -886,7 +1047,12 @@ class Pull {
         if ( empty( $state['source_token'] ) || empty( $state['backup_token'] ) ) {
             return false;
         }
-        $this->source_request( '/cleanup', [ 'backup_token' => $state['backup_token'] ], 'GET', 30 );
+        // POST on 3.0 sources; a 2.9 source only routes GET (reached with
+        // the token kept in the body, see get_with_body()).
+        $done = $this->source_request( '/cleanup', [ 'backup_token' => $state['backup_token'] ], 'POST', 30 );
+        if ( is_wp_error( $done ) ) {
+            $this->source_request( '/cleanup', [ 'backup_token' => $state['backup_token'] ], 'GET', 30 );
+        }
         return true;
     }
 
