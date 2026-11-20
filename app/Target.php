@@ -404,7 +404,12 @@ class Target {
                 $report['matched']++;
                 continue;
             }
-            unset( $u['ID'] );
+            // Only WordPress's own columns, by name: the incoming table's
+            // column names are the source's to choose.
+            $u = array_intersect_key( $u, array_flip( [ 'user_login', 'user_pass', 'user_nicename', 'user_email', 'user_url', 'user_registered', 'user_activation_key', 'user_status', 'display_name' ] ) );
+            if ( ! isset( $u['user_login'], $u['user_nicename'] ) ) {
+                continue;
+            }
             foreach ( [ 'user_login' => 60, 'user_nicename' => 50 ] as $col => $max ) {
                 $base = (string) $u[ $col ];
                 for ( $n = 2; $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM `{$users}` WHERE `{$col}` = %s", $u[ $col ] ) ); $n++ ) {
@@ -430,16 +435,24 @@ class Target {
                 if ( ! isset( $map[ $old ] ) ) {
                     continue;
                 }
-                $key = (string) $r['meta_key'];
+                $key      = (string) $r['meta_key'];
+                $remapped = false;
                 if ( $old_prefix !== '' && strpos( $key, $old_prefix ) === 0 ) {
                     $rest = substr( $key, strlen( $old_prefix ) );
                     if ( in_array( $rest, $site_keys, true ) || strpos( $rest, 'dashboard_' ) === 0 ) {
-                        $key = $this->prefix . $rest;
+                        $key      = $this->prefix . $rest;
+                        $remapped = true;
                     }
+                }
+                // Keys under the network's prefix are roles and settings for
+                // its sites (wp_capabilities is the main site's, wp_3_ subsite
+                // 3's): only the ones remapped to this site's prefix come.
+                if ( ! $remapped && strpos( $key, $wpdb->base_prefix ) === 0 ) {
+                    continue;
                 }
                 // A user who already had an account keeps their own profile:
                 // only their role and settings for this site come across.
-                if ( ! isset( $created[ $old ] ) && strpos( $key, $this->prefix ) !== 0 ) {
+                if ( ! isset( $created[ $old ] ) && ! $remapped ) {
                     continue;
                 }
                 $wpdb->insert( $meta, [ 'user_id' => $map[ $old ], 'meta_key' => $key, 'meta_value' => $r['meta_value'] ] );
