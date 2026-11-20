@@ -95,8 +95,10 @@ class Scope {
         if ( is_multisite() || ! is_file( ABSPATH . 'wp-content/freighter.php' ) || ! preg_match( '/^[A-Za-z0-9_]+$/', $candidate ) ) {
             return $primary;
         }
-        $sites = $wpdb->get_var( "SELECT option_value FROM `{$candidate}options` WHERE option_name = 'stacked_sites'" );
-        if ( $sites !== null ) {
+        // stacked_sites appears with the first tenant; an install converted
+        // a moment ago, with none yet, has only its settings.
+        $found = $wpdb->get_var( "SELECT COUNT(*) FROM `{$candidate}options` WHERE option_name IN ( 'stacked_sites', 'stacked_configurations' )" );
+        if ( (int) $found > 0 ) {
             $primary = $candidate;
         }
         return $primary;

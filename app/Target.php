@@ -262,7 +262,12 @@ class Target {
             }
         }
         $sites[] = [ 'stacked_site_id' => $id, 'created_at' => time(), 'name' => sanitize_text_field( $name ), 'domain' => $mapping ? $domain : '' ];
-        $wpdb->update( $primary . 'options', [ 'option_value' => serialize( array_values( $sites ) ) ], [ 'option_name' => 'stacked_sites' ] );
+        // The install's first tenant: there is no registry row to update yet.
+        if ( Scope::freighter_option( $primary, 'stacked_sites' ) === null ) {
+            $wpdb->insert( $primary . 'options', [ 'option_name' => 'stacked_sites', 'option_value' => serialize( array_values( $sites ) ), 'autoload' => 'yes' ] );
+        } else {
+            $wpdb->update( $primary . 'options', [ 'option_value' => serialize( array_values( $sites ) ) ], [ 'option_name' => 'stacked_sites' ] );
+        }
         wp_cache_delete( 'alloptions', 'options' );
         wp_cache_delete( 'stacked_sites', 'options' );
         $this->domain  = $mapping ? $domain : '';
