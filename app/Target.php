@@ -541,6 +541,11 @@ class Target {
         global $wpdb;
         $options = $this->prefix . 'options';
         $wpdb->delete( $options, [ 'option_name' => 'rewrite_rules' ] );
+        // The source's own Disembark token came across in its options. Left
+        // there, it would sign in on the new subsite's or tenant's address,
+        // and on WP Freighter that reaches the whole install. The site makes
+        // a fresh one the first time Disembark needs it.
+        $wpdb->delete( $options, [ 'option_name' => Token::OPTION ] );
         $active = maybe_unserialize( (string) $wpdb->get_var( "SELECT option_value FROM `{$options}` WHERE option_name = 'active_plugins'" ) );
         $active = is_array( $active ) ? $active : [];
         if ( $this->kind === 'freighter' ) {
