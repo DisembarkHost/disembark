@@ -908,7 +908,8 @@
       var choice = {};
       if (!Object.prototype.hasOwnProperty.call(replay, ridAt(seq + 1))) {
         progress('Choose what to bring\u2026');
-        choice = await D.whatToBring(chooser, contents, { source: opts.site, quiet: opts.quiet, catchUp: catchUpInfo });
+        // srcLabel: the site that comes over (one site of an install is reached through its address).
+        choice = await D.whatToBring(chooser, contents, { source: kind === 'pull' ? srcLabel : opts.site, quiet: opts.quiet, catchUp: catchUpInfo });
       }
       if (!choice) { cancelled = true; throw Cancelled(); }
       if (cancelled) throw Cancelled();
