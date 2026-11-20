@@ -78,12 +78,12 @@
       title: 'Pushing to', doneTitle: 'Delivered', againLabel: 'Start another move', icon: 'ship',
       back: back,
       done: function (outcome, ctx) {
-        var target = api.preflight.home_url || st.site;
+        var target = api.preflight.home_url || st.site, href = D.safeHref(target);
         D.mount(outcome,
           h('h3', null, D.icon('key'), 'Log in there with this site’s details'),
           h('p', null, D.host(target) + ' now holds a copy of this site, user accounts included, so log in there with your credentials from ', h('strong', null, D.host(D.config.homeUrl)), '.'),
           h('div', { class: 'row' },
-            h('a', { class: 'dsk-btn primary', href: target, target: '_blank', rel: 'noopener' }, 'Open ' + D.host(target)),
+            href ? h('a', { class: 'dsk-btn primary', href: href, target: '_blank', rel: 'noopener' }, 'Open ' + D.host(target)) : null,
             h('button', { class: 'dsk-btn', type: 'button', onclick: function (ev) { ctx.rollback(ev.currentTarget); } }, D.icon('restore'), 'Undo push')),
           ctx.undoDetails());
       }

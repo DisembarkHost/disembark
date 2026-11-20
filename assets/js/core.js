@@ -17,6 +17,19 @@
    * h('div', { class: 'x', onclick: fn }, 'text', child, [more]) → Element.
    * Strings become text nodes (never HTML); pass { html } only for markup we built.
    */
+  /**
+   * url when it is a web address (http or https), else null. Links built
+   * from what another site reports (its home address) go through this, so a
+   * javascript: or data: address can't become a link. loose also allows
+   * blob: (local downloads) and mailto:, which h() permits on any href.
+   */
+  function safeHref(url, loose) {
+    var protocol;
+    try { protocol = new URL(String(url), location.href).protocol; } catch (e) { return null; }
+    return (loose ? ['http:', 'https:', 'blob:', 'mailto:'] : ['http:', 'https:']).indexOf(protocol) !== -1 ? String(url) : null;
+  }
+  D.safeHref = function (url) { return safeHref(url, false); };
+
   function h(tag, attrs) {
     var el = document.createElement(tag);
     var kids = Array.prototype.slice.call(arguments, 2);
@@ -35,6 +48,7 @@
         else if (k === 'text') el.textContent = v;
         else if (k.slice(0, 2) === 'on' && typeof v === 'function') el.addEventListener(k.slice(2), v);
         else if (k === 'value' || k === 'checked' || k === 'disabled' || k === 'selected' || k === 'hidden') el[k] = v;
+        else if (k === 'href' && !safeHref(v, true)) return; // never a javascript: or data: link
         else el.setAttribute(k, v === true ? '' : v);
       });
     }

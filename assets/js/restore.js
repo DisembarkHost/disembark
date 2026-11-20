@@ -360,7 +360,7 @@
       }
       var pages = v.pages || {}, fine = 0;
       (pages.list || []).forEach(function (p) {
-        if (p.problem) items.push(h('li', null, h('strong', null, p.label), ' (', h('a', { href: p.url, target: '_blank', rel: 'noopener' }, p.url), '): ' + p.problem));
+        if (p.problem) items.push(h('li', null, h('strong', null, p.label), ' (', h('a', { href: D.safeHref(p.url), target: '_blank', rel: 'noopener' }, p.url), '): ' + p.problem));
         else fine++;
         if (p.old_address) items.push(h('li', null, h('strong', null, p.label), ' still mentions the old address ' + D.fmt.plural(p.old_address, 'time') + '.'));
       });
@@ -914,7 +914,7 @@
         h('p', { style: { marginTop: '8px' } }, net ? 'Its users joined the network: they log in with their own passwords, and an account that was already here keeps its own.'
           : 'It has its own users: log in to it with the source site’s credentials' + (own ? '.' : ', from Tools → WP Freighter.')),
         h('div', { class: 'row' },
-          own ? h('a', { class: 'dsk-btn primary', href: tg.home, target: '_blank', rel: 'noopener' }, 'Open ' + D.host(tg.home)) : null,
+          own && D.safeHref(tg.home) ? h('a', { class: 'dsk-btn primary', href: D.safeHref(tg.home), target: '_blank', rel: 'noopener' }, 'Open ' + D.host(tg.home)) : null,
           h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
         ctx.undoDetails());
       return;
