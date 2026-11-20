@@ -252,6 +252,11 @@ class Run {
             'multisite' => is_multisite(),
             'install'   => self::install_summary(),
         ];
+        // A subsite or tenant: why Move can't replace it from here (see Import::here_refusal()).
+        $refused = Import::here_refusal();
+        if ( $refused ) {
+            $config['refused'] = $refused->get_error_message();
+        }
         // JSON_HEX_TAG / JSON_HEX_AMP: a site name or address with </script>
         // or & in it can't break out of the inline script.
         wp_add_inline_script( 'disembark-core', 'window.DisembarkConfig = ' . wp_json_encode( $config, JSON_HEX_TAG | JSON_HEX_AMP ) . ';', 'before' );
@@ -1334,6 +1339,13 @@ class Run {
         // A network or a WP Freighter install says so, and which site this
         // request reached, so a pull can bring just one site.
         $pre['install'] = Scope::install();
+        // A subsite or tenant reached directly can't take a whole-site move
+        // (see Import::here_refusal()): the dashboard stops before asking
+        // anything, with the move that does it.
+        $refused = Import::here_refusal( $import->target() );
+        if ( $refused ) {
+            $pre['refused'] = $refused->get_error_message();
+        }
         if ( $scope ) {
             $pre['home_url'] = $scope->home;
             $pre['site_url'] = $scope->siteurl;

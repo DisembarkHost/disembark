@@ -158,6 +158,44 @@ class Import {
         return Target::load( $this->import_path );
     }
 
+    /* ------------------------------------------------------------------
+     * Moves that can't land here
+     *
+     * Checked by every step that changes the site (and by connect and the
+     * upload, so nothing is copied for nothing), so a client that skips a
+     * question in the dashboard or the CLI is refused all the same.
+     * ---------------------------------------------------------------- */
+
+    /**
+     * A whole-site move into a subsite or tenant, from inside it (a push to
+     * its own connect line, a pull or restore from its own Disembark, the
+     * CLI in its context): the import would write core, plugins, themes and
+     * uploads into the folders the whole install shares. WP_Error saying
+     * which move does it (from the main site, Into: replace), or null.
+     */
+    public static function here_refusal( $target = null ) {
+        if ( $target ) {
+            return null;
+        }
+        $install = Scope::install();
+        if ( ! $install || (string) $install['current'] === (string) $install['main'] ) {
+            return null;
+        }
+        $id   = (string) $install['current'];
+        $main = (string) $install['home'];
+        $host = (string) wp_parse_url( $main, PHP_URL_HOST ) . rtrim( (string) wp_parse_url( $main, PHP_URL_PATH ), '/' );
+        if ( $install['kind'] === 'multisite' ) {
+            $what = 'a subsite (site ' . $id . ') of the network at ' . $host;
+            $pick = 'replace site ' . $id;
+            $cli  = 'wp disembark pull <connect line> --into=' . $id . ' --url=' . $host;
+        } else {
+            $what = 'tenant ' . $id . ' of the WP Freighter install at ' . $host;
+            $pick = 'replace tenant ' . $id;
+            $cli  = 'wp disembark pull <connect line> --into=' . $id . ' (in the main site\'s context, without STACKED_SITE_ID)';
+        }
+        return new \WP_Error( 'not_main_site', 'This is ' . $what . '. A move run from here would write over files the whole install shares, so it can\'t replace this site directly. To replace it, run the move from the main site (' . $main . ') and pick Into: ' . $pick . '. In WP-CLI: ' . $cli . '. Nothing here was changed.', [ 'status' => 409 ] );
+    }
+
     /** Records where the move goes: '' (this site), "new", or a subsite or tenant ID. */
     public function set_target( $into, $opts = [] ) {
         $this->prepare_import_dir();
@@ -166,6 +204,11 @@ class Import {
             return $t;
         }
         return [ 'ok' => true, 'target' => $t ? $t->info() : null ];
+    }
+
+    /** Why this move can't go on here (see here_refusal()), or null. */
+    public function refused() {
+        return self::here_refusal( $this->target() );
     }
 
     /**
@@ -281,6 +324,10 @@ class Import {
      */
     public function snapshot( $label = '', $budget = null ) {
         global $wpdb;
+
+        if ( $refused = $this->refused() ) {
+            return $refused;
+        }
 
         $this->prepare_import_dir();
         Storage::ensure_dir( $this->rollback_path );
@@ -508,6 +555,9 @@ class Import {
      * Receives a ZIP of files (single POST) and extracts to staging.
      */
     public function upload_zip( $uploaded_file ) {
+        if ( $refused = $this->refused() ) {
+            return $refused;
+        }
         $this->prepare_import_dir();
         if ( ! is_dir( $this->staging_path ) ) {
             mkdir( $this->staging_path, 0755, true );
@@ -893,6 +943,9 @@ class Import {
      * the end of the dump. Without one, the whole dump runs in this request.
      */
     public function import_staged_sql( $sql_file, $old_prefix = '', $new_prefix = '', $budget = null, $merge = false ) {
+        if ( $refused = $this->refused() ) {
+            return $refused;
+        }
         if ( ! self::is_safe_relative_path( $sql_file ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid SQL file path.', [ 'status' => 400 ] );
         }
@@ -1537,6 +1590,9 @@ class Import {
      * address in text files under uploads (rewrite_files()).
      */
     public function move_search_replace( $from, $to, $budget = null ) {
+        if ( $refused = $this->refused() ) {
+            return $refused;
+        }
         $source = $this->staged_source();
         $target = $this->target();
         if ( $target ) {
@@ -1806,6 +1862,9 @@ class Import {
      * Receives a chunk of a large file. Reassembles when all chunks arrive.
      */
     public function upload_chunk( $uploaded_file, $file_path, $chunk_index, $total_chunks ) {
+        if ( $refused = $this->refused() ) {
+            return $refused;
+        }
         if ( ! self::is_safe_relative_path( $file_path ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid file path.', [ 'status' => 400 ] );
         }
@@ -1873,6 +1932,9 @@ class Import {
      * killed call loses nothing and a rollback still finds every file.
      */
     public function deploy_files( $files, $keep_host_files = true, $budget = null ) {
+        if ( $refused = $this->refused() ) {
+            return $refused;
+        }
         if ( $budget !== null && count( $files ) === 1 && $files[0] === '*' ) {
             return $this->deploy_files_paced( $keep_host_files, $budget );
         }
@@ -2601,6 +2663,9 @@ class Import {
      * Executes pre-transformed SQL on the destination database.
      */
     public function execute_sql( $sql_content ) {
+        if ( $refused = $this->refused() ) {
+            return $refused;
+        }
         // Split into individual statements with a quote/comment-aware scanner.
         // A column value may legitimately contain ";" (or ";\n"), so splitting
         // on the delimiter naively would cut a statement mid-value.

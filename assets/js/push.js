@@ -91,6 +91,10 @@
     try { api = await D.busy(btn, function () { return D.remoteApi(st.site, st.token); }); }
     catch (err) { D.toast(D.errorText(err), 'error'); return false; }
     if (!api) return false;
+    // The connect line of a subsite or tenant: it can't take a whole site
+    // from here (the destination would refuse too). Pushed through the main
+    // site instead, into that subsite or tenant.
+    if (api.preflight && api.preflight.refused) { D.toast(api.preflight.refused, 'error'); return false; }
     D.runMove(view, {
       api: api, mode: 'site', site: D.config.homeUrl, token: S.token, quiet: st.quiet, scene: st.scene, kind: 'push',
       targetHome: api.preflight.home_url || st.site, label: 'Before push from ' + D.host(D.config.homeUrl),

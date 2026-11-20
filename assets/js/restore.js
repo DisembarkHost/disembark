@@ -989,6 +989,10 @@
         step('pre');
         if (opts.resume) rlog('Resuming the move started ' + D.fmt.date(opts.resume.started) + ': replaying ' + D.fmt.plural(Object.keys(replay).length, 'finished step') + '\u2026', 'dim');
         var pre = await api.post('import/preflight', t());
+        // A subsite or tenant reached directly (a push to its own connect
+        // line, or its own dashboard): a whole-site move would replace the
+        // files every site there shares. Stopped before anything changes.
+        if (pre.refused) throw new Error(pre.refused);
         resumable = !!pre.resumable;
         pacing = !!pre.pacing;
         if (pre.budget > 0) serverBudget = +pre.budget;

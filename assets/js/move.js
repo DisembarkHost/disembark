@@ -14,19 +14,23 @@
 
   var inst = D.config.install;
   var isMain = !!(inst && inst.current === inst.main && (inst.sites || []).length);
+  // A subsite or tenant: a move here would replace files the whole install
+  // shares, so it only goes out from here (a push of this one site). The
+  // server refuses the rest too (Import::here_refusal()).
+  var subHere = !!(inst && inst.current !== inst.main);
   var net = !!(inst && inst.kind === 'multisite');
   var one = inst && !net ? 'tenant' : 'subsite';
   var here = D.host(D.config.homeUrl);
   var others = isMain ? inst.sites.filter(function (s) { return s.id !== inst.main; }) : [];
 
-  var DEFAULTS = { from: 'other', to: 'this', connect: null, file: null, sourceUrl: '', into: 'new', quiet: true, catchUp: true };
+  var DEFAULTS = { from: subHere ? 'this' : 'other', to: subHere ? 'other' : 'this', connect: null, file: null, sourceUrl: '', into: 'new', quiet: true, catchUp: true };
   var S = Object.assign({}, DEFAULTS);
   var root = null, running = false, points = null;
 
   function valid(from, to) {
     if (from === 'this') return to === 'other';
     if (to === 'new') return isMain;
-    return to === 'this';
+    return to === 'this' && !subHere;
   }
   function kind() { return S.from === 'this' ? 'push' : S.from === 'other' ? 'pull' : 'restore'; }
   function remote() { return S.connect ? D.host(S.connect.url) : ''; }
@@ -36,9 +40,9 @@
 
   function route(asked) {
     if (running) return;
-    if (asked === 'pull') { S.from = 'other'; S.to = 'this'; }
+    if (asked === 'pull') { S.from = 'other'; S.to = subHere ? null : 'this'; }
     else if (asked === 'push') { S.from = 'this'; S.to = 'other'; S.quiet = false; }
-    else if (asked === 'restore') { S.from = 'zip'; S.to = 'this'; }
+    else if (asked === 'restore') { S.from = 'zip'; S.to = subHere ? null : 'this'; }
     if (root) render();
   }
   function home() {
@@ -80,6 +84,7 @@
   /* ------------------------------------------------------------ the words */
   function verdict() {
     var k = kind(), r = remote();
+    if (!S.to) return ['A site can’t be brought into this ' + one + ' from here: run it from the main site.'];
     if (k === 'pull' && S.to === 'this') return ['This site downloads from ', { b: r || 'the site you paste below' }, ' and becomes a copy of it. Nothing changes on ' + (r || 'that site') + '.'];
     if (k === 'pull') return [{ b: here }, ' downloads from ', { b: r || 'the site you paste below' }, S.into === 'new' ? ' and adds it as a new ' + one + '. The rest of the ' + (net ? 'network' : 'install') + ' stays as it is.' : ' and puts it in place of ' + intoLabel() + '.'];
     if (k === 'push') return [{ b: r || 'The other site' }, ' downloads from this site and becomes a copy of it. Nothing changes here.'];
@@ -124,7 +129,7 @@
   function tile(side, val, label, sub, mono) {
     var on = S[side] === val, dis = side === 'to' && !valid(S.from, val), why = '';
     if (dis) {
-      if (val === 'this') why = S.from === 'this' ? 'It’s already here' : '';
+      if (val === 'this') why = S.from === 'this' ? 'It’s already here' : (subHere ? 'From the main site only' : '');
       else if (val === 'other') why = S.from === 'other' ? 'Run it on one of them' : 'Open Disembark there';
       else why = !isMain ? (inst ? 'From the main site only' : 'Network or Freighter only') : 'Bring in a site or a zip';
     }
@@ -225,6 +230,13 @@
 
   function panel() {
     var k = kind(), r = remote(), body = [], ready = false, why = '', warn, good = [];
+    // Nowhere this can go from a subsite or tenant: say which move does it.
+    if (!S.to || !valid(S.from, S.to)) {
+      return h('section', { class: 'dsk-card dsk-panel' },
+        h('div', { class: 'dsk-panel-body' }, h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null,
+          h('strong', null, 'This ' + one + ' can’t be replaced from here.'),
+          D.config.refused || ('Run the move from the main site’s Disembark and pick “Replace” there.')))));
+    }
     if (k === 'pull' || k === 'push') { body.push(connectField()); ready = !!S.connect; why = 'Paste a connect line first'; }
     else { body.push(zipField()); ready = !!S.file; why = 'Choose a backup zip first'; }
     if (S.to === 'new') body.push(intoField());

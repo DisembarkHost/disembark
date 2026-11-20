@@ -234,6 +234,11 @@ class Command {
         $this->notify = [ 'import' => $import_id, 'kind' => 'pull', 'source' => $source['url'], 'destination' => home_url(), 'started' => $started ];
 
         $this->say( '[1/9] Checking this site' );
+        // In a subsite's or tenant's context, the pull would replace the
+        // install's shared files: refused before anything is copied.
+        if ( empty( $assoc_args['into'] ) && ( $refused = Import::here_refusal() ) ) {
+            $this->fail( $refused->get_error_message(), 'preflight' );
+        }
         if ( ! $resuming ) {
             $pre = $import->preflight();
             $this->confirm( $assoc_args, ! empty( $assoc_args['into'] )

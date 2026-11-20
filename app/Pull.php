@@ -521,6 +521,11 @@ class Pull {
      * source (see cache_file_list()).
      */
     public function connect( $source_url, $source_token, $move = [], $catch_up = false, $site = null, $shared_rows = false ) {
+        // A subsite or tenant can't be replaced from inside it (see
+        // Import::here_refusal()): refused before anything is copied.
+        if ( $refused = ( new Import( $this->import_id ) )->refused() ) {
+            return $refused;
+        }
         $source_url = rtrim( $source_url, '/' );
         if ( ! preg_match( '#^https?://#', $source_url ) ) {
             $source_url = 'https://' . $source_url;
