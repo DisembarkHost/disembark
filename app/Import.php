@@ -133,8 +133,12 @@ class Import {
 
     /** Copies $from to $to behind the exit line. True when every byte arrived. */
     public static function copy_protected( $from, $to ) {
+        // A temp name of its own: two requests copying to the same place
+        // (a retried step) never write into one file, and neither is read
+        // half written. The exit line goes first, so even the temp file
+        // shows nothing.
         $in  = @fopen( $from, 'rb' );
-        $tmp = $to . '.tmp';
+        $tmp = $to . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
         $out = $in ? @fopen( $tmp, 'wb' ) : false;
         if ( ! $in || ! $out ) {
             if ( $in ) {
@@ -755,13 +759,7 @@ class Import {
             if ( ! class_exists( 'PclZip' ) ) {
                 require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
             }
-            $pcl = new \PclZip( $zip_path );
-            // The pre-extract guard applies the same zip-slip filtering and
-            // staged names the ZipArchive branch does.
-            if ( $pcl->extract( PCLZIP_OPT_PATH, $root, PCLZIP_CB_PRE_EXTRACT, 'Disembark\\pclzip_pre_extract_guard', PCLZIP_CB_POST_EXTRACT, 'Disembark\\pclzip_post_extract_staged' ) == 0 ) {
-                return new \WP_Error( 'extract_failed', 'Failed to extract ZIP: ' . $pcl->errorInfo( true ), [ 'status' => 500 ] );
-            }
-            return true;
+            return self::extract_with_pclzip( $zip_path, $root );
         }
         // Entry by entry, skipping any name that could escape staging
         // (zip-slip); extractTo() on the whole archive would honour "../".
@@ -795,8 +793,11 @@ class Import {
             if ( ! is_dir( dirname( $dest ) ) ) {
                 wp_mkdir_p( dirname( $dest ) );
             }
+            // Written under a temp name of its own and renamed when whole
+            // (see copy_protected()).
+            $tmp = $dest . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
             $in  = $zip->getStream( $name );
-            $out = $in ? @fopen( $dest, 'wb' ) : false;
+            $out = $in ? @fopen( $tmp, 'wb' ) : false;
             $ok  = $in && $out && fwrite( $out, self::PHP_EXIT ) !== false && stream_copy_to_stream( $in, $out ) !== false;
             if ( $in ) {
                 fclose( $in );
@@ -804,12 +805,83 @@ class Import {
             if ( $out ) {
                 $ok = fclose( $out ) && $ok;
             }
-            if ( ! $ok ) {
+            if ( ! $ok || ! @rename( $tmp, $dest ) ) {
+                @unlink( $tmp );
                 $failed[] = $name;
             }
         }
         $zip->close();
         if ( $failed && $strict ) {
+            return new \WP_Error( 'extract_failed', 'Could not extract ' . count( $failed ) . ' files from the ZIP (first: ' . $failed[0] . '). Is the disk full?', [ 'status' => 500 ] );
+        }
+        return true;
+    }
+
+    /**
+     * The PclZip side of extract_zip_into(), for servers without ZipArchive.
+     * PclZip writes each entry straight to its path, and the exit line could
+     * only go in front afterwards: in between, a staged x.php sat under
+     * uploads holding the source's code, and a request in that moment ran
+     * it. So files that wait under a staged name (runnable ones, database
+     * dumps) are extracted into a folder of this request's own in the
+     * system temp folder, outside the site, and each goes into staging
+     * behind the exit line under a temp name, renamed when whole (see
+     * copy_protected()). Everything else is extracted in place as before:
+     * it's served as itself once deployed anyway. Zip-slip entries are
+     * skipped either way.
+     */
+    private static function extract_with_pclzip( $zip_path, $root ) {
+        if ( ! class_exists( 'PclZip' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
+        }
+        $pcl  = new \PclZip( $zip_path );
+        $list = $pcl->listContent();
+        if ( ! is_array( $list ) ) {
+            return new \WP_Error( 'extract_failed', 'Failed to extract ZIP: ' . $pcl->errorInfo( true ), [ 'status' => 500 ] );
+        }
+        $plain = $staged = [];
+        foreach ( $list as $entry ) {
+            $name = (string) ( $entry['stored_filename'] ?? '' );
+            if ( ! self::is_safe_relative_path( $name ) ) {
+                continue;
+            }
+            if ( empty( $entry['folder'] ) && self::staged_name( $name ) !== $name ) {
+                $staged[] = (int) $entry['index'];
+            } else {
+                $plain[] = (int) $entry['index'];
+            }
+        }
+        if ( $plain && $pcl->extract( PCLZIP_OPT_PATH, $root, PCLZIP_OPT_BY_INDEX, implode( ',', $plain ), PCLZIP_CB_PRE_EXTRACT, 'Disembark\\pclzip_pre_extract_guard' ) == 0 ) {
+            return new \WP_Error( 'extract_failed', 'Failed to extract ZIP: ' . $pcl->errorInfo( true ), [ 'status' => 500 ] );
+        }
+        if ( ! $staged ) {
+            return true;
+        }
+        $work = rtrim( get_temp_dir(), '/' ) . '/disembark-' . bin2hex( random_bytes( 16 ) );
+        if ( ! wp_mkdir_p( $work ) ) {
+            return new \WP_Error( 'extract_failed', 'Could not make a temporary folder to extract the ZIP into.', [ 'status' => 500 ] );
+        }
+        @chmod( $work, 0700 );
+        $failed = [];
+        $out    = $pcl->extract( PCLZIP_OPT_PATH, $work, PCLZIP_OPT_BY_INDEX, implode( ',', $staged ), PCLZIP_CB_PRE_EXTRACT, 'Disembark\\pclzip_pre_extract_guard' );
+        if ( $out == 0 ) {
+            $failed[] = $pcl->errorInfo( true );
+        } else {
+            foreach ( $out as $entry ) {
+                $name = (string) ( $entry['stored_filename'] ?? '' );
+                $from = $work . '/' . $name;
+                if ( ! self::is_safe_relative_path( $name ) || ! is_file( $from ) || is_link( $from ) ) {
+                    continue;
+                }
+                $dest = rtrim( $root, '/' ) . '/' . self::staged_name( $name );
+                if ( ( ! is_dir( dirname( $dest ) ) && ! wp_mkdir_p( dirname( $dest ) ) ) || ! self::copy_protected( $from, $dest ) ) {
+                    $failed[] = $name;
+                }
+                @unlink( $from );
+            }
+        }
+        self::delete_directory_recursive( $work );
+        if ( $failed ) {
             return new \WP_Error( 'extract_failed', 'Could not extract ' . count( $failed ) . ' files from the ZIP (first: ' . $failed[0] . '). Is the disk full?', [ 'status' => 500 ] );
         }
         return true;
@@ -3896,7 +3968,7 @@ class Import {
             }
             $rel = ltrim( str_replace( '\\', '/', substr( $path, strlen( $root ) ) ), '/' );
             // What a copy that stopped left behind.
-            if ( preg_match( '/\.dsk\.php\.tmp$/', $rel ) ) {
+            if ( preg_match( '/\.dsk\.php\.(?:[0-9a-f]{12}\.)?tmp$/', $rel ) ) {
                 if ( (int) @filemtime( $path ) < time() - HOUR_IN_SECONDS ) {
                     @unlink( $path );
                 }
@@ -5603,35 +5675,12 @@ class Import {
 }
 
 /**
- * PclZip pre-extract guard shared by Import and Pull: skips any entry whose
- * stored name could escape the extraction root (zip-slip). PclZip callbacks
- * must be plain function names (function_exists is used to validate them), so
- * this lives outside the class. Returns 1 to extract, 0 to skip.
+ * PclZip pre-extract guard (see Import::extract_with_pclzip()): skips any
+ * entry whose stored name could escape the extraction root (zip-slip).
+ * PclZip callbacks must be plain function names (function_exists is used
+ * to validate them), so this lives outside the class. Returns 1 to
+ * extract, 0 to skip.
  */
 function pclzip_pre_extract_guard( $event, &$header ) {
-    if ( ! Import::is_safe_relative_path( isset( $header['stored_filename'] ) ? $header['stored_filename'] : '' ) ) {
-        return 0;
-    }
-    // A file that could run waits under its staged name (see Import::staged_name()).
-    if ( empty( $header['folder'] ) && isset( $header['filename'] ) ) {
-        $header['filename'] = Import::staged_name( $header['filename'] );
-    }
-    return 1;
-}
-
-/**
- * PclZip post-extract callback: a file extracted under its staged name (a
- * runnable file, a database dump) gets the exit line in front, as the
- * ZipArchive branch writes it.
- */
-function pclzip_post_extract_staged( $event, &$header ) {
-    $file = isset( $header['filename'] ) ? (string) $header['filename'] : '';
-    if ( ! empty( $header['folder'] ) || Import::unstaged_name( $file ) === $file || ! is_file( $file ) ) {
-        return 1;
-    }
-    $data = (string) file_get_contents( $file );
-    if ( strpos( $data, Import::PHP_EXIT ) !== 0 ) {
-        file_put_contents( $file, Import::PHP_EXIT . $data );
-    }
-    return 1;
+    return Import::is_safe_relative_path( isset( $header['stored_filename'] ) ? $header['stored_filename'] : '' ) ? 1 : 0;
 }

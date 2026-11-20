@@ -961,7 +961,6 @@ class Backup {
                  return new \WP_Error('zip_open_failed', 'Could not create the zip file using ZipArchive.');
             }
         } elseif ( $this->archiver_type === 'PclZip' ) {
-            $zip = new \PclZip( $zip_name );
             $www_files = [];
             $core_files = [];
             foreach( $files as $file ) {
@@ -982,21 +981,27 @@ class Backup {
                 }
             }
             
-            $result = 0;
-            if ( !empty($www_files) ) {
-                // Create zip with web root files
-                $result = $zip->create( $www_files, PCLZIP_OPT_REMOVE_PATH, $web_root );
-                if ( $result != 0 && !empty($core_files) ) {
-                    // Add core root files to existing zip
-                    $result = $zip->add( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
+            // Built under a temp name and renamed into place (see pclzip_build()).
+            $lock = self::lock_zip( $zip_name );
+            list( $result, $zip ) = self::pclzip_build( $zip_name, function ( $zip ) use ( $www_files, $core_files, $web_root, $core_root ) {
+                $result = 0;
+                if ( !empty($www_files) ) {
+                    // Create zip with web root files
+                    $result = $zip->create( $www_files, PCLZIP_OPT_REMOVE_PATH, $web_root );
+                    if ( $result != 0 && !empty($core_files) ) {
+                        // Add core root files to existing zip
+                        $result = $zip->add( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
+                    }
+                } elseif ( !empty($core_files) ) {
+                     // Create zip with core root files if no web root files
+                     $result = $zip->create( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
                 }
-            } elseif ( !empty($core_files) ) {
-                 // Create zip with core root files if no web root files
-                 $result = $zip->create( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
-            }
+                return $result;
+            } );
+            self::unlock_zip( $lock );
 
             if ( $result == 0 ) {
-                return new \WP_Error('pclzip_failed', 'Could not create zip: ' . $zip->errorInfo(true));
+                return new \WP_Error('pclzip_failed', 'Could not create zip: ' . ( $zip ? $zip->errorInfo(true) : 'could not copy the archive' ));
             }
         } else {
             return new \WP_Error('no_zip_method', 'No supported zipping library found.');
@@ -1004,6 +1009,54 @@ class Backup {
 
         // Return the public URL
         return "{$this->backup_url}/{$file_name}.zip";
+    }
+
+    /**
+     * PclZip writes an archive in place (create) or through a temp file in
+     * the current folder (add), so a request downloading the zip, or a
+     * retried batch adding to it at the same time, could read or write it
+     * half done. Each PclZip build here works on a copy under a temp name
+     * of its own next to the zip and renames it into place when whole,
+     * while holding the zip's lock (see lock_zip()). $build( PclZip, bool
+     * $existed ) returns PclZip's result; 0 keeps the zip as it was.
+     */
+    private static function pclzip_build( $zip_name, $build ) {
+        $tmp     = $zip_name . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
+        $existed = file_exists( $zip_name );
+        if ( $existed && ! @copy( $zip_name, $tmp ) ) {
+            @unlink( $tmp );
+            return [ 0, null ];
+        }
+        $zip    = new \PclZip( $tmp );
+        $result = $build( $zip, $existed );
+        if ( $result == 0 || ! @rename( $tmp, $zip_name ) ) {
+            @unlink( $tmp );
+            return [ 0, $zip ];
+        }
+        self::make_readable( $zip_name );
+        return [ $result, $zip ];
+    }
+
+    /**
+     * One request at a time builds or adds to $zip_name: a batch sent twice
+     * (a retry after a lost answer) would otherwise add to the same archive
+     * at once and one request's files would be lost. Returns the lock to
+     * hand to unlock_zip(). The lock file stays: removing it while another
+     * request waits on it would let a third one in beside it.
+     */
+    private static function lock_zip( $zip_name ) {
+        $lock = @fopen( $zip_name . '.lock', 'c' );
+        if ( $lock ) {
+            flock( $lock, LOCK_EX );
+        }
+        return $lock;
+    }
+
+    private static function unlock_zip( $lock ) {
+        if ( $lock ) {
+            flock( $lock, LOCK_UN );
+            fclose( $lock );
+        }
     }
 
     /**
@@ -1167,6 +1220,8 @@ class Backup {
             return new \WP_Error( 'no_zip', 'Exporting one site of a shared install needs PHP\'s ZipArchive on the source.', [ 'status' => 501 ] );
         }
         
+        // One request at a time adds to this archive (see lock_zip()).
+        $lock = self::lock_zip( $zip_name );
         // CHECK: Did the zip exist before we started this specific chunk?
         $zip_existed_before = file_exists( $zip_name );
         $files_added = 0;
@@ -1197,10 +1252,10 @@ class Backup {
                 $this->zip_object->close();
                 self::make_readable( $zip_name );
             } else {
+                 self::unlock_zip( $lock );
                  return new \WP_Error('zip_open_failed', 'Could not create the zip file using ZipArchive.');
             }
         } elseif ( $this->archiver_type === 'PclZip' ) {
-            $zip = new \PclZip( $zip_name );
             $www_files = [];
             $core_files = [];
             foreach( $files as $file_obj ) {
@@ -1224,27 +1279,37 @@ class Backup {
             
             $files_added = count($www_files) + count($core_files);
             
-            // If zip exists, use 'add', otherwise 'create'.
-            // PclZip::create overwrites, PclZip::add appends.
-            $pclzip_method = $zip_existed_before ? 'add' : 'create';
-            
             $result = 0;
-            if ( !empty($www_files) ) {
-                $result = $zip->$pclzip_method( $www_files, PCLZIP_OPT_REMOVE_PATH, $web_root );
-                if ( $result != 0 && !empty($core_files) ) {
-                    // Always 'add' for the second batch in the same request
-                    $result = $zip->add( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
-                }
-            } elseif ( !empty($core_files) ) {
-                 $result = $zip->$pclzip_method( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
+            $zip    = null;
+            if ( $files_added > 0 ) {
+                // On a copy under a temp name, renamed into place when whole
+                // (see pclzip_build()). If the zip exists, 'add' appends to
+                // it; otherwise 'create'.
+                list( $result, $zip ) = self::pclzip_build( $zip_name, function ( $zip, $existed ) use ( $www_files, $core_files, $web_root, $core_root ) {
+                    $pclzip_method = $existed ? 'add' : 'create';
+                    $result        = 0;
+                    if ( !empty($www_files) ) {
+                        $result = $zip->$pclzip_method( $www_files, PCLZIP_OPT_REMOVE_PATH, $web_root );
+                        if ( $result != 0 && !empty($core_files) ) {
+                            // Always 'add' for the second batch in the same request
+                            $result = $zip->add( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
+                        }
+                    } elseif ( !empty($core_files) ) {
+                         $result = $zip->$pclzip_method( $core_files, PCLZIP_OPT_REMOVE_PATH, $core_root );
+                    }
+                    return $result;
+                } );
             }
 
             if ( $result == 0 && $files_added > 0 ) {
-                return new \WP_Error('pclzip_failed', 'Could not create zip: ' . $zip->errorInfo(true));
+                self::unlock_zip( $lock );
+                return new \WP_Error('pclzip_failed', 'Could not create zip: ' . ( $zip ? $zip->errorInfo(true) : 'could not copy the archive' ));
             }
         } else {
+            self::unlock_zip( $lock );
             return new \WP_Error('no_zip_method', 'No supported zipping library found.');
         }
+        self::unlock_zip( $lock );
 
         // Only delete if no files were added AND it didn't exist before.
         // This prevents deleting a valid zip just because the current chunk was empty/skipped.
@@ -1272,10 +1337,16 @@ class Backup {
                 self::make_readable( $zip_name );
             }
         } elseif ( $this->archiver_type === 'PclZip' ) {
-            $zip = new \PclZip($zip_name);
-            $result = $zip->create($sql_files, PCLZIP_OPT_REMOVE_PATH, $this->backup_path);
+            // Under a temp name, renamed into place when whole (see pclzip_build()).
+            $lock = self::lock_zip( $zip_name );
+            @unlink( $zip_name );
+            $backup_path = $this->backup_path;
+            list( $result, $zip ) = self::pclzip_build( $zip_name, function ( $zip ) use ( $sql_files, $backup_path ) {
+                return $zip->create( $sql_files, PCLZIP_OPT_REMOVE_PATH, $backup_path );
+            } );
+            self::unlock_zip( $lock );
             if ($result == 0) {
-                return new \WP_Error('pclzip_failed', 'Could not create zip: ' . $zip->errorInfo(true));
+                return new \WP_Error('pclzip_failed', 'Could not create zip: ' . ( $zip ? $zip->errorInfo(true) : 'could not copy the archive' ));
             }
         } else {
             return new \WP_Error('no_zip_method', 'No supported zipping library found.');
