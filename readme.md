@@ -16,6 +16,8 @@ Tools → Disembark has four tabs:
 - **Browse:** look through the site's files and database tables, edit a file or a row, and fix old addresses with search and replace.
 - **Settings:** the connect line, a ready-made prompt for AI agents, the CLI, quiet mode and storage.
 
+**Bringing a site into a network or WP Freighter install trusts it like a super admin.** Its plugins, themes and uploads join the install's shared folders, so its code runs with access to every site there. Only bring in sites you'd trust with the whole install.
+
 **Quiet mode** keeps a staging or dev copy of a live store from reaching real customers. Emails are held, scheduled jobs paused, checkout closed, and payment and marketing APIs blocked.
 
 Everything ships with the plugin: no outside scripts, fonts or accounts. It's free and MIT licensed.
