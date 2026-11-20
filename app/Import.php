@@ -403,42 +403,172 @@ class Import {
     }
 
     /**
-     * Extracts a ZIP into the staging directory, skipping any zip-slip entry
-     * names. Uses ZipArchive, falling back to PclZip. Returns true or WP_Error.
+     * Extracts a ZIP into the staging directory (see extract_zip_into()).
      */
     private function extract_zip_file( $zip_path ) {
-        if ( ! class_exists( 'ZipArchive' ) ) {
+        return self::extract_zip_into( $zip_path, $this->staging_path );
+    }
+
+    /**
+     * Extracts a ZIP into a staging folder ($root), skipping any zip-slip
+     * entry names, with files that could run under a permissive web server
+     * saved under their staged names (see staged_name()) so none of them is
+     * ever a runnable file before deploy_files() puts it in place. Uses
+     * ZipArchive, falling back to PclZip. Shared with Pull. Returns true or
+     * WP_Error.
+     */
+    public static function extract_zip_into( $zip_path, $root ) {
+        $zip = class_exists( 'ZipArchive' ) ? new \ZipArchive() : null;
+        if ( ! $zip || $zip->open( $zip_path ) !== true ) {
             if ( ! class_exists( 'PclZip' ) ) {
                 require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
             }
-            $zip    = new \PclZip( $zip_path );
-            // The pre-extract guard applies the same zip-slip filtering the
-            // ZipArchive branch does — without it PclZip would honour "../".
-            $result = $zip->extract( PCLZIP_OPT_PATH, $this->staging_path, PCLZIP_CB_PRE_EXTRACT, 'Disembark\\pclzip_pre_extract_guard' );
-            if ( $result == 0 ) {
-                return new \WP_Error( 'extract_failed', 'Failed to extract ZIP: ' . $zip->errorInfo( true ), [ 'status' => 500 ] );
+            $pcl = new \PclZip( $zip_path );
+            // The pre-extract guard applies the same zip-slip filtering and
+            // staged names the ZipArchive branch does.
+            if ( $pcl->extract( PCLZIP_OPT_PATH, $root, PCLZIP_CB_PRE_EXTRACT, 'Disembark\\pclzip_pre_extract_guard', PCLZIP_CB_POST_EXTRACT, 'Disembark\\pclzip_post_extract_staged' ) == 0 ) {
+                return new \WP_Error( 'extract_failed', 'Failed to extract ZIP: ' . $pcl->errorInfo( true ), [ 'status' => 500 ] );
             }
             return true;
         }
-
-        $zip = new \ZipArchive();
-        if ( $zip->open( $zip_path ) !== true ) {
-            return new \WP_Error( 'extract_failed', 'Failed to open ZIP archive.', [ 'status' => 500 ] );
-        }
-        // Extract entry-by-entry, skipping any name that could escape staging
+        // Entry by entry, skipping any name that could escape staging
         // (zip-slip); extractTo() on the whole archive would honour "../".
-        $safe_entries = [];
+        $plain    = [];
+        $disguise = [];
         for ( $i = 0; $i < $zip->numFiles; $i++ ) {
             $name = $zip->getNameIndex( $i );
-            if ( self::is_safe_relative_path( $name ) ) {
-                $safe_entries[] = $name;
+            if ( $name === false || ! self::is_safe_relative_path( $name ) ) {
+                continue;
+            }
+            if ( substr( $name, -1 ) !== '/' && self::staged_name( $name ) !== $name ) {
+                $disguise[] = $name;
+            } else {
+                $plain[] = $name;
             }
         }
-        if ( ! empty( $safe_entries ) ) {
-            $zip->extractTo( $this->staging_path, $safe_entries );
+        if ( $plain ) {
+            $zip->extractTo( $root, $plain );
+        }
+        foreach ( $disguise as $name ) {
+            $dest = rtrim( $root, '/' ) . '/' . self::staged_name( $name );
+            if ( ! is_dir( dirname( $dest ) ) ) {
+                wp_mkdir_p( dirname( $dest ) );
+            }
+            $in  = $zip->getStream( $name );
+            $out = $in ? @fopen( $dest, 'wb' ) : false;
+            if ( $in && $out ) {
+                fwrite( $out, self::PHP_EXIT );
+                stream_copy_to_stream( $in, $out );
+            }
+            if ( $in ) {
+                fclose( $in );
+            }
+            if ( $out ) {
+                fclose( $out );
+            }
         }
         $zip->close();
         return true;
+    }
+
+    /* ------------------------------------------------------------------
+     * Staged names
+     *
+     * Staging sits under the public uploads folder until deploy. On a host
+     * that runs PHP there, a staged x.php from the source could be requested
+     * and run before the checks were seen. So such files (and server config
+     * files that change what runs: .htaccess, .user.ini) wait under another
+     * name, with the exit line in front of their contents: every "." and "%"
+     * of the file name percent-encoded, plus ".dsk.php" (wp-config.php →
+     * wp-config%2Ephp.dsk.php). Requested, it either runs and stops at once
+     * or isn't served; it is never the source's code, and never a .htaccess.
+     * Apache maps every extension of a name (x.php.jpg runs as PHP), hence
+     * the encoding rather than a suffix alone. Every name that ends in
+     * .dsk.php is itself encoded, so the mapping is exact. Restore points
+     * keep the files a move replaced the same way.
+     * ---------------------------------------------------------------- */
+
+    const STAGED_SUFFIX = '.dsk.php';
+
+    /** Whether a file named $name could run, or change what runs, on a web server. */
+    private static function runnable_name( $name ) {
+        return (bool) preg_match( '/\.(?:php\d*|phtml|pht|phar|phps|shtml?|cgi|pl|asp|aspx|jsp)(?:\.|$)|^(?:\.htaccess|\.user\.ini|php\.ini|web\.config)$/i', $name );
+    }
+
+    /** The name $rel (a path; only its last part changes) is staged under. */
+    public static function staged_name( $rel ) {
+        $rel  = (string) $rel;
+        $cut  = strrpos( $rel, '/' );
+        $dir  = $cut === false ? '' : substr( $rel, 0, $cut + 1 );
+        $base = $cut === false ? $rel : substr( $rel, $cut + 1 );
+        if ( $base === '' || ( ! self::runnable_name( $base ) && substr( $base, -strlen( self::STAGED_SUFFIX ) ) !== self::STAGED_SUFFIX ) ) {
+            return $rel;
+        }
+        return $dir . strtr( $base, [ '%' => '%25', '.' => '%2E' ] ) . self::STAGED_SUFFIX;
+    }
+
+    /** The real name of a staged path (the reverse of staged_name()). */
+    public static function unstaged_name( $rel ) {
+        $rel = (string) $rel;
+        if ( substr( $rel, -strlen( self::STAGED_SUFFIX ) ) !== self::STAGED_SUFFIX ) {
+            return $rel;
+        }
+        $rel  = substr( $rel, 0, -strlen( self::STAGED_SUFFIX ) );
+        $cut  = strrpos( $rel, '/' );
+        $dir  = $cut === false ? '' : substr( $rel, 0, $cut + 1 );
+        $base = $cut === false ? $rel : substr( $rel, $cut + 1 );
+        return $dir . strtr( $base, [ '%2E' => '.', '%25' => '%' ] );
+    }
+
+    /** Copies the plain file $from to $to, the staged path of $rel (behind the exit line when renamed). */
+    private static function put_staged( $from, $to, $rel ) {
+        if ( self::staged_name( $rel ) === $rel ) {
+            return copy( $from, $to );
+        }
+        return self::copy_protected( $from, $to );
+    }
+
+    /**
+     * Moves the staged file $from to $to as the real file: without the exit
+     * line staged_name() put in front (a file staged by an older build has
+     * none and moves as it is).
+     */
+    private static function take_staged( $from, $to ) {
+        $in = @fopen( $from, 'rb' );
+        if ( ! $in ) {
+            return false;
+        }
+        $head = (string) fread( $in, strlen( self::PHP_EXIT ) );
+        if ( substr( $from, -strlen( self::STAGED_SUFFIX ) ) !== self::STAGED_SUFFIX || $head !== self::PHP_EXIT ) {
+            fclose( $in );
+            if ( @rename( $from, $to ) ) {
+                return true;
+            }
+            if ( copy( $from, $to ) ) {
+                @unlink( $from );
+                return true;
+            }
+            return false;
+        }
+        $tmp = $to . '.dsk-tmp';
+        $out = @fopen( $tmp, 'wb' );
+        $ok  = $out && stream_copy_to_stream( $in, $out ) !== false;
+        fclose( $in );
+        if ( $out ) {
+            $ok = fclose( $out ) && $ok;
+        }
+        if ( ! $ok || ! @rename( $tmp, $to ) ) {
+            @unlink( $tmp );
+            return false;
+        }
+        @unlink( $from );
+        return true;
+    }
+
+    /** Where staged $rel is under $root: its staged name, or (staged by an older build) its own. */
+    private static function staged_file( $root, $rel ) {
+        $staged = $root . '/' . self::staged_name( $rel );
+        return file_exists( $staged ) || ! file_exists( $root . '/' . $rel ) ? $staged : $root . '/' . $rel;
     }
 
     /**
@@ -529,7 +659,7 @@ class Import {
             if ( ! $file->isFile() ) {
                 continue;
             }
-            $rel = ltrim( str_replace( '\\', '/', substr( $file->getPathname(), strlen( $root ) ) ), '/' );
+            $rel = self::unstaged_name( ltrim( str_replace( '\\', '/', substr( $file->getPathname(), strlen( $root ) ) ), '/' ) );
             if ( self::never_deploy( $rel ) ) {
                 continue;
             }
@@ -1176,12 +1306,12 @@ class Import {
      * wp-config.php, so these have to be added there by hand.
      */
     private function staged_multisite_constants() {
-        foreach ( [ '/public/wp-config.php', '/wp-config.php' ] as $rel ) {
-            $file = $this->staging_path . $rel;
+        foreach ( [ 'public/wp-config.php', 'wp-config.php' ] as $rel ) {
+            $file = self::staged_file( $this->staging_path, $rel );
             if ( ! is_file( $file ) ) {
                 continue;
             }
-            $config = (string) file_get_contents( $file, false, null, 0, 262144 );
+            $config = substr( (string) self::read_protected( $file ), 0, 262144 );
             if ( ! preg_match( '/define\(\s*[\'"]MULTISITE[\'"]\s*,\s*true\s*\)/i', $config ) ) {
                 return [];
             }
@@ -1241,14 +1371,17 @@ class Import {
         }
 
         // Reassemble
-        $final_dir = dirname( $this->staging_path . '/' . $file_path );
+        $final_path = $this->staging_path . '/' . self::staged_name( $file_path );
+        $final_dir  = dirname( $final_path );
         if ( ! is_dir( $final_dir ) ) {
             mkdir( $final_dir, 0755, true );
         }
-        $final_path = $this->staging_path . '/' . $file_path;
         $fp         = fopen( $final_path, 'wb' );
         if ( ! $fp ) {
             return new \WP_Error( 'write_failed', 'Could not create final file.', [ 'status' => 500 ] );
+        }
+        if ( self::staged_name( $file_path ) !== $file_path ) {
+            fwrite( $fp, self::PHP_EXIT );
         }
 
         sort( $existing_chunks );
@@ -1308,7 +1441,7 @@ class Import {
                 continue;
             }
 
-            $source = $staging_root . '/' . $relative_path;
+            $source = self::staged_file( $staging_root, $relative_path );
             $dest   = $web_root . '/' . $relative_path;
             if ( $target ) {
                 if ( self::never_deploy( $relative_path ) ) {
@@ -1361,12 +1494,12 @@ class Import {
 
             // Backup original if it exists
             if ( file_exists( $dest ) ) {
-                $backup_dest = $this->rollback_path . '/files/' . $relative_path;
+                $backup_dest = $this->rollback_path . '/files/' . self::staged_name( $relative_path );
                 $backup_dir  = dirname( $backup_dest );
                 if ( ! is_dir( $backup_dir ) ) {
                     mkdir( $backup_dir, 0755, true );
                 }
-                copy( $dest, $backup_dest );
+                self::put_staged( $dest, $backup_dest, $relative_path );
                 $backed_up[] = $relative_path;
             }
 
@@ -1376,17 +1509,11 @@ class Import {
                 mkdir( $dest_dir, 0755, true );
             }
 
-            // Move file
-            if ( rename( $source, $dest ) ) {
+            // Move file (a staged name gets its real one back)
+            if ( self::take_staged( $source, $dest ) ) {
                 $deployed[] = $relative_path;
             } else {
-                // Try copy + delete as fallback
-                if ( copy( $source, $dest ) ) {
-                    @unlink( $source );
-                    $deployed[] = $relative_path;
-                } else {
-                    $errors[] = "Failed to deploy: {$relative_path}";
-                }
+                $errors[] = "Failed to deploy: {$relative_path}";
             }
         }
 
@@ -1408,11 +1535,11 @@ class Import {
                 if ( ! is_file( $dest ) ) {
                     continue;
                 }
-                $backup_dest = $this->rollback_path . '/files/' . $relative_path;
+                $backup_dest = $this->rollback_path . '/files/' . self::staged_name( $relative_path );
                 if ( ! is_dir( dirname( $backup_dest ) ) ) {
                     mkdir( dirname( $backup_dest ), 0755, true );
                 }
-                if ( ! in_array( $relative_path, $backed_up, true ) && copy( $dest, $backup_dest ) ) {
+                if ( ! in_array( $relative_path, $backed_up, true ) && self::put_staged( $dest, $backup_dest, $relative_path ) ) {
                     $backed_up[] = $relative_path;
                 }
                 if ( in_array( $relative_path, $backed_up, true ) && @unlink( $dest ) ) {
@@ -2934,16 +3061,14 @@ class Import {
         $web_root    = dirname( WP_CONTENT_DIR );
         $backed_up   = $meta['backed_up_files'] ?? [];
         foreach ( $backed_up as $relative_path ) {
-            $backup_src = $this->rollback_path . '/files/' . $relative_path;
+            $backup_src = self::staged_file( $this->rollback_path . '/files', $relative_path );
             $dest       = $web_root . '/' . $relative_path;
             if ( file_exists( $backup_src ) ) {
                 $dest_dir = dirname( $dest );
                 if ( ! is_dir( $dest_dir ) ) {
                     mkdir( $dest_dir, 0755, true );
                 }
-                if ( ! rename( $backup_src, $dest ) ) {
-                    copy( $backup_src, $dest );
-                }
+                self::take_staged( $backup_src, $dest );
             }
         }
 
@@ -3710,5 +3835,28 @@ class Import {
  * this lives outside the class. Returns 1 to extract, 0 to skip.
  */
 function pclzip_pre_extract_guard( $event, &$header ) {
-    return Import::is_safe_relative_path( isset( $header['stored_filename'] ) ? $header['stored_filename'] : '' ) ? 1 : 0;
+    if ( ! Import::is_safe_relative_path( isset( $header['stored_filename'] ) ? $header['stored_filename'] : '' ) ) {
+        return 0;
+    }
+    // A file that could run waits under its staged name (see Import::staged_name()).
+    if ( empty( $header['folder'] ) && isset( $header['filename'] ) ) {
+        $header['filename'] = Import::staged_name( $header['filename'] );
+    }
+    return 1;
+}
+
+/**
+ * PclZip post-extract callback: a file extracted under its staged name gets
+ * the exit line in front, as the ZipArchive branch writes it.
+ */
+function pclzip_post_extract_staged( $event, &$header ) {
+    $file = isset( $header['filename'] ) ? (string) $header['filename'] : '';
+    if ( ! empty( $header['folder'] ) || substr( $file, -strlen( Import::STAGED_SUFFIX ) ) !== Import::STAGED_SUFFIX || ! is_file( $file ) ) {
+        return 1;
+    }
+    $data = (string) file_get_contents( $file );
+    if ( strpos( $data, Import::PHP_EXIT ) !== 0 ) {
+        file_put_contents( $file, Import::PHP_EXIT . $data );
+    }
+    return 1;
 }

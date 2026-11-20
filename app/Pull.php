@@ -61,6 +61,20 @@ class Pull {
     }
 
     /**
+     * The id the source is told for this pull (its preflight takes one).
+     * Never this site's import id: that names the staging folder here, which
+     * a source must not be able to find.
+     */
+    private function source_session() {
+        $state = $this->state();
+        if ( empty( $state['session'] ) || ! preg_match( '/^[a-f0-9]{24}$/', (string) $state['session'] ) ) {
+            $state['session'] = bin2hex( random_bytes( 12 ) );
+            $this->save_state( $state );
+        }
+        return $state['session'];
+    }
+
+    /**
      * Whether to verify TLS certificates (and reject internal/unsafe URLs) on
      * the pull channel. Defaults ON — this channel carries the source's
      * full-access token and pulls executable files and SQL, so a MITM here is
@@ -299,6 +313,7 @@ class Pull {
             'source_token' => $source_token,
             'rest_style'   => $style,
             'backup_token' => substr( bin2hex( random_bytes( 12 ) ), 0, 12 ),
+            'session'      => bin2hex( random_bytes( 12 ) ),
             'started'      => time(),
             'move'         => is_array( $move ) ? $move : [],
             'catch_up'     => (bool) $catch_up,
@@ -306,7 +321,7 @@ class Pull {
         ] );
 
         // Source metadata (v2.8 sources expose /import/preflight).
-        $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->import_id ], 'POST' );
+        $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->source_session() ], 'POST' );
 
         // A network or WP Freighter install: bring one site of it when one
         // was named, or when the address reached one site (a subsite, a
@@ -339,7 +354,7 @@ class Pull {
         $state         = $this->state();
         $state['site'] = (string) $site;
         $this->save_state( $state );
-        $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->import_id ], 'POST' );
+        $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->source_session() ], 'POST' );
         if ( is_wp_error( $pre ) || ! is_object( $pre ) || empty( $pre->scope->site ) ) {
             $state = $this->state();
             unset( $state['site'] );
@@ -373,7 +388,7 @@ class Pull {
         if ( $site === '' || strtolower( $site ) === 'all' ) {
             unset( $state['site'] );
             $this->save_state( $state );
-            $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->import_id ], 'POST' );
+            $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->source_session() ], 'POST' );
         } else {
             $pre = $this->use_site( $site );
         }
@@ -749,7 +764,7 @@ class Pull {
      * dump into staging as database-pull.sql.
      */
     public function fetch_database() {
-        $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->import_id ], 'POST' );
+        $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->source_session() ], 'POST' );
         $tables = ( is_object( $pre ) && ! empty( $pre->tables ) ) ? $pre->tables : [];
         if ( empty( $tables ) ) {
             return new \WP_Error( 'no_tables', 'Source returned no tables to export.', [ 'status' => 502 ] );
@@ -854,31 +869,8 @@ class Pull {
         if ( ! is_dir( $this->staging_public ) ) {
             mkdir( $this->staging_public, 0755, true );
         }
-        $zip = class_exists( 'ZipArchive' ) ? new \ZipArchive() : null;
-        if ( ! $zip || $zip->open( $zip_path ) !== true ) {
-            if ( ! class_exists( 'PclZip' ) ) {
-                require_once ABSPATH . 'wp-admin/includes/class-pclzip.php';
-            }
-            $pcl = new \PclZip( $zip_path );
-            // Same zip-slip filtering as the ZipArchive branch — without the
-            // guard PclZip would honour "../" entry names.
-            if ( $pcl->extract( PCLZIP_OPT_PATH, $this->staging_public, PCLZIP_CB_PRE_EXTRACT, 'Disembark\\pclzip_pre_extract_guard' ) == 0 ) {
-                return new \WP_Error( 'extract_failed', 'Could not extract batch zip.', [ 'status' => 500 ] );
-            }
-            return true;
-        }
-        $safe = [];
-        for ( $i = 0; $i < $zip->numFiles; $i++ ) {
-            $name = $zip->getNameIndex( $i );
-            if ( $name !== false && Import::is_safe_relative_path( $name ) ) {
-                $safe[] = $name;
-            }
-        }
-        if ( ! empty( $safe ) ) {
-            $zip->extractTo( $this->staging_public, $safe );
-        }
-        $zip->close();
-        return true;
+        $done = Import::extract_zip_into( $zip_path, $this->staging_public );
+        return is_wp_error( $done ) ? new \WP_Error( 'extract_failed', 'Could not extract batch zip.', [ 'status' => 500 ] ) : true;
     }
 
     /**
