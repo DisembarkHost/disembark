@@ -44,6 +44,7 @@
       return D.note(m.rollback_point ? 'warn' : '', [
         h('strong', null, 'An unfinished ' + (m.move && m.move.kind === 'push' ? 'push' : 'pull') + ' from ' + D.host(m.source) + '. '),
         (m.started ? 'Started ' + D.fmt.ago(m.started) + ', last active ' : 'Last active ') + D.fmt.ago(m.touched) + '. ' + where,
+        m.rollback_point && m.idle_days >= 7 ? ' It has waited ' + D.fmt.plural(m.idle_days, 'day') + ': it stays until you resume it, discard it or roll it back.' : '',
         h('div', { class: 'dsk-row', style: { marginTop: '10px' } },
           cli ? h('code', null, 'wp disembark pull --resume=' + m.id)
             : h('button', { class: 'dsk-btn primary sm', type: 'button', onclick: function (e) { resume(m, e.currentTarget); } }, D.icon('play'), 'Resume'),

@@ -3511,14 +3511,21 @@ class Import {
     }
 
     /**
-     * Daily clean-up (Run registers the cron): everything a move or a backup
-     * left in the uploads folder that nobody has touched for $max_age. A
-     * move folder without a restore point goes completely (a failed backup
-     * restore leaves its staged database-*.sql there, with no pull state to
-     * find it by); one with a restore point keeps it and loses only what an
-     * unfinished move left (staged files, pull state). Backup and export
-     * session folders go too. The pull memory and restore points stay.
-     * Returns the folder names it cleaned.
+     * Daily clean-up (Run registers the cron): what a move or a backup left
+     * in the uploads folder that nobody has touched for a while. Backup and
+     * export session folders go after $max_age. A move folder:
+     * - an unfinished move that can be resumed (its pull state is there)
+     *   and saved no restore point yet: after a week (Pull::unfinished()
+     *   and the changelog say the same);
+     * - a move that saved its restore point and then stopped, so the site
+     *   may be partly changed: never, until it's resumed, discarded or
+     *   rolled back (the Move tab and `wp disembark unfinished` list it);
+     * - one that was rolled back: its leftovers (staged files) after
+     *   $max_age, the restore point stays;
+     * - anything else without a restore point (a failed backup restore's
+     *   staged database-*.sql): after $max_age.
+     * The pull memory and restore points stay. Returns the folder names it
+     * cleaned.
      */
     public static function purge_stale( $max_age = DAY_IN_SECONDS ) {
         $base   = Storage::base_dir();
@@ -3538,7 +3545,11 @@ class Import {
                     continue;
                 }
                 $leftovers = is_dir( "{$dir}/staging" ) || is_file( "{$dir}/pull.json" ) || is_file( "{$dir}/pull-secret.php" ) || glob( "{$dir}/token-guard*" );
-                if ( self::has_restore_point( $dir ) && ! $leftovers ) {
+                $point     = self::rollback_meta( "{$dir}/rollback" );
+                if ( $point !== null && ( ! $leftovers || empty( $point['rolled_back_at'] ) ) ) {
+                    continue;
+                }
+                if ( $point === null && is_file( "{$dir}/pull.json" ) && self::newest_mtime( $dir ) > time() - WEEK_IN_SECONDS ) {
                     continue;
                 }
                 ( new self( $id ) )->cancel( 'cleanup' );

@@ -997,6 +997,9 @@ class Pull {
                 'files_fetched'  => is_file( $dir . '/fetched.php' ) ? Pace::ranges_count( json_decode( (string) Import::read_protected( $dir . '/fetched.php' ), true ) ) : (int) ( $state['fetched'] ?? 0 ),
                 'database'       => ! empty( $state['db_done'] ),
                 'rollback_point' => $has_point,
+                // Past its restore point, it's kept until it's resumed,
+                // discarded or rolled back, however long that takes.
+                'idle_days'      => (int) floor( max( 0, time() - $touched ) / DAY_IN_SECONDS ),
             ];
         }
         usort( $out, function ( $a, $b ) { return $b['touched'] - $a['touched']; } );
