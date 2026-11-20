@@ -1963,6 +1963,16 @@ class Import {
             if ( self::never_deploy( $relative_path ) ) {
                 return [];
             }
+            // A dedicated WP Freighter tenant has its own mu-plugins and
+            // drop-ins folder, but the source host's (its Kinsta mu-plugin,
+            // a drop-in pointing at its object cache) don't belong here
+            // either: the tenant gets this install's own (see Target::finish()).
+            if ( $keep_host_files ) {
+                $host = self::host_file( $relative_path, $web_root );
+                if ( $host !== '' ) {
+                    return [ 'h' => $host, 'k' => 1 ];
+                }
+            }
             $to = $target->dest( $relative_path );
             if ( $to === null ) {
                 return [];

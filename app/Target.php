@@ -566,6 +566,7 @@ class Target {
                     // It copies itself in on its next admin load.
                 }
             }
+            $this->copy_host_mu_plugins();
         } else {
             // Plugins on for the whole network stay on there, not per site.
             $network = array_keys( (array) get_site_option( 'active_sitewide_plugins', [] ) );
@@ -580,6 +581,51 @@ class Target {
             }
         }
         wp_cache_flush();
+    }
+
+    /**
+     * A dedicated tenant loads mu-plugins from its own folder, so it gets
+     * this install's hosting mu-plugins (Kinsta's and the like), as WP
+     * Freighter does for a tenant it creates. The source's copies were left
+     * out (see Import::host_file()). Ones the tenant already has stay.
+     */
+    private function copy_host_mu_plugins() {
+        if ( $this->content === '' ) {
+            return;
+        }
+        $root = rtrim( wp_normalize_path( dirname( WP_CONTENT_DIR ) ), '/' );
+        $from = $root . '/wp-content/mu-plugins';
+        $to   = $root . '/' . $this->content . '/mu-plugins';
+        foreach ( (array) @scandir( $from ) as $entry ) {
+            if ( $entry === '.' || $entry === '..' || $entry === '' || file_exists( $to . '/' . $entry ) || is_link( $from . '/' . $entry ) ) {
+                continue;
+            }
+            $host = false;
+            foreach ( Import::HOST_MU_PLUGINS as $name ) {
+                $host = $host || stripos( $entry, $name ) === 0;
+            }
+            if ( ! $host ) {
+                continue;
+            }
+            wp_mkdir_p( $to );
+            if ( is_file( $from . '/' . $entry ) ) {
+                @copy( $from . '/' . $entry, $to . '/' . $entry );
+                continue;
+            }
+            $items = new \RecursiveIteratorIterator( new \RecursiveDirectoryIterator( $from . '/' . $entry, \FilesystemIterator::SKIP_DOTS ), \RecursiveIteratorIterator::SELF_FIRST );
+            foreach ( $items as $item ) {
+                $dest = $to . '/' . $entry . '/' . substr( wp_normalize_path( $item->getPathname() ), strlen( $from . '/' . $entry ) + 1 );
+                if ( $item->isLink() ) {
+                    continue;
+                }
+                if ( $item->isDir() ) {
+                    wp_mkdir_p( $dest );
+                } else {
+                    wp_mkdir_p( dirname( $dest ) );
+                    @copy( $item->getPathname(), $dest );
+                }
+            }
+        }
     }
 
     /** After a rollback: a site this move created goes completely. */
