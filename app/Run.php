@@ -223,7 +223,9 @@ class Run {
             'multisite' => is_multisite(),
             'install'   => self::install_summary(),
         ];
-        wp_add_inline_script( 'disembark-core', 'window.DisembarkConfig = ' . wp_json_encode( $config ) . ';', 'before' );
+        // JSON_HEX_TAG / JSON_HEX_AMP: a site name or address with </script>
+        // or & in it can't break out of the inline script.
+        wp_add_inline_script( 'disembark-core', 'window.DisembarkConfig = ' . wp_json_encode( $config, JSON_HEX_TAG | JSON_HEX_AMP ) . ';', 'before' );
         wp_enqueue_script( 'disembark-app' );
     }
 
