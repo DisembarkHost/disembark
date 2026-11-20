@@ -105,6 +105,14 @@ class Target {
         $t->into   = $into;
         $t->slug   = sanitize_title( (string) ( $opts['slug'] ?? '' ) );
         $t->domain = strtolower( preg_replace( '#^https?://|/.*$#i', '', trim( (string) ( $opts['domain'] ?? '' ) ) ) );
+        if ( $t->domain !== '' && $t->kind === 'freighter' ) {
+            if ( ! preg_match( '/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::\d+)?$/', $t->domain ) ) {
+                return new \WP_Error( 'bad_domain', $t->domain . ' isn\'t a domain name.', [ 'status' => 400 ] );
+            }
+            if ( self::domain_taken( $t->domain ) ) {
+                return new \WP_Error( 'domain_taken', $t->domain . ' already belongs to this install (its main site or another tenant). Choose another domain.', [ 'status' => 409 ] );
+            }
+        }
         if ( $into !== 'new' ) {
             $t->locate( $into );
         }
@@ -245,7 +253,13 @@ class Target {
         $mapping = ( $config['domain_mapping'] ?? 'off' ) === 'on';
         $domain  = $this->domain;
         if ( $mapping && $domain === '' ) {
+            // The source's own domain, unless it is already the main site's
+            // or another tenant's here (a copy within the same install):
+            // mapped twice, it would take that site's address over.
             $domain = strtolower( (string) wp_parse_url( $from, PHP_URL_HOST ) );
+            if ( $domain !== '' && self::domain_taken( $domain ) ) {
+                $domain = '';
+            }
         }
         $sites[] = [ 'stacked_site_id' => $id, 'created_at' => time(), 'name' => sanitize_text_field( $name ), 'domain' => $mapping ? $domain : '' ];
         $wpdb->update( $primary . 'options', [ 'option_value' => serialize( array_values( $sites ) ) ], [ 'option_name' => 'stacked_sites' ] );
@@ -264,6 +278,27 @@ class Target {
         }
         self::refresh_freighter();
         return true;
+    }
+
+    /** Whether $domain is already the Freighter install's own address or one of its tenants'. */
+    private static function domain_taken( $domain ) {
+        $host    = function ( $d ) {
+            $d = strtolower( trim( (string) $d ) );
+            return (string) ( preg_match( '#^https?://#', $d ) ? wp_parse_url( $d, PHP_URL_HOST ) : preg_replace( '#[:/].*$#', '', $d ) );
+        };
+        $want    = $host( $domain );
+        $primary = Scope::freighter_primary();
+        $taken   = [ $host( (string) Scope::freighter_option( $primary, 'home' ) ), $host( (string) Scope::freighter_option( $primary, 'siteurl' ) ), $host( home_url() ) ];
+        foreach ( (array) Scope::freighter_option( $primary, 'stacked_sites' ) as $site ) {
+            $taken[] = $host( $site['domain'] ?? '' );
+        }
+        $taken = array_filter( $taken );
+        foreach ( $taken as $t ) {
+            if ( $want === $t || preg_replace( '/^www\./', '', $want ) === preg_replace( '/^www\./', '', $t ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Rewrites Freighter's bootstrap (its domain mappings), when it's here to do it. */
