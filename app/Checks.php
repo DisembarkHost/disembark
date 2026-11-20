@@ -131,6 +131,10 @@ class Checks {
                             continue;
                         }
                         $incoming += $file->getSize();
+                        // Runnable files are staged under a safe name; size up the real one.
+                        if ( method_exists( '\Disembark\Import', 'unstaged_name' ) ) {
+                            $rel = Import::unstaged_name( $rel );
+                        }
                         if ( is_file( $web_root . '/' . $rel ) ) {
                             $replaced += (int) @filesize( $web_root . '/' . $rel );
                         }
