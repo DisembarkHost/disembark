@@ -16,29 +16,33 @@
     var view = h('div');
     var vs = D.scope();
     var activeExplorer = null;
-    D.mount(root,
-      h('div', { class: 'dsk-head' },
-        h('div', null, h('h1', null, 'Files'), h('p', null, 'Everything in this WordPress install, as of the last scan. Preview, edit, rename or download.')),
-        h('div', { class: 'dsk-head-tools' }, h('button', { class: 'dsk-btn', id: 'dsk-files-rescan', onclick: function (e) { scan(e.currentTarget); } }, D.icon('refresh'), 'Rescan'))),
-      view);
+    var slot = D.browseTools ? D.browseTools('files') : h('div');
+    var searchBox = h('div', { class: 'dsk-bw-search' });
+    var rescanBtn = h('button', { class: 'dsk-btn', type: 'button', onclick: function () { scan(); } }, D.icon('refresh'), 'Rescan');
+    D.mount(slot, searchBox, rescanBtn);
+    D.mount(root, view);
 
     function render() {
       vs.dispose(); vs = D.scope();
-      if (S.site) { root.querySelector('#dsk-files-rescan').hidden = true; D.mount(view, D.oneSiteNote('Files')); return; }
-      root.querySelector('#dsk-files-rescan').hidden = !S.scanned;
-      D.mount(view, S.scanned ? explorer() : h('div', { class: 'dsk-card' }, D.empty('No file list yet', 'Scan the site to browse its files. It takes a moment on big sites.', 'files',
-        h('button', { class: 'dsk-btn primary', onclick: function (e) { scan(e.currentTarget); } }, D.icon('scan'), 'Scan files'))));
+      D.mount(searchBox);
+      if (S.site) { rescanBtn.hidden = true; D.mount(view, D.oneSiteNote('Files')); return; }
+      rescanBtn.hidden = !S.scanned;
+      D.mount(view, S.scanned ? explorer() : h('div', { class: 'dsk-card dsk-bw-intro' },
+        h('div', null,
+          h('h2', null, 'No file list ', h('em', { class: 'hl' }, 'yet.')),
+          h('p', null, 'Scan the site to browse its files: every folder with its size, so you can see what takes the space. It takes a moment on big sites.'),
+          h('button', { class: 'dsk-btn primary', type: 'button', onclick: function () { scan(); } }, D.icon('scan'), 'Scan files'))));
     }
     D.store.on(['scanned', 'index', 'site'], render);
     render();
 
-    async function scan(btn) {
+    async function scan() {
       var line = h('span', { class: 'muted mono' });
+      rescanBtn.hidden = true; D.mount(searchBox);
       D.mount(view, h('div', { class: 'dsk-card dsk-card-pad' }, h('div', { class: 'dsk-row' }, h('span', { class: 'dsk-spin' }), h('strong', null, 'Scanning files'), line)));
       try {
         await D.scanSite(function (p) { line.textContent = p.phase === 'scanning' ? D.fmt.num(p.done) + ' of ' + D.fmt.num(p.total) + ' folders' : D.fmt.num(p.done) + ' of ' + D.fmt.num(p.total) + ' parts'; });
       } catch (e) { D.toast('The scan did not finish: ' + D.errorText(e), 'error'); render(); }
-      void btn;
     }
 
     /* -------------------------------------------------------- Explorer */
@@ -47,7 +51,8 @@
       var results = h('div', { class: 'dsk-scroll-fill', hidden: true });
       var tree = D.Tree({ mode: 'browse', scope: vs, onSelect: show });
       var treeWrap = h('div', { class: 'dsk-scroll-fill', style: { padding: '6px 0' } }, tree.el);
-      var search = D.search('Find by path', function (q) {
+      var count = h('div', { class: 'dsk-bw-aside-h' }, D.icon('folder'), h('b', null, 'All files'), h('span', { class: 'muted' }, D.fmt.size(S.index.root.size) + ' · ' + D.fmt.plural(S.files.length, 'file')));
+      var search = D.search('Find a file or folder', function (q) {
         if (!q) { results.hidden = true; treeWrap.hidden = false; return; }
         var hits = [];
         for (var i = 0; i < S.files.length && hits.length < 300; i++) if (S.files[i].name.toLowerCase().indexOf(q) !== -1) hits.push(S.files[i]);
@@ -57,38 +62,55 @@
         }), hits.length === 300 ? h('li', { class: 'muted' }, 'Showing the first 300 matches.') : null) : h('div', { class: 'dsk-pad muted' }, 'No files match.'));
         results.hidden = false; treeWrap.hidden = true;
       });
+      D.mount(searchBox, search);
       activeExplorer = { open: function (path) { tree.reveal(path); show(S.index.nodes.get(path)); } };
-      D.mount(detail, D.empty('Pick a file or folder', D.fmt.plural(S.files.length, 'file') + ' · ' + D.fmt.size(S.index.root.size), 'files'));
-      return h('div', { class: 'dsk-card dsk-split' },
-        h('aside', null, h('div', { class: 'dsk-pad', style: { borderBottom: '1px solid var(--line)' } }, search), results, treeWrap),
+      showFolder(S.index.root);
+      return h('div', { class: 'dsk-card dsk-split dsk-bw-split' },
+        h('aside', null, count, results, treeWrap),
         detail);
 
       /* ---------------------------------------------------- Details */
       function show(node) {
         if (!node) return;
         if (node.dir) showFolder(node); else showFile(node);
+        if (window.innerWidth <= 960 && !node.dir) detail.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+      /** A path crumb (each folder opens), the name, size and the actions. */
+      function crumb(node) {
+        var parts = node.path ? node.path.split('/') : [], out = [], p = '';
+        out.push(h('button', { type: 'button', class: 'seg', onclick: function () { showFolder(S.index.root); } }, D.icon('folder'), D.host(D.config.homeUrl)));
+        parts.forEach(function (part, i) {
+          p = i ? p + '/' + part : part;
+          var path = p, last = i === parts.length - 1;
+          out.push(h('span', { class: 'sep' }, '/'));
+          out.push(last ? h('b', null, part) : h('button', { type: 'button', class: 'seg', onclick: function () { activeExplorer.open(path); } }, part));
+        });
+        return h('div', { class: 'dsk-crumb' }, out);
       }
       function head(node, actions) {
-        return h('div', { class: 'dsk-detail-head' },
-          h('div', { class: 'grow' }, h('h2', null, node.name), h('div', { class: 'path' }, node.path + ' · ' + D.fmt.size(node.size) + (node.dir ? ' · ' + D.fmt.plural(node.files, 'file') : ''))),
-          h('div', { class: 'dsk-row' }, actions));
+        return h('div', { class: 'dsk-bw-head' }, crumb(node),
+          h('div', { class: 'dsk-detail-head' },
+            h('div', { class: 'grow' }, h('h2', null, node.path ? node.name : 'Everything'), h('div', { class: 'path' }, D.fmt.size(node.size) + (node.dir ? ' · ' + D.fmt.plural(node.files, 'file') : ''))),
+            h('div', { class: 'dsk-row' }, actions)));
       }
       function renameBtn(node) {
-        return D.config.fileEdits ? h('button', { class: 'dsk-btn sm', onclick: function () { rename(node); } }, D.icon('rename'), 'Rename') : null;
+        return D.config.fileEdits && node.path ? h('button', { class: 'dsk-btn sm', type: 'button', onclick: function () { rename(node); } }, D.icon('rename'), 'Rename') : null;
       }
 
       function showFolder(node) {
-        var largest = node.kids.slice().sort(function (a, b) { return b.size - a.size; }).slice(0, 12);
+        var largest = node.kids.slice().sort(function (a, b) { return b.size - a.size; }).slice(0, 40);
         var max = largest.length ? largest[0].size || 1 : 1;
         D.mount(detail,
-          head(node, [h('button', { class: 'dsk-btn sm', onclick: function (e) { downloadFolder(node, e.currentTarget); } }, D.icon('zip'), 'Download as zip'), renameBtn(node)]),
-          h('div', { class: 'dsk-scroll-fill' }, h('div', { class: 'dsk-pad' },
-            h('div', { class: 'caps', style: { margin: '6px 0 10px' } }, 'Largest inside'),
-            h('ul', { class: 'dsk-list' }, largest.map(function (k) {
-              return h('li', { class: 'clickable', onclick: function () { tree.reveal(k.path); show(k); } },
-                D.fileIcon(k), h('span', { class: 'grow' }, k.name),
-                h('span', { style: { width: '120px' } }, h('span', { class: 'dsk-progress' }, h('i', { style: { width: Math.max(2, (k.size / max) * 100) + '%', background: k.dir ? 'var(--warn)' : 'var(--sea)' } }))),
-                h('span', { class: 'size', style: { minWidth: '70px', textAlign: 'right' } }, D.fmt.size(k.size)));
+          head(node, node.path ? [h('button', { class: 'dsk-btn sm', type: 'button', onclick: function (e) { downloadFolder(node, e.currentTarget); } }, D.icon('zip'), 'Download as zip'), renameBtn(node)] : []),
+          h('div', { class: 'dsk-scroll-fill' },
+            h('div', { class: 'dsk-bw-cap caps' }, node.kids.length > largest.length ? 'Largest ' + largest.length + ' of ' + D.fmt.num(node.kids.length) : 'Largest first'),
+            h('table', { class: 'dsk-ftab' }, h('tbody', null, largest.map(function (k) {
+              var open = function () { tree.reveal(k.path); show(k); };
+              return h('tr', { tabindex: '0', onclick: open, onkeydown: function (e) { if (e.key === 'Enter') open(); } },
+                h('td', null, h('span', { class: 'nm' }, D.fileIcon(k), k.name + (k.dir ? '/' : ''))),
+                h('td', { class: 'bar' }, h('i', { style: { width: Math.max(1, (k.size / max) * 100) + '%', background: k.dir ? 'var(--sea)' : 'var(--files)' } })),
+                h('td', { class: 'num' }, D.fmt.size(k.size)),
+                h('td', { class: 'num d' }, k.dir ? D.fmt.plural(k.files, 'file') : ''));
             })))));
       }
 
@@ -96,7 +118,7 @@
         var preview = h('div', { class: 'dsk-preview' }, h('div', { class: 'dsk-empty' }, h('span', { class: 'dsk-spin' })));
         var actions = h('div', { class: 'dsk-row' });
         D.mount(detail, head(node, actions), preview);
-        var dl = h('button', { class: 'dsk-btn sm', onclick: function (e) { downloadFile(node, e.currentTarget); } }, D.icon('download'), 'Download');
+        var dl = h('button', { class: 'dsk-btn sm', type: 'button', onclick: function (e) { downloadFile(node, e.currentTarget); } }, D.icon('download'), 'Download');
         D.mount(actions, dl, renameBtn(node));
 
         if (IMG.test(node.name)) {
@@ -130,7 +152,7 @@
           else code.textContent = content;
           D.mount(preview, h('pre', null, code));
           D.mount(actions, dl,
-            D.config.fileEdits ? h('button', { class: 'dsk-btn sm', onclick: edit }, D.icon('edit'), 'Edit') : null,
+            D.config.fileEdits ? h('button', { class: 'dsk-btn sm', type: 'button', onclick: edit }, D.icon('edit'), 'Edit') : null,
             renameBtn(node));
         }
         function edit() {

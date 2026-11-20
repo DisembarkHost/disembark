@@ -1,16 +1,14 @@
 /**
- * Restore: bring a backup zip into this site. A rollback point is saved
- * before anything changes. (Copying from a live site is Pull, in pull.js.)
- *
- * Also defines D.runMove(), the step runner shared with Pull and Push: it
- * drives any site's import API (this one, or a destination's) through the
- * same steps.
+ * The move runner shared by every move in the Move tab (move.js): pull,
+ * push and restore. D.runMove() drives any site's import API (this one, or
+ * a destination's) through the same steps and draws them as a voyage: the
+ * harbor scene, six stops, a card for any question that pauses the move,
+ * and the arrival. Also the restore points timeline (Backups) and the
+ * connect-line parser.
  */
 (function () {
   'use strict';
   var D = window.Disembark, h = D.h;
-
-  D.section({ id: 'restore', title: 'Restore', icon: 'restore', mount: mount });
 
   /** Parses "disembark connect <url> <token>" (or "<url> <token>"). */
   D.parseConnect = function (text) {
@@ -23,44 +21,16 @@
     return { url: url.replace(/\/+$/, ''), token: token };
   };
 
-  /** URL + token inputs that fill both from a pasted connect line. */
-  D.connectFields = function (st, onChange, labels) {
-    labels = labels || {};
-    var url = h('input', { class: 'dsk-input mono', placeholder: labels.placeholder || 'https://old-site.com', value: st.site || '', spellcheck: 'false', autocomplete: 'off', autocapitalize: 'none' });
-    var token = h('input', { class: 'dsk-input mono', placeholder: 'Connection token', value: st.token || '', spellcheck: 'false', autocomplete: 'off', autocapitalize: 'none' });
-    [url, token].forEach(function (input) {
-      input.addEventListener('input', function () { st.site = url.value.trim(); st.token = token.value.trim(); onChange(); });
-      input.addEventListener('paste', function (e) {
-        var parsed = D.parseConnect((e.clipboardData || window.clipboardData).getData('text'));
-        if (!parsed) return;
-        e.preventDefault();
-        url.value = st.site = parsed.url; token.value = st.token = parsed.token; onChange();
-        D.toast('Filled in from the connect line.');
-      });
-    });
-    return h('div', null,
-      h('div', { class: 'dsk-field' }, h('label', null, labels.site || 'Source site'), url),
-      h('div', { class: 'dsk-field' }, h('label', null, 'Connection token'), token,
-        h('span', { class: 'hint' }, labels.hint || 'On that site, open Tools → Disembark → Settings and copy the connect line. Paste it into either field to fill both.')));
-  };
-
   /** "example.com/path": scheme, www. and trailing slash don't count (matches Quiet::address). */
   D.address = function (url) {
     return String(url || '').trim().toLowerCase().replace(/^[a-z]+:\/\//, '').replace(/^www\./, '').replace(/\/+$/, '');
   };
 
-  /** The "Keep the copy quiet" switch for a move form; writes st.quiet. */
-  D.quietToggle = function (st, label, hint) {
-    return h('div', { class: 'dsk-field' },
-      D.toggle(label, st.quiet, function (v) { st.quiet = v; }),
-      h('span', { class: 'hint' }, hint));
-  };
-
-  /** Shown after a move that turned quiet mode on. */
+  /** Shown after a move that turned quiet mode on (a row of the checks card). */
   D.quietNote = function (home, source) {
-    return D.note('warn', [h('strong', null, 'Quiet mode is on. '),
+    return h('div', { class: 'dsk-chk q' }, D.icon('moon'), h('div', null, h('strong', null, 'Quiet mode is on. '),
       D.host(home) + ' is a copy' + (source ? ' of ' + D.host(source) : '') + ': emails are held, scheduled jobs paused, checkout closed, and payment and marketing APIs blocked. ',
-      'Lift it in Tools \u2192 Disembark \u2192 Settings there, or with ', h('code', null, 'wp disembark quiet-mode off'), '.'], 'moon');
+      'Lift it in Settings there, or with ', h('code', null, 'wp disembark quiet-mode off'), '.'));
   };
 
   var STEPS = [
@@ -86,6 +56,21 @@
    * }
    */
   /**
+   * A question that pauses a move, shown right under the voyage.
+   * o: { title: [plain, accent], text, body, go (button), cancel(), foot }
+   */
+  D.decideCard = function (o) {
+    return h('section', { class: 'dsk-card dsk-decide dsk-fade' },
+      h('div', { class: 'dsk-decide-h' },
+        h('div', { class: 'q' }, h('span', { class: 'dsk-tag warn' }, D.icon('alert'), 'Waiting on you'), h('h2', null, o.title[0], h('em', { class: 'hl' }, o.title[1])),
+          o.text ? h('div', { class: 'sum' }, o.text) : null),
+        o.go ? h('div', { class: 'acts' }, o.go) : null),
+      o.body ? h('div', { class: 'dsk-decide-b' }, o.body) : null,
+      h('div', { class: 'dsk-decide-f' }, h('p', { class: 'muted', style: { fontSize: '12.5px' } }, o.foot || 'Nothing on the destination changes until you answer.'),
+        o.cancel ? h('div', { class: 'acts' }, h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: o.cancel }, 'Cancel the move')) : null));
+  };
+
+  /**
    * "Which site?" for a source that is a multisite network or a WP Freighter
    * install. Resolves with a site ID, "all", or null when cancelled.
    */
@@ -98,13 +83,11 @@
           return h('option', { value: s.id }, D.host(s.url) + (s.name ? ' \u2014 ' + s.name : '') + ' (' + (s.id === 'main' ? 'main site' : (install.kind === 'multisite' ? 'site ' : 'tenant ') + s.id) + ')');
         }));
       function done(v) { D.mount(box); resolve(v); }
-      D.mount(box, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '12px', marginTop: '16px' } },
-        h('h3', null, 'Which site?'),
-        h('p', { class: 'muted' }, D.host(install.home) + ' is a ' + kind + '. Bring one of its sites as a standalone site (its own tables, its users, its uploads, and the plugins and themes it uses), or the whole ' + kind + '.'),
-        sel,
-        h('div', { class: 'dsk-row' },
-          h('button', { class: 'dsk-btn primary', onclick: function () { done(sel.value); } }, 'Continue'),
-          h('button', { class: 'dsk-btn ghost', onclick: function () { done(null); } }, 'Cancel the move'))));
+      D.mount(box, D.decideCard({ title: ['Which ', 'site?'],
+        text: D.host(install.home) + ' is a ' + kind + '. Bring one of its sites as a standalone site (its own tables, its users, its uploads, and the plugins and themes it uses), or the whole ' + kind + '.',
+        body: sel,
+        go: h('button', { class: 'dsk-btn primary', type: 'button', onclick: function () { done(sel.value); } }, D.icon('ship'), 'Continue'),
+        cancel: function () { done(null); } }));
     });
   };
 
@@ -123,13 +106,11 @@
         }),
         h('option', { value: 'site' }, 'Replace the main site, ' + destHost + ' (the whole ' + (net ? 'network\u2019s users too' : 'install\u2019s main site') + ')'));
       function done(v) { D.mount(box); resolve(v); }
-      D.mount(box, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '12px', marginTop: '16px' } },
-        h('h3', null, 'Where should it go?'),
-        h('p', { class: 'muted' }, destHost + ' is the main site of a ' + (net ? 'multisite network' : 'WP Freighter install') + '. Bring the site in as its own ' + one + ' (its tables, uploads and settings stay its own' + (net ? ', and its users join the network\u2019s' : '') + '), or replace one.'),
-        sel,
-        h('div', { class: 'dsk-row' },
-          h('button', { class: 'dsk-btn primary', onclick: function () { done(sel.value); } }, 'Continue'),
-          h('button', { class: 'dsk-btn ghost', onclick: function () { done(null); } }, 'Cancel the move'))));
+      D.mount(box, D.decideCard({ title: ['Where should it ', 'go?'],
+        text: destHost + ' is the main site of a ' + (net ? 'multisite network' : 'WP Freighter install') + '. Bring the site in as its own ' + one + ' (its tables, uploads and settings stay its own' + (net ? ', and its users join the network\u2019s' : '') + '), or replace one.',
+        body: sel,
+        go: h('button', { class: 'dsk-btn primary', type: 'button', onclick: function () { done(sel.value); } }, D.icon('ship'), 'Continue'),
+        cancel: function () { done(null); } }));
     });
   };
 
@@ -141,25 +122,122 @@
     // first one it didn't.
     var catchUpInfo = null, target = null, seq = 0, replay = (opts.resume && opts.resume.steps) || {}, replaying = Object.keys(replay).length > 0;
     function ridAt(n) { return importId.slice(0, 24) + ('00000000' + n.toString(16)).slice(-8); }
-    var log = h('div', { class: 'dsk-log', hidden: true });
-    var stepEls = {}, current = null, line = h('div', { class: 'muted', style: { minHeight: '20px', marginTop: '10px', fontFamily: 'var(--mono)', fontSize: '12.5px' } });
-    var steps = h('div', { class: 'dsk-steps' }, STEPS.map(function (s, i) {
-      var meta = h('span', { class: 'meta' });
-      var el = h('div', { class: 'dsk-step' }, h('span', { class: 'mark' }, String(i + 1)), s.key === 'pre' && opts.local ? 'Checking this site' : s.label, meta);
-      stepEls[s.key] = { el: el, meta: meta };
-      return el;
-    }));
+    var log = h('div', { class: 'dsk-log' });
+    var kind = opts.kind || (!opts.local ? 'push' : (opts.mode === 'site' ? 'pull' : 'restore'));
+    var KIND = kind.charAt(0).toUpperCase() + kind.slice(1);
+    // The nine steps show as six stops on the voyage; the boat sails to each.
+    var STOPS = [
+      { b: 'Loading', done: 'Loaded', keys: ['pre', 'stage', 'read'] },
+      { b: 'Restore point', keys: ['snap'] },
+      { b: 'Files', keys: ['files'] },
+      { b: 'Database', keys: ['db'] },
+      { b: 'Addresses', keys: ['urls'] },
+      { b: 'Checks', keys: ['fin', 'check'] }
+    ];
+    var SAIL = [0, .1, .4, .66, .86, 1];
+    var stopOf = {};
+    STOPS.forEach(function (st, i) { st.keys.forEach(function (k) { stopOf[k] = i; }); });
+    var stopEls = STOPS.map(function (st) {
+      var small = h('small', null, ' '), dot = h('span', { class: 'dot' }), b = h('b', null, st.b);
+      return { li: h('li', { class: 'dsk-st todo' }, dot, b, small), dot: dot, b: b, small: small };
+    });
+    var stepEls = {}, current = null, curStop = -1;
+    STEPS.forEach(function (s) { var se = stopEls[stopOf[s.key]]; stepEls[s.key] = { el: se.li, meta: se.small }; });
+    var strip = h('ol', { class: 'dsk-strip', 'aria-label': 'Voyage' }, stopEls.map(function (se) { return se.li; }));
+    var line = h('div', { class: 'dsk-voy-line', 'aria-live': 'polite' });
+
+    // Who's where: the source on the left, the destination on the right.
+    var here = D.host(D.config.homeUrl);
+    var srcLabel = opts.mode === 'file' ? (opts.file ? opts.file.name : 'backup.zip') : D.host(opts.site);
+    var dstLabel = D.host(opts.targetHome);
+    var scene = opts.scene || {
+      left: { kind: opts.mode === 'file' ? 'zip' : 'site', label: srcLabel },
+      right: { kind: 'site', label: dstLabel },
+      you: opts.local ? 'right' : 'left'
+    };
+    var sceneBox = h('div', { class: 'dsk-scene' });
+    var boat = { t: null, cargo: 0, dock: 'left', arrived: false, raf: 0 };
+    var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    function drawScene() {
+      var right = boat.arrived ? Object.assign({}, scene.right, { arrived: true, hot: scene.right.kind === 'site' ? true : scene.right.hot }) : scene.right;
+      sceneBox.innerHTML = D.H.scene({ harbor: { left: scene.left, right: right, you: scene.you, youText: 'You are here', t: boat.t, cargo: boat.cargo, alt: 'From ' + scene.left.label + ' to ' + scene.right.label }, dock: boat.dock });
+    }
+    function sail(to) {
+      cancelAnimationFrame(boat.raf);
+      var from = boat.t == null ? 0 : boat.t;
+      boat.dock = null; boat.cargo = 4;
+      if (reduce || to <= from) { boat.t = Math.max(.001, to); drawScene(); return; }
+      var start = null, ms = 1100;
+      (function frame(now) {
+        if (start === null) start = now;
+        var k = Math.min(1, (now - start) / ms), e = k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+        boat.t = Math.max(.001, from + (to - from) * e);
+        drawScene();
+        if (k < 1) boat.raf = requestAnimationFrame(frame);
+      })(performance.now());
+    }
+    if (D.H.phone.addEventListener) D.H.phone.addEventListener('change', drawScene);
+
     var outcome = h('div');
-    var title = h('h2', { style: { fontSize: '28px', flex: 1 } }, opts.title || 'Restoring');
-    var detailsBtn = h('button', { class: 'dsk-btn ghost sm', onclick: function () { log.hidden = !log.hidden; detailsBtn.lastChild.textContent = log.hidden ? 'Show details' : 'Hide details'; } }, D.icon('terminal'), h('span', null, 'Show details'));
-    var cancelBtn = h('button', { class: 'dsk-btn ghost sm', onclick: askCancel }, D.icon('x'), 'Cancel');
-    var notifyBtn = h('button', { class: 'dsk-btn ghost sm', title: 'Get an email or a Slack/Discord message when this finishes or stops', onclick: askNotify }, D.icon('mail'), h('span', null, 'Notify me'));
-    var chooser = h('div');
-    D.mount(view, h('div', { class: 'dsk-stack' }, h('div', { class: 'dsk-grid two', style: { alignItems: 'start' } },
-      h('div', { class: 'dsk-card dsk-card-pad' },
-        h('div', { class: 'dsk-row', style: { marginBottom: '16px' } }, title, notifyBtn, detailsBtn, cancelBtn),
-        steps, line, h('div', { style: { marginTop: '12px' } }, log)),
-      outcome), chooser));
+    var live = h('span', { class: 'dsk-live' });
+    var capsText = h('span', null, KIND + ' in progress · started ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }));
+    var title = h('h1');
+    var sub = h('p', null, kind === 'pull' ? 'This site is downloading from ' + srcLabel + ', server to server. You can close this tab: the move keeps going, and you can pick it up here.'
+      : kind === 'push' ? dstLabel + ' is downloading from this site. You can close this tab: the move keeps going.'
+      : 'The backup is coming ashore. Keep this tab open while it uploads.');
+    function setTitle(words, accent) { D.mount(title, words ? words + ' ' : '', accent ? h('em', { class: 'hl' }, accent) : null); }
+    setTitle(opts.title || 'Restoring', kind === 'push' ? dstLabel : srcLabel);
+    var headK = h('span', { class: 'k' }, KIND + '.'), headP = h('p'), headTag = h('span', { class: 'dsk-tag hot tagline' });
+    function setHead(parts, tag, tagKind) {
+      D.mount(headP, parts.map(function (x) { return x && x.b ? h('b', null, x.b) : x; }));
+      headTag.className = 'dsk-tag tagline ' + (tagKind || 'hot');
+      D.mount(headTag, tag || '');
+      headTag.hidden = !tag;
+    }
+    var HEADS = [
+      kind === 'push' ? ['Loading the boat here. Nothing on ', { b: dstLabel }, ' has changed yet.']
+        : kind === 'pull' ? ['Loading the boat at ', { b: srcLabel }, '. Nothing on this site has changed yet.']
+        : ['Unloading ', { b: srcLabel }, ' onto the dock. Nothing on this site has changed yet.'],
+      ['Saving a restore point. Whatever happens next, this puts ', { b: dstLabel }, ' back as it was.'],
+      ['Putting files in place.'],
+      ['Importing the database.'],
+      ['Rewriting addresses from ', { b: srcLabel }, ' to ', { b: dstLabel }, '.'],
+      ['Checking the result.']
+    ];
+    var cancelBtn = h('button', { class: 'dsk-btn ghost', type: 'button', onclick: askCancel }, D.icon('x'), 'Cancel');
+    var notifyBtn = h('button', { class: 'dsk-btn', type: 'button', title: 'Get an email or a Slack/Discord message when this finishes or stops', onclick: askNotify }, D.icon('bell'), h('span', null, 'Notify me'));
+    var chooser = h('div', { class: 'dsk-chooser' });
+    var headEl = h('div', { class: 'dsk-ph dsk-fade' },
+      h('div', { class: 'dsk-ph-main' }, h('div', { class: 'caps' }, live, capsText), title, sub),
+      h('div', { class: 'dsk-ph-side' }, notifyBtn, cancelBtn));
+    D.mount(view,
+      headEl,
+      h('section', { class: 'dsk-card dsk-voy' }, h('div', { class: 'dsk-voy-head' }, headK, headP, headTag), sceneBox, strip, line),
+      chooser,
+      outcome,
+      h('details', { class: 'dsk-movelog' }, h('summary', null, D.icon('terminal'), 'Show details'), log));
+    setHead(HEADS[0], 'Stop 1 of 6');
+    drawScene();
+    window.scrollTo({ top: 0, behavior: reduce ? 'auto' : 'smooth' });
+
+    // A question for the user (which site, where it goes, what to bring)
+    // pauses the voyage: the header and the current stop say so.
+    new MutationObserver(function () {
+      var waiting = chooser.childNodes.length > 0;
+      if (curStop < 0) return;
+      var se = stopEls[curStop];
+      if (waiting) {
+        live.className = 'dsk-live wait';
+        capsText.textContent = 'Paused · waiting on you';
+        se.li.className = 'dsk-st wait'; D.mount(se.dot, '?');
+        setHead(HEADS[curStop], 'Paused: waiting on you', 'warn');
+      } else if (se.li.classList.contains('wait')) {
+        live.className = 'dsk-live';
+        capsText.textContent = KIND + ' in progress';
+        se.li.className = 'dsk-st cur'; D.mount(se.dot);
+        setHead(HEADS[curStop], 'Stop ' + (curStop + 1) + ' of 6');
+      }
+    }).observe(chooser, { childList: true });
 
     // Cancel: the next request isn't sent (and a long step on a current
     // Disembark stops early). Before the rollback point nothing here has
@@ -171,7 +249,7 @@
       if (cancelled) return;
       var after = !!rollbackId;
       var ok = await D.confirm(after
-        ? h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, D.host(opts.targetHome) + ' is partly changed by now.'), h('p', { class: 'muted' }, 'Cancelling stops the move and rolls it back to the rollback point, then deletes the copied files and the rollback point.'))
+        ? h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, D.host(opts.targetHome) + ' is partly changed by now.'), h('p', { class: 'muted' }, 'Cancelling stops the move and rolls it back to the restore point, then deletes the copied files and the restore point.'))
         : h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, 'Nothing on ' + D.host(opts.targetHome) + ' has changed yet.'), h('p', { class: 'muted' }, 'Cancelling stops the move and deletes what was copied so far.')),
         { title: after ? 'Cancel and roll back?' : 'Cancel this move?', confirmLabel: after ? 'Cancel and roll back' : 'Cancel the move', cancelLabel: 'Keep going', danger: true });
       if (!ok || cancelled) return;
@@ -183,8 +261,9 @@
       opts.api.post('import/cancel', t({ action: 'stop' })).catch(function () { /* older Disembark: it stops between steps */ });
     }
     async function cleanUp() {
-      cancelBtn.hidden = true;
-      title.textContent = 'Cancelling';
+      cancelBtn.hidden = true; notifyBtn.hidden = true;
+      setTitle('Cancelling', '');
+      capsText.textContent = 'Cancelling';
       var rolledBack = false;
       if (rollbackId) {
         rlog('Rolling back to the snapshot\u2026');
@@ -203,15 +282,18 @@
         if (e.status === 404) rlog('This Disembark can\u2019t clean up on cancel; the copied files stay in uploads/disembark until you delete them (Settings \u2192 clean up).', 'dim');
         else rlog('Cleanup: ' + D.errorText(e), 'err');
       }
-      title.textContent = 'Cancelled';
+      setTitle('', 'Cancelled.');
+      sub.textContent = kept ? 'The move stopped, but the rollback didn\u2019t finish. The restore point is kept.' : (rollbackId ? D.host(opts.targetHome) + ' is back to how it was, and what was copied is gone.' : 'Nothing on ' + D.host(opts.targetHome) + ' changed, and what was copied is gone.');
+      live.className = 'dsk-live stop'; capsText.textContent = KIND + ' cancelled';
       progress('');
-      if (current) { stepEls[current].el.classList.remove('active'); stepEls[current].meta.textContent = 'cancelled'; }
+      failStop('cancelled');
+      setHead(['The move stopped and was cleaned up.'], 'Cancelled', 'warn');
       D.mount(chooser);
-      D.mount(outcome, h('div', { class: 'dsk-stack' },
+      D.mount(outcome, h('div', { class: 'dsk-stack', style: { marginTop: '16px' } },
         kept
-          ? D.note('error', [h('strong', null, 'Cancelled, but the rollback didn\u2019t finish. '), 'The rollback point is kept: roll back from Restore \u2192 Restore points or with ', h('code', null, 'wp disembark rollback ' + rollbackId), '.'])
+          ? D.note('error', [h('strong', null, 'Cancelled, but the rollback didn\u2019t finish. '), 'The restore point is kept: roll back from Backups \u2192 Restore points or with ', h('code', null, 'wp disembark rollback ' + rollbackId), '.'])
           : D.note('ok', [h('strong', null, 'Cancelled. '), rollbackId ? D.host(opts.targetHome) + ' is back to how it was, and the copied files are gone.' : 'Nothing on ' + D.host(opts.targetHome) + ' changed, and the copied files are gone.']),
-        h('div', null, h('button', { class: 'dsk-btn', onclick: opts.back }, 'Back to the form'))));
+        h('div', null, h('button', { class: 'dsk-btn', type: 'button', onclick: opts.back }, D.icon('ship'), 'Back to Move'))));
     }
 
     // Calls outside the numbered steps (checks, notifications): they run
@@ -292,17 +374,35 @@
       if (good.length) body.push(good.join(', ').replace(/^./, function (c) { return c.toUpperCase(); }) + '.');
       if (pages.note) body.push(' ' + pages.note);
       if (items.length) body.push(h('ul', { style: { margin: '8px 0 0', paddingLeft: '18px' } }, items));
-      return D.note(v.ok ? 'ok' : 'warn', body, v.ok ? 'checkCircle' : null);
+      return h('div', { class: 'dsk-chk' + (v.ok ? '' : ' warn') }, D.icon(v.ok ? 'check' : 'alert'), h('div', null, body));
     }
 
     function rlog(msg, cls) { log.appendChild(h('div', { class: cls || '' }, msg)); log.scrollTop = log.scrollHeight; }
+    function setStop(i, cls) {
+      var se = stopEls[i], st = STOPS[i];
+      se.li.className = 'dsk-st ' + cls;
+      D.mount(se.dot, cls === 'done' ? D.icon('check') : cls === 'failed' ? D.icon('x') : null);
+      if (i === 0) se.b.textContent = cls === 'done' ? st.done : st.b;
+    }
     function step(key, meta) {
-      if (current) { stepEls[current].el.classList.remove('active'); stepEls[current].el.classList.add('done'); }
       current = key;
-      stepEls[key].el.classList.add('active');
+      var i = stopOf[key];
+      if (i !== curStop) {
+        for (var j = 0; j < i; j++) if (!stopEls[j].li.classList.contains('done')) setStop(j, 'done');
+        curStop = i;
+        setStop(i, 'cur');
+        strip.style.setProperty('--p', i / 5);
+        setHead(HEADS[i], 'Stop ' + (i + 1) + ' of 6');
+        if (i > 0) sail(SAIL[i]);
+      }
       if (meta) stepEls[key].meta.textContent = meta;
     }
-    function skip(key, why) { stepEls[key].el.classList.add('done'); stepEls[key].meta.textContent = why; }
+    function skip(key, why) { stepEls[key].meta.textContent = why; }
+    function failStop(why) {
+      if (curStop < 0) return;
+      setStop(curStop, 'failed');
+      stepEls[current].meta.textContent = why;
+    }
     function progress(text) { line.textContent = text || ''; }
     var t = function (body) { return Object.assign({ import_id: importId }, body || {}); };
 
@@ -496,7 +596,34 @@
       await api.post('import/extract-zip', t({ file_path: 'restore.zip' }));
     }
 
+    // The arrival: every stop done, the boat moored on the far side, and two
+    // cards under the voyage (what to do next, and the checks).
+    var doneBox = h('div', { class: 'dsk-card' }), checks = h('div', { class: 'dsk-card' });
+    function arrive(verify) {
+      cancelAnimationFrame(boat.raf);
+      stopEls.forEach(function (se, i) { setStop(i, 'done'); });
+      strip.style.setProperty('--p', 1);
+      boat.t = 1; boat.cargo = 0; boat.dock = 'right'; boat.arrived = true; drawScene();
+      var bad = !!(verify && !verify.ok);
+      live.className = 'dsk-live ' + (bad ? 'wait' : 'ok');
+      var mins = Math.max(1, Math.round((Date.now() - startedAt) / 60000));
+      capsText.textContent = KIND + ' finished \u00b7 ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + ' \u00b7 took ' + D.fmt.plural(mins, 'minute');
+      if (bad) setTitle('Ashore, with', D.fmt.plural(verify.problems, 'problem') + '.'); else setTitle('Safely', 'ashore.');
+      sub.textContent = kind === 'push' ? dstLabel + ' now holds a copy of this site.' : (ctx.target ? D.host(ctx.target.home) : dstLabel) + ' now holds a copy of ' + srcLabel + '.';
+      headK.textContent = 'Arrived.';
+      setHead([bad ? 'Everything came across, but the checks after the move found something to look at (below). The restore point is kept if you\u2019d rather undo.' : 'Everything on the manifest came ashore. The restore point is kept in case you change your mind.'], bad ? D.fmt.plural(verify.problems, 'problem') : 'All 6 stops', bad ? 'warn' : 'ok');
+      progress('');
+      cancelBtn.hidden = true;
+      D.mount(chooser);
+      D.mount(outcome, h('div', { class: 'dsk-after dsk-fade' }, doneBox, checks));
+    }
+
     var ctx = {
+      undoDetails: function () {
+        return h('details', { class: 'dsk-gtk', style: { marginTop: '16px' } },
+          h('summary', null, D.icon('terminal'), 'Undo from the terminal', D.icon('chevron', 'chev')),
+          h('div', { class: 'dsk-gtk-body' }, ctx.cliUndo()));
+      },
       importId: importId,
       rollbackId: function () { return rollbackId; },
       cliUndo: function () { return D.cmd('disembark restore ' + opts.targetHome + ' --rollback=' + rollbackId); },
@@ -552,9 +679,8 @@
           destHome = String(target.home).replace(/\/$/, ''); destPrefix = target.prefix;
           rlog((target.created ? 'Created ' : 'Replacing ') + (target.kind === 'multisite' ? 'subsite ' : 'tenant ') + target.id + ' at ' + destHome + ' (tables ' + destPrefix + '*)' + (target.created ? '. Rolling back removes it.' : '.'), 'ok');
         }
-        D.mount(outcome, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '12px' } },
-          h('h3', null, 'Rollback point saved'),
-          h('p', { class: 'muted' }, 'Whatever happens next, this puts ' + D.host(destHome) + ' back as it was:'), ctx.cliUndo()));
+        stepEls.snap.meta.textContent = 'saved \u00b7 ' + importId.slice(0, 6);
+        rlog('Whatever happens next, this puts ' + D.host(destHome) + ' back as it was: disembark restore ' + opts.targetHome + ' --rollback=' + rollbackId, 'dim');
 
         // Quiet mode goes on before the files and database arrive, so no
         // request in between can run the source's jobs or send its emails.
@@ -638,20 +764,20 @@
           stepEls.check.meta.textContent = verify.ok ? 'all good' : D.fmt.plural(verify.problems, 'problem');
           rlog(verify.ok ? 'Checks after the move: all good.' : 'Checks after the move found ' + D.fmt.plural(verify.problems, 'problem') + '.', verify.ok ? 'ok' : 'err');
         } else skip('check', 'not available');
-        stepEls.check.el.classList.remove('active'); stepEls.check.el.classList.add('done');
         rlog('Done.', 'ok');
-        title.textContent = opts.doneTitle || 'Restored';
         notifyBtn.hidden = true;
+        arrive(verify);
         sendNotice('finished', { lines: [verify ? (verify.ok ? 'Checks after the move: all good.' : 'Checks after the move found ' + D.fmt.plural(verify.problems, 'problem') + ': see Tools \u2192 Disembark on ' + D.host(opts.targetHome) + ', or run wp disembark verify ' + importId + '.') : ''].concat(ctx.loginUrl ? ['Log in at ' + ctx.loginUrl] : []).filter(Boolean) });
-        opts.done(outcome, ctx);
-        if (verify) outcome.appendChild(h('div', { style: { marginTop: '14px' } }, verifyCard(verify)));
-        if (quietOn) outcome.appendChild(h('div', { style: { marginTop: '14px' } }, D.quietNote(destHome, quietSource)));
+        opts.done(doneBox, ctx);
+        if (verify) checks.appendChild(verifyCard(verify));
+        if (quietOn) checks.appendChild(D.quietNote(destHome, quietSource));
+        checks.appendChild(h('div', { class: 'dsk-chk' }, D.icon('anchor'), h('div', null, h('strong', null, 'Restore point kept. '), 'Find it under ', h('a', { href: '#backups' }, 'Backups'), ' with the others, or undo from the left.')));
         if (codeMentions) {
-          outcome.appendChild(h('div', { style: { marginTop: '14px' } }, D.note('warn', [
+          checks.appendChild(h('div', { class: 'dsk-chk warn' }, D.icon('alert'), h('div', null,
             h('strong', null, D.fmt.plural(codeMentions.total, 'theme or plugin file') + (codeMentions.total === 1 ? ' still mentions ' : ' still mention ') + D.host(codeMentions.from) + '. '),
             'Disembark doesn\u2019t edit code, so check these by hand:',
-            h('ul', { style: { margin: '8px 0 0', paddingLeft: '18px', fontFamily: 'var(--mono)', fontSize: '12px' } }, codeMentions.list.map(function (f) { return h('li', null, f); }),
-              codeMentions.total > codeMentions.list.length ? h('li', null, '\u2026 and ' + (codeMentions.total - codeMentions.list.length) + ' more') : null)])));
+            h('ul', { style: { fontFamily: 'var(--mono)', fontSize: '12px' } }, codeMentions.list.map(function (f) { return h('li', null, f); }),
+              codeMentions.total > codeMentions.list.length ? h('li', null, '\u2026 and ' + (codeMentions.total - codeMentions.list.length) + ' more') : null))));
         }
       } catch (e) {
         notifyBtn.hidden = true;
@@ -660,16 +786,22 @@
         var msg = D.errorText(e);
         sendNotice('failed', { error: msg, step: current ? (STEPS.filter(function (s) { return s.key === current; })[0] || {}).label : '' });
         rlog('ERROR: ' + msg, 'err');
-        title.textContent = 'Stopped';
+        setTitle('It', 'stopped.');
+        sub.textContent = rollbackId ? D.host(opts.targetHome) + ' may be partly changed. Roll back below to put it as it was.' : 'Nothing on ' + D.host(opts.targetHome) + ' changed.';
+        live.className = 'dsk-live stop'; capsText.textContent = KIND + ' stopped';
         progress('');
-        if (current) { stepEls[current].el.classList.remove('active'); stepEls[current].el.classList.add('failed'); stepEls[current].meta.textContent = 'stopped'; }
-        D.mount(outcome, h('div', { class: 'dsk-stack' },
+        cancelAnimationFrame(boat.raf);
+        failStop('stopped');
+        setHead([rollbackId ? D.host(opts.targetHome) + ' may be partly changed. Roll back to put it as it was.' : 'Nothing on ' + D.host(opts.targetHome) + ' changed.'], 'Stopped', 'warn');
+        D.mount(chooser);
+        D.mount(outcome, h('div', { class: 'dsk-stack', style: { marginTop: '16px' } },
           D.note('error', [h('strong', null, 'It stopped. '), msg]),
           rollbackId ? h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '12px' } },
-            h('h3', null, D.host(opts.targetHome) + ' may be partly changed'),
+            h('h3', null, D.icon('restore'), D.host(opts.targetHome) + ' may be partly changed'),
             h('p', { class: 'muted' }, 'Roll back to the snapshot taken before it started.'),
-            h('div', null, h('button', { class: 'dsk-btn primary', onclick: function (ev) { rollback(ev.currentTarget, outcome); } }, D.icon('restore'), 'Roll back')), ctx.cliUndo())
-            : h('div', null, h('button', { class: 'dsk-btn', onclick: opts.back }, 'Back to the form'))));
+            h('div', { class: 'dsk-row' }, h('button', { class: 'dsk-btn primary', type: 'button', onclick: function (ev) { rollback(ev.currentTarget, outcome); } }, D.icon('restore'), 'Roll back'),
+              h('button', { class: 'dsk-btn ghost', type: 'button', onclick: opts.back }, 'Back to Move')), ctx.cliUndo())
+            : h('div', null, h('button', { class: 'dsk-btn', type: 'button', onclick: opts.back }, D.icon('ship'), 'Back to Move'))));
       }
     })();
 
@@ -684,10 +816,18 @@
           }
           rlog('Rolled back.', 'ok');
           if (r.quiet_mode_lifted) rlog('Quiet mode lifted with it.', 'dim');
-          title.textContent = 'Rolled back';
-          D.mount(into || outcome, h('div', { class: 'dsk-stack' },
+          setTitle('Rolled', 'back.');
+          live.className = 'dsk-live ok'; capsText.textContent = KIND + ' undone';
+          sub.textContent = D.host(opts.targetHome) + ' is back to how it was before the move.';
+          headK.textContent = 'Undone.';
+          setHead(['The crates went back to ', { b: srcLabel }, '. Nothing from the move is left on ', { b: D.host(opts.targetHome) }, '.'], 'Rolled back', 'ok');
+          cancelAnimationFrame(boat.raf);
+          boat.t = null; boat.cargo = 0; boat.dock = 'left'; boat.arrived = false; drawScene();
+          stopEls.forEach(function (se, i) { setStop(i, 'todo'); se.small.textContent = '\u00a0'; });
+          strip.style.setProperty('--p', 0);
+          D.mount(outcome, h('div', { class: 'dsk-stack', style: { marginTop: '16px' } },
             D.note('ok', [h('strong', null, 'Rolled back. '), D.host(opts.targetHome) + ' is back to how it was before.']),
-            h('div', null, h('button', { class: 'dsk-btn', onclick: opts.back }, D.icon(opts.icon || (opts.local ? 'restore' : 'upload')), opts.againLabel || 'Start another restore'))));
+            h('div', null, h('button', { class: 'dsk-btn', type: 'button', onclick: opts.back }, D.icon(opts.icon || 'ship'), opts.againLabel || 'Start another move'))));
         } catch (e) {
           rlog('ERROR: ' + D.errorText(e), 'err');
           D.toast('Rollback failed: ' + D.errorText(e), 'error');
@@ -697,31 +837,43 @@
   };
 
   /**
-   * The saved rollback points, with Roll back and Delete. Shared by Restore
-   * and Database (search & replace saves one too).
+   * The saved rollback points as a timeline of buoys, each with Roll back
+   * and Delete. Used by Backups. Returns a card; card.reload() refreshes it,
+   * and o.onCount(n, bytes) hears how many there are.
    */
-  D.restorePoints = function () {
-    var body = h('div');
-    var card = h('div', { class: 'dsk-card' },
-      h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('anchor'), 'Restore points'), h('span', { class: 'grow' }),
-        h('span', { class: 'muted', style: { fontSize: '12.5px' } }, 'Saved before every pull, restore and search & replace.')),
+  var BUOYS = ['#c8553d', '#d9a441', '#2b8a7e', '#3f78a8'];
+  D.restorePoints = function (o) {
+    o = o || {};
+    var body = h('div'), count = h('span', { class: 'dsk-tag r', hidden: true });
+    var showAll = false;
+    var card = h('section', { class: 'dsk-card dsk-sec' },
+      h('div', { class: 'dsk-sec-h' }, h('div', { class: 'spotmini', html: D.H.spot('points') }),
+        h('div', null, h('h3', null, 'Restore points'), h('p', null, 'One is saved before every pull, restore and search and replace. Roll back puts this site back exactly as it was then, files and database both.')),
+        h('span', { class: 'r' }, count)),
       body);
     async function load() {
-      D.mount(body, h('div', { class: 'dsk-card-pad muted' }, h('span', { class: 'dsk-spin' }), ' Loading…'));
+      D.mount(body, h('div', { class: 'dsk-tl-empty' }, h('span', { class: 'dsk-spin' }), ' Loading…'));
       var points;
       try { points = await D.api.get('restore-points'); }
-      catch (e) { D.mount(body, h('div', { class: 'dsk-card-pad' }, D.note('error', 'Could not list restore points: ' + D.errorText(e)))); return; }
-      if (!points.length) { D.mount(body, h('div', { class: 'dsk-card-pad muted' }, 'None yet. One is saved automatically before anything changes this site.')); return; }
-      D.mount(body, h('ul', { class: 'dsk-list' }, points.map(function (p) {
-        return h('li', { style: { padding: '12px 18px' } },
-          D.icon('anchor'),
-          h('div', { class: 'grow' },
-            h('div', { style: { fontWeight: 500 } }, p.label || 'Rollback point'),
-            h('div', { class: 'muted', style: { fontSize: '12.5px' } }, D.fmt.date(p.created_at) + ' · ' + D.fmt.ago(p.created_at) + ' · ' + D.fmt.plural(p.tables, 'table') + (p.files ? ' · ' + D.fmt.plural(p.files, 'file') : '') + ' · ' + D.fmt.size(p.size))),
-          p.rolled_back_at ? h('span', { class: 'dsk-badge ok' }, 'rolled back ' + D.fmt.ago(p.rolled_back_at)) : null,
-          h('button', { class: 'dsk-btn sm', onclick: function (e) { rollback(p, e.currentTarget); } }, D.icon('restore'), 'Roll back'),
-          h('button', { class: 'dsk-btn ghost sm icon', 'aria-label': 'Delete this restore point', title: 'Delete', onclick: function (e) { remove(p, e.currentTarget); } }, D.icon('trash')));
-      })));
+      catch (e) { D.mount(body, h('div', { class: 'dsk-tl-empty' }, D.note('error', 'Could not list restore points: ' + D.errorText(e)))); return; }
+      var bytes = points.reduce(function (n, p) { return n + (p.size || 0); }, 0);
+      count.hidden = !points.length;
+      count.textContent = points.length + ' kept · ' + D.fmt.size(bytes);
+      if (o.onCount) o.onCount(points.length, bytes, points[0]);
+      if (!points.length) { D.mount(body, h('div', { class: 'dsk-tl-empty' }, 'None yet. One is saved automatically before anything changes this site.')); return; }
+      var limit = showAll ? points.length : 5;
+      D.mount(body, h('ol', { class: 'dsk-tl' }, points.slice(0, limit).map(function (p, i) {
+        return h('li', null,
+          h('span', { class: 'by', html: D.H.buoyIcon(BUOYS[i % BUOYS.length]) }),
+          h('div', null,
+            h('b', null, p.label || 'Restore point'),
+            i === 0 ? h('span', { class: 'dsk-tag ok', style: { marginLeft: '8px' } }, 'latest') : null,
+            p.rolled_back_at ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' } }, 'rolled back ' + D.fmt.ago(p.rolled_back_at)) : null,
+            h('div', { class: 'when' }, D.fmt.date(p.created_at) + ' · ' + D.fmt.size(p.size) + ' · ' + (p.files ? 'files and database' : 'database only'))),
+          h('div', { class: 'acts' },
+            h('button', { class: 'dsk-btn sm', type: 'button', onclick: function (e) { rollback(p, e.currentTarget); } }, D.icon('restore'), 'Roll back'),
+            h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function (e) { remove(p, e.currentTarget); } }, 'Delete')));
+      })), points.length > limit ? h('div', { class: 'dsk-tl-more' }, h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function () { showAll = true; load(); } }, 'Show all ' + points.length)) : null);
     }
     async function rollback(p, btn) {
       var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
@@ -752,79 +904,27 @@
     return card;
   };
 
-  /** The "Safely ashore." card after a move into this site (Restore and Pull). */
-  D.arrivedView = function (outcome, ctx, undoLabel) {
+  /** What to do after a move into this site (Restore and Pull), in the arrival's left card. */
+  D.arrivedView = function (box, ctx, undoLabel) {
     if (ctx.target) {
-      var tg = ctx.target, net = tg.kind === 'multisite';
-      D.mount(outcome, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '14px' } },
-        h('div', { class: 'dsk-row' }, D.icon('checkCircle'), h('h2', { style: { fontSize: '30px' } }, 'Safely ashore.')),
-        h('p', null, (net ? 'Subsite ' : 'Tenant ') + tg.id + ' (' + D.host(tg.home) + ') now holds the copied site. The rest of ' + D.host(D.config.homeUrl) + ' is as it was, and you\u2019re still logged in.'),
-        D.note('', net ? ['Its users joined the network: they log in with their own passwords, and an account that was already here keeps its own.'] : ['It has its own users: log in to it with the source site\u2019s credentials' + (D.address(tg.home) === D.address(D.config.homeUrl) ? ', from Tools \u2192 WP Freighter.' : '.')]),
-        h('div', { class: 'dsk-row' },
-          D.address(tg.home) !== D.address(D.config.homeUrl) ? h('a', { class: 'dsk-btn primary', href: tg.home, target: '_blank', rel: 'noopener' }, 'Open ' + D.host(tg.home) + (String(tg.home).replace(/^https?:\/\/[^/]+/, '') || '')) : null,
-          h('button', { class: 'dsk-btn', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
-        h('div', null, h('div', { class: 'caps', style: { marginBottom: '6px' } }, 'Undo from the CLI'), ctx.cliUndo())));
+      var tg = ctx.target, net = tg.kind === 'multisite', own = D.address(tg.home) !== D.address(D.config.homeUrl);
+      D.mount(box,
+        h('h3', null, D.icon('checkCircle'), (net ? 'Subsite ' : 'Tenant ') + tg.id + ' is ready'),
+        h('p', null, D.host(tg.home) + ' now holds the copied site. The rest of ' + D.host(D.config.homeUrl) + ' is as it was, and you’re still logged in.'),
+        h('p', { style: { marginTop: '8px' } }, net ? 'Its users joined the network: they log in with their own passwords, and an account that was already here keeps its own.'
+          : 'It has its own users: log in to it with the source site’s credentials' + (own ? '.' : ', from Tools → WP Freighter.')),
+        h('div', { class: 'row' },
+          own ? h('a', { class: 'dsk-btn primary', href: tg.home, target: '_blank', rel: 'noopener' }, 'Open ' + D.host(tg.home)) : null,
+          h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
+        ctx.undoDetails());
       return;
     }
-    D.mount(outcome, h('div', { class: 'dsk-card dsk-card-pad dsk-stack', style: { gap: '14px' } },
-      h('div', { class: 'dsk-row' }, D.icon('checkCircle'), h('h2', { style: { fontSize: '30px' } }, 'Safely ashore.')),
-      h('p', null, D.host(D.config.homeUrl) + ' now holds the copied site.'),
-      D.note('warn', ['User accounts came over with it, so your current login no longer applies. ', h('strong', null, 'Log in with the source site’s credentials.')]),
-      h('div', { class: 'dsk-row' },
+    D.mount(box,
+      h('h3', null, D.icon('key'), 'Log in again'),
+      h('p', null, 'User accounts came over with the copy, so your current login no longer applies here. ', h('strong', { style: { color: 'var(--ink)' } }, 'Log in with the source site’s credentials.')),
+      h('div', { class: 'row' },
         h('a', { class: 'dsk-btn primary', href: ctx.loginUrl || D.config.loginUrl }, 'Log in again'),
-        h('button', { class: 'dsk-btn', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
-      h('div', null, h('div', { class: 'caps', style: { marginBottom: '6px' } }, 'Undo from the CLI'), ctx.cliUndo())));
+        h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
+      ctx.undoDetails());
   };
-
-  /* ---------------------------------------------------------- Restore */
-  function mount(root) {
-    var st = { file: null, sourceUrl: '', quiet: true };
-    var view = h('div');
-    D.mount(root,
-      h('div', { class: 'dsk-head' }, h('div', null, h('h1', null, 'Restore'),
-        h('p', null, 'Bring a backup zip into this site. A rollback point is saved first, so you can always go back. To copy straight from another live site, use ', h('a', { href: '#pull' }, 'Pull'), '.'))),
-      view);
-    renderForm();
-
-    function renderForm() {
-      var startBtn = h('button', { class: 'dsk-btn primary lg', disabled: true, onclick: confirmStart }, D.icon('restore'), 'Restore into this site');
-      function sync() { startBtn.disabled = !st.file; }
-
-      var fileName = h('strong', null, st.file ? st.file.name : 'Choose a backup zip');
-      var fileMeta = h('div', { class: 'muted', style: { marginTop: '4px' } }, st.file ? D.fmt.size(st.file.size) : 'or drop it here · from “disembark backup” or Back up → Download');
-      var fileInput = h('input', { type: 'file', accept: '.zip', hidden: true, onchange: function () { pick(fileInput.files[0]); } });
-      function pick(f) { if (!f) return; st.file = f; fileName.textContent = f.name; fileMeta.textContent = D.fmt.size(f.size); sync(); }
-      var drop = h('div', { class: 'dsk-drop', tabindex: '0', role: 'button', onclick: function () { fileInput.click(); }, onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } } },
-        D.icon('zip'), h('div', { style: { marginTop: '6px' } }, fileName), fileMeta, fileInput);
-      drop.addEventListener('dragover', function (e) { e.preventDefault(); drop.classList.add('over'); });
-      drop.addEventListener('dragleave', function () { drop.classList.remove('over'); });
-      drop.addEventListener('drop', function (e) { e.preventDefault(); drop.classList.remove('over'); pick(e.dataTransfer.files[0]); });
-      var srcUrl = h('input', { class: 'dsk-input mono', placeholder: 'Recorded in the backup', value: st.sourceUrl, spellcheck: 'false', oninput: function () { st.sourceUrl = srcUrl.value.trim(); } });
-      var filePane = h('div', null, drop,
-        h('div', { class: 'dsk-field', style: { marginTop: '14px' } }, h('label', null, 'Source URL to rewrite (optional)'), srcUrl,
-          h('span', { class: 'hint' }, 'Defaults to the address recorded in the backup. It’s rewritten to ' + D.config.homeUrl + '.')));
-      sync();
-      D.mount(view, h('div', { class: 'dsk-stack' }, h('div', { class: 'dsk-grid two', style: { alignItems: 'start' } },
-        h('div', { class: 'dsk-card dsk-card-pad dsk-stack' }, filePane, D.quietToggle(st, 'Keep this copy quiet', 'For a staging or dev copy: emails are held, scheduled jobs paused, checkout closed, and payment and marketing APIs blocked, so the copy can’t reach real customers. Only applies when the address changes, and stands down by itself if this site later moves to the real domain.'), h('div', null, startBtn)),
-        h('div', { class: 'dsk-stack' },
-          D.note('warn', [h('strong', null, 'This replaces this site.'), ' Its files and database are overwritten with the backup. User accounts come from the backup too, so afterwards you log in with the source site’s credentials.']),
-          D.note('', ['A rollback point is saved before anything changes. If something goes wrong, or you change your mind, ', h('strong', null, 'Roll back'), ' puts this site back exactly as it was.'], 'anchor'),
-          D.note('', ['Prefer the terminal? ', h('code', null, 'disembark restore ' + D.config.homeUrl + ' <folder>'), ' does the same from a backup folder.'], 'terminal'))),
-        D.restorePoints()));
-    }
-
-    async function confirmStart() {
-      var what = st.file.name;
-      var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
-        h('p', null, 'Replace ', h('strong', null, D.host(D.config.homeUrl)), ' with ', h('strong', null, what), '?'),
-        h('p', { class: 'muted' }, 'A rollback point is saved first. You’ll need to log in again afterwards.')), { title: 'Restore this site?', confirmLabel: 'Restore', danger: true });
-      if (!ok) return;
-      D.runMove(view, {
-        api: D.api, local: true, mode: 'file', file: st.file, sourceUrl: st.sourceUrl, quiet: st.quiet,
-        targetHome: D.config.homeUrl, label: 'Before restore from ' + what, title: 'Restoring', doneTitle: 'Restored',
-        back: renderForm,
-        done: function (outcome, ctx) { D.arrivedView(outcome, ctx, 'Undo restore'); }
-      });
-    }
-  }
 })();

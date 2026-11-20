@@ -174,8 +174,9 @@ class Run {
 
         $scripts = [
             'disembark-core'     => [ 'js/core.js', [ 'disembark-prism' ] ],
+            'disembark-harbor'   => [ 'js/harbor.js', [ 'disembark-core' ] ],
             'disembark-tree'     => [ 'js/tree.js', [ 'disembark-core' ] ],
-            'disembark-backup'   => [ 'js/backup.js', [ 'disembark-tree' ] ],
+            'disembark-backup'   => [ 'js/backup.js', [ 'disembark-tree', 'disembark-harbor', 'disembark-restore' ] ],
             'disembark-restore'  => [ 'js/restore.js', [ 'disembark-core' ] ],
             'disembark-push'     => [ 'js/push.js', [ 'disembark-restore' ] ],
             'disembark-pull'     => [ 'js/pull.js', [ 'disembark-restore' ] ],
@@ -183,7 +184,9 @@ class Run {
             'disembark-files'    => [ 'js/files.js', [ 'disembark-tree' ] ],
             'disembark-database' => [ 'js/database.js', [ 'disembark-core' ] ],
             'disembark-settings' => [ 'js/settings.js', [ 'disembark-core' ] ],
-            'disembark-app'      => [ 'js/app.js', [ 'disembark-backup', 'disembark-restore', 'disembark-push', 'disembark-pull', 'disembark-bring', 'disembark-files', 'disembark-database', 'disembark-settings' ] ],
+            'disembark-move'     => [ 'js/move.js', [ 'disembark-harbor', 'disembark-restore', 'disembark-push', 'disembark-pull', 'disembark-bring' ] ],
+            'disembark-browse'   => [ 'js/browse.js', [ 'disembark-harbor', 'disembark-files', 'disembark-database' ] ],
+            'disembark-app'      => [ 'js/app.js', [ 'disembark-move', 'disembark-backup', 'disembark-browse', 'disembark-settings' ] ],
         ];
         foreach ( $scripts as $handle => list( $file, $deps ) ) {
             wp_register_script( $handle, $base . $file, $deps, $ver( $file ), true );

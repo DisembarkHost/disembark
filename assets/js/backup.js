@@ -1,39 +1,60 @@
 /**
- * Back up: scan the site, choose what to include, and get the CLI commands
- * that run the backup with those choices.
+ * Backups: download a backup zip (scan the site, choose what to bring, then
+ * zip it in the browser or run it with the CLI), the restore points saved
+ * before every move, and earlier scans to pick up again.
  */
 (function () {
   'use strict';
   var D = window.Disembark, h = D.h, S = D.store.state;
 
-  D.section({ id: 'backup', title: 'Back up', icon: 'backup', mount: mount });
+  D.section({ id: 'backups', title: 'Backups', icon: 'history', tab: 2, mount: mount });
 
-  var HERO_ART = '<svg viewBox="0 0 280 170" aria-hidden="true"><rect class="dsk-art-water" width="280" height="170" rx="18"/>' +
-    '<rect class="dsk-art-land" width="280" height="44"/><rect class="dsk-art-wood" x="118" y="44" width="26" height="78" rx="3"/>' +
-    '<path class="dsk-art-wave" fill="none" stroke-width="2" stroke-linecap="round" opacity=".55" d="M24 92q5-5 10 0t10 0M210 140q5-5 10 0t10 0M40 146q5-5 10 0t10 0M222 72q5-5 10 0t10 0"/>' +
-    '<g class="dsk-boat"><path class="dsk-art-hull" d="M182 40c13 10 17 22 17 36v44c0 6-4 9-9 9h-16c-5 0-9-3-9-9V76c0-14 4-26 17-36z"/>' +
-    '<path class="dsk-art-deck" d="M182 48c9 7 12 17 12 28v42c0 3-2 5-5 5h-14c-3 0-5-2-5-5V76c0-11 3-21 12-28z"/>' +
-    '<rect x="172" y="62" width="9" height="9" rx="1.5" fill="#c8553d"/><rect x="183" y="62" width="9" height="9" rx="1.5" fill="#2b8a7e"/>' +
-    '<rect x="172" y="73" width="9" height="9" rx="1.5" fill="#2b8a7e"/><rect x="183" y="73" width="9" height="9" rx="1.5" fill="#d9a441"/>' +
-    '<rect x="173" y="96" width="18" height="16" rx="3" fill="#fff"/></g>' +
-    '<rect x="96" y="14" width="70" height="22" rx="3" fill="#c8553d" opacity=".85"/></svg>';
+  /** "Today, 2:31 PM", "Yesterday, 9:02 AM", "Nov 17, 11:44 AM", "Feb 16, 2025, 7:59 PM". */
+  function when(ts) {
+    if (!ts) return '';
+    var d = new Date(ts * 1000), now = new Date();
+    var time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    var day = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime(), then = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+    var diff = Math.round((day - then) / 86400000);
+    if (diff === 0) return 'Today, ' + time;
+    if (diff === 1) return 'Yesterday, ' + time;
+    return d.toLocaleDateString([], d.getFullYear() === now.getFullYear() ? { month: 'short', day: 'numeric' } : { month: 'short', day: 'numeric', year: 'numeric' }) + ', ' + time;
+  }
+
+  // File count and size of an earlier scan, read from its manifest (each part
+  // lists its own count and size). Cached per session.
+  var scanInfo = {};
+  function sessionInfo(s) {
+    if (!scanInfo[s.token]) {
+      scanInfo[s.token] = D.api.get('manifest', { backup_token: s.token }).then(function (m) {
+        if (!Array.isArray(m)) return null;
+        return m.reduce(function (a, p) { a.files += Number(p.count) || 0; a.size += Number(p.size) || 0; return a; }, { files: 0, size: 0 });
+      }).catch(function () { return null; });
+    }
+    return scanInfo[s.token];
+  }
 
   function mount(root) {
-    var view = h('div');
+    var view = h('div'), picker = h('div'), scans = h('div');
+    var points = D.restorePoints();
     D.mount(root,
-      h('div', { class: 'dsk-head' },
-        h('div', null, h('h1', null, 'Back up'), h('p', null, 'Scan the site, choose what to bring, then run the backup with the Disembark CLI. Files and database stream straight to you.')),
-        h('div', { class: 'dsk-head-tools' }, h('button', { class: 'dsk-btn', id: 'dsk-rescan', hidden: true, onclick: function (e) { scan(e.currentTarget); } }, D.icon('refresh'), 'Rescan'))),
-      view);
+      D.pageHead({ caps: 'Backups', icon: 'history', title: ['Every move, ', 'anchored.'],
+        text: 'A restore point is saved before every pull, restore and search and replace. Download a full backup zip whenever you like.' }),
+      picker, view, points, scans);
 
     var vs = D.scope();
     function fresh() { vs.dispose(); vs = D.scope(); }
     function render() {
       fresh();
-      root.querySelector('#dsk-rescan').hidden = !S.scanned;
-      D.mount(view, h('div', { class: 'dsk-stack' }, sitePicker(), S.scanned ? ready() : start()));
+      D.mount(picker, sitePicker());
+      D.mount(view, S.scanned ? ready() : start());
     }
     D.store.on(['scanned', 'index', 'site'], render);
+    D.store.on(['sessions', 'lastScan'], function () { if (!S.scanned && !busy) render(); renderScans(); });
+    D.store.on(['backupToken'], renderScans);
+    var busy = false;
+    render();
+    renderScans();
 
     // A network or WP Freighter install: back up all of it or one site, as
     // a standalone site (restores into any single site).
@@ -41,39 +62,30 @@
       var inst = D.config.install;
       if (!inst || !(inst.sites || []).length) return null;
       var kind = inst.kind === 'multisite' ? 'network' : 'WP Freighter install';
-      var sel = h('select', { class: 'dsk-select', style: { width: 'auto', minWidth: '280px' }, onchange: function () { D.setSite(sel.value); } },
+      var sel = h('select', { class: 'dsk-select', 'aria-label': 'What to back up', onchange: function () { D.setSite(sel.value); } },
         h('option', { value: '' }, 'The whole ' + kind + ' (' + D.fmt.plural(inst.total || inst.sites.length, 'site') + ')'),
         inst.sites.map(function (s) { return h('option', { value: s.id, selected: s.id === S.site }, D.siteName(s.id)); }));
-      return h('div', { class: 'dsk-card dsk-card-pad dsk-row', style: { gap: '12px', flexWrap: 'wrap' } },
-        h('strong', null, 'Back up'), sel,
-        h('span', { class: 'muted', style: { flex: '1 1 260px' } }, S.site ? 'This site alone, as a standalone site: its tables, its users, its uploads, and the plugins and themes it uses. Restore it into any single WordPress site.' : 'Every site of the ' + kind + ', exactly as it is here.'));
+      return h('div', { class: 'dsk-card dsk-bk-scope' },
+        h('span', { class: 'caps' }, 'Back up'), sel,
+        h('span', { class: 'muted' }, S.site ? 'This site alone, as a standalone site: its tables, its users, its uploads, and the plugins and themes it uses. Restore it into any single WordPress site.' : 'Every site of the ' + kind + ', exactly as it is here.'));
     }
-    D.store.on(['sessions', 'lastScan'], function () { if (!S.scanned) render(); });
-    render();
 
-    /* ----------------------------------------------------------- Start */
+    /* ---------------------------------------------------- The two cards */
+    function dlCard(body) {
+      return h('section', { class: 'dsk-card dsk-bk-dl' }, h('div', { class: 'dsk-bk-art', html: D.H.spot('zip') }), h('div', { class: 'dsk-bk-dl-main' }, body));
+    }
     function start() {
-      var sessions = (S.sessions || []).slice(0, 5);
-      return h('div', { class: 'dsk-stack' },
-        h('div', { class: 'dsk-card dsk-hero' },
-          h('div', null,
-            h('h2', null, 'Ready when ', h('em', null, 'you are.')),
-            h('p', null, 'A scan maps every file and table so you can leave out what you don’t need (caches, old backups, log tables) before anything is copied.'),
-            h('div', { class: 'dsk-row' },
-              h('button', { class: 'dsk-btn primary lg', onclick: function (e) { scan(e.currentTarget); } }, D.icon('scan'), 'Scan this site'),
-              S.lastScan ? h('span', { class: 'muted' }, 'Last scan ' + D.fmt.ago(S.lastScan.timestamp) + ' · ' + D.fmt.plural(S.lastScan.total_files, 'file') + ' · ' + D.fmt.size(S.lastScan.total_size)) : null)),
-          D.svg(HERO_ART, 'art')),
-        sessions.length ? h('div', { class: 'dsk-card' },
-          h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('history'), 'Pick up an earlier scan'), h('span', { class: 'grow' }), h('span', { class: 'muted' }, 'Files may have changed since.')),
-          h('ul', { class: 'dsk-list' }, sessions.map(function (s) {
-            return h('li', { class: 'clickable', tabindex: '0', onclick: function () { resume(s); }, onkeydown: function (e) { if (e.key === 'Enter') resume(s); } },
-              D.icon('history'), h('span', { class: 'grow' }, D.fmt.date(s.timestamp)), h('span', { class: 'size' }, D.fmt.ago(s.timestamp) + ' · ' + s.token.slice(0, 8)), D.icon('chevron'));
-          }))) : null,
+      return h('div', { class: 'dsk-two' },
+        dlCard([
+          h('h2', null, 'Download a ', h('em', { class: 'hl' }, 'backup zip')),
+          h('p', null, 'Scan the site, choose what to bring (leave out caches, old backups, log tables), then download one zip of its files and database.'),
+          h('button', { class: 'dsk-btn primary lg', type: 'button', onclick: function () { scan(); } }, D.icon('scan'), 'Scan this site'),
+          S.lastScan ? h('div', { class: 'meta' }, 'Last scan ' + D.fmt.ago(S.lastScan.timestamp) + ' · ' + D.fmt.plural(S.lastScan.total_files, 'file') + ' · ' + D.fmt.size(S.lastScan.total_size)) : null]),
         cliCard(false));
     }
 
     /* ------------------------------------------------------------ Scan */
-    async function scan(btn) {
+    async function scan() {
       var steps = [
         { key: 'db', label: 'Reading the database' },
         { key: 'scanning', label: 'Scanning folders' },
@@ -97,9 +109,10 @@
         bar.set(pct);
       }
       fresh();
-      D.mount(view, h('div', { class: 'dsk-card dsk-card-pad', style: { maxWidth: '640px' } },
-        h('h2', { style: { fontSize: '28px', marginBottom: '16px' } }, 'Scanning ', D.host(D.config.homeUrl)), list, h('div', { style: { marginTop: '18px' } }, bar)));
-      root.querySelector('#dsk-rescan').hidden = true;
+      busy = true;
+      D.mount(view, h('div', { class: 'dsk-two' },
+        dlCard([h('h2', null, 'Scanning ', h('em', { class: 'hl' }, D.host(S.site ? D.siteName(S.site).split(' ')[0] : D.config.homeUrl))), h('div', { class: 'dsk-bk-steps' }, list, bar)]),
+        cliCard(false)));
       try {
         at('db', '', null);
         var tables = await D.loadDatabase(true);
@@ -109,22 +122,29 @@
           var meta = p.phase === 'scanning' ? D.fmt.num(p.done) + ' of ' + D.fmt.num(p.total) + ' folders' : D.fmt.num(p.done) + ' of ' + D.fmt.num(p.total) + ' parts';
           at(p.phase, meta, pct);
         });
+        busy = false;
         D.toast('Scan complete: ' + D.fmt.plural(S.files.length, 'file') + '.');
       } catch (e) {
+        busy = false;
         D.toast('The scan did not finish: ' + D.errorText(e), 'error');
         render();
       }
-      void btn;
     }
 
     async function resume(session) {
       fresh();
-      D.mount(view, h('div', { class: 'dsk-card dsk-card-pad', style: { maxWidth: '640px' } }, h('div', { class: 'dsk-row' }, h('span', { class: 'dsk-spin' }), 'Loading the scan from ' + D.fmt.date(session.timestamp) + '…')));
+      busy = true;
+      D.mount(view, h('div', { class: 'dsk-two' },
+        dlCard([h('h2', null, 'Picking up ', h('em', { class: 'hl' }, 'a scan')), h('div', { class: 'dsk-row muted' }, h('span', { class: 'dsk-spin' }), 'Loading the scan from ' + when(session.timestamp) + '…')]),
+        cliCard(false)));
+      window.scrollTo({ top: 0, behavior: 'smooth' });
       try {
         await D.loadDatabase(true);
         await D.resumeSession(session);
+        busy = false;
         D.toast('Scan loaded.');
       } catch (e) {
+        busy = false;
         D.toast('Could not load that scan: ' + D.errorText(e), 'error');
         render();
       }
@@ -132,22 +152,35 @@
 
     /* ----------------------------------------------------------- Ready */
     function ready() {
-      var summary = h('div', { class: 'dsk-grid three' });
+      var summary = h('p'), totals = h('span', { class: 'dsk-tag r' });
       function renderSummary() {
-        var fileStats = fileTotals(), db = dbTotals();
-        D.mount(summary,
-          stat('Files', S.includeFiles ? D.fmt.size(fileStats.size) : 'Skipped', S.includeFiles ? D.fmt.plural(fileStats.files, 'file') + (fileStats.excluded ? ' · ' + D.fmt.num(fileStats.excluded) + ' left out' : '') : 'Not included', 'var(--files)'),
-          stat('Database', S.includeDb ? D.fmt.size(db.size) : 'Skipped', S.includeDb ? D.fmt.plural(db.tables, 'table') + (db.left ? ' · ' + D.fmt.num(db.left) + ' left out' : '') : 'Not included', 'var(--db)'),
-          stat('Total', D.fmt.size((S.includeFiles ? fileStats.size : 0) + (S.includeDb ? db.size : 0)), 'Scanned ' + (S.lastScan ? D.fmt.ago(S.lastScan.timestamp) : 'just now'), 'var(--sea)'));
+        var f = fileTotals(), db = dbTotals();
+        var parts = [];
+        if (S.includeFiles) parts.push(h('b', null, D.fmt.plural(f.files, 'file')), ' (' + D.fmt.size(f.size) + ')');
+        if (S.includeFiles && S.includeDb) parts.push(' and ');
+        if (S.includeDb) parts.push(h('b', null, D.fmt.plural(db.tables, 'table')), ' (' + D.fmt.size(db.size) + ')');
+        if (!S.includeFiles && !S.includeDb) parts.push('Nothing is included yet. Turn on files, the database, or both below.');
+        else parts.push((f.excluded || db.left) ? ', with ' + [f.excluded ? D.fmt.plural(f.excluded, 'file') : '', db.left ? D.fmt.plural(db.left, 'table') : ''].filter(Boolean).join(' and ') + ' left out.' : '. Leave out anything you don’t need below.');
+        D.mount(summary, parts);
+        totals.textContent = D.fmt.size((S.includeFiles ? f.size : 0) + (S.includeDb ? db.size : 0)) + ' in all';
       }
       vs.on(['excluded', 'included', 'includeDb', 'includeFiles'], renderSummary);
       renderSummary();
-      return h('div', { class: 'dsk-stack' }, summary, h('div', { class: 'dsk-grid two' }, dbCard(), filesCard()), browserCard(), cliCard(true));
+      return h('div', null,
+        h('div', { class: 'dsk-two' },
+          dlCard([
+            h('h2', null, 'Download a ', h('em', { class: 'hl' }, 'backup zip')),
+            summary,
+            h('div', { class: 'dsk-row' },
+              h('button', { class: 'dsk-btn primary lg', type: 'button', onclick: function () { browserBackup(); } }, D.icon('download'), 'Download backup zip'),
+              h('button', { class: 'dsk-btn ghost', type: 'button', onclick: function () { scan(); } }, D.icon('refresh'), 'Rescan')),
+            h('div', { class: 'meta' }, 'Scanned ' + (S.lastScan ? D.fmt.ago(S.lastScan.timestamp) : 'just now') + '. The zip is built on the server, then downloaded. No CLI needed.')]),
+          cliCard(true)),
+        h('section', { class: 'dsk-card dsk-sec' },
+          h('div', { class: 'dsk-sec-h' }, h('div', null, h('h3', null, 'Choose what to bring'), h('p', null, 'Leave out caches, old backups and log tables. Your choices also apply to the terminal commands.')), totals),
+          h('div', { class: 'dsk-bk-choose' }, dbPane(), filesPane())));
     }
 
-    function stat(label, value, sub, color) {
-      return h('div', { class: 'dsk-stat' }, h('div', { class: 'caps', style: { display: 'flex', gap: '8px', alignItems: 'center' } }, h('span', { class: 'dsk-dot', style: { background: color } }), label), h('div', { class: 'v' }, value), h('div', { class: 's' }, sub));
-    }
     function fileTotals() {
       var out = { files: 0, size: 0, excluded: 0 };
       if (!S.excluded.size) { out.files = S.files.length; out.size = S.index ? S.index.root.size : 0; return out; }
@@ -164,9 +197,10 @@
     }
 
     /* Database picker */
-    function dbCard() {
+    function dbPane() {
       var q = '', sortBy = 'name', anchor = null, list = h('ul', { class: 'dsk-list' });
       var body = h('div', { class: 'dsk-scroll' }, list);
+      var stat = h('span', { class: 'muted' });
       function visible() {
         var rows = S.database.filter(function (t) { return !q || t.table.toLowerCase().indexOf(q) !== -1; });
         return rows.sort(function (a, b) { return sortBy === 'size' ? b.size - a.size : a.table.localeCompare(b.table); });
@@ -177,7 +211,8 @@
         D.store.set({ included: inc });
       }
       function renderList() {
-        var rows = visible();
+        var rows = visible(), db = dbTotals();
+        stat.textContent = S.includeDb ? D.fmt.plural(db.tables, 'table') + ' · ' + D.fmt.size(db.size) : 'Skipped';
         D.mount(list, rows.length ? rows.map(function (t) {
           var on = S.included.has(t.table);
           return h('li', { class: on ? '' : 'off' },
@@ -193,54 +228,49 @@
               },
               onkeydown: function (e) { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); e.currentTarget.click(); } }
             }),
-            h('span', { class: 'grow mono', style: { fontSize: '13px' } }, t.table),
+            h('span', { class: 'grow nm' }, t.table),
             h('span', { class: 'size' }, D.fmt.num(t.row_count) + ' rows'),
-            h('span', { class: 'size', style: { minWidth: '64px', textAlign: 'right' } }, D.fmt.size(t.size)));
+            h('span', { class: 'size sz' }, D.fmt.size(t.size)));
         }) : h('li', { class: 'muted' }, 'No tables match.'));
       }
-      vs.on(['included'], renderList);
+      vs.on(['included', 'includeDb'], renderList);
       renderList();
-      var sortBtn = h('button', { class: 'dsk-btn ghost sm', onclick: function () { sortBy = sortBy === 'name' ? 'size' : 'name'; sortBtn.lastChild.textContent = sortBy === 'name' ? 'A–Z' : 'Largest'; renderList(); } }, D.icon('settings'), h('span', null, 'A–Z'));
-      var card = h('div', { class: 'dsk-card' },
-        h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('database'), 'Database'), h('span', { class: 'grow' }), D.toggle('Include', S.includeDb, function (v) { D.store.set({ includeDb: v }); body.hidden = !v; tools.hidden = !v; })),
-        null, body);
-      var tools = h('div', { class: 'dsk-row', style: { padding: '10px 14px', borderBottom: '1px solid var(--line)' } },
-        h('div', { style: { flex: '1 1 120px', minWidth: '120px' } }, D.search('Search tables', function (v) { q = v; renderList(); })),
+      var sortBtn = h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function () { sortBy = sortBy === 'name' ? 'size' : 'name'; sortBtn.lastChild.textContent = sortBy === 'name' ? 'A–Z' : 'Largest'; renderList(); } }, D.icon('settings'), h('span', null, 'A–Z'));
+      var tools = h('div', { class: 'dsk-bk-tools' },
+        h('div', { class: 'grow' }, D.search('Search tables', function (v) { q = v; renderList(); })),
         sortBtn,
-        h('button', { class: 'dsk-btn ghost sm', onclick: function () { setIncluded(visible().map(function (t) { return t.table; }), true); } }, 'All'),
-        h('button', { class: 'dsk-btn ghost sm', onclick: function () { setIncluded(visible().map(function (t) { return t.table; }), false); } }, 'None'));
-      card.insertBefore(tools, body);
+        h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function () { setIncluded(visible().map(function (t) { return t.table; }), true); } }, 'All'),
+        h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function () { setIncluded(visible().map(function (t) { return t.table; }), false); } }, 'None'));
       body.hidden = tools.hidden = !S.includeDb;
-      return card;
+      return h('div', { class: 'dsk-bk-pane' },
+        h('div', { class: 'dsk-bk-pane-h' }, h('span', { class: 'dsk-dot', style: { background: 'var(--db)' } }), h('h3', null, 'Database'), stat, h('span', { class: 'grow' }),
+          D.toggle('Include', S.includeDb, function (v) { D.store.set({ includeDb: v }); body.hidden = tools.hidden = !v; })),
+        tools, body);
     }
 
     /* File picker */
-    function filesCard() {
+    function filesPane() {
       var tree = D.Tree({ mode: 'exclude', scope: vs });
       var body = h('div', { class: 'dsk-scroll', style: { padding: '6px 0' } }, tree.el);
-      var resetBtn = h('button', { class: 'dsk-btn ghost sm', onclick: function () { D.store.set({ excluded: new Set() }); } }, 'Reset');
-      function syncReset() { resetBtn.hidden = !S.excluded.size; }
-      vs.on(['excluded'], syncReset); syncReset();
-      var hint = h('div', { class: 'muted', style: { padding: '10px 18px', borderBottom: '1px solid var(--line)', fontSize: '12.5px' } },
-        'Click ', D.icon('checkCircle'), ' to leave something out. ', h('kbd', null, 'Shift'), '-click another to apply it to everything between.');
+      var stat = h('span', { class: 'muted' });
+      var resetBtn = h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function () { D.store.set({ excluded: new Set() }); } }, 'Reset');
+      function sync() {
+        var f = fileTotals();
+        resetBtn.hidden = !S.excluded.size || !S.includeFiles;
+        stat.textContent = S.includeFiles ? D.fmt.plural(f.files, 'file') + ' · ' + D.fmt.size(f.size) : 'Skipped';
+      }
+      vs.on(['excluded', 'includeFiles'], sync); sync();
+      var hint = h('div', { class: 'dsk-bk-tools muted' },
+        h('span', null, 'Click ', D.icon('checkCircle'), ' to leave something out. ', h('kbd', null, 'Shift'), '-click another to apply it to everything between.'));
       hint.querySelector('svg').style.cssText = 'width:14px;height:14px;vertical-align:-2px;color:var(--teal)';
-      var card = h('div', { class: 'dsk-card' },
-        h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('folder'), 'Files'), h('span', { class: 'grow' }), resetBtn, D.toggle('Include', S.includeFiles, function (v) { D.store.set({ includeFiles: v }); body.hidden = hint.hidden = !v; })),
-        hint, body);
       body.hidden = hint.hidden = !S.includeFiles;
-      return card;
+      return h('div', { class: 'dsk-bk-pane' },
+        h('div', { class: 'dsk-bk-pane-h' }, h('span', { class: 'dsk-dot', style: { background: 'var(--files)' } }), h('h3', null, 'Files'), stat, h('span', { class: 'grow' }), resetBtn,
+          D.toggle('Include', S.includeFiles, function (v) { D.store.set({ includeFiles: v }); body.hidden = hint.hidden = !v; })),
+        hint, body);
     }
 
     /* Back up in the browser */
-    function browserCard() {
-      var btn = h('button', { class: 'dsk-btn primary', onclick: function () { browserBackup(); } }, D.icon('download'), 'Download a backup zip');
-      return h('div', { class: 'dsk-card dsk-card-pad dsk-row', style: { gap: '18px', alignItems: 'center' } },
-        h('div', { style: { flex: 1, minWidth: '260px' } },
-          h('h3', { style: { display: 'flex', gap: '9px', alignItems: 'center', marginBottom: '4px' } }, D.icon('zip'), 'Back up in the browser'),
-          h('p', { class: 'muted' }, 'Builds a zip of your choices on the server, then downloads it. No CLI needed. Bring it back with Restore, or with the CLI. For very large sites the CLI is faster and never stores a copy on the server.')),
-        btn);
-    }
-
     async function browserBackup() {
       if (!S.includeFiles && !S.includeDb) { D.toast('Include files, the database, or both.', 'error'); return; }
       var files = S.includeFiles ? S.files.filter(function (f) { return !D.isExcluded(f.name); }) : [];
@@ -273,17 +303,17 @@
       async function step(body) { if (cancelled) throw new Error('cancelled'); return D.api.post('backup/archive', Object.assign({ backup_token: token, archive: archive }, S.site ? { site: S.site } : {}, body)); }
       try {
         for (var i = 0; i < batches.length; i++) {
-          line.textContent = 'Adding files\u2026 batch ' + (i + 1) + ' of ' + batches.length;
+          line.textContent = 'Adding files… batch ' + (i + 1) + ' of ' + batches.length;
           await step({ step: 'files', files: batches[i].files });
           tick(batches[i].size);
         }
         for (var j = 0; j < dbJobs.length; j++) {
           var job = dbJobs[j];
-          line.textContent = job.tables ? 'Exporting the database\u2026 ' + (j + 1) + ' of ' + dbJobs.length : 'Exporting ' + job.table + ' (part ' + job.part + ' of ' + job.parts + ')\u2026';
+          line.textContent = job.tables ? 'Exporting the database… ' + (j + 1) + ' of ' + dbJobs.length : 'Exporting ' + job.table + ' (part ' + job.part + ' of ' + job.parts + ')…';
           await step(job.tables ? { step: 'database', tables: job.tables } : { step: 'database', table: job.table, part: job.part, rows_per_part: job.rows });
           tick(job.size);
         }
-        line.textContent = 'Finishing the zip\u2026';
+        line.textContent = 'Finishing the zip…';
         var fin = await step({ step: 'finish' });
         bar.set(100);
         if (close) close(null);
@@ -292,7 +322,7 @@
           title: 'Backup ready',
           body: h('div', { class: 'dsk-stack', style: { gap: '10px' } },
             h('p', null, h('strong', null, fin.file_name), ' (' + D.fmt.size(fin.size) + ') is downloading.'),
-            h('p', { class: 'muted' }, 'Delete it from the server once the download finishes? It\u2019s a full copy of the site in a public folder (with an unguessable name).')),
+            h('p', { class: 'muted' }, 'Delete it from the server once the download finishes? It’s a full copy of the site in a public folder (with an unguessable name).')),
           actions: [{ label: 'Keep it for now', value: 'keep' }, { label: 'Delete from server', kind: 'primary', value: 'delete' }]
         });
         if (choice === 'delete') { await cleanupArchive(); D.toast('Backup zip deleted from the server.'); }
@@ -310,13 +340,17 @@
       }
     }
 
-    /* CLI commands */
+    /* "Or from your terminal": the backup command, plus the rest behind a disclosure. */
     function cliCard(withChoices) {
-      if (S.site) return D.note('', ['The Disembark CLI backs up the whole install. For this one site, use Back up in the browser above, or pull it straight into another site with ', h('code', null, 'wp disembark pull <connect line> --site=' + S.site), '.'], 'terminal');
+      var head = h('h3', null, D.icon('terminal'), 'Or from your terminal');
+      if (S.site) {
+        return h('section', { class: 'dsk-card dsk-bk-cli' }, head,
+          h('p', null, 'The Disembark CLI backs up the whole install. For this one site, use the backup zip, or pull it straight into another site with ', h('code', null, 'wp disembark pull <connect line> --site=' + S.site), '.'));
+      }
       var home = D.config.homeUrl;
+      var main = D.cmd('');
       var blocks = {
         runner: D.cmd('', { label: 'Back up now', hint: 'Downloads the CLI if needed and runs the backup with your choices.' }),
-        backup: D.cmd('', { label: 'Backup', hint: 'A zip with files and database.' }),
         sync: D.cmd('', { label: 'Sync', hint: 'Create or refresh a local mirror.' }),
         ncdu: D.cmd('', { label: 'Disk usage', hint: 'Browse what takes up space (needs ncdu).' }),
         info: D.cmd('', { label: 'Info', hint: 'Connection, storage and earlier sessions.' })
@@ -332,24 +366,38 @@
         return f;
       }
       function update() {
-        var f = withChoices ? flags() : '', sid = S.backupToken ? ' --session-id=' + S.backupToken : '';
-        var folder = D.host(home);
-        blocks.runner.querySelector('pre').textContent = 'curl -sL https://disembark.host/run | bash -s -- backup "' + home + '" --token="' + S.token + '"' + (S.backupToken ? ' --session-id="' + S.backupToken + '"' : '') + f;
-        blocks.backup.querySelector('pre').textContent = 'disembark backup ' + home + f + sid;
-        blocks.sync.querySelector('pre').textContent = 'disembark sync ' + home + ' "' + folder + '"' + f + sid;
+        var f = withChoices ? flags() : '', sid = withChoices && S.backupToken ? ' --session-id=' + S.backupToken : '';
+        main.set('disembark backup ' + home + f + sid);
+        blocks.runner.querySelector('pre').textContent = 'curl -sL https://disembark.host/run | bash -s -- backup "' + home + '" --token="' + S.token + '"' + (withChoices && S.backupToken ? ' --session-id="' + S.backupToken + '"' : '') + f;
+        blocks.sync.querySelector('pre').textContent = 'disembark sync ' + home + ' "' + D.host(home) + '"' + f + sid;
         blocks.ncdu.querySelector('pre').textContent = 'disembark ncdu ' + home + sid;
         blocks.info.querySelector('pre').textContent = 'disembark info ' + home;
       }
       vs.on(['excluded', 'included', 'includeDb', 'includeFiles', 'backupToken', 'token'], update);
       update();
-      return h('div', { class: 'dsk-card' },
-        h('div', { class: 'dsk-card-head' }, h('h3', null, D.icon('terminal'), withChoices ? 'Run the backup' : 'Back up from your terminal'), h('span', { class: 'grow' }),
-          h('a', { href: '#settings', class: 'dsk-btn ghost sm' }, D.icon('link'), 'Connect the CLI')),
-        h('div', { class: 'dsk-card-pad dsk-stack', style: { gap: '16px' } },
-          withChoices ? blocks.runner : null,
-          blocks.backup, blocks.sync,
-          withChoices ? h('div', { class: 'dsk-grid two' }, blocks.ncdu, blocks.info) : blocks.info,
-          withChoices && S.backupToken ? D.note('', ['These commands reuse this scan (session ', h('code', null, S.backupToken), '), so the CLI skips scanning again.']) : null));
+      return h('section', { class: 'dsk-card dsk-bk-cli' }, head, main,
+        h('p', null, 'Files and database stream straight to your machine. Connect the CLI once in ', h('a', { href: '#settings' }, 'Settings'), '. ', h('code', null, 'disembark sync'), ' keeps a local mirror up to date.'),
+        h('details', { class: 'dsk-gtk' },
+          h('summary', null, D.icon('terminal'), 'More commands', D.icon('chevron', 'chev')),
+          h('div', { class: 'dsk-gtk-body dsk-stack', style: { gap: '14px' } },
+            blocks.runner, blocks.sync, blocks.ncdu, blocks.info,
+            withChoices && S.backupToken ? h('p', null, 'These reuse this scan (session ', h('code', null, S.backupToken), '), so the CLI skips scanning again.') : null)));
+    }
+
+    /* ------------------------------------------- Pick up an earlier scan */
+    function renderScans() {
+      var sessions = (S.sessions || []).slice(0, 5);
+      if (!sessions.length) { D.mount(scans); return; }
+      D.mount(scans, h('section', { class: 'dsk-card dsk-sec' },
+        h('div', { class: 'dsk-sec-h' }, h('div', null, h('h3', null, 'Pick up an earlier scan'), h('p', null, 'Skip the scan and download from one of these. Files may have changed since.'))),
+        h('ul', { class: 'dsk-scans' }, sessions.map(function (s) {
+          var meta = h('span', { class: 'm' }, '…');
+          var loaded = S.scanned && S.backupToken === s.token;
+          sessionInfo(s).then(function (i) { meta.textContent = i ? D.fmt.plural(i.files, 'file') + ' · ' + D.fmt.size(i.size) : D.fmt.ago(s.timestamp); });
+          var go = function () { if (!busy) resume(s); };
+          return h('li', { tabindex: '0', role: 'button', 'aria-label': 'Pick up the scan from ' + when(s.timestamp), onclick: go, onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } } },
+            D.icon('scan'), h('span', { class: 'd' }, when(s.timestamp), loaded ? h('span', { class: 'dsk-tag ok' }, 'in use') : null), meta, D.icon('chevron', 'chev'));
+        }))));
     }
   }
 })();

@@ -96,6 +96,7 @@
     globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 3.5 5.5 3.5 9s-1 6.5-3.5 9c-2.5-2.5-3.5-5.5-3.5-9s1-6.5 3.5-9z"/>',
     zip: '<path d="M6 3h8l4 4v14H6z"/><path d="M11 3v2h2v2h-2v2h2v2h-2v2"/><rect x="10" y="14" width="4" height="4" rx="1"/>',
     play: '<path d="M7 5v14l11-7z"/>',
+    arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>',
     ship: '<path d="M3 15h18l-2.4 5.2Q12 22.4 5.4 20.2Z"/><path d="M6 15V9h12v6"/><path d="M12 9V4"/>',
     anchor: '<circle cx="12" cy="5" r="2"/><path d="M12 7v14M8 11h8"/><path d="M5 14c0 4 3 7 7 7s7-3 7-7"/>',
     bell: '<path d="M6 16v-5a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/>',
@@ -115,6 +116,40 @@
     var el = wrap.firstElementChild;
     if (cls) el.setAttribute('class', cls);
     return el;
+  };
+
+  /**
+   * The brand: a freighter in a coral disc. The window is knocked out with a
+   * mask so the disc shows through in both themes. Each call gets its own
+   * mask id, since the mark can appear more than once on a page.
+   */
+  var markSeq = 0;
+  D.mark = function (size) {
+    var id = 'dsk-mark-' + (++markSeq), s = size || 30;
+    return D.svg('<svg class="dsk-mark" viewBox="0 0 32 32" width="' + s + '" height="' + s + '" aria-hidden="true" focusable="false">' +
+      '<defs><mask id="' + id + '" maskUnits="userSpaceOnUse" x="0" y="0" width="32" height="32"><rect width="32" height="32" fill="#fff"/><rect x="21.6" y="10.8" width="3.3" height="2.2" rx=".5" fill="#000"/></mask></defs>' +
+      '<circle cx="16" cy="16" r="16" style="fill:var(--accent)"/>' +
+      '<g transform="translate(16 16) scale(.66) translate(-16 -16)" style="fill:var(--accent-ink)"><g mask="url(#' + id + ')">' +
+      '<path d="M2.5 19h27l-3.5 6.3q-.7 1.2-2 1.2H8q-1.3 0-2-1.2Z"/>' +
+      '<rect x="4.5" y="12.5" width="6" height="5.5" rx=".8"/><rect x="11.5" y="12.5" width="6" height="5.5" rx=".8"/><rect x="8" y="5.5" width="6" height="6" rx=".8"/>' +
+      '<rect x="20" y="9" width="6.5" height="10" rx="1"/><path d="M23.25 9V4.5" style="fill:none;stroke:var(--accent-ink);stroke-width:1.8;stroke-linecap:round"/>' +
+      '</g></g></svg>');
+  };
+
+  /**
+   * A page header: small caps label, a serif title (pass an array to put
+   * part of it in the italic accent, e.g. ['Where’s it ', 'going?']),
+   * a line of text, and optional tools on the right.
+   * o: { caps, icon, title, text, side, live: 'run' | 'wait' | 'ok' }
+   */
+  D.pageHead = function (o) {
+    var title = Array.isArray(o.title) ? [o.title[0], h('em', { class: 'hl' }, o.title[1]), o.title[2] || null] : o.title;
+    return h('div', { class: 'dsk-ph' },
+      h('div', { class: 'dsk-ph-main' },
+        o.caps ? h('div', { class: 'caps' }, o.live ? h('span', { class: 'dsk-live ' + o.live }) : (o.icon ? D.icon(o.icon) : null), o.caps) : null,
+        h('h1', null, title),
+        o.text ? h('p', null, o.text) : null),
+      o.side ? h('div', { class: 'dsk-ph-side' }, o.side) : null);
   };
 
   /* ----------------------------------------------------------- Formatting */

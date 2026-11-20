@@ -26,19 +26,18 @@
     var listEl = h('div', { class: 'dsk-scroll-fill' });
     var detail = h('section');
     var allBox = h('span', { class: 'dsk-check', role: 'checkbox', tabindex: '0', 'aria-label': 'Select all visible tables', onclick: toggleAll });
-    var countEl = h('span', { class: 'muted', style: { fontSize: '12.5px' } });
+    var countEl = h('span', { class: 'muted' });
     var search = D.search('Search tables', function (v) { st.q = v; renderList(); });
 
+    var slot = D.browseTools ? D.browseTools('database') : h('div');
+    D.mount(slot,
+      h('div', { class: 'dsk-bw-search' }, search),
+      h('button', { class: 'dsk-btn', type: 'button', onclick: function () { searchReplace(st.selected.slice()); } }, D.icon('search'), 'Search and replace'),
+      h('button', { class: 'dsk-btn ghost icon', type: 'button', 'aria-label': 'Reload the table list', title: 'Reload the table list', onclick: function (e) { D.busy(e.currentTarget, function () { return D.loadDatabase(true).catch(function (err) { D.toast(D.errorText(err), 'error'); }); }); } }, D.icon('refresh')));
     D.mount(root,
-      h('div', { class: 'dsk-head' },
-        h('div', null, h('h1', null, 'Database'), h('p', null, 'Browse and edit tables directly, or export them as SQL. Changes are written immediately.')),
-        h('div', { class: 'dsk-head-tools' },
-          h('button', { class: 'dsk-btn', onclick: function () { searchReplace(st.selected.slice()); } }, D.icon('search'), 'Search & replace'),
-          h('button', { class: 'dsk-btn', onclick: function (e) { D.busy(e.currentTarget, function () { return D.loadDatabase(true).catch(function (err) { D.toast(D.errorText(err), 'error'); }); }); } }, D.icon('refresh'), 'Refresh'))),
-      h('div', { class: 'dsk-card dsk-split' },
+      h('div', { class: 'dsk-card dsk-split dsk-db-split' },
         h('aside', null,
-          h('div', { class: 'dsk-pad', style: { borderBottom: '1px solid var(--line)', display: 'grid', gap: '10px' } }, search,
-            h('div', { class: 'dsk-row', style: { gap: '8px' } }, allBox, countEl)),
+          h('div', { class: 'dsk-bw-aside-h' }, allBox, countEl),
           listEl),
         detail));
 
@@ -56,13 +55,14 @@
       var rows = visible();
       var selCount = rows.filter(function (t) { return st.selected.indexOf(t.table) !== -1; }).length;
       allBox.className = 'dsk-check' + (selCount && selCount === rows.length ? ' on' : selCount ? ' mixed' : '');
-      countEl.textContent = S.database.length ? D.fmt.plural(rows.length, 'table') + (st.selected.length ? ' · ' + st.selected.length + ' selected' : '') : '';
+      countEl.textContent = S.database.length ? D.fmt.plural(rows.length, 'table') + ' · ' + D.fmt.size(rows.reduce(function (n, t) { return n + t.size; }, 0)) + (st.selected.length ? ' · ' + st.selected.length + ' selected' : '') : '';
       if (!S.database.length) { D.mount(listEl, h('div', { class: 'dsk-pad muted' }, h('span', { class: 'dsk-spin' }), ' Loading tables…')); return; }
-      D.mount(listEl, h('ul', { class: 'dsk-list' }, rows.map(function (t) {
+      if (!rows.length) { D.mount(listEl, h('div', { class: 'dsk-pad muted' }, 'No tables match.')); return; }
+      D.mount(listEl, h('ul', { class: 'dsk-list dsk-db-list' }, rows.map(function (t) {
         var sel = st.selected.indexOf(t.table) !== -1;
         return h('li', { class: 'clickable' + (sel ? ' sel' : ''), tabindex: '0', onclick: function (e) { pick(t.table, e, rows); }, onkeydown: function (e) { if (e.key === 'Enter') pick(t.table, e, rows); } },
-          h('span', { class: 'dsk-check' + (sel ? ' on' : ''), onclick: function (e) { e.stopPropagation(); pick(t.table, { metaKey: true, shiftKey: e.shiftKey }, rows); } }),
-          h('span', { class: 'grow mono', style: { fontSize: '12.5px' } }, t.table),
+          h('span', { class: 'dsk-check' + (sel ? ' on' : ''), title: 'Add to the selection', onclick: function (e) { e.stopPropagation(); pick(t.table, { metaKey: true, shiftKey: e.shiftKey }, rows); } }),
+          h('span', { class: 'nm' }, t.table),
           h('span', { class: 'size' }, D.fmt.size(t.size)));
       })));
     }
@@ -79,6 +79,7 @@
         st.selected = [name]; st.anchor = name;
       }
       renderList(); renderDetail();
+      if (window.innerWidth <= 960 && !e.shiftKey && !e.metaKey && !e.ctrlKey) detail.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
     function toggleAll() {
       var names = visible().map(function (t) { return t.table; });
@@ -86,7 +87,7 @@
       st.selected = all ? st.selected.filter(function (n) { return names.indexOf(n) === -1; }) : Array.from(new Set(st.selected.concat(names)));
       renderList(); renderDetail();
     }
-    /* ------------------------------------------------- Search & replace */
+    /* ---------------------------------------------- Search and replace */
     function mark(text, needle) {
       var out = h('span'), i = 0, at;
       if (!needle) return out.appendChild(document.createTextNode(text)), out;
@@ -107,9 +108,9 @@
       [from, to].forEach(function (i) { i.addEventListener('input', function () { result.replaceChildren(); }); i.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); preview(); } }); });
       function scope() { return onlySelected && onlySelected.input.checked ? selected : []; }
       D.modal({
-        title: 'Search & replace', wide: true,
+        title: 'Search and replace', wide: true,
         body: h('div', { class: 'dsk-stack', style: { gap: '12px' } },
-          h('p', null, 'Rewrites text across the database, safely inside serialized PHP values and JSON (the same engine a restore uses). Preview first; a rollback point is saved before anything changes.'),
+          h('p', null, 'Rewrites text across the database, safely inside serialized PHP values and JSON (the same engine a restore uses). Preview first; a restore point is saved before anything changes.'),
           h('div', { class: 'dsk-grid two', style: { gap: '12px' } },
             h('div', { class: 'dsk-field', style: { margin: 0 } }, h('label', null, 'Find'), from),
             h('div', { class: 'dsk-field', style: { margin: 0 } }, h('label', null, 'Replace with'), to)),
@@ -145,12 +146,12 @@
       async function replace(r, btn) {
         var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
           h('p', null, 'Replace ', h('strong', null, from.value), ' with ', h('strong', null, to.value || '(nothing)'), ' in ', D.fmt.plural(r.cells_changed, 'cell'), '?'),
-          h('p', { class: 'muted' }, 'A rollback point is saved first, so this can be undone.')), { title: 'Replace now?', confirmLabel: 'Replace', danger: true });
+          h('p', { class: 'muted' }, 'A restore point is saved first, so this can be undone.')), { title: 'Replace now?', confirmLabel: 'Replace', danger: true });
         if (!ok) return;
         await D.busy(btn, async function () {
           var id = D.randomHex(24), saved = false;
           try {
-            await D.api.post('import/snapshot', { import_id: id, label: 'Before search & replace: ' + from.value + ' → ' + (to.value || '(nothing)') });
+            await D.api.post('import/snapshot', { import_id: id, label: 'Before search and replace: ' + from.value + ' → ' + (to.value || '(nothing)') });
             saved = true;
             var done = await D.api.post('search-replace', { from: from.value, to: to.value, tables: scope() });
             var undo = h('button', { class: 'dsk-btn', onclick: async function () {
@@ -164,28 +165,49 @@
               });
             } }, D.icon('restore'), 'Undo');
             result.replaceChildren(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
-              D.note('ok', [h('strong', null, 'Replaced ' + D.fmt.plural(done.cells_changed, 'cell') + '.'), ' A rollback point was saved first (Restore → Restore points).']),
+              D.note('ok', [h('strong', null, 'Replaced ' + D.fmt.plural(done.cells_changed, 'cell') + '.'), ' A restore point was saved first: undo it here, or later from ', pointsLink(), '.']),
               h('div', null, undo)));
             D.loadDatabase(true).catch(function () {});
           } catch (e) {
             result.replaceChildren(D.note('error', saved
-              ? ['The replace stopped partway: ' + D.errorText(e) + ' Some cells may have changed. Roll back from ', h('strong', null, 'Restore → Restore points'), '.']
+              ? ['The replace stopped partway: ' + D.errorText(e) + ' Some cells may have changed. Roll back from ', pointsLink(), '.']
               : 'Nothing was replaced: ' + D.errorText(e)));
           }
         });
       }
     }
 
+    function pointsLink() {
+      return h('a', { href: '#backups', onclick: function (e) { var d = e.currentTarget.closest('dialog'); if (d) d.querySelector('header .dsk-btn').click(); } }, h('strong', null, 'Backups → Restore points'));
+    }
     function tableInfo(name) { return S.database.find(function (t) { return t.table === name; }) || { table: name, size: 0, row_count: 0 }; }
 
     /* ---------------------------------------------------------- Detail */
     function renderDetail() {
-      if (!st.selected.length) {
-        D.mount(detail, D.empty('Pick a table', S.database.length ? D.fmt.plural(S.database.length, 'table') + ' · ' + D.fmt.size(S.database.reduce(function (s, t) { return s + t.size; }, 0)) + '. Cmd- or Shift-click to select several for export.' : '', 'db'));
-        return;
-      }
+      if (!st.selected.length) { overview(); return; }
       if (st.selected.length > 1) { batch(); return; }
       single(tableInfo(st.selected[0]));
+    }
+
+    /** Nothing picked: the largest tables, with what they hold. */
+    function overview() {
+      if (!S.database.length) { D.mount(detail, h('div', { class: 'dsk-empty' }, h('span', { class: 'dsk-spin' }))); return; }
+      var total = S.database.reduce(function (s, t) { return s + t.size; }, 0);
+      var top = S.database.slice().sort(function (a, b) { return b.size - a.size; }).slice(0, 25), max = top[0].size || 1;
+      D.mount(detail,
+        h('div', { class: 'dsk-bw-head' },
+          h('div', { class: 'dsk-crumb' }, D.icon('database'), h('b', null, D.fmt.plural(S.database.length, 'table')), h('span', { class: 'r' }, D.fmt.size(total))),
+          h('div', { class: 'dsk-detail-head' }, h('div', { class: 'grow' }, h('h2', null, 'Largest ', h('em', { class: 'hl' }, 'tables')),
+            h('div', { class: 'path sans' }, 'Pick one to see its rows. Cmd- or Shift-click to select several for export.')))),
+        h('div', { class: 'dsk-scroll-fill' },
+          h('table', { class: 'dsk-ftab' }, h('tbody', null, top.map(function (t) {
+            var open = function (e) { pick(t.table, e, visible()); };
+            return h('tr', { tabindex: '0', onclick: open, onkeydown: function (e) { if (e.key === 'Enter') open(e); } },
+              h('td', null, h('span', { class: 'nm' }, D.icon('database'), t.table)),
+              h('td', { class: 'bar' }, h('i', { style: { width: Math.max(1, (t.size / max) * 100) + '%', background: 'var(--teal)' } })),
+              h('td', { class: 'num' }, D.fmt.size(t.size)),
+              h('td', { class: 'num d' }, D.fmt.num(t.row_count) + ' rows'));
+          })))));
     }
 
     function batch() {
@@ -193,7 +215,7 @@
       var size = tables.reduce(function (s, t) { return s + t.size; }, 0), rows = tables.reduce(function (s, t) { return s + t.row_count; }, 0);
       var btn = h('button', { class: 'dsk-btn primary lg', onclick: function () { exportBatch(tables, btn); } }, D.icon('download'), 'Export ' + tables.length + ' tables');
       D.mount(detail, h('div', { class: 'dsk-empty' }, h('div', { style: { maxWidth: '420px' } },
-        D.art('db'), h('h3', null, D.fmt.plural(tables.length, 'table') + ' selected'),
+        h('div', { class: 'dsk-bw-spot', html: D.H.spot('db') }), h('h3', null, D.fmt.plural(tables.length, 'table') + ' selected'),
         h('div', { class: 'dsk-row', style: { justifyContent: 'center', margin: '10px 0 16px' } }, h('span', { class: 'dsk-badge' }, D.fmt.size(size)), h('span', { class: 'dsk-badge' }, D.fmt.num(rows) + ' rows')),
         h('p', { style: { marginBottom: '16px' } }, 'Downloads SQL dumps of the selected tables. Big tables are split into parts so no request times out.'), btn)));
     }
@@ -201,7 +223,7 @@
     function single(t) {
       var tabs = [{ id: 'rows', label: 'Rows' }, { id: 'structure', label: 'Structure' }, { id: 'export', label: 'Export' }];
       var body = h('div', { style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } });
-      var tabBar = h('div', { class: 'dsk-tabs', role: 'tablist' });
+      var tabBar = h('div', { class: 'dsk-dbtabs', role: 'tablist' });
       var schema = null;
       function loadSchema() {
         if (!schema) schema = D.api.get('database/schema', { table: t.table }).catch(function (e) { schema = null; throw e; });
@@ -209,7 +231,7 @@
       }
       function renderTabs() {
         D.mount(tabBar, tabs.map(function (x) {
-          return h('button', { role: 'tab', 'aria-selected': String(st.tab === x.id), onclick: function () { st.tab = x.id; renderTabs(); renderTab(); } }, x.label);
+          return h('button', { type: 'button', role: 'tab', 'aria-selected': String(st.tab === x.id), onclick: function () { st.tab = x.id; renderTabs(); renderTab(); } }, x.label);
         }));
       }
       function renderTab() {
@@ -218,8 +240,10 @@
         else exportTab(t, body);
       }
       D.mount(detail,
-        h('div', { class: 'dsk-detail-head' }, h('div', { class: 'grow' }, h('h2', { class: 'mono', style: { fontFamily: 'var(--mono)', fontSize: '20px' } }, t.table),
-          h('div', { class: 'path' }, D.fmt.num(t.row_count) + ' rows · ' + D.fmt.size(t.size)))),
+        h('div', { class: 'dsk-bw-head' },
+          h('div', { class: 'dsk-crumb' }, h('button', { type: 'button', class: 'seg', onclick: function () { st.selected = []; renderList(); renderDetail(); } }, D.icon('database'), D.fmt.plural(S.database.length, 'table')), h('span', { class: 'sep' }, '/'), h('b', null, t.table)),
+          h('div', { class: 'dsk-detail-head' }, h('div', { class: 'grow' }, h('h2', { class: 'dsk-db-name' }, t.table),
+            h('div', { class: 'path' }, D.fmt.num(t.row_count) + ' rows · ' + D.fmt.size(t.size))))),
         tabBar, body);
       renderTabs(); renderTab();
     }
@@ -248,7 +272,7 @@
       }
       function draw() {
         if (!st2.rows.length) {
-          D.mount(tableWrap, D.empty('This table is empty', 'Add a row to get started.', 'db'));
+          D.mount(tableWrap, h('div', { class: 'dsk-empty' }, h('div', null, h('h3', null, 'This table is empty'), h('p', null, 'Add a row to get started.'))));
         } else {
           D.mount(tableWrap, h('table', { class: 'dsk-table' },
             h('thead', null, h('tr', null, st2.cols.map(function (c) {
@@ -342,7 +366,7 @@
     /* Export */
     function exportTab(t, body) {
       var btn = h('button', { class: 'dsk-btn primary lg', onclick: function () { exportBatch([t], btn); } }, D.icon('download'), 'Download ' + t.table + '.sql');
-      D.mount(body, h('div', { class: 'dsk-empty' }, h('div', { style: { maxWidth: '420px' } }, D.art('db'),
+      D.mount(body, h('div', { class: 'dsk-empty' }, h('div', { style: { maxWidth: '420px' } }, h('div', { class: 'dsk-bw-spot', html: D.H.spot('db') }),
         h('h3', null, 'Export this table'), h('p', { style: { margin: '6px 0 16px' } }, D.fmt.num(t.row_count) + ' rows · ' + D.fmt.size(t.size) + '. The dump is generated on the server, then downloaded.'), btn)));
     }
   }
