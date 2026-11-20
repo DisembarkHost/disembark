@@ -40,6 +40,10 @@
       /* ----------------------------------------------------------- State */
       var on = new Set(), paths = new Set(), rows = new Set(), keepRows = new Set(), open = new Set();
       var templates = [], start = 'suggested';
+      // One site of a network: its super admins with no role on it come
+      // across as administrators unless unticked. null: the source predates
+      // the choice (they always come); undefined: not a network site.
+      var superList = c.super_admins, superOn = true;
 
       function apply(kind) {
         start = kind;
@@ -100,7 +104,8 @@
       var tree = h('div', { class: 'dsk-tree dsk-bring-scroll' });
       var tables = h('ul', { class: 'dsk-list dsk-bring-scroll' });
       var summary = h('div', { class: 'grow' });
-      var goBtn = h('button', { class: 'dsk-btn primary', type: 'button', onclick: function () { finish({ skip_paths: skipPaths(), skip_names: skipNames(), skip_rows: skipRows() }); } }, D.icon('download'), 'Bring it over');
+      var superBox = h('div', { class: 'dsk-bring-sugg' });
+      var goBtn = h('button', { class: 'dsk-btn primary', type: 'button', onclick: function () { finish({ skip_paths: skipPaths(), skip_names: skipNames(), skip_rows: skipRows(), super_admins: superOn }); } }, D.icon('download'), 'Bring it over');
 
       function renderStart() {
         D.mount(startSel, [h('option', { value: 'suggested' }, 'Suggested skips'), h('option', { value: 'everything' }, 'Everything')]
@@ -204,7 +209,24 @@
             : 'Nothing left behind.'));
       }
 
-      function render() { renderStart(); renderSugg(); renderTree(); renderTables(); renderSummary(); }
+      function renderSuper() {
+        if (superList === undefined) return;
+        if (superList === null) {
+          D.mount(superBox, h('p', { class: 'muted' }, 'The source runs an older Disembark, so the network\u2019s super admins come across as administrators either way.'));
+          return;
+        }
+        if (!superList.length) return;
+        D.mount(superBox, h('div', { class: 'dsk-bring-item' + (superOn ? '' : ' off'), role: 'checkbox', 'aria-checked': String(superOn), tabindex: '0',
+          onclick: function () { superOn = !superOn; render(); },
+          onkeydown: function (e) { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); e.currentTarget.click(); } } },
+          check(superOn ? 'on' : ''),
+          h('div', { class: 'grow' },
+            h('div', { class: 'dsk-row', style: { gap: '8px' } }, h('strong', null, 'Bring the network\u2019s super admins (as administrators)'), h('span', { class: 'size' }, D.fmt.plural(superList.length, 'super admin'))),
+            h('div', { class: 'why' }, 'They have no role on this site. Ticked, they arrive as its administrators, never as super admins. Super admins who already have a role here come either way.'),
+            h('div', { class: 'what' }, superList.slice(0, 8).join(', ') + (superList.length > 8 ? ', \u2026' : '')))));
+      }
+
+      function render() { renderStart(); renderSugg(); renderSuper(); renderTree(); renderTables(); renderSummary(); }
 
       async function saveTemplate(e) {
         var current = start.indexOf('tpl:') === 0 ? start.slice(4) : '';
@@ -250,12 +272,13 @@
           h('div', { class: 'dsk-row' }, h('label', { class: 'muted' }, 'Start from'), startSel,
             h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: saveTemplate }, D.icon('plus'), 'Save as template'), delBtn),
           h('div', null, h('h3', { style: { marginBottom: '8px' } }, 'Leave behind'), suggBox),
+          superList === undefined || (Array.isArray(superList) && !superList.length) ? null : h('div', null, h('h3', { style: { marginBottom: '8px' } }, 'Users'), superBox),
           h('div', { class: 'dsk-grid two' },
             h('div', null, h('h3', { style: { marginBottom: '4px' } }, 'Files'), h('p', { class: 'muted', style: { margin: '0 0 8px', fontSize: '12.5px' } }, 'Untick a folder to leave it behind.'), h('div', { class: 'dsk-bring-pane' }, tree)),
             h('div', null, h('h3', { style: { marginBottom: '4px' } }, 'Database'), h('p', { class: 'muted', style: { margin: '0 0 8px', fontSize: '12.5px' } }, 'Untick a table to bring it empty: its structure comes across, its rows stay behind.'), h('div', { class: 'dsk-bring-pane' }, tables)))),
         h('div', { class: 'dsk-card-foot dsk-bring-foot' }, summary,
           h('button', { class: 'dsk-btn ghost', type: 'button', onclick: function () { finish(null); } }, 'Cancel'),
-          h('button', { class: 'dsk-btn', type: 'button', onclick: function () { finish({ skip_paths: [], skip_names: [], skip_rows: [] }); } }, 'Bring everything'),
+          h('button', { class: 'dsk-btn', type: 'button', onclick: function () { finish({ skip_paths: [], skip_names: [], skip_rows: [], super_admins: true }); } }, 'Bring everything'),
           goBtn)));
       render();
       if (box.scrollIntoView) box.scrollIntoView({ behavior: 'smooth', block: 'start' });

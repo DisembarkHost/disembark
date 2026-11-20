@@ -1815,7 +1815,8 @@ class Run {
         $list = function ( $key ) use ( $request ) {
             return is_array( $request[ $key ] ) ? array_values( array_filter( $request[ $key ], 'is_string' ) ) : [];
         };
-        return ( new Pull( $import_id ) )->select( $list( 'skip_paths' ), $list( 'skip_names' ), $list( 'skip_rows' ) );
+        $super = $request['super_admins'];
+        return ( new Pull( $import_id ) )->select( $list( 'skip_paths' ), $list( 'skip_names' ), $list( 'skip_rows' ), $super === null ? null : rest_sanitize_boolean( $super ) );
     }
 
     /**

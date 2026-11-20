@@ -315,6 +315,8 @@ class Pull {
             [ 'token' => $state['source_token'] ?? '', 'backup_token' => $state['backup_token'] ?? '' ],
             // One site of a network or WP Freighter install (see Scope).
             isset( $state['site'] ) && $state['site'] !== '' ? [ 'site' => (string) $state['site'] ] : [],
+            // Leaving the network's super admins out (see select()).
+            isset( $state['super_admins'] ) && $state['super_admins'] === false ? [ 'super_admins' => '0' ] : [],
             $payload
         );
         $args = [
@@ -2010,7 +2012,28 @@ class Pull {
             return $files;
         }
         $state = $this->state();
-        return Skips::analyze( $files, (array) ( $state['tables'] ?? [] ), (string) ( $state['source_prefix'] ?? '' ), [ 'install_root' => self::scoped_tenant( $state ) ] );
+        $out = Skips::analyze( $files, (array) ( $state['tables'] ?? [] ), (string) ( $state['source_prefix'] ?? '' ), [ 'install_root' => self::scoped_tenant( $state ) ] );
+        // One site of a network: its super admins with no role on it, for the
+        // toggle (null: the source predates it, so they always come).
+        $scope = (array) ( $state['scope'] ?? [] );
+        if ( ( $scope['kind'] ?? '' ) === 'multisite' ) {
+            $out['super_admins'] = isset( $scope['super_admins']['added'] ) ? array_values( array_map( 'strval', (array) $scope['super_admins']['added'] ) ) : null;
+        }
+        return $out;
+    }
+
+    /**
+     * The super admins this pull brings as administrators (logins): the
+     * ones with no role on the site, unless left out. Empty for anything
+     * but one site of a network.
+     */
+    public function super_admins_brought() {
+        $state = $this->state();
+        $scope = (array) ( $state['scope'] ?? [] );
+        if ( ( $scope['kind'] ?? '' ) !== 'multisite' || ( $state['super_admins'] ?? true ) === false ) {
+            return [];
+        }
+        return array_values( array_map( 'strval', (array) ( $scope['super_admins']['added'] ?? [] ) ) );
     }
 
     /**
@@ -2019,7 +2042,7 @@ class Pull {
      * (those tables still come across, empty). Safe to call again: it always
      * starts from the full scan.
      */
-    public function select( $skip_paths = [], $skip_names = [], $skip_rows = [] ) {
+    public function select( $skip_paths = [], $skip_names = [], $skip_rows = [], $super_admins = null ) {
         $files = $this->all_files();
         if ( is_wp_error( $files ) ) {
             return $files;
@@ -2032,6 +2055,11 @@ class Pull {
         file_put_contents( $state['file_list'], wp_json_encode( $kept ) );
         $state['total_files'] = count( $kept );
         $state['skip_rows']   = $rows;
+        // One site of a network: whether its super admins with no role on it
+        // come across as administrators (on by default).
+        if ( $super_admins !== null ) {
+            $state['super_admins'] = (bool) $super_admins;
+        }
         $state['left_out']    = [
             'paths'  => Skips::topmost( array_values( array_filter( array_map( function ( $p ) { return trim( (string) $p, '/' ); }, (array) $skip_paths ) ) ) ),
             'names'  => array_values( array_map( 'strval', (array) $skip_names ) ),
@@ -2048,7 +2076,7 @@ class Pull {
         foreach ( $kept as $f ) {
             $bytes += (int) ( $f['size'] ?? 0 );
         }
-        return [ 'files' => count( $kept ), 'bytes' => $bytes, 'left_out' => $state['left_out'] ];
+        return [ 'files' => count( $kept ), 'bytes' => $bytes, 'left_out' => $state['left_out'], 'super_admins' => $this->super_admins_brought() ];
     }
 
     /**

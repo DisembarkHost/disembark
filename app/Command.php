@@ -141,6 +141,12 @@ class Command {
      * firewall files and traffic data. Logs and data tables come across
      * empty rather than missing.
      *
+     * [--[no-]super-admins]
+     * : With --site on a network: the network's super admins who have no
+     * role on that site come across as its administrators (on by default;
+     * --no-super-admins leaves them out). Super admins with a role there come
+     * either way. Never made super admins anywhere.
+     *
      * [--bring-root[=<names>]]
      * : With --site (one site of a network or WP Freighter install, not its
      * main site): also bring the install's own files in its web root (scripts,
@@ -259,7 +265,7 @@ class Command {
         }
 
         $this->say( '[2/9] Bringing the site over' );
-        $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'bring-root', 'skip-quiet-mode', 'bring-host-files', 'catch-up', 'full-database', 'site', 'shared-tables', 'into', 'slug', 'domain' ] ) );
+        $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'bring-root', 'super-admins', 'skip-quiet-mode', 'bring-host-files', 'catch-up', 'full-database', 'site', 'shared-tables', 'into', 'slug', 'domain' ] ) );
         $c = $this->check( $this->step( function () use ( $pull, $source, $move_args ) {
             return $pull->connect( $source['url'], $source['token'], [ 'client' => 'cli', 'kind' => 'pull', 'args' => $move_args ], ! empty( $move_args['catch-up'] ), isset( $move_args['site'] ) ? (string) $move_args['site'] : null, ! empty( $move_args['shared-tables'] ) );
         } ), 'connect' );
@@ -399,6 +405,11 @@ class Command {
             $this->say( '      ' . number_format( (int) $sq['statements_executed'] ) . ' statements executed, ' . self::plural( (int) ( $sq['tables_swapped'] ?? 0 ), 'table' ) . ' swapped in.' );
             if ( ! empty( $sq['tables_left_out'] ) ) {
                 $this->say( '      Left out ' . self::plural( (int) $sq['tables_left_out'], 'table' ) . ' without the source\'s prefix (' . $src_prefix . '), so nothing else here is touched.' );
+            }
+            $brought = $pull->super_admins_brought();
+            if ( $brought ) {
+                $summary['super_admins'] = $brought;
+                $this->say( '      Brought ' . self::plural( count( $brought ), 'super admin' ) . ' as administrators: ' . implode( ', ', $brought ) . '.' );
             }
             if ( isset( $sq['users'] ) && ( $sq['users']['created'] || $sq['users']['matched'] ) ) {
                 $summary['users'] = $sq['users'];
@@ -864,7 +875,17 @@ class Command {
                 $this->say( "      --bring-root: {$unknown} isn't one of the install's root files here (" . implode( ', ', $root ) . ').' );
             }
         }
-        $sel    = $this->check( $this->step( function () use ( $pull, $choice ) { return $pull->select( $choice['skip_paths'], $choice['skip_names'], $choice['skip_rows'] ); } ), 'scan' );
+        // The network's super admins with no role on the site (see Scope).
+        $super_on = ! isset( $assoc_args['super-admins'] ) || ! in_array( $assoc_args['super-admins'], [ false, 'false', '0', 'no' ], true );
+        $sel    = $this->check( $this->step( function () use ( $pull, $choice, $super_on ) { return $pull->select( $choice['skip_paths'], $choice['skip_names'], $choice['skip_rows'], $super_on ); } ), 'scan' );
+        if ( array_key_exists( 'super_admins', $contents ) ) {
+            $added = $contents['super_admins'];
+            if ( $added === null ) {
+                $this->say( '      The source runs an older Disembark: the network\'s super admins come across as administrators' . ( $super_on ? '.' : ', so --no-super-admins can\'t leave them out.' ) );
+            } elseif ( $added ) {
+                $this->say( '      ' . ( $super_on ? 'Bringing ' : 'Leaving out ' ) . self::plural( count( $added ), 'network super admin' ) . ' with no role on this site' . ( $super_on ? ' (as administrators)' : '' ) . ': ' . implode( ', ', $added ) . '.' . ( $super_on ? ' --no-super-admins leaves them out.' : '' ) );
+            }
+        }
 
         $this->say( '      ' . self::plural( (int) $sel['files'], 'file' ) . ' to copy (' . size_format( (int) $sel['bytes'] ) . ').' );
         $left = $sel['left_out'];

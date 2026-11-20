@@ -75,9 +75,18 @@ class Scope {
             $value = (string) ( $request['site'] ?? '' );
         }
         $scope = self::resolve( $value );
+        // super_admins=0: the pulling site chose to leave out the network's
+        // super admins who have no role on this site (see super_admins_added()).
+        $super = is_object( $request ) && method_exists( $request, 'get_param' ) ? $request->get_param( 'super_admins' ) : ( is_array( $request ) ? ( $request['super_admins'] ?? null ) : null );
+        if ( $scope instanceof self && $super !== null && in_array( strtolower( (string) $super ), [ '0', 'false', 'no', 'off' ], true ) ) {
+            $scope->bring_super = false;
+        }
         self::activate( is_wp_error( $scope ) ? null : $scope );
         return $scope;
     }
+
+    /** Whether the network's super admins without a role on this site come across, as its administrators. */
+    public $bring_super = true;
 
     /* ------------------------------------------------------------------
      * The install
@@ -577,6 +586,27 @@ class Scope {
         return $this->super;
     }
 
+    /**
+     * The network's super admins with no role on this site: they come across
+     * (unless the pulling site chose not to) as its administrators. IDs.
+     */
+    private function super_admins_added() {
+        global $wpdb;
+        $super = $this->super_admins();
+        if ( ! $super ) {
+            return [];
+        }
+        $have = array_map( 'intval', (array) $wpdb->get_col( $wpdb->prepare( "SELECT user_id FROM `{$this->base}usermeta` WHERE meta_key = %s AND meta_value NOT IN ('', 'a:0:{}') AND user_id IN (" . implode( ',', $super ) . ')', $this->prefix . 'capabilities' ) ) );
+        return array_values( array_diff( $super, $have ) );
+    }
+
+    /** Logins of $ids, in order. */
+    private function logins( $ids ) {
+        global $wpdb;
+        $ids = array_filter( array_map( 'intval', (array) $ids ) );
+        return $ids ? array_map( 'strval', (array) $wpdb->get_col( "SELECT user_login FROM `{$this->base}users` WHERE ID IN (" . implode( ',', $ids ) . ') ORDER BY ID' ) ) : [];
+    }
+
     /** SQL condition limiting a table's rows, or ''. */
     public function where( $out ) {
         if ( $this->kind !== 'multisite' ) {
@@ -588,7 +618,7 @@ class Scope {
         }
         $members = "SELECT user_id FROM `{$this->base}usermeta` WHERE meta_key = '" . esc_sql( $this->prefix . 'capabilities' ) . "' AND meta_value NOT IN ('', 'a:0:{}')"
             . " UNION SELECT post_author FROM `{$this->prefix}posts`";
-        $super = $this->super_admins();
+        $super = $this->bring_super ? $this->super_admins() : [];
         if ( $super ) {
             $members .= ' UNION SELECT ID FROM `' . $this->base . 'users` WHERE ID IN (' . implode( ',', $super ) . ')';
         }
@@ -679,7 +709,7 @@ class Scope {
     /** Rows to add after a table's own: super admins without a role here. */
     public function extra_rows( $out, $cols ) {
         global $wpdb;
-        if ( $this->kind !== 'multisite' || $out !== $this->prefix . 'usermeta' || ! $this->super_admins() ) {
+        if ( $this->kind !== 'multisite' || $out !== $this->prefix . 'usermeta' || ! $this->bring_super || ! $this->super_admins() ) {
             return [];
         }
         $have = array_map( 'intval', (array) $wpdb->get_col( $wpdb->prepare( "SELECT user_id FROM `{$this->base}usermeta` WHERE meta_key = %s AND user_id IN (" . implode( ',', $this->super_admins() ) . ')', $this->prefix . 'capabilities' ) ) );
@@ -790,6 +820,9 @@ class Scope {
             'shared_tables' => $this->shared_tables(),
             'aliases'       => $this->aliases,
             'users'         => $this->user_count(),
+            // The network's super admins: the ones with no role here come
+            // across as administrators unless the pulling site leaves them out.
+            'super_admins'  => $this->kind === 'multisite' ? [ 'added' => $this->logins( $this->super_admins_added() ), 'with_role' => $this->logins( array_diff( $this->super_admins(), $this->super_admins_added() ) ) ] : null,
             'left_out'      => $this->left_out,
         ];
     }

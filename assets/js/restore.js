@@ -120,7 +120,7 @@
     // the same move asks for the same ids. Resuming replays the steps the
     // server already finished (opts.resume.steps) and carries on from the
     // first one it didn't.
-    var tablePlan = null, catchUpInfo = null, target = null, seq = 0, replay = (opts.resume && opts.resume.steps) || {}, replaying = Object.keys(replay).length > 0;
+    var superBrought = [], tablePlan = null, catchUpInfo = null, target = null, seq = 0, replay = (opts.resume && opts.resume.steps) || {}, replaying = Object.keys(replay).length > 0;
     function ridAt(n) { return importId.slice(0, 24) + ('00000000' + n.toString(16)).slice(-8); }
     var log = h('div', { class: 'dsk-log' });
     var kind = opts.kind || (!opts.local ? 'push' : (opts.mode === 'site' ? 'pull' : 'restore'));
@@ -914,6 +914,7 @@
       if (!choice) { cancelled = true; throw Cancelled(); }
       if (cancelled) throw Cancelled();
       var sel = await api.post('import/pull/select', t(choice));
+      superBrought = (sel && sel.super_admins) || [];
       var left = sel.left_out || {};
       if (left.files || (left.rows && left.rows.length)) {
         rlog('Leaving behind ' + D.fmt.plural(left.files || 0, 'file') + ' (' + D.fmt.size(left.bytes || 0) + ')' + (left.rows && left.rows.length ? ' and the rows of ' + D.fmt.plural(left.rows.length, 'table') : '') + '.', 'dim');
@@ -1088,6 +1089,7 @@
           }
           if (sq.tables_swapped) rlog('Swapped in ' + D.fmt.plural(sq.tables_swapped, 'imported table') + '.', 'dim');
           if (sq.tables_left_out) rlog('Left out ' + D.fmt.plural(sq.tables_left_out, 'table') + ' without the source\u2019s prefix, so nothing else here is touched.', 'dim');
+          if (superBrought.length) rlog('Brought ' + D.fmt.plural(superBrought.length, 'super admin') + ' as administrators: ' + superBrought.join(', ') + '.', 'ok');
           if (sq.users && (sq.users.created || sq.users.matched)) rlog('Users joined the network: ' + D.fmt.plural(sq.users.created, 'new account') + ', ' + D.fmt.plural(sq.users.matched, 'existing account') + ' matched by email' + (sq.users.renumbered ? ' (' + D.fmt.plural(sq.users.renumbered, 'row') + ' of posts, comments and orders renumbered)' : '') + '.');
           if (srcPrefix && destPrefix && srcPrefix !== destPrefix) {
             var rp = await api.post('import/remap-prefix', t({ old_prefix: srcPrefix, new_prefix: destPrefix }));
