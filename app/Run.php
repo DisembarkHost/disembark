@@ -17,7 +17,6 @@ class Run {
 
         add_action( 'admin_menu', [ $this, 'register_admin_page' ] );
         add_action( 'admin_enqueue_scripts', [ $this, 'enqueue_admin_scripts' ] );
-        add_action( 'init', [ $this, 'register_shortcode' ] );
 
         add_action( 'rest_api_init', [ $this, 'register_rest_endpoints' ] );
         add_filter( 'rest_authentication_errors', [ $this, 'allow_token_auth' ], 99 );
@@ -123,38 +122,20 @@ class Run {
     
     /**
      * Renders the Disembark admin page. The dashboard draws its own header, so
-     * the page is just the app's mount point (via the shortcode). The
-     * wp-header-end marker tells WordPress where to put admin notices, so they
-     * land above the app instead of under its first heading. The dashboard
-     * then gathers them into its notices tray.
+     * the page is just the app's mount point. The wp-header-end marker tells
+     * WordPress where to put admin notices, so they land above the app instead
+     * of under its first heading. The dashboard then gathers them into its
+     * notices tray. The page config carries the site token, so it only ever
+     * renders here, for users who can manage the site (there is no shortcode).
      */
     public function render_admin_page() {
-        echo '<div class="wrap disembark-wrap"><hr class="wp-header-end">' . do_shortcode( '[disembark_ui]' ) . '</div>';
-    }
-
-    /**
-     * Registers the shortcode that embeds the dashboard.
-     */
-    public function register_shortcode() {
-        add_shortcode( 'disembark_ui', [ $this, 'render_shortcode_ui' ] );
-    }
-
-    /**
-     * Handles the rendering of the shortcode by loading the template file.
-     *
-     * @return string The HTML content of the template file.
-     */
-    public function render_shortcode_ui() {
-        // The template prints the site's Disembark token (full file/database
-        // access) into the page. Only render it for users who can manage the
-        // site, so the shortcode can't leak the token on a front-end page.
         if ( ! User::can_manage() ) {
-            return '';
+            return;
         }
         $this->enqueue_app_assets();
-        ob_start();
+        echo '<div class="wrap disembark-wrap"><hr class="wp-header-end">';
         include $this->plugin_path . '/template.php';
-        return ob_get_clean();
+        echo '</div>';
     }
 
     /**
