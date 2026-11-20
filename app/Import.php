@@ -444,15 +444,19 @@ class Import {
             if ( $old_prefix === '' || $target->prefix === '' ) {
                 return new \WP_Error( 'no_prefix', 'This backup doesn\'t record its table prefix, so it can\'t go into a subsite or tenant.', [ 'status' => 400 ] );
             }
+            if ( ! preg_match( '/^[A-Za-z0-9_]+$/', (string) $old_prefix ) ) {
+                return new \WP_Error( 'bad_prefix', 'This backup\'s table prefix isn\'t a plain table prefix, so it can\'t go into a subsite or tenant.', [ 'status' => 400 ] );
+            }
             $new_prefix = $target->prefix;
         }
-        $foreign = 0;
+        $foreign  = 0;
+        $refused  = 0;
         $run    = $this->begin_statements();
         $count  = 0;
         $swap     = self::swap_start();
         $compat   = self::db_compat();
         $expected = [];
-        $read     = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, $old_prefix, $new_prefix, $skip_rows, $target ) {
+        $read     = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, $old_prefix, $new_prefix, $skip_rows, $target ) {
             if ( ++$count % 500 === 0 && $this->cancelled() ) {
                 $run['errors'][] = 'Cancelled.';
                 return false;
@@ -475,11 +479,18 @@ class Import {
             if ( $skip_rows && preg_match( '/^\s*INSERT\s+INTO\s+`([^`]+)`/i', $statement, $m ) && isset( $skip_rows[ strtolower( $m[1] ) ] ) ) {
                 return true;
             }
-            if ( $target && preg_match( '/^\s*(?:\/\*!\d+\s+)?(?:INSERT\s+INTO|REPLACE\s+INTO|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|ALTER\s+TABLE|LOCK\s+TABLES|DROP\s+VIEW(?:\s+IF\s+EXISTS)?|CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW)\s+`([^`]+)`/i', self::strip_leading_comments( $statement ), $m ) && strpos( $m[1], $old_prefix ) !== 0 ) {
-                if ( stripos( ltrim( self::strip_leading_comments( $statement ) ), 'CREATE' ) === 0 ) {
+            // Into a subsite or tenant, only statements that create, fill or
+            // drop one of the source's own tables run (see target_statement()).
+            if ( $target ) {
+                $verdict = self::target_statement( $statement, $old_prefix );
+                if ( $verdict === 'foreign_create' ) {
                     $foreign++;
+                } elseif ( $verdict === 'refused' ) {
+                    $refused++;
                 }
-                return true;
+                if ( $verdict !== 'ok' ) {
+                    return true;
+                }
             }
             foreach ( self::swap_statements( self::transform_statements( [ $statement ], $old_prefix, $new_prefix ), $swap ) as $transformed ) {
                 if ( ! $this->run_statement( self::compat_statement( $transformed, $compat ), $run ) ) {
@@ -514,6 +525,11 @@ class Import {
         if ( $target ) {
             $result['target']         = $target->info();
             $result['tables_left_out'] = $foreign;
+            $result['statements_refused'] = $refused;
+            if ( $refused ) {
+                $result['warnings'][] = "Left out {$refused} statements that would have changed something other than the incoming site's own tables.";
+                error_log( "Disembark: import {$this->import_id} into {$target->kind} {$target->id} left out {$refused} statements outside the source's tables." );
+            }
             if ( empty( $result['errors'] ) ) {
                 $result['users'] = $target->merge_users( $old_prefix );
             }
@@ -1462,6 +1478,202 @@ class Import {
             }
         }
         return $i ? substr( $statement, $i ) : $statement;
+    }
+
+    /**
+     * Into a subsite or tenant, the dump may only touch the incoming site's
+     * own tables: everything else in the install belongs to other sites (and
+     * on a network, wp_users and wp_sitemeta decide who is super admin). So
+     * this is an allowlist, not a filter: CREATE TABLE, INSERT [IGNORE] INTO,
+     * REPLACE INTO, ALTER TABLE, DROP TABLE / DROP VIEW and LOCK TABLES on ONE
+     * backticked name (no database. qualifier) starting with the source's
+     * prefix, UNLOCK TABLES, and SET of session settings that can't change
+     * how later statements are read. A statement wrapped whole in an
+     * executable comment is judged by what's inside it. Anything that reads
+     * another table (a SELECT anywhere), renames one, or reaches outside the
+     * database is refused too.
+     *
+     * Returns 'ok', 'foreign' (a table without the source's prefix, left
+     * out), 'foreign_create' (the same, its CREATE) or 'refused'.
+     */
+    private static function target_statement( $statement, $prefix ) {
+        $sql = trim( self::strip_leading_comments( $statement ) );
+        if ( $sql === '' ) {
+            return 'ok';
+        }
+        if ( preg_match( '/^\/\*M?!\d*\s?(.*)\*\/$/s', $sql, $m ) && strpos( $m[1], '*/' ) === false ) {
+            $sql = trim( $m[1] );
+        }
+        $ident = '`((?:[^`]|``)+)`';
+        $heads = [
+            'create' => '/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+' . $ident . '(?!\s*\.)/i',
+            'insert' => '/^(?:INSERT(?:\s+IGNORE)?|REPLACE)\s+INTO\s+' . $ident . '(?!\s*\.)/i',
+            'alter'  => '/^ALTER\s+TABLE\s+' . $ident . '(?!\s*\.)/i',
+            'drop'   => '/^DROP\s+(?:TABLE|VIEW)(?:\s+IF\s+EXISTS)?\s+' . $ident . '\s*$/i',
+            'lock'   => '/^LOCK\s+TABLES\s+' . $ident . '\s+(?:READ(?:\s+LOCAL)?|(?:LOW_PRIORITY\s+)?WRITE)\s*$/i',
+        ];
+        foreach ( $heads as $kind => $pattern ) {
+            if ( ! preg_match( $pattern, $sql, $m ) ) {
+                continue;
+            }
+            $rest = self::sql_skeleton( (string) substr( $sql, strlen( $m[0] ) ) );
+            if ( $rest === null || strpos( $m[1], '``' ) !== false ) {
+                return 'refused';
+            }
+            if ( in_array( $kind, [ 'create', 'insert', 'alter' ], true ) ) {
+                // Nothing that reads, renames or swaps another table, runs a
+                // routine, or reaches outside the database or onto the disk.
+                if ( preg_match( '/\b(SELECT|UNION|RENAME|LIKE|EXCHANGE|TABLE|TABLESPACE|DISCARD|OUTFILE|DUMPFILE|LOAD_FILE|DIRECTORY|CONNECTION|TABLE_TYPE|TABNAME|FILE_NAME|TRIGGER|PROCEDURE|FUNCTION|EVENT|GRANT|HANDLER|CALL|EXECUTE|PREPARE|DATABASE|SCHEMA|INTO)\b|;|`i`\s*\.|\.\s*`i`/i', $rest ) ) {
+                    return 'refused';
+                }
+                if ( preg_match_all( '/\bENGINE\s*=?\s*(\w+)/i', $rest, $engines ) ) {
+                    foreach ( $engines[1] as $engine ) {
+                        if ( ! in_array( strtolower( $engine ), [ 'innodb', 'myisam', 'aria', 'memory', 'heap', 'archive', 'rocksdb', 'tokudb' ], true ) ) {
+                            return 'refused';
+                        }
+                    }
+                }
+            }
+            if ( strpos( $m[1], $prefix ) !== 0 ) {
+                return $kind === 'create' ? 'foreign_create' : 'foreign';
+            }
+            return 'ok';
+        }
+        if ( preg_match( '/^UNLOCK\s+TABLES\s*$/i', $sql ) ) {
+            return 'ok';
+        }
+        if ( preg_match( '/^SET\s/i', $sql ) ) {
+            return self::target_set_allowed( $sql ) ? 'ok' : 'refused';
+        }
+        return 'refused';
+    }
+
+    /**
+     * SET statements a dump may run into a subsite or tenant: user variables,
+     * and session settings that can't change how the next statements are
+     * parsed. Never sql_mode (NO_BACKSLASH_ESCAPES, ANSI_QUOTES) nor a
+     * multibyte client character set: either would let a statement read
+     * differently here than target_statement() read it.
+     */
+    private static function target_set_allowed( $sql ) {
+        $safe_charset = '(?:utf8mb4|utf8mb3|utf8|latin1|ascii|binary)';
+        if ( preg_match( '/^SET\s+(?:NAMES|CHARACTER\s+SET|CHARSET)\s+([\'"]?)' . $safe_charset . '\1(?:\s+COLLATE\s+([\'"]?)\w+\2)?\s*$/i', $sql ) ) {
+            return true;
+        }
+        $skeleton = self::sql_skeleton( $sql );
+        if ( $skeleton === null || ! preg_match( '/^SET\s+(.*)$/is', $skeleton, $m ) ) {
+            return false;
+        }
+        if ( preg_match( '/\b(GLOBAL|PERSIST|PERSIST_ONLY|PASSWORD|ROLE|STATEMENT|FOR|SELECT|TRANSACTION|NAMES|CHARACTER|CHARSET)\b|@@(?:GLOBAL|PERSIST)|;/i', $m[1] ) ) {
+            return false;
+        }
+        foreach ( explode( ',', $m[1] ) as $part ) {
+            $part = trim( $part );
+            // A user variable takes any plain value.
+            if ( preg_match( '/^@[A-Za-z0-9_$.]+\s*:?=\s*(?:@@?(?:SESSION\.|LOCAL\.)?[A-Za-z0-9_$.]+|\'\'|-?[0-9.]+|NULL|TRUE|FALSE|ON|OFF|DEFAULT)$/i', $part ) ) {
+                continue;
+            }
+            if ( preg_match( '/^(?:@@(?:SESSION\.|LOCAL\.)?|(?:SESSION|LOCAL)\s+)?(time_zone|foreign_key_checks|unique_checks|sql_notes|character_set_results)\s*:?=\s*(?:@[A-Za-z0-9_$.]+|\'\'|-?[0-9.]+|\w+)$/i', $part ) ) {
+                continue;
+            }
+            if ( preg_match( '/^(?:@@(?:SESSION\.|LOCAL\.)?|(?:SESSION|LOCAL)\s+)?character_set_client\s*:?=\s*' . $safe_charset . '$/i', $part ) ) {
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * $sql with what MySQL reads as data or names blanked out: string
+     * literals become '' and backticked names `i`; plain comments go and
+     * executable ones keep their content (MySQL runs it). Follows MySQL's
+     * own lexing (backslash escapes, doubled quotes, "-- " with any space or
+     * control character, "#"), so a keyword hidden in a comment or a string
+     * as this reads it is hidden from MySQL too. Null when it ends inside a
+     * string or comment.
+     */
+    private static function sql_skeleton( $sql ) {
+        $out  = '';
+        $len  = strlen( $sql );
+        $i    = 0;
+        $exec = false;
+        while ( $i < $len ) {
+            $run = strcspn( $sql, "-#/*'\"`", $i );
+            if ( $run > 0 ) {
+                $out .= substr( $sql, $i, $run );
+                $i   += $run;
+                continue;
+            }
+            $c = $sql[ $i ];
+            $n = $i + 1 < $len ? $sql[ $i + 1 ] : '';
+            if ( $c === '-' && $n === '-' && ( $i + 2 >= $len || ord( $sql[ $i + 2 ] ) <= 32 ) || $c === '#' ) {
+                $nl = strpos( $sql, "\n", $i );
+                if ( $nl === false ) {
+                    return $out;
+                }
+                $out .= ' ';
+                $i    = $nl + 1;
+            } elseif ( $c === '/' && $n === '*' ) {
+                if ( preg_match( '/\G\/\*M?!\d*/', $sql, $mm, 0, $i ) ) {
+                    if ( $exec ) {
+                        return null; // nested executable comments
+                    }
+                    $exec = true;
+                    $out .= ' ';
+                    $i   += strlen( $mm[0] );
+                    continue;
+                }
+                $end = strpos( $sql, '*/', $i + 2 );
+                if ( $end === false ) {
+                    return null;
+                }
+                $out .= ' ';
+                $i    = $end + 2;
+            } elseif ( $c === '*' && $n === '/' && $exec ) {
+                $exec = false;
+                $out .= ' ';
+                $i   += 2;
+            } elseif ( $c === "'" || $c === '"' ) {
+                $j = $i + 1;
+                while ( true ) {
+                    $j += strcspn( $sql, '\\' . $c, $j );
+                    if ( $j >= $len ) {
+                        return null;
+                    }
+                    if ( $sql[ $j ] === '\\' ) {
+                        $j += 2;
+                        continue;
+                    }
+                    if ( $j + 1 < $len && $sql[ $j + 1 ] === $c ) {
+                        $j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                $out .= "''";
+                $i    = $j + 1;
+            } elseif ( $c === '`' ) {
+                $j = $i + 1;
+                while ( true ) {
+                    $j = strpos( $sql, '`', $j );
+                    if ( $j === false ) {
+                        return null;
+                    }
+                    if ( $j + 1 < $len && $sql[ $j + 1 ] === '`' ) {
+                        $j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                $out .= '`i`';
+                $i    = $j + 1;
+            } else {
+                $out .= $c;
+                $i++;
+            }
+        }
+        return $exec ? null : $out;
     }
 
     /**
