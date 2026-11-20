@@ -263,225 +263,284 @@ class Run {
     }
 
     // --- REST API Endpoints ---
+    /**
+     * Every route checks who's calling inside its handler (User::allowed():
+     * a user who can manage the site, or the token), before doing anything,
+     * so permission_callback is __return_true on purpose.
+     */
     function register_rest_endpoints() {
         register_rest_route('disembark/v1', '/backup-size', [
             'methods'  => 'GET',
-            'callback' => [ $this, 'get_backup_size' ]
+            'callback' => [ $this, 'get_backup_size' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/database', [
             'methods'  => 'GET',
-            'callback' => [ $this, 'database' ]
+            'callback' => [ $this, 'database' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/database/row', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'update_database_row' ]
+            'callback' => [ $this, 'update_database_row' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/database/row/create', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'insert_database_row' ]
+            'callback' => [ $this, 'insert_database_row' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/database/row/delete', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'delete_database_row' ]
+            'callback' => [ $this, 'delete_database_row' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/database/rows', [
             'methods'  => 'GET',
-            'callback' => [ $this, 'get_table_rows' ]
+            'callback' => [ $this, 'get_table_rows' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/database/schema', [
             'methods'  => 'GET',
-            'callback' => [ $this, 'get_table_schema' ]
+            'callback' => [ $this, 'get_table_schema' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/file/save', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'save_file' ]
+            'callback' => [ $this, 'save_file' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/file/rename', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'rename_file' ]
+            'callback' => [ $this, 'rename_file' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/regenerate-manifest', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'regenerate_manifest' ]
+            'callback' => [ $this, 'regenerate_manifest' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/zip-sync-files', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'zip_sync_files' ]
+            'callback' => [ $this, 'zip_sync_files' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/zip-database', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'zip_database' ]
+            'callback' => [ $this, 'zip_database' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/regenerate-token', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'regenerate_token' ]
+            'callback' => [ $this, 'regenerate_token' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/manifest', [
             'methods'  => 'GET',
-            'callback' => [ $this, 'get_manifest' ]
+            'callback' => [ $this, 'get_manifest' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/export/database/(?P<table>[a-zA-Z0-9-_]+)', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'export_database' ]
+            'callback' => [ $this, 'export_database' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/export-database-batch', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'export_database_batch' ]
+            'callback' => [ $this, 'export_database_batch' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/stream-file', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'stream_file' ]
+            'callback' => [ $this, 'stream_file' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/cleanup', [
             'methods'  => 'GET',
-            'callback' => [ $this, 'cleanup' ]
+            'callback' => [ $this, 'cleanup' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/cleanup-file', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'cleanup_file' ]
+            'callback' => [ $this, 'cleanup_file' ],
+            'permission_callback' => '__return_true',
         ]);
 
         // Import / Restore endpoints
         register_rest_route('disembark/v1', '/import/preflight', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_preflight' ]
+            'callback' => [ $this, 'import_preflight' ],
+            'permission_callback' => '__return_true',
         ]);
         // Pull (direct site-to-site) endpoints
         register_rest_route('disembark/v1', '/import/pull/connect', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_pull_connect' ]
+            'callback' => [ $this, 'import_pull_connect' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/target', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_target' ]
+            'callback' => [ $this, 'import_target' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/pull/site', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_pull_site' ]
+            'callback' => [ $this, 'import_pull_site' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/pull/scan', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_pull_scan' ]
+            'callback' => [ $this, 'import_pull_scan' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/pull/fetch-files', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_pull_fetch_files' ]
+            'callback' => [ $this, 'import_pull_fetch_files' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/pull/fetch-database', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_pull_fetch_database' ]
+            'callback' => [ $this, 'import_pull_fetch_database' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/pull/contents', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_pull_contents' ]
+            'callback' => [ $this, 'import_pull_contents' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/pull/select', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_pull_select' ]
+            'callback' => [ $this, 'import_pull_select' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/unfinished', [
             'methods'  => 'GET',
-            'callback' => [ $this, 'import_unfinished' ]
+            'callback' => [ $this, 'import_unfinished' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/resume', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_resume' ]
+            'callback' => [ $this, 'import_resume' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/last-pulls', [
             'methods'  => 'GET',
-            'callback' => [ $this, 'import_last_pulls' ]
+            'callback' => [ $this, 'import_last_pulls' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/cancel', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_cancel' ]
+            'callback' => [ $this, 'import_cancel' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/checks', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_checks' ]
+            'callback' => [ $this, 'import_checks' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/verify', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_verify' ]
+            'callback' => [ $this, 'import_verify' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/notify', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_notify' ]
+            'callback' => [ $this, 'import_notify' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/templates', [
             'methods'  => 'GET, POST',
-            'callback' => [ $this, 'templates' ]
+            'callback' => [ $this, 'templates' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/snapshot', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_snapshot' ]
+            'callback' => [ $this, 'import_snapshot' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/upload-zip', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_upload_zip' ]
+            'callback' => [ $this, 'import_upload_zip' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/upload-chunk', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_upload_chunk' ]
+            'callback' => [ $this, 'import_upload_chunk' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/extract-zip', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_extract_zip' ]
+            'callback' => [ $this, 'import_extract_zip' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/deploy-files', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_deploy_files' ]
+            'callback' => [ $this, 'import_deploy_files' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/sql', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_sql' ]
+            'callback' => [ $this, 'import_sql' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/staged-info', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_staged_info' ]
+            'callback' => [ $this, 'import_staged_info' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/import-staged-sql', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_staged_sql' ]
+            'callback' => [ $this, 'import_staged_sql' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/search-replace', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_search_replace' ]
+            'callback' => [ $this, 'import_search_replace' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/remap-prefix', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_remap_prefix' ]
+            'callback' => [ $this, 'import_remap_prefix' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/rollback', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_rollback' ]
+            'callback' => [ $this, 'import_rollback' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/import/finalize', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'import_finalize' ]
+            'callback' => [ $this, 'import_finalize' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/backup/session', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'backup_session' ]
+            'callback' => [ $this, 'backup_session' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/backup/archive', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'backup_archive' ]
+            'callback' => [ $this, 'backup_archive' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/restore-points', [
             'methods'  => 'GET',
-            'callback' => [ $this, 'restore_points' ]
+            'callback' => [ $this, 'restore_points' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/restore-points/delete', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'delete_restore_point' ]
+            'callback' => [ $this, 'delete_restore_point' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/search-replace', [
             'methods'  => 'POST',
-            'callback' => [ $this, 'search_replace' ]
+            'callback' => [ $this, 'search_replace' ],
+            'permission_callback' => '__return_true',
         ]);
         register_rest_route('disembark/v1', '/quiet-mode', [
             'methods'  => 'GET, POST',
-            'callback' => [ $this, 'quiet_mode' ]
+            'callback' => [ $this, 'quiet_mode' ],
+            'permission_callback' => '__return_true',
         ]);
     }
 
