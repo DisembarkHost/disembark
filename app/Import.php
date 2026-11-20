@@ -898,6 +898,15 @@ class Import {
         }
         $expected = $saved ? (array) $saved['expected'] : [];
         $imported = $saved ? (array) $saved['imported'] : [];
+        if ( $paced && ! $saved ) {
+            // A first call the host kills still leaves its journal to go on from.
+            $this->prepare_import_dir();
+            Import::write_protected( $state_file, (string) wp_json_encode( [
+                'file' => $sql_file, 'size' => filesize( $path ), 'offset' => 0, 'count' => 0, 'executed' => 0, 'warnings' => [],
+                'foreign' => 0, 'refused' => 0, 'swap' => $swap, 'compat' => array_intersect_key( $compat, array_flip( [ 'converted', 'definers_removed', 'map' ] ) ),
+                'expected' => [], 'imported' => [],
+            ] ) );
+        }
         $journal  = $paced ? Pace::journal_open( $journal_file ) : null;
         $stop_at  = 0;
         $tolerant = $replay_to > 0;
@@ -2738,23 +2747,32 @@ class Import {
         $st           = $paced ? json_decode( (string) self::read_protected( $state_file ), true ) : null;
         if ( ! is_array( $st ) ) {
             $st = [ 'tables' => array_values( array_map( 'strval', $tables ) ), 't' => 0, 'key' => null, 'offset' => 0, 'seen' => 0, 'rows' => 0, 'cells' => 0, 'by_table' => [] ];
-            @unlink( $journal_file );
+            if ( $paced ) {
+                // Saved before any row changes, so a first call the host
+                // kills leaves its journal to go on from.
+                @unlink( $journal_file );
+                self::write_protected( $state_file, (string) wp_json_encode( $st ) );
+            }
         } else {
-            // A killed call changed rows after its last checkpoint.
-            $last = Pace::journal_last( $journal_file );
+            // A killed call changed rows after its last checkpoint: carry on
+            // after the last one it recorded, with its counts.
+            $records = Pace::journal_read( $journal_file );
+            $last    = $records ? end( $records ) : null;
             if ( $last && ( (int) $last['t'] > (int) $st['t'] || ( (int) $last['t'] === (int) $st['t'] && (int) $last['o'] > (int) $st['offset'] ) ) ) {
                 if ( (int) $last['t'] > (int) $st['t'] ) {
                     $st['seen'] += (int) $last['t'] - (int) $st['t'];
+                }
+                foreach ( $records as $rec ) {
+                    $name = (string) ( $st['tables'][ (int) $rec['t'] ] ?? '' );
+                    if ( $name !== '' ) {
+                        $st['by_table'][ $name ] = (int) $rec['n'];
+                    }
                 }
                 $st['t']      = (int) $last['t'];
                 $st['key']    = $last['k'];
                 $st['offset'] = (int) $last['o'];
                 $st['rows']   = (int) $last['r'];
                 $st['cells']  = (int) $last['c'];
-                $table_now    = (string) ( $st['tables'][ $st['t'] ] ?? '' );
-                if ( $table_now !== '' ) {
-                    $st['by_table'][ $table_now ] = (int) $last['n'];
-                }
             }
         }
         $tables        = $st['tables'];
