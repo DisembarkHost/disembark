@@ -30,6 +30,20 @@ class Token {
     }
 
     /**
+     * Replaces the token with a new one and returns it. The old token stops
+     * working everywhere, including the copies restores keep so their
+     * remaining steps and rollbacks stay authorized (token guards).
+     */
+    public static function regenerate() {
+        $token = wp_generate_password( 42, false );
+        self::set( $token );
+        if ( method_exists( '\Disembark\Import', 'clear_token_guards' ) ) {
+            \Disembark\Import::clear_token_guards();
+        }
+        return $token;
+    }
+
+    /**
      * Reads the stored token without generating one; false if none.
      */
     public static function read() {

@@ -966,10 +966,7 @@ class Run {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
 
-        $token = wp_generate_password( 42, false );
-        Token::set( $token );
-
-        return [ 'token' => $token ];
+        return [ 'token' => Token::regenerate() ];
     }
 
     function export_database ( $request ) {
