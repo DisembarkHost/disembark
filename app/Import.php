@@ -881,14 +881,6 @@ class Import {
         return $dir . strtr( $base, [ '%2E' => '.', '%25' => '%' ] );
     }
 
-    /** Copies the plain file $from to $to, the staged path of $rel (behind the exit line when renamed). */
-    private static function put_staged( $from, $to, $rel ) {
-        if ( self::staged_name( $rel ) === $rel ) {
-            return copy( $from, $to );
-        }
-        return self::copy_protected( $from, $to );
-    }
-
     /**
      * Moves the staged file $from to $to as the real file: without the exit
      * line staged_name() put in front (a file staged by an older build has
@@ -930,6 +922,49 @@ class Import {
     private static function staged_file( $root, $rel ) {
         $staged = $root . '/' . self::staged_name( $rel );
         return file_exists( $staged ) || ! file_exists( $root . '/' . $rel ) ? $staged : $root . '/' . $rel;
+    }
+
+    /* ------------------------------------------------------------------
+     * The files a restore point keeps
+     *
+     * Before a move replaces or removes a file, the restore point keeps the
+     * original under rollback/files. Every one of them waits like a staged
+     * runnable file, whatever it is: the name encoded plus .dsk.php, the
+     * exit line in front. A .env, a private download, a log or a dump that
+     * the site's own server rules protect where it lives would otherwise
+     * be served from here to anyone with the move's id, and a .php copy
+     * would run. A rollback takes the exit line off again, so the file
+     * comes back byte for byte.
+     * ---------------------------------------------------------------- */
+
+    /** The name a restore point keeps the original of $rel under (only its last part changes). */
+    public static function rollback_name( $rel ) {
+        $rel  = (string) $rel;
+        $cut  = strrpos( $rel, '/' );
+        $dir  = $cut === false ? '' : substr( $rel, 0, $cut + 1 );
+        $base = $cut === false ? $rel : substr( $rel, $cut + 1 );
+        $name = strtr( $base, [ '%' => '%25', '.' => '%2E' ] ) . self::STAGED_SUFFIX;
+        // Too long for the disk encoded: a hash ("%d" never comes out of the encoding).
+        if ( strlen( $name ) > 255 ) {
+            $name = '%dsk-' . md5( $base ) . self::STAGED_SUFFIX;
+        }
+        return $dir . $name;
+    }
+
+    /** Where this restore point keeps the original of $rel: its rollback name, or where an older build kept it. */
+    private function rollback_file( $rel ) {
+        $files = $this->rollback_path . '/files';
+        $saved = $files . '/' . self::rollback_name( $rel );
+        return file_exists( $saved ) ? $saved : self::staged_file( $files, $rel );
+    }
+
+    /** Keeps the original of $rel ($file) in this restore point. True when every byte is there. */
+    private function save_original( $file, $rel ) {
+        $to = $this->rollback_path . '/files/' . self::rollback_name( $rel );
+        if ( ! is_dir( dirname( $to ) ) && ! wp_mkdir_p( dirname( $to ) ) ) {
+            return false;
+        }
+        return self::copy_protected( $file, $to );
     }
 
     /**
@@ -2244,7 +2279,7 @@ class Import {
             // A killed call moved it, then died before saying so.
             if ( $resumed && file_exists( $dest ) ) {
                 $out = [ 'd' => $relative_path ];
-                if ( file_exists( self::staged_file( $this->rollback_path . '/files', $relative_path ) ) ) {
+                if ( file_exists( $this->rollback_file( $relative_path ) ) ) {
                     $out['b'] = $relative_path;
                 }
                 return $out;
@@ -2271,14 +2306,12 @@ class Import {
         }
 
         $out = [];
-        // Backup original if it exists
+        // The original goes into the restore point first. A file that
+        // can't be saved there whole isn't replaced.
         if ( file_exists( $dest ) ) {
-            $backup_dest = $this->rollback_path . '/files/' . self::staged_name( $relative_path );
-            $backup_dir  = dirname( $backup_dest );
-            if ( ! is_dir( $backup_dir ) ) {
-                mkdir( $backup_dir, 0755, true );
+            if ( ! $this->save_original( $dest, $relative_path ) ) {
+                return [ 'e' => "Could not save {$relative_path} in the restore point (is the disk full?), so it was left as it was." ];
             }
-            self::put_staged( $dest, $backup_dest, $relative_path );
             $out['b'] = $relative_path;
         }
 
@@ -2439,11 +2472,7 @@ class Import {
                 if ( ! is_file( $dest ) ) {
                     continue;
                 }
-                $backup_dest = $this->rollback_path . '/files/' . self::staged_name( $relative_path );
-                if ( ! is_dir( dirname( $backup_dest ) ) ) {
-                    mkdir( dirname( $backup_dest ), 0755, true );
-                }
-                if ( ! in_array( $relative_path, $backed_up, true ) && self::put_staged( $dest, $backup_dest, $relative_path ) ) {
+                if ( ! in_array( $relative_path, $backed_up, true ) && $this->save_original( $dest, $relative_path ) ) {
                     $backed_up[] = $relative_path;
                 }
                 if ( in_array( $relative_path, $backed_up, true ) && @unlink( $dest ) ) {
@@ -4443,7 +4472,7 @@ class Import {
             }
             if ( $st['i'] < count( $backed_up ) ) {
                 $relative_path = $backed_up[ $st['i'] ];
-                $backup_src    = self::staged_file( $this->rollback_path . '/files', $relative_path );
+                $backup_src    = $this->rollback_file( $relative_path );
                 $dest          = $web_root . '/' . $relative_path;
                 if ( file_exists( $backup_src ) ) {
                     if ( ! is_dir( dirname( $dest ) ) ) {
