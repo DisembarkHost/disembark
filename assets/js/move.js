@@ -129,13 +129,15 @@
       else why = !isMain ? (inst ? 'From the main site only' : 'Network or Freighter only') : 'Bring in a site or a zip';
     }
     return h('button', { type: 'button', class: 'dsk-opt', role: 'radio', 'aria-checked': String(on), 'aria-disabled': dis ? 'true' : null, title: dis ? why : null,
-      onclick: function () {
+      onclick: function (e) {
         if (dis) return;
         S[side] = val;
         if (side === 'from' && !valid(S.from, S.to)) S.to = ['this', 'new', 'other'].filter(function (x) { return valid(S.from, x); })[0];
         if (side === 'from') S.quiet = S.from !== 'this';
         render();
-        var again = root.querySelector('.dsk-opt[data-k="' + side + '-' + val + '"]'); if (again) again.focus();
+        // Keep keyboard users on the tile they chose (the page is redrawn);
+        // a mouse click (e.detail > 0) shouldn't leave a focus ring behind.
+        if (e.detail === 0) { var again = root.querySelector('.dsk-opt[data-k="' + side + '-' + val + '"]'); if (again) again.focus(); }
       }, 'data-k': side + '-' + val },
       h('span', { class: 'pic', html: pic(val) }), h('b', null, label), h('small', { class: mono && !dis ? 'mono' : null }, dis ? why : sub));
   }

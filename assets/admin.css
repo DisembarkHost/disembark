@@ -460,15 +460,15 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
 .dsk-builder { display: grid; grid-template-columns: minmax(0, 1fr) 96px minmax(0, 1fr); align-items: stretch; margin-bottom: 16px; }
 .dsk-grp-h { margin: 0 0 9px 2px; }
 .dsk-grp { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-.dsk-opt { display: flex; flex-direction: column; align-items: stretch; padding: 6px 6px 11px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); color: var(--ink); text-align: left; cursor: pointer; font: inherit; min-width: 0; transition: border-color .15s, box-shadow .15s, transform .15s; }
+.dsk-opt { position: relative; display: flex; flex-direction: column; align-items: stretch; padding: 6px 6px 11px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); color: var(--ink); text-align: left; cursor: pointer; font: inherit; min-width: 0; transition: border-color .15s, box-shadow .15s, transform .15s; }
 .dsk-opt:hover:not([aria-disabled="true"]) { border-color: var(--line-2); transform: translateY(-1px); }
 .dsk-opt .pic { height: 46px; border-radius: 8px; background: var(--land); overflow: hidden; margin-bottom: 9px; display: block; }
 .dsk-opt .pic svg { width: 100%; height: 100%; display: block; }
-.dsk-opt b { font: 600 13.5px/1.25 var(--sans); padding: 0 6px; display: flex; align-items: center; gap: 6px; }
+.dsk-opt b { font: 600 13.5px/1.25 var(--sans); padding: 0 6px; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dsk-opt small { display: block; padding: 0 6px; margin-top: 3px; font-size: 12px; line-height: 1.3; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dsk-opt small.mono { font: 11.5px/1.3 var(--mono); }
 .dsk-opt[aria-checked="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent), var(--shadow); }
-.dsk-opt[aria-checked="true"] b::after { content: ""; margin-left: auto; width: 16px; height: 16px; border-radius: 50%; flex: none; background: var(--accent) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 8.3l2.2 2.2 4.8-5' fill='none' stroke='white' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/16px no-repeat; }
+.dsk-opt[aria-checked="true"]::after { content: ""; position: absolute; top: 10px; right: 10px; width: 18px; height: 18px; border-radius: 50%; box-shadow: 0 0 0 2px var(--surface); background: var(--accent) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.5 8.3l2.2 2.2 4.8-5' fill='none' stroke='white' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/18px no-repeat; }
 .dsk-opt[aria-disabled="true"] { cursor: not-allowed; background: transparent; border-style: dashed; color: var(--ink-3); box-shadow: none; }
 .dsk-opt[aria-disabled="true"] .pic { opacity: .45; filter: grayscale(.8); }
 .dsk-opt[aria-disabled="true"] small { font-style: italic; }
@@ -667,7 +667,7 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
   .dsk-opt b { font-size: 12.5px; padding: 0 3px; }
   .dsk-opt small { font-size: 11px; padding: 0 3px; }
   .dsk-opt small.mono { font-size: 10.5px; }
-  .dsk-opt[aria-checked="true"] b::after { display: none; }
+  .dsk-opt[aria-checked="true"]::after { top: 8px; right: 8px; width: 16px; height: 16px; background-size: 16px; }
   .dsk-voy-head { flex-wrap: wrap; padding: 12px 16px; gap: 4px 10px; }
   .dsk-voy-head .k { font-size: 24px; }
   .dsk-voy-head p { font-size: 13.5px; flex-basis: 100%; }
