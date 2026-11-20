@@ -712,7 +712,8 @@ class Import {
         $swap     = self::swap_start();
         $compat   = self::db_compat();
         $expected = [];
-        $read     = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, $old_prefix, $new_prefix, $skip_rows, $target ) {
+        $imported = [];
+        $read     = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, &$imported, $old_prefix, $new_prefix, $skip_rows, $target ) {
             if ( ++$count % 500 === 0 && $this->cancelled() ) {
                 $run['errors'][] = 'Cancelled.';
                 return false;
@@ -748,7 +749,13 @@ class Import {
                     return true;
                 }
             }
-            foreach ( self::swap_statements( self::transform_statements( [ $statement ], $old_prefix, $new_prefix ), $swap ) as $transformed ) {
+            $transformed_statements = self::transform_statements( [ $statement ], $old_prefix, $new_prefix );
+            foreach ( $transformed_statements as $t ) {
+                if ( preg_match( '/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`((?:[^`]|``)+)`/i', $t, $tm ) ) {
+                    $imported[ str_replace( '``', '`', $tm[1] ) ] = true;
+                }
+            }
+            foreach ( self::swap_statements( $transformed_statements, $swap ) as $transformed ) {
                 if ( ! $this->run_statement( self::compat_statement( $transformed, $compat ), $run ) ) {
                     return false;
                 }
@@ -769,6 +776,9 @@ class Import {
             self::swap_abandon( $swap );
             $swapped = 0;
         }
+        // The address rewrite after the move covers these and this site's own.
+        $this->prepare_import_dir();
+        file_put_contents( $this->import_path . '/imported-tables.json', wp_json_encode( array_keys( $imported ) ) );
         // Rows are counted right after the swap, before this site's own
         // token is written back into the options table.
         $rows   = empty( $run['errors'] ) ? $this->check_rows( $expected ) : null;
@@ -1146,11 +1156,15 @@ class Import {
     public function move_search_replace( $from, $to ) {
         $source = $this->staged_source();
         $target = $this->target();
-        $tables = [];
         if ( $target ) {
             // The new site's address and folders, and its tables alone.
             $to     = $target->home;
             $tables = $target->tables();
+        } else {
+            $tables = $this->move_tables();
+        }
+        if ( ! $tables ) {
+            return [ 'tables' => 0, 'rows_changed' => 0, 'cells_changed' => 0, 'by_table' => [], 'samples' => [], 'paths' => [], 'moved' => [] ];
         }
         $moved  = self::scope_pairs( $source, $to, $target ) + self::target_pairs( $source, $target );
         $result = $this->search_replace( $from, $to, $tables, false, [ 'variants' => true, 'extra' => self::path_pairs( $source ) + $moved ] );
@@ -1164,6 +1178,49 @@ class Import {
             $file_pairs += self::replacement_pairs( $f, $t );
         }
         return array_merge( $result, $this->rewrite_files( $file_pairs, $target ) );
+    }
+
+    /**
+     * The tables a whole-site move rewrites: this site's (its prefix) and the
+     * ones the import created. Never every table in the database: one shared
+     * with another site (staging beside production, two prefixes) keeps the
+     * other site's tables as they are.
+     */
+    private function move_tables() {
+        global $wpdb;
+        $tables = (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->base_prefix ) . '%' ) );
+        $file   = $this->import_path . '/imported-tables.json';
+        if ( is_file( $file ) ) {
+            $all    = array_flip( (array) $wpdb->get_col( 'SHOW TABLES' ) );
+            $extra  = array_filter( (array) json_decode( (string) file_get_contents( $file ), true ), function ( $t ) use ( $all ) { return is_string( $t ) && isset( $all[ $t ] ); } );
+            $tables = array_merge( $tables, $extra );
+        }
+        return array_values( array_unique( array_map( 'strval', $tables ) ) );
+    }
+
+    /**
+     * A folder path from the source (its abspath, content_dir) fit to use
+     * as a search & replace pair: absolute, at least two folders deep, and
+     * plain path characters only. A shorter or odd one would rewrite text
+     * that merely contains it.
+     */
+    private static function safe_source_path( $path ) {
+        $path = trim( (string) $path );
+        if ( ! preg_match( '#^(?:/|[A-Za-z]:[\\\\/])[A-Za-z0-9 _.~@+\-/\\\\:]*$#D', $path ) || preg_match( '#(?:^|[\\\\/])\.\.(?:[\\\\/]|$)#', $path ) ) {
+            return false;
+        }
+        return count( array_filter( preg_split( '#[\\\\/]+#', preg_replace( '#^[A-Za-z]:#', '', $path ) ), 'strlen' ) ) >= 2;
+    }
+
+    /** An address from the source fit for a pair: http(s), with a host, no spaces or quotes. */
+    private static function safe_source_url( $url ) {
+        $url = (string) $url;
+        return (bool) preg_match( '#^https?://[^\s"\'<>\\\\]+$#iD', $url ) && (string) wp_parse_url( $url, PHP_URL_HOST ) !== '';
+    }
+
+    /** A folder of the source's (wp-content/uploads/sites/5, content/8): relative, two folders or more. */
+    private static function safe_source_folder( $folder ) {
+        return (bool) preg_match( '#^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+$#D', (string) $folder ) && ! preg_match( '#(?:^|/)\.\.?(?:/|$)#', (string) $folder );
     }
 
     /**
@@ -1190,7 +1247,7 @@ class Import {
             }
             $url = untrailingslashit( $target->home ) . '/' . $to . '/';
             foreach ( $bases as $base ) {
-                if ( preg_match( '#^https?://#i', $base ) ) {
+                if ( self::safe_source_url( $base ) ) {
                     $pairs += self::url_variants( untrailingslashit( $base ) . '/' . $from . '/', $url );
                 }
             }
@@ -1198,7 +1255,7 @@ class Import {
             foreach ( [ '"', "'", '(' ] as $q ) {
                 $pairs += [ $q . '/' . $from . '/' => $q . $path ];
             }
-            if ( ! empty( $source['content_dir'] ) ) {
+            if ( ! empty( $source['content_dir'] ) && self::safe_source_path( $source['content_dir'] ) ) {
                 $pairs += [ trailingslashit( (string) $source['content_dir'] ) . ( $from === 'wp-content' ? '' : substr( $from, strlen( 'wp-content/' ) ) . '/' ) => $root . '/' . $to . '/' ];
             }
         }
@@ -1235,28 +1292,28 @@ class Import {
         }
         $pairs   = [];
         foreach ( (array) ( $scope['url_pairs'] ?? [] ) as $from_url => $to ) {
-            if ( isset( $urls[ $to ] ) && preg_match( '#^https?://#i', (string) $from_url ) ) {
+            if ( isset( $urls[ $to ] ) && self::safe_source_url( $from_url ) ) {
                 $pairs += self::url_variants( trailingslashit( (string) $from_url ), trailingslashit( $urls[ $to ] ) );
             }
         }
         foreach ( (array) ( $scope['moves'] ?? [] ) as $move ) {
             list( $from, $to ) = array_values( (array) $move ) + [ '', '' ];
             $from = trim( (string) $from, '/' );
-            if ( $from === '' || ! isset( $urls[ $to ] ) ) {
+            if ( ! self::safe_source_folder( $from ) || ! isset( $urls[ $to ] ) ) {
                 continue;
             }
             foreach ( (array) ( $scope['bases'] ?? [] ) as $base ) {
-                if ( preg_match( '#^https?://#i', (string) $base ) ) {
+                if ( self::safe_source_url( $base ) ) {
                     $pairs += self::url_variants( untrailingslashit( (string) $base ) . '/' . $from . '/', trailingslashit( $urls[ $to ] ) );
                 }
             }
             $pairs += [ '/' . $from . '/' => trailingslashit( (string) ( wp_parse_url( $urls[ $to ], PHP_URL_PATH ) ?: '/' . $to ) ) ];
-            if ( ! empty( $scope['abspath'] ) ) {
+            if ( ! empty( $scope['abspath'] ) && self::safe_source_path( $scope['abspath'] ) ) {
                 $pairs += [ trailingslashit( (string) $scope['abspath'] ) . $from . '/' => trailingslashit( wp_normalize_path( $dirs[ $to ] ) ) ];
             }
         }
         foreach ( (array) ( $scope['aliases'] ?? [] ) as $alias ) {
-            if ( preg_match( '#^https?://#i', (string) $alias ) ) {
+            if ( self::safe_source_url( $alias ) ) {
                 $pairs += self::url_variants( untrailingslashit( (string) $alias ), untrailingslashit( $target ? $target->home : home_url() ) );
             }
         }
@@ -1280,7 +1337,7 @@ class Import {
         $pairs  = [];
         foreach ( [ 'abspath' => ABSPATH, 'content_dir' => WP_CONTENT_DIR ] as $key => $here ) {
             $there = trim( (string) ( $source[ $key ] ?? '' ) );
-            if ( strlen( $there ) < 4 || strpos( $there, '/' ) === false ) {
+            if ( strlen( $there ) < 4 || strpos( $there, '/' ) === false || ! self::safe_source_path( $there ) ) {
                 continue;
             }
             $there = rtrim( $there, '/' ) . '/';
