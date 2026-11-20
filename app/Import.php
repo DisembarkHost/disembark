@@ -1217,6 +1217,7 @@ class Import {
                 } elseif ( $verdict === 'refused' ) {
                     $refused++;
                 }
+                // 'skip': mysqldump's own session bookkeeping, left out quietly.
                 if ( $verdict !== 'ok' ) {
                     return true;
                 }
@@ -2694,7 +2695,9 @@ class Import {
      * database is refused too.
      *
      * Returns 'ok', 'foreign' (a table without the source's prefix, left
-     * out), 'foreign_create' (the same, its CREATE) or 'refused'.
+     * out), 'foreign_create' (the same, its CREATE), 'skip' (mysqldump's
+     * own session bookkeeping, left out without a count; see
+     * dump_session_restore()) or 'refused'.
      */
     private static function target_statement( $statement, $prefix ) {
         $sql = trim( self::strip_leading_comments( $statement ) );
@@ -2743,10 +2746,32 @@ class Import {
             return 'ok';
         }
         if ( preg_match( '/^SET\s/i', $sql ) ) {
-            return self::target_set_allowed( $sql ) ? 'ok' : 'refused';
+            if ( self::target_set_allowed( $sql ) ) {
+                return 'ok';
+            }
+            return self::dump_session_restore( $sql ) ? 'skip' : 'refused';
         }
         return 'refused';
     }
+
+    /**
+     * mysqldump's own bookkeeping around a dump: the header that saves the
+     * session's settings and sets sql_mode to NO_AUTO_VALUE_ON_ZERO, and
+     * the trailer (and the line after each CREATE TABLE) that puts saved
+     * values back from @OLD_* / @saved_* variables. target_set_allowed()
+     * refuses the sql_mode, character_set_client and collation_connection
+     * ones, so they never run into a subsite or tenant; they're left out
+     * without counting them as refused, since every dump has them. Only
+     * those exact shapes: anything else in the same SET is still refused.
+     */
+    private static function dump_session_restore( $sql ) {
+        $names = '(?:sql_mode|character_set_client|character_set_results|collation_connection|foreign_key_checks|unique_checks|sql_notes|time_zone)';
+        $part  = '(?:(?:@@(?:SESSION\.|LOCAL\.)?|(?:SESSION|LOCAL)\s+)?' . $names . '\s*:?=\s*@(?:OLD|saved)_[A-Za-z_]+'
+            . '|@OLD_[A-Za-z_]+\s*:?=\s*@@(?:SESSION\.)?' . $names
+            . '|sql_mode\s*:?=\s*(?:\'NO_AUTO_VALUE_ON_ZERO\'|"NO_AUTO_VALUE_ON_ZERO"))';
+        return (bool) preg_match( '/^SET\s+' . $part . '(?:\s*,\s*' . $part . ')*\s*;?\s*$/i', trim( $sql ) );
+    }
+
 
     /**
      * SET statements a dump may run into a subsite or tenant: user variables,
