@@ -313,7 +313,9 @@ class Command {
         }
 
         $this->say( '[4/9] Saving a rollback point' );
-        $label = ( ! empty( $summary['catch_up'] ) ? 'Before catch-up from ' : 'Before pull from ' ) . wp_parse_url( $source['url'], PHP_URL_HOST );
+        // Named for the site that came over (one site of an install is
+        // reached through the install's address).
+        $label = ( ! empty( $summary['catch_up'] ) ? 'Before catch-up from ' : 'Before pull from ' ) . wp_parse_url( $src_home !== '' ? $src_home : $source['url'], PHP_URL_HOST );
         $snap = $this->check( $this->budgeted( function ( $r ) { return 'Saved ' . (int) $r['tables_done'] . ' of ' . (int) $r['tables_total'] . ' tables'; }, function ( $budget ) use ( $import, $label ) { return $import->snapshot( $label, $budget ); } ), 'snapshot' );
         $summary['rollback_id'] = $import_id;
         $summary['undo']        = "wp disembark rollback {$import_id}";

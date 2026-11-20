@@ -1543,7 +1543,7 @@ class Pull {
         }
         $nofp = '';
         if ( ! empty( $pre->scope ) ) {
-            $nofp = 'the source is one site of a network, so every table was copied';
+            $nofp = 'the source is one site of a network or WP Freighter install, so every table was copied';
         } elseif ( empty( $pre->fingerprint ) ) {
             $nofp = 'the source runs an older Disembark without table fingerprints, so every table was copied';
         }
