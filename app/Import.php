@@ -374,10 +374,12 @@ class Import {
     /**
      * Creates a rollback snapshot of the destination database and file manifest.
      */
-    public function snapshot( $label = '', $budget = null ) {
+    public function snapshot( $label = '', $budget = null, $tables = null ) {
         global $wpdb;
 
-        if ( $refused = $this->refused() ) {
+        // $tables: a restore point of just those tables, before a change
+        // that isn't a move (Browse's search and replace).
+        if ( $tables === null && ( $refused = $this->refused() ) ) {
             return $refused;
         }
 
@@ -386,7 +388,7 @@ class Import {
 
         // Without a budget (an older client), the whole restore point in
         // this one request, the same way.
-        return $this->snapshot_paced( $label, $budget !== null ? $budget : DAY_IN_SECONDS );
+        return $this->snapshot_paced( $label, $budget !== null ? $budget : DAY_IN_SECONDS, $tables );
     }
 
     /**
@@ -461,7 +463,7 @@ class Import {
      * remembers the table and row it stopped at. The call that writes the
      * last row saves the restore point.
      */
-    private function snapshot_paced( $label, $budget ) {
+    private function snapshot_paced( $label, $budget, $only = null ) {
         global $wpdb;
         $deadline   = Pace::deadline( $budget );
         $state_file = $this->rollback_path . '/snapshot-state.php';
@@ -473,7 +475,14 @@ class Import {
             if ( $meta !== null && ! empty( $meta['sql_files'] ) ) {
                 return [ 'done' => true, 'rollback_id' => $this->import_id, 'tables' => count( (array) $meta['tables'] ), 'target' => $target ? $target->info() : null ];
             }
-            $all = $this->snapshot_scope( $target );
+            if ( $only !== null ) {
+                // Only tables that exist, each once.
+                $target = null;
+                $here   = array_flip( (array) $wpdb->get_col( 'SHOW TABLES' ) );
+                $all    = array_values( array_unique( array_filter( array_map( 'strval', (array) $only ), function ( $t ) use ( $here ) { return isset( $here[ $t ] ); } ) ) );
+            } else {
+                $all = $this->snapshot_scope( $target );
+            }
             // A new subsite or tenant has no tables yet: an empty restore
             // point still takes it away again.
             if ( empty( $all ) && ! $target ) {
@@ -484,7 +493,7 @@ class Import {
             $plan   = json_decode( (string) self::read_protected( $this->import_path . '/db-plan.php' ), true );
             $skip   = array_flip( (array) ( $plan['skipped_dst'] ?? [] ) );
             $tables = array_values( array_filter( $all, function ( $t ) use ( $skip ) { return ! isset( $skip[ $t ] ); } ) );
-            $state  = [ 'tables' => $tables, 'all' => array_values( $all ), 'name' => 'batch-' . md5( implode( ',', $tables ) ), 'cur' => [], 'size' => 0 ];
+            $state  = [ 'tables' => $tables, 'all' => array_values( $all ), 'name' => 'batch-' . md5( implode( ',', $tables ) ), 'cur' => [], 'size' => 0, 'partial' => $only !== null ];
         }
         $done = $this->write_restore_dump( $state, $state_file, $deadline );
         if ( is_wp_error( $done ) ) {
@@ -493,7 +502,7 @@ class Import {
         if ( ! $done ) {
             return [ 'done' => false, 'tables_done' => (int) ( $state['cur']['t'] ?? 0 ), 'tables_total' => count( $state['tables'] ) ];
         }
-        $result = $this->snapshot_saved( $label, $state['all'] ?? $state['tables'], $target, $state['tables'] );
+        $result = $this->snapshot_saved( $label, $state['all'] ?? $state['tables'], ! empty( $state['partial'] ) ? null : $target, $state['tables'], ! empty( $state['partial'] ) );
         if ( is_array( $result ) ) {
             $result['done'] = true;
         }
@@ -589,7 +598,7 @@ class Import {
     }
 
     /** Records a restore point whose dumps are in place, and makes a new subsite or tenant. */
-    private function snapshot_saved( $label, $all_tables, $target, $saved_tables = null ) {
+    private function snapshot_saved( $label, $all_tables, $target, $saved_tables = null, $partial = false ) {
         $sql_sizes = [];
         foreach ( self::rollback_sql_files( $this->rollback_path ) as $sql_file ) {
             $sql_sizes[ basename( $sql_file ) ] = filesize( $sql_file );
@@ -611,6 +620,11 @@ class Import {
             'deployed_files' => [],
             'backed_up_files' => [],
         ];
+        // Only the tables a change touches (Browse's search and replace):
+        // a rollback puts those back and drops nothing.
+        if ( $partial ) {
+            $meta['partial'] = true;
+        }
         // Known before the new site exists, so a rollback never mistakes
         // this for a whole-site restore point.
         if ( $target ) {
@@ -3177,6 +3191,9 @@ class Import {
 
         $paced        = isset( $options['budget'] ) && ! $dry_run;
         $deadline     = $paced ? Pace::deadline( $options['budget'] ) : 0;
+        if ( $paced ) {
+            $this->prepare_import_dir();
+        }
         $state_file   = $this->import_path . '/replace-state.php';
         $journal_file = $this->import_path . '/replace-journal.php';
         $st           = $paced ? json_decode( (string) self::read_protected( $state_file ), true ) : null;
@@ -4139,133 +4156,136 @@ class Import {
 
     /**
      * Restores the destination to pre-import state using the rollback snapshot.
+     *
+     * With a $budget (seconds, see Pace) it works in pieces like the other
+     * long steps: the snapshot's tables go back statement by statement until
+     * the budget, then the tables the move added go, then the files, each
+     * call answering { done: false } with where it got to and the next one
+     * carrying on from there. Statements a killed call ran past its last
+     * checkpoint are journaled, so none runs twice. Without a budget (an
+     * older client), all of it in this one request.
      */
-    public function rollback() {
+    public function rollback( $budget = null ) {
         global $wpdb;
-
-        // A paced deploy that stopped partway journaled what it placed.
-        $this->merge_deploy_journal();
-        $meta = self::rollback_meta( $this->rollback_path );
-        if ( $meta === null ) {
-            return new \WP_Error( 'no_rollback', 'No rollback data found for this import ID.', [ 'status' => 404 ] );
-        }
-        $errors = [];
-
-        // 1. Restore database from snapshot SQL. Validate the whole snapshot
-        // before anything is dropped: a missing, truncated or unreadable
-        // snapshot must leave the current database alone.
-        $sql_files = self::rollback_sql_files( $this->rollback_path );
-        $check     = self::validate_snapshot( $sql_files, $meta );
-        if ( is_wp_error( $check ) ) {
-            return $check;
-        }
-
-        // The main site of a WP Freighter install keeps its registry as it
-        // is now (tenants made since the restore point included), not as
-        // its options table had it then.
-        $registry = ! empty( $meta['target'] ) ? [] : $this->registry_rows();
-
-        if ( ! empty( $sql_files ) ) {
-            // Each table is dropped just before the snapshot recreates it
-            // (DROP-before-CREATE), never all up front, so a rollback that
-            // stops midway leaves every table present and can be run again.
-            $run = $this->begin_statements();
-            // Rows go back many at a time, as the import sends them (one
-            // statement per row made a large table take minutes).
-            $packet  = (int) $wpdb->get_var( 'SELECT @@max_allowed_packet' );
-            $max     = (int) max( 65536, min( 1048576, $packet > 0 ? $packet / 2 : 1048576 ) );
-            $pending = null;
-            $flush   = function () use ( &$pending, &$run ) {
-                if ( ! $pending ) {
-                    return true;
-                }
-                $sql     = $pending['head'] . implode( ',', $pending['rows'] );
-                $pending = null;
-                return $this->run_statement( $sql, $run );
-            };
-            foreach ( $sql_files as $sql_file ) {
-                $read = self::each_sql_statement_in_file( $sql_file, function ( $statement ) use ( &$run, &$pending, $flush, $max ) {
-                    foreach ( self::transform_statements( [ $statement ] ) as $transformed ) {
-                        $transformed = trim( $transformed );
-                        if ( strlen( $transformed ) < $max && preg_match( '/^(INSERT\s+INTO\s+`(?:[^`]|``)+`\s+VALUES\s*)(\(.*\))$/s', $transformed, $im ) ) {
-                            if ( $pending && ( $pending['head'] !== $im[1] || $pending['bytes'] + strlen( $im[2] ) >= $max || count( $pending['rows'] ) >= 2000 ) && ! $flush() ) {
-                                return false;
-                            }
-                            if ( ! $pending ) {
-                                $pending = [ 'head' => $im[1], 'rows' => [], 'bytes' => strlen( $im[1] ) ];
-                            }
-                            $pending['rows'][] = $im[2];
-                            $pending['bytes'] += strlen( $im[2] ) + 1;
-                            continue;
-                        }
-                        if ( ! $flush() || ! $this->run_statement( $transformed, $run ) ) {
-                            return false;
-                        }
-                    }
-                    return true;
-                } );
-                $flush();
-                if ( is_wp_error( $read ) ) {
-                    $run['errors'][] = $read->get_error_message();
-                    break;
-                }
+        $paced      = $budget !== null;
+        $deadline   = $paced ? Pace::deadline( $budget ) : 0;
+        $state_file = $this->import_path . '/rollback-state.php';
+        $done_file  = $this->import_path . '/rollback-done.php';
+        $st         = json_decode( (string) self::read_protected( $state_file ), true );
+        if ( ! is_array( $st ) ) {
+            // Asked again right after it finished (a lost answer): the same
+            // answer, not a second rollback.
+            $done = json_decode( (string) self::read_protected( $done_file ), true );
+            if ( $paced && is_array( $done ) && (int) ( $done['at'] ?? 0 ) > time() - 600 ) {
+                return (array) $done['result'];
             }
-            // The snapshot's own token row is the right one now; don't
-            // overwrite it with whatever the imported site had.
-            $run['preserved_token'] = '';
-            $result = $this->end_statements( $run );
-            $errors = $result['errors'];
+            // A paced deploy that stopped partway journaled what it placed.
+            $this->merge_deploy_journal();
+            $meta = self::rollback_meta( $this->rollback_path );
+            if ( $meta === null ) {
+                return new \WP_Error( 'no_rollback', 'No rollback data found for this import ID.', [ 'status' => 404 ] );
+            }
+            // Validate the whole snapshot before anything is dropped: a
+            // missing, truncated or unreadable snapshot must leave the
+            // current database alone.
+            $sql_files = self::rollback_sql_files( $this->rollback_path );
+            $check     = self::validate_snapshot( $sql_files, $meta );
+            if ( is_wp_error( $check ) ) {
+                return $check;
+            }
+            $st = [
+                'phase'    => 'database',
+                'files'    => array_map( 'basename', $sql_files ),
+                'f'        => 0,
+                'o'        => 0,
+                'i'        => 0,
+                'errors'   => [],
+                // The main site of a WP Freighter install keeps its registry
+                // as it is now (tenants made since the restore point
+                // included), not as its options table had it then.
+                'registry' => ! empty( $meta['target'] ) ? [] : $this->registry_rows(),
+            ];
+            @unlink( $this->import_path . '/rollback-journal.php' );
+            @unlink( $done_file );
+            if ( $paced ) {
+                $this->prepare_import_dir();
+                self::write_protected( $state_file, (string) wp_json_encode( $st ) );
+            }
+        }
+        $meta = (array) self::rollback_meta( $this->rollback_path );
+        $save = function () use ( &$st, $state_file, $paced ) {
+            if ( $paced ) {
+                self::write_protected( $state_file, (string) wp_json_encode( $st ) );
+            }
+        };
 
+        // 1. The snapshot's tables, then what the move added beside them.
+        if ( $st['phase'] === 'database' ) {
+            if ( ! $this->rollback_tables( $st, $deadline, $save ) ) {
+                return [ 'done' => false, 'phase' => 'database', 'parts_done' => (int) $st['f'], 'parts_total' => count( $st['files'] ) ];
+            }
+            $errors = (array) $st['errors'];
             // Tables the restore added (the source's plugin tables) go only
             // once the snapshot is fully back, and only tables this site
             // owns: a subsite's or tenant's own prefix, or this site's own
             // tables and the ones this move imported. Never another site's
             // of the install, one made after the restore point included.
-            if ( empty( $errors ) && empty( $meta['partial'] ) ) {
+            if ( $st['files'] && empty( $errors ) && empty( $meta['partial'] ) ) {
                 $this->drop_added_tables( $meta );
             }
-            $this->put_registry_rows( $registry );
+            $this->put_registry_rows( (array) $st['registry'] );
             wp_cache_flush();
-        }
-
-        // Users the move created or gave a role on a network go again, and
-        // the roles it replaced come back (see Target::merge_users()).
-        if ( empty( $errors ) ) {
-            Target::undo_merge( $this->rollback_path . '/users-merge.php' );
-        }
-
-        // A catch-up pull's memory goes back to what it was before this move.
-        Pull::restore_memory( $this->rollback_path );
-        $target = ! empty( $meta['target'] ) ? $this->target() : null;
-
-        // 2. Restore backed-up files
-        $web_root    = dirname( WP_CONTENT_DIR );
-        $backed_up   = $meta['backed_up_files'] ?? [];
-        foreach ( $backed_up as $relative_path ) {
-            $backup_src = self::staged_file( $this->rollback_path . '/files', $relative_path );
-            $dest       = $web_root . '/' . $relative_path;
-            if ( file_exists( $backup_src ) ) {
-                $dest_dir = dirname( $dest );
-                if ( ! is_dir( $dest_dir ) ) {
-                    mkdir( $dest_dir, 0755, true );
-                }
-                self::take_staged( $backup_src, $dest );
+            // Users the move created or gave a role on a network go again,
+            // and the roles it replaced come back (see Target::merge_users()).
+            if ( empty( $errors ) ) {
+                Target::undo_merge( $this->rollback_path . '/users-merge.php' );
             }
+            // A catch-up pull's memory goes back to what it was before this move.
+            Pull::restore_memory( $this->rollback_path );
+            $st['phase'] = 'files';
+            $st['i']     = 0;
+            $save();
         }
 
-        // 3. Delete newly deployed files that weren't overwriting originals
-        $deployed = $meta['deployed_files'] ?? [];
-        $emptied  = [];
-        foreach ( $deployed as $relative_path ) {
-            if ( in_array( $relative_path, $backed_up, true ) ) {
+        // 2. Files: the ones the move replaced come back, the ones it added go.
+        $web_root  = dirname( WP_CONTENT_DIR );
+        $backed_up = array_values( (array) ( $meta['backed_up_files'] ?? [] ) );
+        $deployed  = array_values( (array) ( $meta['deployed_files'] ?? [] ) );
+        $was_saved = array_flip( $backed_up );
+        $removed   = false;
+        $total     = count( $backed_up ) + count( $deployed );
+        for ( ; $st['i'] < $total; $st['i']++ ) {
+            if ( $paced && $st['i'] % 200 === 0 && microtime( true ) >= $deadline ) {
+                $save();
+                if ( $removed ) {
+                    self::quiet_shutdown();
+                }
+                return [ 'done' => false, 'phase' => 'files', 'files_done' => (int) $st['i'], 'files_total' => $total ];
+            }
+            if ( $st['i'] < count( $backed_up ) ) {
+                $relative_path = $backed_up[ $st['i'] ];
+                $backup_src    = self::staged_file( $this->rollback_path . '/files', $relative_path );
+                $dest          = $web_root . '/' . $relative_path;
+                if ( file_exists( $backup_src ) ) {
+                    if ( ! is_dir( dirname( $dest ) ) ) {
+                        mkdir( dirname( $dest ), 0755, true );
+                    }
+                    self::take_staged( $backup_src, $dest );
+                }
+                continue;
+            }
+            // Newly deployed files that weren't overwriting originals.
+            $relative_path = $deployed[ $st['i'] - count( $backed_up ) ];
+            if ( isset( $was_saved[ $relative_path ] ) ) {
                 continue; // Already restored from backup
             }
-            $file = $web_root . '/' . $relative_path;
-            if ( file_exists( $file ) ) {
-                @unlink( $file );
+            if ( file_exists( $web_root . '/' . $relative_path ) ) {
+                @unlink( $web_root . '/' . $relative_path );
+                $removed = true;
             }
-            $emptied[ dirname( $relative_path ) ] = true;
         }
+        $errors = (array) $st['errors'];
+        $target = ! empty( $meta['target'] ) ? $this->target() : null;
 
         // Folders the move created (a plugin it brought, a WP Freighter
         // install's content/<id>) go too once empty. rmdir() never removes a
@@ -4288,6 +4308,12 @@ class Import {
         } else {
             // A restore point from an earlier build: folders that end up
             // empty go, walking up, short of the ones above.
+            $emptied = [];
+            foreach ( $deployed as $relative_path ) {
+                if ( ! isset( $was_saved[ $relative_path ] ) ) {
+                    $emptied[ dirname( $relative_path ) ] = true;
+                }
+            }
             krsort( $emptied );
             foreach ( array_keys( $emptied ) as $dir ) {
                 while ( $dir !== '.' && $dir !== '' && ! $keep( $dir ) && @rmdir( $web_root . '/' . $dir ) ) {
@@ -4301,13 +4327,8 @@ class Import {
             $target->undo();
         }
 
-        // Plugins the restore brought in are gone now, but they loaded at the
-        // start of this request: their shutdown hooks would autoload classes
-        // from deleted files and fatal (into the JSON response where errors
-        // are displayed). Only core's output flush still belongs here.
-        if ( array_diff( $deployed, $backed_up ) ) {
-            remove_all_actions( 'shutdown' );
-            add_action( 'shutdown', 'wp_ob_end_flush_all', 1 );
+        if ( $removed || array_diff( $deployed, $backed_up ) ) {
+            self::quiet_shutdown();
         }
 
         @unlink( $this->import_path . '/token-guard.php' );
@@ -4327,9 +4348,9 @@ class Import {
             }
         }
 
-        return [
+        $result = [
             'success'          => empty( $errors ),
-            'tables_restored'  => count( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? $sql_files ) ),
+            'tables_restored'  => count( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? $st['files'] ) ),
             'files_restored'   => count( $backed_up ),
             'files_removed'    => count( array_diff( $deployed, $backed_up ) ),
             'quiet_mode_lifted' => $quiet_lifted,
@@ -4338,6 +4359,145 @@ class Import {
             'logins_kept'      => ! empty( $meta['target'] ) || is_multisite(),
             'errors'           => $errors,
         ];
+        @unlink( $state_file );
+        @unlink( $this->import_path . '/rollback-journal.php' );
+        if ( $paced ) {
+            $result['done'] = true;
+            self::write_protected( $done_file, (string) wp_json_encode( [ 'at' => time(), 'result' => $result ] ) );
+        }
+        return $result;
+    }
+
+    /**
+     * Plugins the rollback removed loaded at the start of this request:
+     * their shutdown hooks would autoload classes from deleted files and
+     * fatal (into the JSON response where errors are displayed). Only
+     * core's output flush still belongs here.
+     */
+    private static function quiet_shutdown() {
+        remove_all_actions( 'shutdown' );
+        add_action( 'shutdown', 'wp_ob_end_flush_all', 1 );
+    }
+
+    /**
+     * Puts the snapshot's tables back (see rollback()), from where $st says
+     * it got to, until $deadline when there is one. Each table is dropped
+     * just before the snapshot recreates it (DROP-before-CREATE), never all
+     * up front, so a rollback that stops midway leaves every table present
+     * and carries on. True once every dump is back.
+     */
+    private function rollback_tables( array &$st, $deadline, $save ) {
+        global $wpdb;
+        $journal_file = $this->import_path . '/rollback-journal.php';
+        $paced        = $deadline > 0;
+        // A call that was killed got past its last checkpoint: the journal
+        // says how far, and the statement just after may have run too.
+        $last     = $paced ? Pace::journal_last( $journal_file ) : null;
+        $tolerant = false;
+        if ( $last && ( (int) $last['f'] > (int) $st['f'] || ( (int) $last['f'] === (int) $st['f'] && (int) $last['o'] > (int) $st['o'] ) ) ) {
+            $st['f']  = (int) $last['f'];
+            $st['o']  = (int) $last['o'];
+            $tolerant = true;
+        }
+        $run = $this->begin_statements();
+        // Rows go back many at a time, as the import sends them (one
+        // statement per row made a large table take minutes).
+        $packet  = (int) $wpdb->get_var( 'SELECT @@max_allowed_packet' );
+        $max     = (int) max( 65536, min( 1048576, $packet > 0 ? $packet / 2 : 1048576 ) );
+        $pending = null;
+        $journal = $paced ? Pace::journal_open( $journal_file ) : null;
+        $fi      = (int) $st['f'];
+        $exec    = function ( $sql ) use ( &$run, &$tolerant ) {
+            $before = count( $run['errors'] );
+            $more   = $this->run_statement( $sql, $run );
+            if ( $tolerant && count( $run['errors'] ) > $before && preg_match( '/Duplicate entry|already exists/i', (string) $run['errors'][ $before ] ) ) {
+                array_splice( $run['errors'], $before );
+            }
+            $tolerant = false;
+            return $more;
+        };
+        $flush = function () use ( &$pending, $exec, $journal, &$fi ) {
+            if ( ! $pending ) {
+                return true;
+            }
+            $batch   = $pending;
+            $pending = null;
+            $more    = $exec( $batch['head'] . implode( ',', $batch['rows'] ) );
+            Pace::journal_add( $journal, [ 'f' => $fi, 'o' => $batch['end'] ] );
+            return $more;
+        };
+        $stop_at = 0;
+        for ( ; $fi < count( $st['files'] ); $fi++ ) {
+            $path = $this->rollback_path . '/' . $st['files'][ $fi ];
+            $read = self::each_sql_statement_in_file( $path, function ( $statement, $end ) use ( &$pending, &$stop_at, $exec, $flush, $max, $journal, &$fi, $paced, $deadline ) {
+                foreach ( self::transform_statements( [ $statement ] ) as $transformed ) {
+                    $transformed = trim( $transformed );
+                    if ( strlen( $transformed ) < $max && preg_match( '/^(INSERT\s+INTO\s+`(?:[^`]|``)+`\s+VALUES\s*)(\(.*\))$/s', $transformed, $im ) ) {
+                        if ( $pending && ( $pending['head'] !== $im[1] || $pending['bytes'] + strlen( $im[2] ) >= $max || count( $pending['rows'] ) >= 2000 ) && ! $flush() ) {
+                            return false;
+                        }
+                        if ( ! $pending ) {
+                            $pending = [ 'head' => $im[1], 'rows' => [], 'bytes' => strlen( $im[1] ) ];
+                        }
+                        $pending['rows'][] = $im[2];
+                        $pending['bytes'] += strlen( $im[2] ) + 1;
+                        $pending['end']    = $end;
+                        continue;
+                    }
+                    if ( ! $flush() || ! $exec( $transformed ) ) {
+                        return false;
+                    }
+                }
+                if ( ! $pending ) {
+                    Pace::journal_add( $journal, [ 'f' => $fi, 'o' => $end ] );
+                }
+                if ( $paced && microtime( true ) >= $deadline ) {
+                    if ( ! $flush() ) {
+                        return false;
+                    }
+                    $stop_at = $end;
+                    return false;
+                }
+                return true;
+            }, $fi === (int) $st['f'] ? (int) $st['o'] : 0 );
+            if ( $stop_at === 0 ) {
+                $flush();
+            }
+            if ( is_wp_error( $read ) ) {
+                $run['errors'][] = $read->get_error_message();
+            }
+            if ( $stop_at > 0 && ! is_wp_error( $read ) ) {
+                break;
+            }
+            $st['o'] = 0;
+            if ( is_wp_error( $read ) || count( $run['errors'] ) > 50 ) {
+                $fi = count( $st['files'] );
+                break;
+            }
+            $st['f'] = $fi + 1;
+            $save();
+        }
+        if ( $journal ) {
+            fclose( $journal );
+        }
+        $st['errors'] = array_merge( (array) $st['errors'], $run['errors'] );
+        if ( $stop_at > 0 ) {
+            // Out of time: everything in the journal is in the checkpoint now.
+            $st['f'] = $fi;
+            $st['o'] = $stop_at;
+            $save();
+            @unlink( $journal_file );
+            $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
+            $wpdb->query( 'SET UNIQUE_CHECKS = 1' );
+            return false;
+        }
+        @unlink( $journal_file );
+        // The snapshot's own token row is the right one now; don't
+        // overwrite it with whatever the imported site had.
+        $run['preserved_token'] = '';
+        $run['errors']          = [];
+        $this->end_statements( $run );
+        return true;
     }
 
     /**

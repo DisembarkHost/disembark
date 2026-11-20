@@ -1368,7 +1368,9 @@ class Run {
             return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
         }
         $import = new Import( $import_id );
-        return $import->snapshot( (string) ( $params['label'] ?? '' ), self::paced( $params ) );
+        // tables: a restore point of just those (Browse's search and replace).
+        $tables = isset( $params['tables'] ) && is_array( $params['tables'] ) ? array_values( array_filter( $params['tables'], 'is_string' ) ) : null;
+        return $import->snapshot( (string) ( $params['label'] ?? '' ), self::paced( $params ), $tables );
     }
 
     /** A new backup session id for the dashboard (see Storage::new_session()). */
@@ -1432,18 +1434,34 @@ class Run {
     /**
      * On-demand search & replace (the same serialize- and JSON-safe engine a
      * restore uses). dry_run counts what would change and returns samples.
+     * Without tables it covers this site's own (Import::own_tables()), not
+     * the other sites of a network or WP Freighter install, nor another
+     * WordPress in the same database; all_tables covers every table in the
+     * database. With an import_id and paced, it works in pieces (see Pace),
+     * answering { done: false } until it's through.
      */
     function search_replace( $request ) {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
+        global $wpdb;
         $from   = (string) ( $request['from'] ?? '' );
         $to     = (string) ( $request['to'] ?? '' );
         $tables = array_values( array_filter( (array) ( $request['tables'] ?? [] ), 'is_string' ) );
+        $dry    = ! empty( $request['dry_run'] );
         if ( $from === '' ) {
             return new \WP_Error( 'missing_from', 'Enter the text to search for.', [ 'status' => 400 ] );
         }
-        return ( new Import() )->search_replace( $from, $to, $tables, ! empty( $request['dry_run'] ) );
+        if ( ! $tables ) {
+            $tables = ! empty( $request['all_tables'] ) ? (array) $wpdb->get_col( 'SHOW TABLES' ) : Import::own_tables();
+        }
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) ( $request['import_id'] ?? '' ) ) );
+        $options   = [];
+        $budget    = $import_id !== '' && ! $dry ? self::paced( $request->get_params() ) : null;
+        if ( $budget !== null ) {
+            $options['budget'] = $budget;
+        }
+        return ( new Import( $import_id ) )->search_replace( $from, $to, $tables, $dry, $options );
     }
 
     /**
@@ -1923,7 +1941,7 @@ class Run {
 
         $import = new Import( $import_id );
         $import->set_request_token( User::request_token( $request ) );
-        return $import->rollback();
+        return $import->rollback( self::paced( $params ) );
     }
 
     function import_finalize( $request ) {

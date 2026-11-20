@@ -103,10 +103,15 @@
       var from = h('input', { class: 'dsk-input mono', placeholder: 'https://old-address.com', spellcheck: 'false' });
       var to = h('input', { class: 'dsk-input mono', placeholder: 'https://new-address.com', spellcheck: 'false' });
       var onlySelected = selected.length ? D.toggle('Only the ' + D.fmt.plural(selected.length, 'selected table'), false, function () { result.replaceChildren(); }) : null;
+      // This site's own tables by default: on a network or WP Freighter
+      // install, the other sites' tables (and another WordPress sharing the
+      // database) only when asked for.
+      var everyTable = D.toggle('Every table in the database, not just this site’s', false, function () { result.replaceChildren(); });
       var result = h('div');
       var previewBtn = h('button', { class: 'dsk-btn primary', onclick: preview }, D.icon('search'), 'Preview changes');
       [from, to].forEach(function (i) { i.addEventListener('input', function () { result.replaceChildren(); }); i.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); preview(); } }); });
       function scope() { return onlySelected && onlySelected.input.checked ? selected : []; }
+      function allTables() { return !scope().length && everyTable.input.checked ? 1 : 0; }
       D.modal({
         title: 'Search and replace', wide: true,
         body: h('div', { class: 'dsk-stack', style: { gap: '12px' } },
@@ -114,20 +119,20 @@
           h('div', { class: 'dsk-grid two', style: { gap: '12px' } },
             h('div', { class: 'dsk-field', style: { margin: 0 } }, h('label', null, 'Find'), from),
             h('div', { class: 'dsk-field', style: { margin: 0 } }, h('label', null, 'Replace with'), to)),
-          onlySelected, h('div', null, previewBtn), result),
+          onlySelected, everyTable, h('div', null, previewBtn), result),
         actions: [{ label: 'Close', value: null }]
       });
       async function preview() {
         if (!from.value) { from.focus(); return; }
         await D.busy(previewBtn, async function () {
           try {
-            var r = await D.api.post('search-replace', { from: from.value, to: to.value, tables: scope(), dry_run: true });
+            var r = await D.api.post('search-replace', { from: from.value, to: to.value, tables: scope(), all_tables: allTables(), dry_run: true });
             showPreview(r);
           } catch (e) { result.replaceChildren(D.note('error', D.errorText(e))); }
         });
       }
       function showPreview(r) {
-        if (!r.cells_changed) { result.replaceChildren(D.note('', 'Nothing matches \u201c' + from.value + '\u201d' + (scope().length ? ' in the selected tables.' : ' anywhere in the database.'))); return; }
+        if (!r.cells_changed) { result.replaceChildren(D.note('', 'Nothing matches \u201c' + from.value + '\u201d' + (scope().length ? ' in the selected tables.' : allTables() ? ' anywhere in the database.' : ' in this site\u2019s tables.'))); return; }
         var go = h('button', { class: 'dsk-btn danger solid', onclick: function () { replace(r, go); } }, 'Replace ' + D.fmt.plural(r.cells_changed, 'cell'));
         result.replaceChildren(h('div', { class: 'dsk-stack', style: { gap: '12px' } },
           D.note('warn', [h('strong', null, D.fmt.plural(r.cells_changed, 'cell')), ' in ', D.fmt.plural(r.rows_changed, 'row'), ' across ', D.fmt.plural(Object.keys(r.by_table).length, 'table'), ' would change.']),
@@ -151,13 +156,16 @@
         await D.busy(btn, async function () {
           var id = D.randomHex(24), saved = false;
           try {
-            await D.api.post('import/snapshot', { import_id: id, label: 'Before search and replace: ' + from.value + ' → ' + (to.value || '(nothing)') });
+            // The tables the preview found, and only those: their restore
+            // point, then the replace, each a piece at a time.
+            var tables = Object.keys(r.by_table);
+            await D.paced(D.api, 'import/snapshot', { import_id: id, label: 'Before search and replace: ' + from.value + ' → ' + (to.value || '(nothing)'), tables: tables });
             saved = true;
-            var done = await D.api.post('search-replace', { from: from.value, to: to.value, tables: scope() });
+            var done = await D.paced(D.api, 'search-replace', { import_id: id, from: from.value, to: to.value, tables: tables });
             var undo = h('button', { class: 'dsk-btn', onclick: async function () {
               await D.busy(undo, async function () {
                 try {
-                  var rb = await D.api.post('import/rollback', { import_id: id });
+                  var rb = await D.paced(D.api, 'import/rollback', { import_id: id });
                   if (rb.errors && rb.errors.length) throw new Error(rb.errors[0]);
                   result.replaceChildren(D.note('ok', 'Undone. The database is back to how it was before the replace.'));
                   D.loadDatabase(true).catch(function () {});

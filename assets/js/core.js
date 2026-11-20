@@ -319,6 +319,31 @@
     }
     return data;
   }
+  /**
+   * Calls a paced step (see app/Pace.php) on api (D.api, or a destination's
+   * API for a push) until it's through: an answer with done: false means
+   * "call again", and onStep(answer) hears each one. A request the host cut
+   * off, or a busy answer, is sent again after a pause (up to six times in
+   * a row), asking for half the time after a cut-off.
+   */
+  D.paced = async function (api, endpoint, body, onStep) {
+    var budget = 0, fails = 0, r;
+    do {
+      try {
+        r = await api.post(endpoint, Object.assign({}, body, { paced: 1 }, budget ? { budget: budget } : {}));
+        fails = 0;
+        if (r && r.done === false && onStep) onStep(r);
+      } catch (e) {
+        var again = !e.status || [429, 500, 502, 503, 504].indexOf(e.status) !== -1;
+        if (!again || ++fails > 6) throw e;
+        if (e.status !== 429 && e.status !== 503) budget = Math.max(5, (budget || 20) / 2);
+        await new Promise(function (ok) { setTimeout(ok, 1000 * (e.retryAfter || 2 * fails)); });
+        r = { done: false };
+      }
+    } while (r && r.done === false);
+    return r;
+  };
+
   D.api = {
     url: apiUrl,
     get: function (path, query, opts) { return request('GET', path, Object.assign({ query: query }, opts)); },

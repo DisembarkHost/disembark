@@ -72,7 +72,7 @@
         try {
           var rolledBack = false;
           if (m.rollback_point) {
-            var r = await D.api.post('import/rollback', { import_id: m.id });
+            var r = await D.paced(D.api, 'import/rollback', { import_id: m.id });
             if (r.errors && r.errors.length) throw new Error('The rollback reported ' + D.fmt.plural(r.errors.length, 'error') + '. The rollback point is kept: try again from Backups → Restore points.');
             rolledBack = true;
           }

@@ -730,7 +730,9 @@ class Command {
         $this->confirm( $assoc_args, 'Roll ' . home_url() . " back to \"{$point['label']}\"? Anything changed since is lost." );
         @set_time_limit( 0 );
         $this->say( 'Rolling back…' );
-        $r = $this->check( ( new Import( $point['id'] ) )->rollback(), 'rollback' );
+        $import = new Import( $point['id'] );
+        $r      = $this->check( $this->budgeted( function ( $x ) { return ( $x['phase'] ?? '' ) === 'files' ? 'Putting files back: ' . (int) $x['files_done'] . ' of ' . (int) $x['files_total'] : 'Putting the database back'; }, function ( $budget ) use ( $import ) { return $import->rollback( $budget ); } ), 'rollback' );
+        unset( $r['done'] );
         if ( $this->json ) {
             \WP_CLI::line( wp_json_encode( array_merge( [ 'ok' => true, 'id' => $point['id'] ], (array) $r ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
             return;
@@ -784,7 +786,12 @@ class Command {
      * : Count what would change and show samples. Changes nothing.
      *
      * [--tables=<tables>]
-     * : Only these tables (comma-separated).
+     * : Only these tables (comma-separated). By default, this site's own
+     * tables: on a network or WP Freighter install, not the other sites'
+     * (nor another WordPress sharing the database).
+     *
+     * [--all-tables]
+     * : Every table in the database.
      *
      * [--yes]
      * : Don't ask for confirmation.
@@ -806,19 +813,41 @@ class Command {
         if ( $from === '' ) {
             $this->fail( 'Enter the text to search for.' );
         }
+        global $wpdb;
         $tables = array_values( array_filter( array_map( 'trim', explode( ',', (string) ( $assoc_args['tables'] ?? '' ) ) ) ) );
+        $named  = (bool) $tables;
+        if ( ! $tables ) {
+            $tables = ! empty( $assoc_args['all-tables'] ) ? (array) $wpdb->get_col( 'SHOW TABLES' ) : Import::own_tables();
+        }
         $dry    = ! empty( $assoc_args['dry-run'] );
         @set_time_limit( 0 );
         $out = [];
         if ( ! $dry ) {
-            $this->confirm( $assoc_args, "Replace \"{$from}\" with \"{$to}\" across " . ( $tables ? implode( ', ', $tables ) : 'every table' ) . '? A rollback point is saved first.' );
-            $id = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
-            $this->say( 'Saving a rollback point…' );
-            $this->check( ( new Import( $id ) )->snapshot( "Before search & replace: {$from} → " . ( $to === '' ? '(nothing)' : $to ) ), 'snapshot' );
-            $out['rollback_id'] = $id;
-            $out['undo']        = "wp disembark rollback {$id}";
+            $this->confirm( $assoc_args, "Replace \"{$from}\" with \"{$to}\" across " . ( $named ? implode( ', ', $tables ) : ( ! empty( $assoc_args['all-tables'] ) ? 'every table in the database' : 'this site\'s tables' ) ) . '? A rollback point is saved first.' );
+            // The restore point holds the tables that would change, and the
+            // replace runs on those (both a piece at a time, see Pace).
+            $preview = $this->check( ( new Import() )->search_replace( $from, $to, $tables, true ), 'search-replace' );
+            $tables  = array_keys( (array) ( $preview['by_table'] ?? [] ) );
+            $id      = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
+            if ( $tables ) {
+                $this->say( 'Saving a rollback point…' );
+                $this->check( $this->budgeted( function () { return 'Saving the rollback point'; }, function ( $budget ) use ( $id, $from, $to, $tables ) {
+                    return ( new Import( $id ) )->snapshot( "Before search & replace: {$from} → " . ( $to === '' ? '(nothing)' : $to ), $budget, $tables );
+                } ), 'snapshot' );
+                $out['rollback_id'] = $id;
+                $out['undo']        = "wp disembark rollback {$id}";
+            }
         }
-        $r   = $this->check( ( new Import() )->search_replace( $from, $to, $tables, $dry ), 'search-replace', $out['rollback_id'] ?? '' );
+        if ( ! $dry && ! $tables ) {
+            $r = [ 'tables' => 0, 'rows_changed' => 0, 'cells_changed' => 0, 'by_table' => [], 'samples' => [] ];
+        } elseif ( ! $dry ) {
+            $r = $this->check( $this->budgeted( function ( $x ) { return 'Replacing in table ' . ( (int) $x['tables_done'] + 1 ) . ' of ' . (int) $x['tables_total']; }, function ( $budget ) use ( $id, $from, $to, $tables ) {
+                return ( new Import( $id ) )->search_replace( $from, $to, $tables, false, [ 'budget' => $budget ] );
+            } ), 'search-replace', $out['rollback_id'] ?? '' );
+            unset( $r['done'] );
+        } else {
+            $r = $this->check( ( new Import() )->search_replace( $from, $to, $tables, $dry ), 'search-replace' );
+        }
         $out = array_merge( [ 'ok' => true, 'dry_run' => $dry ], $r, $out );
         if ( $this->json ) {
             \WP_CLI::line( wp_json_encode( $out, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
@@ -1209,7 +1238,8 @@ class Command {
     private function run_step( $rid, $work, $on_fail = null ) {
         for ( $n = 0; ; ) {
             $t0     = microtime( true );
-            $result = Steps::run( $this->steps_import, $rid, $work );
+            // Outside a pull (a rollback, a search and replace), nothing is recorded to replay.
+            $result = $this->steps_import === '' ? $work() : Steps::run( $this->steps_import, $rid, $work );
             if ( $result instanceof \WP_REST_Response ) {
                 $result = $result->get_data();
             }
@@ -1494,7 +1524,7 @@ class Command {
         $import      = new Import( $move['id'] );
         $rolled_back = false;
         if ( $move['rollback_point'] ) {
-            $r = $import->rollback();
+            $r = $this->budgeted( function () { return 'Rolling back'; }, function ( $budget ) use ( $import ) { return $import->rollback( $budget ); } );
             if ( is_wp_error( $r ) || ! empty( $r['errors'] ) ) {
                 \WP_CLI::error( 'The rollback reported errors; the rollback point is kept. Try: wp disembark rollback ' . $move['id'] );
             }

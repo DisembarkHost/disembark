@@ -269,7 +269,8 @@
       if (rollbackId) {
         rlog('Rolling back to the snapshot\u2026');
         try {
-          var r = await opts.api.post('import/rollback', { import_id: rollbackId, request_id: D.randomHex(24) });
+          var r = await D.paced(opts.api, 'import/rollback', { import_id: rollbackId }, function (x) { progress('Rolling back\u2026 ' + (x.phase === 'files' ? D.fmt.num(x.files_done || 0) + ' of ' + D.fmt.plural(x.files_total || 0, 'file') : 'the database')); });
+          progress('');
           rolledBack = !(r.errors && r.errors.length);
           (r.errors || []).slice(0, 5).forEach(function (e) { rlog('  ' + e, 'err'); });
           if (r.quiet_mode_lifted) rlog('Quiet mode lifted with it.', 'dim');
@@ -1210,7 +1211,8 @@
       await D.busy(btn, async function () {
         rlog('Rolling back to the snapshot…');
         try {
-          var r = await api.post('import/rollback', { import_id: rollbackId });
+          var r = await D.paced(api, 'import/rollback', { import_id: rollbackId }, function (x) { progress('Rolling back\u2026 ' + (x.phase === 'files' ? D.fmt.num(x.files_done || 0) + ' of ' + D.fmt.plural(x.files_total || 0, 'file') : 'the database')); });
+          progress('');
           if (r.errors && r.errors.length) {
             r.errors.slice(0, 5).forEach(function (e) { rlog('  ' + e, 'err'); });
             throw new Error('Rollback reported ' + D.fmt.plural(r.errors.length, 'error') + '. It can be run again from the CLI.');
@@ -1284,7 +1286,7 @@
       if (!ok) return;
       await D.busy(btn, async function () {
         try {
-          var r = await D.api.post('import/rollback', { import_id: p.id });
+          var r = await D.paced(D.api, 'import/rollback', { import_id: p.id });
           if (r.errors && r.errors.length) throw new Error(D.fmt.plural(r.errors.length, 'error') + ': ' + r.errors.slice(0, 2).join(' · '));
           D.toast('Rolled back to ' + D.fmt.date(p.created_at) + '.');
           if (D.store.state.database.length) D.loadDatabase(true).catch(function () {});
