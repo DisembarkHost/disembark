@@ -13,7 +13,19 @@
   function mount(root) {
     var home = D.config.homeUrl, shown = false;
     var connectLine = function () { return 'disembark connect ' + home + ' ' + S.token; };
-    var agentText = function (tok) { return 'Move the WordPress site ' + home + ' to my new host with Disembark. Instructions: https://disembark.host/disembark.md\nSource connect line: disembark connect ' + home + ' ' + tok; };
+    // A subsite or tenant: the agent brings that one site (--site), never
+    // the whole install. A tenant without its own domain answers only at
+    // the main site's address, with the main site's token.
+    var inst = D.config.install, sub = !!(inst && inst.current !== inst.main);
+    var unmapped = sub && inst.kind === 'freighter' && D.address(home) === D.address(inst.home);
+    var which = sub ? (inst.kind === 'multisite' ? 'site ' + inst.current + ' of the multisite network at ' : 'tenant ' + inst.current + ' of the WP Freighter install at ') + D.host(inst.home) : '';
+    /** The prompt as parts: tok (a string or the masked token) goes where the token does. */
+    var agentParts = function (tok) {
+      var intro = 'Move the WordPress site ' + home + (sub ? ' (' + which + ')' : '') + ' to my new host with Disembark. Instructions: https://disembark.host/disembark.md\n';
+      if (unmapped) return [intro + 'It has no address of its own, so use the main site\u2019s connect line (Tools \u2192 Disembark \u2192 Settings on ' + inst.home + ') with --site=' + inst.current + ', so only this site comes across.'];
+      return [intro + 'Source connect line: disembark connect ' + home + ' ', tok].concat(sub ? ['\nPass --site=' + inst.current + ' to wp disembark pull, so only this site comes across.'] : []);
+    };
+    var agentText = function (tok) { return agentParts(tok).join(''); };
 
     /** The token as shown on screen: the first and last four, or all of it. */
     function tokenEl() {
@@ -31,7 +43,7 @@
     }
 
     var tokline = h('div', { class: 'dsk-tokline' });
-    var agent = secretCmd(function () { return [agentText(''), tokenEl()]; }, function () { return agentText(S.token); }, true);
+    var agent = secretCmd(function () { return agentParts(tokenEl()); }, function () { return agentText(S.token); }, true);
     var connectCmd = secretCmd(function () { return ['disembark connect ' + home + ' ', tokenEl()]; }, connectLine);
     var agentNote = h('span');
     var revealBtn = h('button', { class: 'dsk-btn sm', type: 'button', onclick: function () { shown = !shown; syncToken(); } }, h('span', null, 'Show token'));
