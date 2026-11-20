@@ -32,7 +32,26 @@ class Updater {
      * made under uploads/disembark: the requests DISEMBARK_DEV_MODE covers.
      */
     public static function is_own_request( $url ) {
-        return (bool) preg_match( '#(/disembark/v1(/|\?|$)|[?&]rest_route=(/|%2F)disembark(/|%2F)v1|/uploads/disembark/)#i', (string) $url );
+        // Judge the parsed path and the rest_route parameter only: a URL that
+        // merely carries "/disembark/v1" in its query string isn't one of ours.
+        $parts = wp_parse_url( (string) $url );
+        if ( ! is_array( $parts ) ) {
+            return false;
+        }
+        $path = isset( $parts['path'] ) ? rawurldecode( $parts['path'] ) : '';
+        if ( strpos( $path, '/..' ) !== false ) {
+            return false;
+        }
+        if ( preg_match( '#/disembark/v1(/|$)#i', $path ) || strpos( $path, '/uploads/disembark/' ) !== false ) {
+            return true;
+        }
+        if ( ! empty( $parts['query'] ) ) {
+            parse_str( $parts['query'], $query );
+            if ( isset( $query['rest_route'] ) && is_string( $query['rest_route'] ) && preg_match( '#^/?disembark/v1(/|$)#i', $query['rest_route'] ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static function dev_mode_args( $args, $url ) {
@@ -105,7 +124,10 @@ class Updater {
      * hijacked manifest could point WordPress at.
      */
     public static function trusted_package( $url ) {
-        return is_string( $url ) && (bool) preg_match( '#^https://github\.com/DisembarkHost/[A-Za-z0-9._-]+/#', $url );
+        // Only this plugin's own release assets: no other repository, no dot
+        // segments that a client would normalise into another path.
+        return is_string( $url ) && strpos( $url, '..' ) === false
+            && (bool) preg_match( '#^https://github\.com/DisembarkHost/disembark/releases/download/v?[0-9][0-9A-Za-z.+-]*/disembark\.zip$#', $url );
     }
 
     function info( $response, $action, $args ) {
