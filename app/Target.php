@@ -638,6 +638,16 @@ class Target {
             }
             self::remove_dir( $root . '/' . $rel );
         }
+        // A tenant this move created owns its content/<id> outright (the
+        // list above can hold only its subfolders, when the move also had
+        // to create content/ for the install's first tenant), and that
+        // content/ goes too if nothing else is in it.
+        if ( $this->created && $this->content !== '' && preg_match( '#^content/\d+$#', (string) $this->content ) ) {
+            self::remove_dir( $root . '/' . $this->content );
+            if ( in_array( 'content', (array) $this->created_dirs, true ) ) {
+                @rmdir( $root . '/content' );
+            }
+        }
         if ( $this->kind === 'freighter' ) {
             wp_cache_flush();
             self::refresh_freighter();
