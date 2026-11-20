@@ -466,6 +466,11 @@ class Command {
             $summary['caches_cleared'] = array_keys( (array) $tidy['caches_cleared'] );
             $this->say( '      Cleared page caches so nothing serves the old site: ' . implode( ', ', $summary['caches_cleared'] ) . '.' );
         }
+        if ( ! empty( $tidy['tables_removed'] ) ) {
+            $gone = (array) $tidy['tables_removed'];
+            $summary['tables_removed'] = $gone;
+            $this->say( '      Removed ' . self::plural( count( $gone ), 'table' ) . ' the incoming site doesn\'t have (kept in the restore point): ' . implode( ', ', array_slice( $gone, 0, 8 ) ) . ( count( $gone ) > 8 ? ', …' : '' ) . '.' );
+        }
         foreach ( (array) ( $tidy['plugins_turned_off'] ?? [] ) as $plugin ) {
             $summary['plugins_turned_off'][] = $plugin['plugin'];
             $this->say( "      Turned off {$plugin['name']}: {$plugin['why']}." );

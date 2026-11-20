@@ -1523,6 +1523,22 @@ class Pull {
         return [ 'copied' => count( (array) $plan['copied'] ), 'skipped' => array_values( (array) $plan['skipped'] ), 'soft' => (object) ( $plan['soft'] ?? [] ), 'changed' => (object) ( $plan['changed'] ?? [] ), 'nofp' => (string) ( $plan['nofp'] ?? '' ) ];
     }
 
+    /**
+     * The incoming site's tables by the names they have here (lowercase
+     * keys): every table the source has, copied this time or not (a catch-up
+     * leaves unchanged ones alone). Empty when there's no pull to go by.
+     */
+    public function incoming_tables() {
+        $out = [];
+        foreach ( (array) ( $this->state()['tables'] ?? [] ) as $t ) {
+            $name = (string) ( $t['name'] ?? '' );
+            if ( $name !== '' ) {
+                $out[ strtolower( $this->dest_name( $name ) ) ] = true;
+            }
+        }
+        return $out;
+    }
+
     /** The name a source table gets here (the import swaps the prefix). */
     private function dest_name( $table ) {
         global $wpdb;

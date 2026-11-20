@@ -4004,6 +4004,7 @@ class Import {
             $tidy = [ 'opcache_reset' => self::reset_opcache(), 'caches_cleared' => self::clear_page_caches(), 'plugins_turned_off' => [], 'login_url' => null, 'target' => $target->info() ];
         } else {
             $tidy = $this->tidy( $source );
+            $tidy['tables_removed'] = $this->drop_extra_tables();
         }
         Verify::save_context( $this->import_path, (string) ( is_object( $source ) ? ( $source->home_url ?? '' ) : '' ), (string) ( $tidy['login_url']['url'] ?? '' ), $target );
 
@@ -4045,6 +4046,67 @@ class Import {
             'message'     => 'Import finalized. Rollback data retained.',
             'tidy'        => $tidy,
         ];
+    }
+
+    /**
+     * After a whole-site pull: this site's tables that the incoming site
+     * doesn't have (a plugin only the old site ran, a table the source
+     * dropped since the last catch-up) go, so the copy matches the source.
+     * Only tables the restore point holds (a rollback brings them back), only
+     * under this site's prefix, and never one that belongs to the rest of an
+     * install: a WP Freighter tenant's (stacked_<id>_), a network's subsites
+     * and shared tables, or another WordPress in this database whose prefix
+     * starts with this one's (wp_ and wp_staging_). In doubt, a table stays.
+     * Returns the names dropped.
+     */
+    private function drop_extra_tables() {
+        global $wpdb;
+        $incoming = ( new Pull( $this->import_id ) )->incoming_tables();
+        $meta     = self::rollback_meta( $this->rollback_path );
+        $saved    = $meta === null ? [] : array_flip( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? [] ) );
+        $prefix   = strtolower( (string) $wpdb->prefix );
+        if ( ! $incoming || ! $saved || $prefix === '' ) {
+            return [];
+        }
+        $rows  = (array) $wpdb->get_results( 'SHOW FULL TABLES', ARRAY_N );
+        $names = array_map( function ( $r ) { return strtolower( (string) $r[0] ); }, $rows );
+        $all   = array_flip( $names );
+        $other = [];
+        foreach ( $names as $n ) {
+            if ( substr( $n, -7 ) === 'options' && ( $p = substr( $n, 0, -7 ) ) !== $prefix && strpos( $p, $prefix ) === 0 && isset( $all[ $p . 'posts' ] ) ) {
+                $other[] = $p;
+            }
+        }
+        $shared = [];
+        if ( is_multisite() ) {
+            foreach ( array_merge( (array) $wpdb->global_tables, (array) $wpdb->ms_global_tables ) as $t ) {
+                $shared[ strtolower( $wpdb->base_prefix . $t ) ] = true;
+            }
+        }
+        $dropped = [];
+        foreach ( $rows as $row ) {
+            $table = (string) $row[0];
+            $lower = strtolower( $table );
+            if ( strpos( $lower, $prefix ) !== 0 || isset( $incoming[ $lower ] ) || ! isset( $saved[ $table ] ) ) {
+                continue;
+            }
+            if ( preg_match( '/^stacked_(\d+)_/', $lower, $m ) && 'stacked_' . $m[1] . '_' !== $prefix ) {
+                continue;
+            }
+            if ( is_multisite() && ( isset( $shared[ $lower ] ) || preg_match( '/^' . preg_quote( strtolower( $wpdb->base_prefix ), '/' ) . '\d+_/', $lower ) ) ) {
+                continue;
+            }
+            foreach ( $other as $p ) {
+                if ( strpos( $lower, $p ) === 0 ) {
+                    continue 2;
+                }
+            }
+            $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
+            if ( $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $table ) . '`' ) !== false ) {
+                $dropped[] = $table;
+            }
+        }
+        return $dropped;
     }
 
     /* ------------------------------------------------------------------
