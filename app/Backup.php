@@ -1016,8 +1016,12 @@ class Backup {
             $core_files = [];
             foreach( $files as $file_obj ) {
                 if ( !is_array($file_obj) || empty($file_obj['name']) ) continue;
-                $file_relative_path = $file_obj['name'];
-                
+                $file_relative_path = (string) $file_obj['name'];
+                // Same rule as the ZipArchive branch: nothing outside the site.
+                if ( strpos( '/' . str_replace( '\\', '/', $file_relative_path ) . '/', '/../' ) !== false ) {
+                    continue;
+                }
+
                 $web_path = "{$web_root}/{$file_relative_path}";
                 $core_path = "{$core_root}/{$file_relative_path}";
 
