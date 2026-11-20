@@ -199,6 +199,9 @@ class Command {
         }
         $import  = new Import( $import_id );
         $pull    = new Pull( $import_id );
+        if ( $resuming && ( $kept = Pace::recall( $import_id ) ) ) {
+            $this->pace = array_merge( $this->pace, array_intersect_key( $kept, $this->pace ) );
+        }
         $summary = [ 'ok' => false, 'source' => $source['url'], 'import_id' => $import_id ];
         $started = time();
         if ( ! empty( $assoc_args['notify'] ) ) {
@@ -272,14 +275,13 @@ class Command {
         }
         $this->choose( $pull, $assoc_args, $summary );
         $this->report_checks( Checks::before_move( $import_id ), $summary, ! empty( $assoc_args['skip-checks'] ) );
-        $fetched = 0;
-        do {
-            $r       = $this->check( $this->step( function () use ( $pull, $fetched ) { return $pull->fetch_files( $fetched, 1000 ); } ), 'files' );
-            $fetched = (int) $r['fetched'];
-            $this->say( '      Copied ' . number_format( $fetched ) . ' of ' . number_format( (int) $r['total'] ) . ' files' );
-        } while ( empty( $r['done'] ) );
+        // Batches sized to the source as it goes (see Pace).
+        $this->pull_files_paced( $pull );
         $this->say( '      Copying the database' );
-        $db = $this->check( $this->step( function () use ( $pull ) { return $pull->fetch_database(); } ), 'database' );
+        $db = $this->pull_database_paced( $pull );
+        if ( ! empty( $db['single'] ) ) {
+            $this->say( '      The source runs an older Disembark, so its database came in one request.' );
+        }
         $this->say( '      Database copied (' . (int) ( $db['tables'] ?? 0 ) . ' tables, ' . size_format( (int) ( $db['bytes'] ?? 0 ) ) . ').' );
 
         $this->say( '[3/9] Reading the backup' );
@@ -298,7 +300,7 @@ class Command {
 
         $this->say( '[4/9] Saving a rollback point' );
         $label = ( ! empty( $summary['catch_up'] ) ? 'Before catch-up from ' : 'Before pull from ' ) . wp_parse_url( $source['url'], PHP_URL_HOST );
-        $snap = $this->check( $this->step( function () use ( $import, $label ) { return $import->snapshot( $label ); } ), 'snapshot' );
+        $snap = $this->check( $this->budgeted( function ( $r ) { return 'Saved ' . (int) $r['tables_done'] . ' of ' . (int) $r['tables_total'] . ' tables'; }, function ( $budget ) use ( $import, $label ) { return $import->snapshot( $label, $budget ); } ), 'snapshot' );
         $summary['rollback_id'] = $import_id;
         $summary['undo']        = "wp disembark rollback {$import_id}";
         $this->say( "      Saved. Undo any time with: wp disembark rollback {$import_id}" );
@@ -323,7 +325,7 @@ class Command {
 
         $this->say( '[5/9] Putting files in place' );
         $keep = empty( $assoc_args['bring-host-files'] );
-        $dep  = $this->check( $this->step( function () use ( $import, $keep ) { return $import->deploy_files( [ '*' ], $keep ); } ), 'files', $import_id );
+        $dep  = $this->check( $this->budgeted( function ( $r ) { return 'Placed ' . number_format( (int) $r['placed'] ) . ' of ' . number_format( (int) $r['total'] ) . ' files'; }, function ( $budget ) use ( $import, $keep ) { return $import->deploy_files( [ '*' ], $keep, $budget ); } ), 'files', $import_id );
         if ( ! empty( $dep['removed'] ) ) {
             $summary['files_removed'] = (int) $dep['removed'];
             $this->say( '      Removed ' . self::plural( (int) $dep['removed'], 'file' ) . ' that ' . ( (int) $dep['removed'] === 1 ? 'is' : 'are' ) . ' gone from the source (kept in the rollback point).' );
@@ -349,7 +351,7 @@ class Command {
         if ( ! empty( $info['sql_file'] ) ) {
             $this->say( '[6/9] Importing the database' );
             $sql_file = $info['sql_file'];
-            $sq = $this->check( $this->step( function () use ( $import, $sql_file, $src_prefix, $dest_prefix ) { return $import->import_staged_sql( $sql_file, $src_prefix, $dest_prefix ); } ), 'database', $import_id );
+            $sq = $this->check( $this->budgeted( function ( $r ) { return 'Imported ' . (int) floor( 100 * $r['bytes_done'] / max( 1, $r['bytes_total'] ) ) . '%'; }, function ( $budget ) use ( $import, $sql_file, $src_prefix, $dest_prefix ) { return $import->import_staged_sql( $sql_file, $src_prefix, $dest_prefix, $budget ); } ), 'database', $import_id );
             $summary['statements'] = (int) $sq['statements_executed'];
             foreach ( (array) ( $sq['converted'] ?? [] ) as $conversion => $tables ) {
                 $summary['converted'][ $conversion ] = (int) $tables;
@@ -380,8 +382,8 @@ class Command {
             $paths = Import::path_pairs( $info['source'] ?? null ) + Import::scope_pairs( $info['source'] ?? null );
             if ( ( $src_home !== '' && $src_home !== $dest_home ) || $paths ) {
                 $from = $src_home !== '' ? $src_home : $dest_home;
-                $sr   = $this->check( $this->step( function () use ( $import, $from, $dest_home ) {
-                    return $import->move_search_replace( $from, $dest_home );
+                $sr   = $this->check( $this->budgeted( function ( $r ) { return 'Rewriting table ' . ( (int) $r['tables_done'] + 1 ) . ' of ' . (int) $r['tables_total']; }, function ( $budget ) use ( $import, $from, $dest_home ) {
+                    return $import->move_search_replace( $from, $dest_home, $budget );
                 } ), 'urls', $import_id );
                 foreach ( (array) ( $sr['paths'] ?? [] ) as $old_path => $new_path ) {
                     $summary['paths'][ $old_path ] = $new_path;
@@ -1030,8 +1032,8 @@ class Command {
         if ( $this->steps_import === '' ) {
             $result = $work();
         } else {
-            $rid    = substr( $this->steps_import, 0, 24 ) . sprintf( '%08x', ++$this->steps_seq );
-            $result = Steps::run( $this->steps_import, $rid, $work );
+            // A source that is busy or slow for a moment is asked again.
+            list( $result ) = $this->run_step( substr( $this->steps_import, 0, 24 ) . sprintf( '%08x', ++$this->steps_seq ), $work );
         }
         if ( is_wp_error( $result ) ) {
             return $result;
@@ -1040,6 +1042,221 @@ class Command {
             $result = $result->get_data();
         }
         return json_decode( (string) wp_json_encode( $result ), true );
+    }
+
+    /* ------------------------------------------------------------------
+     * Pace to the host (see Pace): the pull's batches sized to the source
+     * as it goes, failed requests tried again, long steps in pieces.
+     * ---------------------------------------------------------------- */
+
+    /** files, bytes (per file batch), db (bytes per database batch), budget (seconds). */
+    private $pace = [ 'files' => 400, 'bytes' => 50331648, 'db' => 16777216, 'budget' => 0 ];
+    private $pace_busy  = 0;
+    private $pace_pause = 0;
+
+    const PACE_LIMITS = [ 'files' => [ 50, 5000 ], 'bytes' => [ 4194304, 536870912 ], 'db' => [ 1048576, 134217728 ] ];
+
+    /**
+     * Runs one request of a paced step (request id: the step's place in
+     * the move, then the request's within the step), again with the same
+     * id after a failure the source or this host may get past. $on_fail($error, $n)
+     * returns 'retry' or 'split'. Returns [ result, seconds, failures ],
+     * with 'split' as the result when asked to split.
+     */
+    private function paced_step( $s, $k, $work, $on_fail = null ) {
+        return $this->run_step( substr( $this->steps_import, 0, 24 ) . sprintf( '%08x%08x', $s, $k ), $work, $on_fail );
+    }
+
+    /** Runs one recorded step under $rid, again after a failure worth trying again (see paced_step()). */
+    private function run_step( $rid, $work, $on_fail = null ) {
+        for ( $n = 0; ; ) {
+            $t0     = microtime( true );
+            $result = Steps::run( $this->steps_import, $rid, $work );
+            if ( $result instanceof \WP_REST_Response ) {
+                $result = $result->get_data();
+            }
+            if ( ! is_wp_error( $result ) ) {
+                $this->pace_busy  = 0;
+                $this->pace_pause = 0;
+                return [ json_decode( (string) wp_json_encode( $result ), true ), microtime( true ) - $t0, $n ];
+            }
+            $status = (int) ( $result->get_error_data()['status'] ?? 0 );
+            // Only what the source (or the network to it) may get past.
+            if ( ! in_array( $status, [ 429, 502, 503, 504 ], true ) || in_array( $result->get_error_code(), [ 'cancelled', 'unsafe_url', 'invalid_url' ], true ) ) {
+                return [ $result, 0, $n ];
+            }
+            $n++;
+            $this->pace_busy = in_array( $status, [ 429, 503 ], true ) ? $this->pace_busy + 1 : 0;
+            if ( $this->pace_busy >= 5 ) {
+                $secs = [ 30, 60, 120, 240, 300 ][ min( $this->pace_pause++, 4 ) ];
+                $this->say( "      Slow host: it answered busy {$this->pace_busy} times in a row. Waiting {$secs}s and trying again." );
+                sleep( $secs );
+                $this->pace_busy = 0;
+            }
+            if ( $on_fail && $on_fail( $result, $n ) === 'split' ) {
+                return [ 'split', 0, $n ];
+            }
+            $wait = min( 30, pow( 2, $n - 1 ) ) * ( 0.7 + mt_rand( 0, 600 ) / 1000 );
+            $this->say( '      ' . $result->get_error_message() . ' Trying again in ' . max( 1, (int) round( $wait ) ) . 's (attempt ' . ( $n + 1 ) . ').' );
+            usleep( (int) ( $wait * 1000000 ) );
+        }
+    }
+
+    /** A step that works until its budget, asked again until done (see Pace). */
+    private function budgeted( $label, $work ) {
+        $s = ++$this->steps_seq;
+        $k = 0;
+        do {
+            list( $r ) = $this->paced_step( $s, ++$k, function () use ( $work ) { return $work( $this->pace['budget'] > 0 ? $this->pace['budget'] : Pace::default_budget() ); }, function ( $e ) {
+                $status = (int) ( $e->get_error_data()['status'] ?? 0 );
+                if ( $status === 504 && $e->get_error_code() !== 'source_unreachable' ) {
+                    $cur  = $this->pace['budget'] > 0 ? $this->pace['budget'] : Pace::default_budget();
+                    $next = max( 5, floor( $cur / 2 ) );
+                    if ( $next < $cur ) {
+                        $this->pace['budget'] = $next;
+                        $this->say( "      Asking for {$next}s of work per request from now on." );
+                    }
+                }
+                return 'retry';
+            } );
+            if ( is_wp_error( $r ) ) {
+                return $r;
+            }
+            if ( isset( $r['done'] ) && $r['done'] === false && $label ) {
+                $this->say( '      ' . $label( $r ) );
+            }
+        } while ( isset( $r['done'] ) && $r['done'] === false );
+        return $r;
+    }
+
+    /** The source cut the request off or didn't answer in time: too much asked at once (a busy answer is luck). */
+    private static function size_error( $e ) {
+        $data = (array) $e->get_error_data();
+        $st   = (int) ( $data['source_status'] ?? 0 );
+        return $e->get_error_code() === 'source_unreachable' || ( $e->get_error_code() === 'source_error' && ( in_array( $st, [ 500, 502, 504 ], true ) || $st >= 520 ) );
+    }
+
+    private function adapt( $key, $secs, $failures ) {
+        if ( $failures ) {
+            return;
+        }
+        $lim = self::PACE_LIMITS[ $key ];
+        $f   = $secs < 4 ? 1.5 : ( $secs < 8 ? 1.25 : ( $secs > 18 ? 0.5 : ( $secs > 12 ? 0.8 : 1 ) ) );
+        $this->pace[ $key ] = (int) max( $lim[0], min( $lim[1], round( $this->pace[ $key ] * $f ) ) );
+    }
+
+    private function halve( $key ) {
+        $lim = self::PACE_LIMITS[ $key ];
+        $this->pace[ $key ] = (int) max( $lim[0], round( $this->pace[ $key ] / 2 ) );
+    }
+
+    /** The pull's files, in batches sized to the source (see Pull::fetch_files_paced()). */
+    private function pull_files_paced( $pull ) {
+        $s      = ++$this->steps_seq;
+        $k      = 0;
+        $done   = [];
+        $total  = null;
+        $forced = [];
+        $shown  = 0;
+        while ( true ) {
+            $task = null;
+            while ( $forced && ! $task ) {
+                $f = array_shift( $forced );
+                if ( ! Pace::ranges_cover( $done, $f['offset'], $f['offset'] + $f['count'] ) ) {
+                    $task = $f;
+                }
+            }
+            if ( ! $task ) {
+                if ( $total === null ) {
+                    $task = [ 'offset' => 0, 'count' => $this->pace['files'] ];
+                } else {
+                    $gap = Pace::ranges_gap( $done, $total );
+                    if ( ! $gap ) {
+                        break;
+                    }
+                    $task = [ 'offset' => $gap[0], 'count' => min( $gap[1] - $gap[0], $this->pace['files'] ) ];
+                }
+            }
+            if ( ! empty( $task['range'] ) ) {
+                list( $r ) = $this->paced_step( $s, ++$k, function () use ( $pull, $task ) {
+                    return $pull->fetch_file_part( $task['offset'], $this->pace['budget'] > 0 ? $this->pace['budget'] : Pace::default_budget() );
+                } );
+                if ( is_wp_error( $r ) && $r->get_error_code() === 'no_ranges' ) {
+                    $forced = array_merge( [ [ 'offset' => $task['offset'], 'count' => 1, 'whole' => true ] ], $forced );
+                    continue;
+                }
+                if ( ! is_wp_error( $r ) && empty( $r['file_done'] ) ) {
+                    $forced = array_merge( [ $task ], $forced );
+                    $this->say( '      A large file in pieces: ' . size_format( (int) ( $r['got'] ?? 0 ) ) . ' of ' . size_format( (int) ( $r['size'] ?? 0 ) ) );
+                }
+            } else {
+                $bytes = (int) ( $task['bytes'] ?? $this->pace['bytes'] );
+                $cut   = false;
+                list( $r, $secs, $failures ) = $this->paced_step( $s, ++$k, function () use ( $pull, $task, $bytes ) {
+                    return $pull->fetch_files_paced( $task['offset'], $task['count'], $bytes, $this->pace['budget'] > 0 ? $this->pace['budget'] : Pace::default_budget() );
+                }, function ( $e, $n ) use ( $task, &$cut ) {
+                    $cut = $cut || self::size_error( $e );
+                    return $n >= 2 && empty( $task['whole'] ) ? 'split' : 'retry';
+                } );
+                if ( $r === 'split' ) {
+                    if ( $task['count'] > 1 ) {
+                        $half = (int) ceil( $task['count'] / 2 );
+                        $this->say( '      A batch of ' . self::plural( (int) $task['count'], 'file' ) . ' failed twice. Splitting it in two.' );
+                        if ( $cut ) {
+                            $this->halve( 'files' );
+                            $this->halve( 'bytes' );
+                        }
+                        $forced = array_merge( [ [ 'offset' => $task['offset'], 'count' => $half, 'bytes' => (int) ( $bytes / 2 ) ], [ 'offset' => $task['offset'] + $half, 'count' => $task['count'] - $half, 'bytes' => (int) ( $bytes / 2 ) ] ], $forced );
+                    } else {
+                        $this->say( '      File ' . number_format( $task['offset'] + 1 ) . ' failed twice in a batch. Fetching it in pieces.' );
+                        $forced = array_merge( [ [ 'offset' => $task['offset'], 'count' => 1, 'range' => true ] ], $forced );
+                    }
+                    continue;
+                }
+                if ( ! is_wp_error( $r ) ) {
+                    $this->adapt( 'files', $secs, $failures );
+                    $this->adapt( 'bytes', $secs, $failures );
+                }
+            }
+            $r = $this->check( $r, 'files' );
+            $total = (int) $r['total'];
+            foreach ( (array) ( $r['ranges'] ?? [] ) as $range ) {
+                $done = Pace::ranges_add( $done, $range[0], $range[1] );
+            }
+            $have = min( $total, Pace::ranges_count( $done ) );
+            if ( $have !== $shown ) {
+                $shown = $have;
+                $this->say( '      Copied ' . number_format( $have ) . ' of ' . number_format( $total ) . ' files (' . number_format( $this->pace['files'] ) . ' a batch)' );
+            }
+            Pace::remember( $this->steps_import, $this->pace );
+        }
+        return [ 'fetched' => $total, 'total' => $total ];
+    }
+
+    /** The pull's database, a batch per request (see Pull::fetch_database_paced()). */
+    private function pull_database_paced( $pull ) {
+        $s = ++$this->steps_seq;
+        $k = 0;
+        do {
+            $cut = false;
+            list( $r, $secs, $failures ) = $this->paced_step( $s, ++$k, function () use ( $pull ) {
+                return $pull->fetch_database_paced( $this->pace['budget'] > 0 ? $this->pace['budget'] : Pace::default_budget(), $this->pace['db'] );
+            }, function ( $e, $n ) use ( &$cut ) {
+                $cut = $cut || self::size_error( $e );
+                if ( $n >= 2 && $cut ) {
+                    $this->halve( 'db' );
+                    $this->say( '      A database batch failed twice. Smaller ones from now on (' . size_format( $this->pace['db'] ) . ').' );
+                }
+                return 'retry';
+            } );
+            $r = $this->check( $r, 'database' );
+            $this->adapt( 'db', $secs, $failures );
+            Pace::remember( $this->steps_import, $this->pace );
+            if ( isset( $r['done'] ) && $r['done'] === false ) {
+                $this->say( '      Copied ' . (int) $r['tables_done'] . ' of ' . (int) $r['total_tables'] . ' tables (' . size_format( (int) $r['bytes'] ) . ')' );
+            }
+        } while ( isset( $r['done'] ) && $r['done'] === false );
+        return $r;
     }
 
     private static function plural( $n, $word ) {
