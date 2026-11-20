@@ -34,6 +34,25 @@
   }
   function kind() { return S.from === 'this' ? 'push' : S.from === 'other' ? 'pull' : 'restore'; }
   function remote() { return S.connect ? D.host(S.connect.url) : ''; }
+
+  // What the push's destination is: a plain site, or the main site of a
+  // network or WP Freighter install (whose users a push treats
+  // differently). Asked once per connect line, in the background, from its
+  // preflight; until it answers (or if it can't), the warning stays general.
+  var dest = { key: '', kind: '' };
+  function destKind() {
+    if (kind() !== 'push' || !S.connect || !D.remoteApi) return '';
+    var key = S.connect.url + ' ' + S.connect.token;
+    if (dest.key !== key) {
+      dest = { key: key, kind: '' };
+      D.remoteApi(S.connect.url, S.connect.token).then(function (api) {
+        var pre = (api && api.preflight) || {}, prof = pre.profile || {};
+        var k = pre.refused ? '' : (prof.install && prof.install.kind) || (prof.multisite ? 'multisite' : '');
+        if (dest.key === key && k) { dest.kind = k; if (!running) render(); }
+      }).catch(function () { /* the push says why when it starts */ });
+    }
+    return dest.kind;
+  }
   function intoSite() { return others.filter(function (s) { return String(s.id) === String(S.into); })[0]; }
   function intoName() { var s = intoSite(); return s ? (s.name || D.host(s.url)) : ''; }
   function intoLabel() { var s = intoSite(); return s ? intoName() + ' (' + one + ' ' + s.id + ')' : ''; }
@@ -254,7 +273,14 @@
     if (S.to === 'new' && S.into === 'new') warn = h('div', { class: 'dsk-warn1 calm' }, D.icon('check'), h('div', null, h('strong', null, 'Nothing here is replaced.'), 'It arrives as a new ' + one + ' with its own tables, uploads and settings' + (net ? ', and its users join the network’s' : '') + '. Rolling back removes the ' + one + '.'));
     else if (S.to === 'new') warn = h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null, h('strong', null, 'This replaces ' + intoLabel() + '.'), 'Its tables, uploads and settings are overwritten. The main site and the other ' + one + 's aren’t touched.'));
     else if (localToLive) warn = h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null, h('strong', null, 'A live site can’t reach this one.'), localToLive, ' ', h('a', { href: '#backups' }, 'Go to Backups')));
-    else if (k === 'push') warn = h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null, h('strong', null, 'This replaces ' + (r || 'the destination') + '.'), 'Its files and database are overwritten with this site, including its user accounts: afterwards you log in there with this site’s credentials.'));
+    else if (k === 'push') {
+      // A network's or WP Freighter install's main site keeps what isn't
+      // its own: the network its users, the install its tenants.
+      var dk = destKind();
+      if (dk === 'multisite') warn = h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null, h('strong', null, 'This replaces the main site of the network at ' + r + '.'), 'Its tables and files are overwritten with this site’s (the plugins, themes and WordPress its subsites share too). The network keeps its users, super admins and subsite members, so you log in there as before; this site’s users join them (matched by email, never as super admins) and log in with their own passwords.'));
+      else if (dk === 'freighter') warn = h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null, h('strong', null, 'This replaces the main site of the WP Freighter install at ' + r + '.'), 'Its tables and files are overwritten with this site’s (the plugins, themes and WordPress its tenants share too), including the main site’s user accounts: afterwards you log in to the main site with this site’s credentials. Its tenants keep their own tables and users.'));
+      else warn = h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null, h('strong', null, 'This replaces ' + (r || 'the destination') + '.'), 'Its files and database are overwritten with this site, including its user accounts: afterwards you log in there with this site’s credentials.'));
+    }
     else warn = h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null, h('strong', null, isMain ? 'This replaces the main site of the ' + (net ? 'network' : 'install') + '.' : 'This replaces this site.'), 'Its files and database are overwritten with ' + (k === 'pull' ? (r || 'the source') + '’s' : 'the backup’s') + '. ' + (isMain && net ? 'The network keeps its users, super admins and subsite members; the incoming site’s users join them (matched by email, never as super admins).' : 'User accounts come over too, so afterwards you log in with the source site’s credentials.') + (isMain ? ' To keep what’s here, choose “A new ' + one + '” instead.' : '')));
 
     // Good to know.
