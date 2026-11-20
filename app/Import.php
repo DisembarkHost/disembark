@@ -2660,6 +2660,8 @@ class Import {
             }
         }
 
+        $this->keep_install_rows();
+
         $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
         $wpdb->query( 'SET UNIQUE_CHECKS = 0' );
         $wpdb->query( "SET sql_mode='NO_AUTO_VALUE_ON_ZERO'" );
@@ -2724,12 +2726,58 @@ class Import {
         if ( ! empty( $run['preserved_token'] ) ) {
             Token::set( $run['preserved_token'] );
         }
+        $this->restore_install_rows();
 
         return [
             'statements_executed' => $run['statements_executed'],
             'errors'              => $run['errors'],
             'warnings'            => $run['warnings'] ?? [],
         ];
+    }
+
+    /**
+     * The main site of a WP Freighter install keeps the install's registry in
+     * its options table (stacked_sites: the tenants; stacked_configurations:
+     * files mode and domain mapping), and runs WP Freighter. A whole-site
+     * import replaces that table with the incoming site's, which has neither
+     * (one tenant arrives without them), so the install forgot its tenants
+     * and the next refresh of its bootstrap would have cut them off. Noted
+     * once, at the start of the import, in this move's folder.
+     */
+    private function keep_install_rows() {
+        global $wpdb;
+        $file = $this->import_path . '/install-keep.php';
+        if ( is_file( $file ) || $this->target() || Scope::freighter_primary() !== $wpdb->prefix ) {
+            return;
+        }
+        $rows   = (array) $wpdb->get_results( "SELECT option_name, option_value, autoload FROM `{$wpdb->options}` WHERE option_name IN ( 'stacked_sites', 'stacked_configurations' )", ARRAY_A );
+        $active = maybe_unserialize( (string) $wpdb->get_var( "SELECT option_value FROM `{$wpdb->options}` WHERE option_name = 'active_plugins'" ) );
+        $this->prepare_import_dir();
+        self::write_protected( $file, (string) wp_json_encode( [ 'rows' => $rows, 'freighter' => is_array( $active ) && in_array( 'wp-freighter/wp-freighter.php', $active, true ) ] ) );
+    }
+
+    /** Puts the install's rows back after an import replaced the options table without them (see keep_install_rows()). */
+    private function restore_install_rows() {
+        global $wpdb;
+        $keep = json_decode( (string) self::read_protected( $this->import_path . '/install-keep.php' ), true );
+        if ( ! is_array( $keep ) || $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->options ) ) ) !== $wpdb->options ) {
+            return;
+        }
+        foreach ( (array) ( $keep['rows'] ?? [] ) as $row ) {
+            $name = (string) ( $row['option_name'] ?? '' );
+            if ( $name !== '' && ! $wpdb->get_var( $wpdb->prepare( "SELECT option_id FROM `{$wpdb->options}` WHERE option_name = %s", $name ) ) ) {
+                $wpdb->insert( $wpdb->options, [ 'option_name' => $name, 'option_value' => (string) $row['option_value'], 'autoload' => (string) ( $row['autoload'] ?? 'yes' ) ] );
+            }
+        }
+        if ( ! empty( $keep['freighter'] ) ) {
+            $active = maybe_unserialize( (string) $wpdb->get_var( "SELECT option_value FROM `{$wpdb->options}` WHERE option_name = 'active_plugins'" ) );
+            if ( is_array( $active ) && ! in_array( 'wp-freighter/wp-freighter.php', $active, true ) ) {
+                $active[] = 'wp-freighter/wp-freighter.php';
+                $wpdb->update( $wpdb->options, [ 'option_value' => serialize( array_values( $active ) ) ], [ 'option_name' => 'active_plugins' ] );
+            }
+        }
+        wp_cache_delete( 'alloptions', 'options' );
+        wp_cache_delete( 'notoptions', 'options' );
     }
 
     /** Set once a request got in with a token guard rather than the site's token (see preflight()). */

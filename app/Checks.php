@@ -300,7 +300,9 @@ class Checks {
         $older  = [];
         $idle   = [];
         foreach ( $ours as $file => $data ) {
-            if ( $file === $own ) {
+            // Disembark itself, and WP Freighter on an install's main site:
+            // both stay on whatever the source runs (see Import::keep_install_rows()).
+            if ( $file === $own || ( $file === 'wp-freighter/wp-freighter.php' && Scope::freighter_primary() !== '' ) ) {
                 continue;
             }
             if ( isset( $theirs[ $file ] ) ) {
