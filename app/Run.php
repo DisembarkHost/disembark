@@ -439,6 +439,10 @@ class Run {
             'methods'  => 'POST',
             'callback' => [ $this, 'import_finalize' ]
         ]);
+        register_rest_route('disembark/v1', '/backup/session', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'backup_session' ]
+        ]);
         register_rest_route('disembark/v1', '/backup/archive', [
             'methods'  => 'POST',
             'callback' => [ $this, 'backup_archive' ]
@@ -881,8 +885,10 @@ class Run {
         ];
         switch ( $step ) {
             case 'initiate':
+                // Without a backup_token, a new session is minted here and
+                // returned (the dashboard); the CLI still names its own.
                 $backup_manager->initiate_scan_state();
-                return [ 'status' => 'ready' ];
+                return [ 'status' => 'ready', 'backup_token' => $backup_manager->session() ];
             case 'scan':
                 $exclude_files_string = $request['exclude_files'] ?? '';
                 $user_exclude_paths = !empty($exclude_files_string) ? explode( "\n", $exclude_files_string ) : [];
@@ -1180,6 +1186,14 @@ class Run {
         }
         $import = new Import( $import_id );
         return $import->snapshot( (string) ( $params['label'] ?? '' ) );
+    }
+
+    /** A new backup session id for the dashboard (see Storage::new_session()). */
+    function backup_session( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        return [ 'backup_token' => Storage::new_session() ];
     }
 
     /**

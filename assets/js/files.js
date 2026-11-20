@@ -202,10 +202,11 @@
         });
         if (cur.length) chunks.push(cur);
         var archive = node.name.replace(/[^a-z0-9]/gi, '_').toLowerCase() + '-' + Math.floor(Date.now() / 1000) + '.zip';
-        var token = S.backupToken || D.randomHex(12);
+        var token = '';
         var label = h('span', null, 'Zipping…');
         btn.replaceChildren(h('span', { class: 'dsk-spin' }), label); btn.disabled = true;
         try {
+          token = await D.backupSession();
           var url = '';
           for (var i = 0; i < chunks.length; i++) {
             label.textContent = 'Zipping ' + (i + 1) + ' of ' + chunks.length;

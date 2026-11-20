@@ -45,9 +45,18 @@ class Storage {
     }
 
     /**
-     * Backup session ids are folder names under the base folder (12 hex
-     * characters, or "rollback-<hex>" for snapshots). Anything else is
-     * stripped so a caller-supplied id can never climb out of it.
+     * A new backup session id: 128 random bits as 32 hex characters. The id
+     * names a folder of dumps and zips under uploads, so it has to be
+     * unguessable; the server mints it rather than trusting the browser's.
+     */
+    public static function new_session() {
+        return bin2hex( random_bytes( 16 ) );
+    }
+
+    /**
+     * Backup session ids are folder names under the base folder (hex, or
+     * "rollback-<hex>" for snapshots). Anything else is stripped so a
+     * caller-supplied id can never climb out of it.
      */
     public static function sanitize_session( $session ) {
         return preg_replace( '/[^a-z0-9-]/', '', strtolower( (string) $session ) );

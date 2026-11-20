@@ -11,11 +11,10 @@ class Backup {
     private $archiver_type    = 'none'; // Can be 'ZipArchive', 'PclZip', or 'none'
     private $zip_object       = null;
     public function __construct( $token = "" ) {
-        $bytes             = random_bytes( 20 );
         // The token names a folder under uploads/disembark; strip anything
         // that could climb out of it (e.g. "../.." via /cleanup-file).
         $token             = Storage::sanitize_session( $token );
-        $this->token       = empty( $token ) ? substr( bin2hex( $bytes ), 0, -28) : $token;
+        $this->token       = empty( $token ) ? Storage::new_session() : $token;
         $this->backup_path = wp_upload_dir()["basedir"] . "/disembark/{$this->token}";
         $backup_url        = wp_upload_dir()["baseurl"] . "/disembark/{$this->token}";
         // Ensure URL scheme matches the current request to prevent mixed content issues
@@ -53,6 +52,11 @@ class Backup {
      * install names its files from the install's folder (its content folder
      * may be content/<id>).
      */
+    /** This backup's session id (the folder name under uploads/disembark). */
+    public function session() {
+        return $this->token;
+    }
+
     public static function web_root() {
         $scope = Scope::active();
         return $scope ? $scope->root : dirname( WP_CONTENT_DIR );

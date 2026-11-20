@@ -468,6 +468,13 @@
     D.download(url, name);
     setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
   };
+  /** The current scan's session, or a new one minted by the server. */
+  D.backupSession = async function () {
+    if (D.store.state.backupToken) return D.store.state.backupToken;
+    var r = await D.api.post('backup/session', {});
+    if (!r || !r.backup_token) throw new Error('The site did not start a session.');
+    return r.backup_token;
+  };
   D.randomHex = function (len) {
     var bytes = new Uint8Array(Math.ceil(len / 2));
     window.crypto.getRandomValues(bytes);
@@ -606,11 +613,13 @@
    * onProgress receives { phase: 'scanning'|'chunking'|'loading', done, total }.
    */
   D.scanSite = async function (onProgress) {
-    var token = D.randomHex(12);
+    var token = '';
     var site = D.store.state.site;
     var step = function (name, extra) { return D.api.post('regenerate-manifest', Object.assign({ backup_token: token, step: name }, site ? { site: site } : {}, extra || {})); };
     onProgress = onProgress || function () {};
-    await step('initiate');
+    // The server mints the session id (an unguessable folder name).
+    token = (await step('initiate')).backup_token;
+    if (!token) throw new Error('The site did not start a scan session.');
     for (var guard = 0; guard < 100000; guard++) {
       var s = await step('scan', { exclude_files: '' });
       onProgress({ phase: 'scanning', done: s.scanned_dirs || 0, total: s.total_dirs || 0 });

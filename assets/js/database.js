@@ -377,9 +377,10 @@
    */
   async function exportBatch(tables, btn) {
     var queue = D.planDbExport(tables);
-    var token = S.backupToken || D.randomHex(12), label = btn.lastChild, original = label.textContent;
+    var token = '', label = btn.lastChild, original = label.textContent;
     btn.disabled = true;
     try {
+      token = await D.backupSession();
       for (var q = 0; q < queue.length; q++) {
         var job = queue[q];
         label.textContent = queue.length > 1 ? 'Exporting ' + (q + 1) + ' of ' + queue.length + '…' : 'Exporting…';
