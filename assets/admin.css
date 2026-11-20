@@ -860,3 +860,12 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
   .dsk-bw-search { flex: 1 1 180px; }
   .dsk-bk-tools .grow { flex-basis: 100%; }
 }
+
+/* Backups: the scan's step list fits its half-width card (counts go under
+   each step instead of pushing the card wider). */
+.dsk-two > *, .dsk-bk-dl-main, .dsk-bk-steps { min-width: 0; }
+.dsk-bk-steps .dsk-step { display: grid; grid-template-columns: 24px minmax(0, 1fr); column-gap: 12px; row-gap: 3px; align-items: center; }
+.dsk-bk-steps .dsk-step .meta { grid-column: 2; margin-left: 0; padding-left: 0; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
+.dsk-bk-steps .dsk-step .meta:empty { display: none; }
+.dsk-bk-steps .dsk-progress { max-width: 100%; }
+.dsk-bk-cli .dsk-cmd pre { word-break: normal; overflow-wrap: anywhere; }
