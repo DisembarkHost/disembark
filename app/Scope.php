@@ -104,6 +104,11 @@ class Scope {
         return $primary;
     }
 
+    /** A site name as plain text: WordPress keeps blogname HTML-escaped ("Crane &amp; Turtle"). */
+    public static function plain( $name ) {
+        return html_entity_decode( (string) $name, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+    }
+
     public static function freighter_option( $prefix, $name ) {
         global $wpdb;
         $value = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM `{$prefix}options` WHERE option_name = %s", $name ) );
@@ -120,7 +125,7 @@ class Scope {
         if ( is_multisite() ) {
             $sites = [];
             foreach ( get_sites( [ 'number' => 500, 'orderby' => 'id' ] ) as $site ) {
-                $sites[] = [ 'id' => (string) $site->blog_id, 'url' => untrailingslashit( get_home_url( (int) $site->blog_id ) ), 'name' => (string) get_blog_option( (int) $site->blog_id, 'blogname' ) ];
+                $sites[] = [ 'id' => (string) $site->blog_id, 'url' => untrailingslashit( get_home_url( (int) $site->blog_id ) ), 'name' => self::plain( get_blog_option( (int) $site->blog_id, 'blogname' ) ) ];
             }
             return [
                 'kind'    => 'multisite',
@@ -138,7 +143,7 @@ class Scope {
         $config  = (array) self::freighter_option( $primary, 'stacked_configurations' );
         $mapping = ( $config['domain_mapping'] ?? 'off' ) === 'on';
         $main    = untrailingslashit( (string) self::freighter_option( $primary, 'home' ) );
-        $sites   = [ [ 'id' => 'main', 'url' => $main, 'name' => (string) self::freighter_option( $primary, 'blogname' ) ] ];
+        $sites   = [ [ 'id' => 'main', 'url' => $main, 'name' => self::plain( self::freighter_option( $primary, 'blogname' ) ) ] ];
         foreach ( (array) self::freighter_option( $primary, 'stacked_sites' ) as $site ) {
             $id = (int) ( $site['stacked_site_id'] ?? 0 );
             if ( $id < 1 ) {
@@ -241,7 +246,7 @@ class Scope {
         switch_to_blog( $id );
         $this->home     = untrailingslashit( (string) get_option( 'home' ) );
         $this->siteurl  = untrailingslashit( (string) get_option( 'siteurl' ) );
-        $this->name     = (string) get_option( 'blogname' );
+        $this->name     = self::plain( get_option( 'blogname' ) );
         $this->active   = (array) get_option( 'active_plugins', [] );
         $this->theme    = [ (string) get_option( 'stylesheet' ), (string) get_option( 'template' ) ];
         $own            = wp_upload_dir( null, false );
@@ -297,7 +302,7 @@ class Scope {
                 }
             }
         }
-        $this->name   = (string) self::freighter_option( $this->prefix, 'blogname' );
+        $this->name   = self::plain( self::freighter_option( $this->prefix, 'blogname' ) );
         $this->active = (array) self::freighter_option( $this->prefix, 'active_plugins' );
         $this->theme  = [ (string) self::freighter_option( $this->prefix, 'stylesheet' ), (string) self::freighter_option( $this->prefix, 'template' ) ];
 
