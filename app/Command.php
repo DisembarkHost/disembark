@@ -243,7 +243,7 @@ class Command {
             $pre = $import->preflight();
             $this->confirm( $assoc_args, ! empty( $assoc_args['into'] )
                 ? "Bring {$source['url']} into " . ( $assoc_args['into'] === 'new' ? 'a new subsite or tenant' : 'subsite or tenant ' . $assoc_args['into'] . ' (replacing it)' ) . ' here? A rollback point is saved first.'
-                : 'Replace ' . untrailingslashit( (string) $pre['home_url'] ) . " with {$source['url']}? A rollback point is saved first, and afterwards you log in with the source site's credentials." );
+                : 'Replace ' . untrailingslashit( (string) $pre['home_url'] ) . " with {$source['url']}? A rollback point is saved first, and " . ( is_multisite() ? 'the network keeps its users (the incoming site\'s users join them).' : "afterwards you log in with the source site's credentials." ) );
         } else {
             $this->say( "      Resuming {$import_id} (a pull from {$source['url']}): finished steps are replayed." );
         }
@@ -409,6 +409,9 @@ class Command {
                 $this->fail( 'The database import reported ' . count( $sq['errors'] ) . ' errors (first: ' . $sq['errors'][0] . '). ' . ( ! empty( $sq['database_unchanged'] ) ? 'This site\'s database was not changed: the import works on copies of the tables and only swaps them in when every statement succeeds.' : 'Stopped before rewriting URLs.' ), 'database', $import_id );
             }
             $this->say( '      ' . number_format( (int) $sq['statements_executed'] ) . ' statements executed, ' . self::plural( (int) ( $sq['tables_swapped'] ?? 0 ), 'table' ) . ' swapped in.' );
+            if ( ! empty( $sq['tables_other_sites'] ) ) {
+                $this->say( '      Left out ' . self::plural( (int) $sq['tables_other_sites'], 'table' ) . ' that belong to other sites of this install.' );
+            }
             if ( ! empty( $sq['tables_left_out'] ) ) {
                 $this->say( '      Left out ' . self::plural( (int) $sq['tables_left_out'], 'table' ) . ' without the source\'s prefix (' . $src_prefix . '), so nothing else here is touched.' );
             }
@@ -419,7 +422,7 @@ class Command {
             }
             if ( isset( $sq['users'] ) && ( $sq['users']['created'] || $sq['users']['matched'] ) ) {
                 $summary['users'] = $sq['users'];
-                $this->say( '      Users joined the network: ' . self::plural( (int) $sq['users']['created'], 'new account' ) . ', ' . self::plural( (int) $sq['users']['matched'], 'existing account' ) . ' matched by email' . ( $sq['users']['renumbered'] ? ' (' . self::plural( (int) $sq['users']['renumbered'], 'row' ) . ' of posts, comments and orders renumbered to match)' : '' ) . '.' );
+                $this->say( '      ' . ( empty( $sq['target'] ) ? 'The network keeps its users. ' : '' ) . 'Users joined the network: ' . self::plural( (int) $sq['users']['created'], 'new account' ) . ', ' . self::plural( (int) $sq['users']['matched'], 'existing account' ) . ' matched by email' . ( $sq['users']['renumbered'] ? ' (' . self::plural( (int) $sq['users']['renumbered'], 'row' ) . ' of posts, comments and orders renumbered to match)' : '' ) . '.' );
             }
             if ( $src_prefix !== '' && $dest_prefix !== '' && $src_prefix !== $dest_prefix ) {
                 $rp = $this->check( $this->step( function () use ( $import, $src_prefix, $dest_prefix ) { return $import->remap_table_prefix( $src_prefix, $dest_prefix ); } ), 'prefix', $import_id );
@@ -519,14 +522,14 @@ class Command {
         $this->notify = [];
 
         $summary['ok']   = true;
-        $summary['note'] = "User accounts are now the source's: log in with the source site's credentials.";
+        $summary['note'] = is_multisite() && empty( $target ) ? "The network kept its users; the source's users joined them (an account already here keeps its own password)." : "User accounts are now the source's: log in with the source site's credentials.";
         if ( $this->json ) {
             \WP_CLI::line( wp_json_encode( $summary, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
             return;
         }
         \WP_CLI::success( ! empty( $target )
             ? "Pulled {$source['url']} into " . ( $target['kind'] === 'multisite' ? 'subsite ' : 'tenant ' ) . "{$target['id']} at {$dest_home}." . ( $target['kind'] === 'multisite' ? ' Its users log in with their own passwords (an account that was already here keeps its own).' : " Log in to it with the source site's credentials." )
-            : "Pulled {$source['url']} into {$dest_home}. Log in with the source site's credentials." );
+            : "Pulled {$source['url']} into {$dest_home}. " . ( is_multisite() ? "The network kept its users; the source's users joined them (an account already here keeps its own password)." : "Log in with the source site's credentials." ) );
         \WP_CLI::log( "Undo: wp disembark rollback {$import_id}" );
         if ( $quiet ) {
             \WP_CLI::log( 'Quiet mode is on (this is a copy). Lift it with: wp disembark quiet-mode off' );

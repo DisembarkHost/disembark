@@ -157,6 +157,37 @@ class Target {
         return strpos( $path, $root . '/' ) === 0 ? substr( $path, strlen( $root ) + 1 ) : $path;
     }
 
+    /**
+     * The network's main site, as the site whose users a whole-site move
+     * merges into the network's (see Import::import_staged_sql()): replaced
+     * in place, never created or undone.
+     */
+    public static function network_main() {
+        global $wpdb;
+        $t         = new self();
+        $t->kind   = 'multisite';
+        $t->into   = 'main';
+        $t->id     = (string) get_main_site_id();
+        $t->prefix = $wpdb->base_prefix;
+        $t->home   = untrailingslashit( get_home_url( get_main_site_id() ) );
+        return $t;
+    }
+
+    /**
+     * SQL matching the usermeta keys that hold a user's role and settings
+     * for this site: everything under a subsite's prefix (wp_5_), or the
+     * main site's own keys under the network's base prefix, which every
+     * subsite's keys share.
+     */
+    private function own_meta_where() {
+        global $wpdb;
+        if ( $this->into === 'main' ) {
+            $keys = array_map( function ( $k ) { return $this->prefix . $k; }, [ 'capabilities', 'user_level', 'user-settings', 'user-settings-time', 'persisted_preferences' ] );
+            return $wpdb->prepare( 'meta_key IN (' . implode( ',', array_fill( 0, count( $keys ), '%s' ) ) . ') OR meta_key LIKE %s', array_merge( $keys, [ $wpdb->esc_like( $this->prefix . 'dashboard_' ) . '%' ] ) );
+        }
+        return $wpdb->prepare( 'meta_key LIKE %s', $wpdb->esc_like( $this->prefix ) . '%' );
+    }
+
     /* ------------------------------------------------------------------
      * Creating a new site (after the rollback point)
      * ---------------------------------------------------------------- */
@@ -413,25 +444,26 @@ class Target {
 
     /**
      * Merges the users a network subsite arrived with ({prefix}users and
-     * {prefix}usermeta, imported beside its other tables) into the network's
-     * users, renumbers the site's content to match, and drops the copies.
+     * {prefix}usermeta, imported beside its other tables, or the tables
+     * $incoming names) into the network's users, renumbers the site's
+     * content to match, and drops the copies.
      */
-    public function merge_users( $old_prefix ) {
+    public function merge_users( $old_prefix, $incoming = null ) {
         global $wpdb;
         $report = [ 'created' => 0, 'matched' => 0, 'renumbered' => 0 ];
         if ( $this->kind !== 'multisite' ) {
             return $report;
         }
-        $in_users = $this->prefix . 'users';
-        $in_meta  = $this->prefix . 'usermeta';
+        $in_users = $incoming ? (string) $incoming[0] : $this->prefix . 'users';
+        $in_meta  = $incoming ? (string) $incoming[1] : $this->prefix . 'usermeta';
         $users    = $wpdb->base_prefix . 'users';
         $meta     = $wpdb->base_prefix . 'usermeta';
         if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $in_users ) ) ) !== $in_users ) {
             return $report;
         }
-        // Replacing a subsite: its old roles go, the incoming ones replace them.
+        // Replacing a site: its old roles go, the incoming ones replace them.
         if ( $this->into !== 'new' ) {
-            $wpdb->query( $wpdb->prepare( "DELETE FROM `{$meta}` WHERE meta_key LIKE %s", $wpdb->esc_like( $this->prefix ) . '%' ) );
+            $wpdb->query( "DELETE FROM `{$meta}` WHERE " . $this->own_meta_where() );
         }
         $map     = [];
         $created = [];

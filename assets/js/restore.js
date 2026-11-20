@@ -1094,7 +1094,9 @@
           if (sq.tables_swapped) rlog('Swapped in ' + D.fmt.plural(sq.tables_swapped, 'imported table') + '.', 'dim');
           if (sq.tables_left_out) rlog('Left out ' + D.fmt.plural(sq.tables_left_out, 'table') + ' without the source\u2019s prefix, so nothing else here is touched.', 'dim');
           if (superBrought.length) rlog('Brought ' + D.fmt.plural(superBrought.length, 'super admin') + ' as administrators: ' + superBrought.join(', ') + '.', 'ok');
-          if (sq.users && (sq.users.created || sq.users.matched)) rlog('Users joined the network: ' + D.fmt.plural(sq.users.created, 'new account') + ', ' + D.fmt.plural(sq.users.matched, 'existing account') + ' matched by email' + (sq.users.renumbered ? ' (' + D.fmt.plural(sq.users.renumbered, 'row') + ' of posts, comments and orders renumbered)' : '') + '.');
+          // Into the network's main site: the network kept its users, and the incoming ones joined them.
+          if (sq.users && !target) ctx.keptUsers = true;
+          if (sq.users && (sq.users.created || sq.users.matched)) rlog((target ? '' : 'The network keeps its users. ') + 'Users joined the network: ' + D.fmt.plural(sq.users.created, 'new account') + ', ' + D.fmt.plural(sq.users.matched, 'existing account') + ' matched by email' + (sq.users.renumbered ? ' (' + D.fmt.plural(sq.users.renumbered, 'row') + ' of posts, comments and orders renumbered)' : '') + '.');
           if (srcPrefix && destPrefix && srcPrefix !== destPrefix) {
             var rp = await api.post('import/remap-prefix', t({ old_prefix: srcPrefix, new_prefix: destPrefix }));
             rlog('Table prefix remapped ' + srcPrefix + ' → ' + destPrefix + ' (' + (rp.keys_changed || 0) + ' keys).');
@@ -1306,6 +1308,15 @@
         h('div', { class: 'row' },
           own && D.safeHref(tg.home) ? h('a', { class: 'dsk-btn primary', href: D.safeHref(tg.home), target: '_blank', rel: 'noopener' }, 'Open ' + D.host(tg.home)) : null,
           h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
+        ctx.undoDetails());
+      return;
+    }
+    if (ctx.keptUsers) {
+      D.mount(box,
+        h('h3', null, D.icon('checkCircle'), 'The network kept its users'),
+        h('p', null, D.host(D.config.homeUrl) + ' now holds the copied site, and you’re still logged in. The network’s users, super admins and every subsite’s members are as they were.'),
+        h('p', { style: { marginTop: '8px' } }, 'The incoming site’s users joined the network: they log in with their own passwords, and an account that was already here keeps its own.'),
+        h('div', { class: 'row' }, h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
         ctx.undoDetails());
       return;
     }

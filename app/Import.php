@@ -977,6 +977,23 @@ class Import {
             }
             $new_prefix = $target->prefix;
         }
+        // The main site of a network or WP Freighter install: its own tables
+        // only. The incoming site lands under this site's prefix, and a table
+        // that belongs to another site of the install (a subsite's wp_5_*, the
+        // network's blogs and sitemeta, a tenant's stacked_8_*) is left out.
+        // On a network the incoming users are imported beside the network's
+        // and merged into them afterwards (see Target::merge_users()), so
+        // the network keeps its users, its super admins and every subsite's
+        // members.
+        global $wpdb;
+        $shared_main = ! $target && Scope::install();
+        $in_users    = [];
+        if ( $shared_main ) {
+            $new_prefix = $wpdb->prefix;
+            if ( is_multisite() ) {
+                $in_users = [ $new_prefix . 'users' => $wpdb->base_prefix . self::INCOMING_USERS . 'users', $new_prefix . 'usermeta' => $wpdb->base_prefix . self::INCOMING_USERS . 'usermeta' ];
+            }
+        }
 
         // Where an earlier call of a paced import stopped (see Pace).
         $paced        = $budget !== null;
@@ -1061,7 +1078,7 @@ class Import {
             }
             return true;
         };
-        $read     = self::each_sql_statement_in_file( $path, function ( $statement, $end ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, &$imported, &$stop_at, &$pending, $exec, $flush, $max, $old_prefix, $new_prefix, $skip_rows, $target, $paced, $deadline, $replay_to, $journal ) {
+        $read     = self::each_sql_statement_in_file( $path, function ( $statement, $end ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, &$imported, &$stop_at, &$pending, $exec, $flush, $max, $old_prefix, $new_prefix, $skip_rows, $target, $paced, $deadline, $replay_to, $journal, $shared_main, $in_users ) {
             $dry = $end <= $replay_to;
             if ( ++$count % 500 === 0 && ! $dry && $this->cancelled() ) {
                 $run['errors'][] = 'Cancelled.';
@@ -1076,6 +1093,10 @@ class Import {
                 }
                 if ( $old_prefix !== '' && $new_prefix !== '' && strpos( $table, $old_prefix ) === 0 ) {
                     $table = $new_prefix . substr( $table, strlen( $old_prefix ) );
+                }
+                $table = $in_users[ $table ] ?? $table;
+                if ( $shared_main && self::other_sites_table( $table ) ) {
+                    return true;
                 }
                 if ( ! isset( $skip_rows[ strtolower( $m[1] ) ] ) ) {
                     $expected[ $table ] = (int) $m[2];
@@ -1099,6 +1120,21 @@ class Import {
                 }
             }
             $transformed_statements = self::transform_statements( [ $statement ], $old_prefix, $new_prefix );
+            if ( $shared_main ) {
+                $kept = [];
+                foreach ( $transformed_statements as $t ) {
+                    $t    = self::rename_statement_table( $t, $in_users );
+                    $name = self::statement_table( $t );
+                    if ( $name !== null && self::other_sites_table( $name ) ) {
+                        if ( preg_match( '/^(?:\/\*!\d+\s+)?CREATE\s/i', $t ) ) {
+                            $foreign++;
+                        }
+                        continue;
+                    }
+                    $kept[] = $t;
+                }
+                $transformed_statements = $kept;
+            }
             foreach ( $transformed_statements as $t ) {
                 if ( preg_match( '/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`((?:[^`]|``)+)`/i', $t, $tm ) ) {
                     $imported[ str_replace( '``', '`', $tm[1] ) ] = true;
@@ -1228,6 +1264,14 @@ class Import {
             }
             if ( empty( $result['errors'] ) ) {
                 $result['users'] = $target->merge_users( $old_prefix );
+            }
+        } elseif ( $shared_main ) {
+            $result['tables_other_sites'] = $foreign;
+            if ( $foreign ) {
+                $result['warnings'][] = "Left out {$foreign} tables that belong to other sites of this install.";
+            }
+            if ( $in_users && empty( $result['errors'] ) ) {
+                $result['users'] = Target::network_main()->merge_users( $old_prefix, array_values( $in_users ) );
             }
         }
         if ( empty( $result['errors'] ) && $rows !== null ) {
@@ -2403,6 +2447,49 @@ class Import {
      * Prefix-scoped values inside the data are handled after import by
      * remap_table_prefix(), which re-serializes safely.
      */
+    /** The incoming users of a whole-site move into a network's main site wait under {base}{this}users (see import_staged_sql()). */
+    const INCOMING_USERS = 'dskin_';
+
+    /** The table a CREATE, INSERT, ALTER, DROP, TRUNCATE or LOCK statement names, or null. */
+    private static function statement_table( $statement ) {
+        if ( preg_match( '/^(?:\/\*!\d+\s+)?(?:CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT(?:\s+(?:IGNORE|DELAYED|LOW_PRIORITY|HIGH_PRIORITY))*\s+INTO|REPLACE(?:\s+(?:DELAYED|LOW_PRIORITY))*\s+INTO|ALTER\s+TABLE|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|TRUNCATE(?:\s+TABLE)?|LOCK\s+TABLES)\s+`((?:[^`]|``)+)`/i', ltrim( (string) $statement ), $m ) ) {
+            return str_replace( '``', '`', $m[1] );
+        }
+        return null;
+    }
+
+    /** $statement with the table it names renamed per $map (old name => new name). */
+    private static function rename_statement_table( $statement, $map ) {
+        if ( ! $map ) {
+            return $statement;
+        }
+        return preg_replace_callback( '/^(\s*(?:\/\*!\d+\s+)?(?:CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT(?:\s+(?:IGNORE|DELAYED|LOW_PRIORITY|HIGH_PRIORITY))*\s+INTO|REPLACE(?:\s+(?:DELAYED|LOW_PRIORITY))*\s+INTO|ALTER\s+TABLE|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|TRUNCATE(?:\s+TABLE)?|LOCK\s+TABLES)\s+`)((?:[^`]|``)+)`/i', function ( $m ) use ( $map ) {
+            $name = str_replace( '``', '`', $m[2] );
+            return $m[1] . str_replace( '`', '``', $map[ $name ] ?? $name ) . '`';
+        }, (string) $statement, 1 );
+    }
+
+    /**
+     * Whether $table belongs to another site of the install this site is
+     * the main site of: a subsite's (wp_5_*), the network's own (blogs,
+     * site, sitemeta, signups, users and the like), or a WP Freighter
+     * tenant's (stacked_8_*). False on a plain site.
+     */
+    public static function other_sites_table( $table ) {
+        global $wpdb;
+        $lower = strtolower( (string) $table );
+        if ( is_multisite() ) {
+            $base = strtolower( $wpdb->base_prefix );
+            if ( strpos( $lower, $base ) !== 0 ) {
+                return false;
+            }
+            $rest = substr( $lower, strlen( $base ) );
+            return (bool) preg_match( '/^\d+_/', $rest ) || in_array( $rest, array_merge( (array) $wpdb->global_tables, (array) $wpdb->ms_global_tables ), true );
+        }
+        $primary = Scope::freighter_primary();
+        return $primary !== '' && preg_match( '/^stacked_(\d+)_/', $lower, $m ) && 'stacked_' . $m[1] . '_' !== strtolower( $wpdb->prefix );
+    }
+
     private static function transform_statements( $statements, $old_prefix = '', $new_prefix = '' ) {
         $remap = ( $old_prefix !== '' && $new_prefix !== '' && $old_prefix !== $new_prefix );
         $out   = [];
@@ -3826,7 +3913,14 @@ class Import {
         // alone — their plugins regenerate them.
         $allowed_keys = [ 'capabilities', 'user_level', 'user-settings', 'user-settings-time', 'persisted_preferences' ];
         $usermeta     = $new_prefix . 'usermeta';
-        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $usermeta ) ) ) === $usermeta ) {
+        // A network's usermeta holds every site's keys, and the import
+        // already merged the incoming users' ones under this site's prefix
+        // (see Target::merge_users()): a key there that starts with the
+        // source's prefix (wp_5_ from another network) is another site's.
+        if ( is_multisite() ) {
+            $usermeta = '';
+        }
+        if ( $usermeta !== '' && $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $usermeta ) ) ) === $usermeta ) {
             $like = $wpdb->esc_like( $old_prefix ) . '%';
             $rows = $wpdb->get_results(
                 $wpdb->prepare( "SELECT umeta_id, meta_key FROM `{$usermeta}` WHERE meta_key LIKE %s", $like )

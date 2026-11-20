@@ -116,6 +116,16 @@
             ctx.undoDetails());
           return;
         }
+        if (ctx.keptUsers) {
+          D.mount(outcome,
+            h('h3', null, D.icon('checkCircle'), D.host(target) + ' kept its users'),
+            h('p', null, D.host(target) + ' is the main site of a network, so its users stay as they were. This site’s users joined them: they log in with their own passwords, and an account that was already there keeps its own.'),
+            h('div', { class: 'row' },
+              href ? h('a', { class: 'dsk-btn primary', href: href, target: '_blank', rel: 'noopener' }, 'Open ' + D.host(target)) : null,
+              h('button', { class: 'dsk-btn', type: 'button', onclick: function (ev) { ctx.rollback(ev.currentTarget); } }, D.icon('restore'), 'Undo push')),
+            ctx.undoDetails());
+          return;
+        }
         D.mount(outcome,
           h('h3', null, D.icon('key'), 'Log in there with this site’s details'),
           h('p', null, D.host(target) + ' now holds a copy of this site, user accounts included, so log in there with your credentials from ', h('strong', null, D.host(D.config.homeUrl)), '.'),
