@@ -16,6 +16,7 @@
  * License URI:       https://opensource.org/licenses/MIT
  * Text Domain:       disembark
  * Domain Path:       /languages
+ * Update URI:        https://github.com/DisembarkHost/disembark
  */
 
 // If this file is called directly, abort.

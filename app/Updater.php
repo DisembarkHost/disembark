@@ -99,13 +99,22 @@ class Updater {
         return $local_manifest;
     }
 
+    /**
+     * Only release zips from the DisembarkHost organisation on GitHub are
+     * installed. The manifest isn't signed, so this caps what a tampered or
+     * hijacked manifest could point WordPress at.
+     */
+    public static function trusted_package( $url ) {
+        return is_string( $url ) && (bool) preg_match( '#^https://github\.com/DisembarkHost/[A-Za-z0-9._-]+/#', $url );
+    }
+
     function info( $response, $action, $args ) {
         if ( 'plugin_information' !== $action || empty( $args->slug ) || $this->plugin_slug !== $args->slug ) {
             return $response;
         }
 
         $remote = $this->request();
-        if ( ! $remote ) { return $response; }
+        if ( ! $remote || ! self::trusted_package( $remote->download_url ?? '' ) ) { return $response; }
 
         $response = new \stdClass();
         $response->name           = $remote->name;
@@ -136,7 +145,7 @@ class Updater {
         if ( empty($transient->checked ) ) { return $transient; }
 
         $remote = $this->request();
-        if ( $remote && isset($remote->version) && version_compare( $this->version, $remote->version, '<' ) ) {
+        if ( $remote && isset($remote->version) && self::trusted_package( $remote->download_url ?? '' ) && version_compare( $this->version, $remote->version, '<' ) ) {
             $response = new \stdClass();
             $response->slug = $this->plugin_slug;
             $response->plugin = "{$this->plugin_slug}/{$this->plugin_slug}.php";
