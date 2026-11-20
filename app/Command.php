@@ -226,9 +226,10 @@ class Command {
         } else {
             $this->say( "      Resuming {$import_id} (a pull from {$source['url']}): finished steps are replayed." );
         }
-        // From here every step is recorded: a pull that stops can be resumed.
+        // From here every step is recorded. A pull that stops can be resumed
+        // once it has connected (that's when it's listed as unfinished).
         $this->steps_import = $import_id;
-        $this->resume_hint  = $import_id;
+        $this->resume_hint  = $resuming ? $import_id : '';
         $pre         = $this->check( $this->step( function () use ( $import ) { return $import->preflight(); } ), 'preflight' );
         $dest_prefix = (string) ( $pre['db_prefix'] ?? '' );
         $dest_home   = untrailingslashit( (string) ( $pre['home_url'] ?? home_url() ) );
@@ -253,6 +254,7 @@ class Command {
         $c = $this->check( $this->step( function () use ( $pull, $source, $move_args ) {
             return $pull->connect( $source['url'], $source['token'], [ 'client' => 'cli', 'kind' => 'pull', 'args' => $move_args ], ! empty( $move_args['catch-up'] ), isset( $move_args['site'] ) ? (string) $move_args['site'] : null, ! empty( $move_args['shared-tables'] ) );
         } ), 'connect' );
+        $this->resume_hint = $import_id;
         $src_home = untrailingslashit( (string) ( $c['source_home'] ?? '' ) );
         $this->say( '      Connected to ' . ( $src_home ?: $source['url'] ) . ' (' . (int) ( $c['table_count'] ?? 0 ) . ' tables).' );
         $this->report_scope( $c, $summary, ! empty( $move_args['shared-tables'] ) );
