@@ -1839,7 +1839,9 @@ class Import {
 
     /** Where staged files sit: staging, or its public/ folder when a whole-snapshot zip nests the site there. */
     private function staging_root() {
-        if ( is_dir( $this->staging_path . '/public/wp-includes' ) || is_dir( $this->staging_path . '/public/wp-content' ) ) {
+        // A pull stages under public/ too, with its source record, even when
+        // a catch-up brings no files (then there's no wp-content to see).
+        if ( is_dir( $this->staging_path . '/public/wp-includes' ) || is_dir( $this->staging_path . '/public/wp-content' ) || is_file( $this->staging_path . '/public/disembark-source.json' ) ) {
             return $this->staging_path . '/public';
         }
         return $this->staging_path;
