@@ -808,7 +808,7 @@ class Command {
             $summary['site'] = [ 'id' => $scope['site'], 'kind' => $scope['kind'], 'home' => $scope['home'], 'prefix' => $scope['prefix'] ];
             $this->say( '      Bringing one site: ' . $scope['label'] . '. It arrives as a standalone site.' );
             if ( isset( $scope['users'] ) && $scope['users'] !== null ) {
-                $this->say( '      ' . self::plural( (int) $scope['users'], 'user' ) . ( (int) $scope['users'] === 1 ? ' comes' : ' come' ) . ' across: its members, the authors of its posts, and the network\'s super admins (as administrators).' );
+                $this->say( '      ' . self::plural( (int) $scope['users'], 'user' ) . ( (int) $scope['users'] === 1 ? ' comes' : ' come' ) . ' across: its members, the authors of its posts, and the network\'s super admins (as administrators; --no-super-admins leaves out the ones with no role there).' );
             }
             $left = (array) ( $scope['left_out'] ?? [] );
             if ( ! empty( $left['plugins'] ) || ! empty( $left['themes'] ) ) {

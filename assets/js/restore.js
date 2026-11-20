@@ -839,7 +839,7 @@
       if (c.scope && c.source_home && kind === 'pull') { srcLabel = D.host(c.source_home); setTitle(opts.title || 'Restoring', srcLabel); }
       if (c.scope) {
         rlog('Bringing one site: ' + c.scope.label + '. It arrives as a standalone site.', 'ok');
-        if (c.scope.users !== null && c.scope.users !== undefined) rlog(D.fmt.plural(c.scope.users, 'user') + (c.scope.users === 1 ? ' comes' : ' come') + ' across: its members, the authors of its posts, and the network\u2019s super admins (as administrators).', 'dim');
+        if (c.scope.users !== null && c.scope.users !== undefined) rlog(D.fmt.plural(c.scope.users, 'user') + (c.scope.users === 1 ? ' comes' : ' come') + ' across: its members, the authors of its posts, and the network\u2019s super admins (as administrators, unless you leave out the ones with no role there).', 'dim');
         var lo = c.scope.left_out || {};
         if ((lo.plugins || []).length || (lo.themes || []).length) rlog('Leaving out ' + D.fmt.plural((lo.plugins || []).length, 'plugin') + ' and ' + D.fmt.plural((lo.themes || []).length, 'theme') + ' that this site doesn\u2019t use.', 'dim');
         if ((c.scope.shared_tables || []).length) rlog(D.fmt.plural(c.scope.shared_tables.length, 'network-wide table') + (c.scope.shared_tables.length === 1 ? ' comes' : ' come') + ' across empty, since ' + (c.scope.shared_tables.length === 1 ? 'it holds' : 'they hold') + ' every site\u2019s data: ' + c.scope.shared_tables.slice(0, 6).join(', ') + (c.scope.shared_tables.length > 6 ? ', \u2026' : '') + '.', 'dim');
