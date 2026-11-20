@@ -582,7 +582,7 @@ class Import {
      * root, such as a sync mirror's database.sql or a db_export.sql.
      */
     private static function never_deploy( $rel ) {
-        $rel  = ltrim( str_replace( '\\', '/', (string) $rel ), '/' );
+        $rel  = self::normalize_rel( $rel );
         $base = basename( $rel );
         if ( $rel === 'disembark-source.json' || $rel === 'restore.zip' ) {
             return true;
@@ -613,11 +613,25 @@ class Import {
         // backup carries the source's copy (often another version), and every
         // step after the file deploy (database import, URL rewrite, finalize)
         // would otherwise run the source's code. The destination keeps its own.
-        $own = self::own_plugin_dir();
-        if ( $own !== '' && ( $rel === rtrim( $own, '/' ) || strpos( $rel, $own ) === 0 ) ) {
+        // Compared case-insensitively: on a case-insensitive disk
+        // wp-content/Plugins/Disembark/ is this same folder.
+        $own = strtolower( self::own_plugin_dir() );
+        $low = strtolower( $rel );
+        if ( $own !== '' && ( $low === rtrim( $own, '/' ) || strpos( $low, $own ) === 0 ) ) {
             return true;
         }
         return false;
+    }
+
+    /**
+     * A relative path the way the disk resolves it: forward slashes, no
+     * repeated slashes, no "." segments. "wp-content//plugins/x" and
+     * "wp-content/./plugins/x" are wp-content/plugins/x on disk, so every
+     * check that compares prefixes compares this.
+     */
+    private static function normalize_rel( $rel ) {
+        $parts = array_filter( explode( '/', str_replace( '\\', '/', (string) $rel ) ), function ( $p ) { return $p !== '' && $p !== '.'; } );
+        return implode( '/', $parts );
     }
 
     /**
@@ -1497,6 +1511,7 @@ class Import {
                 $errors[] = "Unsafe path skipped: {$relative_path}";
                 continue;
             }
+            $relative_path = self::normalize_rel( $relative_path );
 
             $source = self::staged_file( $staging_root, $relative_path );
             $dest   = $web_root . '/' . $relative_path;
@@ -1530,8 +1545,8 @@ class Import {
                 continue;
             }
 
-            // Skip wp-config.php
-            if ( basename( $relative_path ) === 'wp-config.php' ) {
+            // Skip wp-config.php (in any case: one disk is case-insensitive)
+            if ( strtolower( basename( $relative_path ) ) === 'wp-config.php' ) {
                 continue;
             }
             // Never put a database dump (or Disembark's own working files) in
@@ -1582,7 +1597,11 @@ class Import {
         if ( is_file( $delete ) && ! $this->cancelled() && ! $target ) {
             foreach ( (array) json_decode( (string) file_get_contents( $delete ), true ) as $relative_path ) {
                 $relative_path = (string) $relative_path;
-                if ( ! self::is_safe_relative_path( $relative_path ) || basename( $relative_path ) === 'wp-config.php' || self::never_deploy( $relative_path ) ) {
+                if ( ! self::is_safe_relative_path( $relative_path ) ) {
+                    continue;
+                }
+                $relative_path = self::normalize_rel( $relative_path );
+                if ( strtolower( basename( $relative_path ) ) === 'wp-config.php' || self::never_deploy( $relative_path ) ) {
                     continue;
                 }
                 if ( $keep_host_files && self::host_file( $relative_path, $web_root ) !== '' ) {
@@ -2264,13 +2283,14 @@ class Import {
 
         foreach ( $tables as $table ) {
             // Only touch real tables on this database.
-            $exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
-            if ( ! $exists ) {
+            $table  = (string) $table;
+            $exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) );
+            if ( $exists !== $table ) {
                 continue;
             }
             $tables_seen++;
 
-            $columns     = $wpdb->get_results( "SHOW COLUMNS FROM `{$table}`" );
+            $columns     = $wpdb->get_results( 'SHOW COLUMNS FROM `' . str_replace( '`', '``', $table ) . '`' );
             $column_names = [];
             $primary_keys = [];
             foreach ( $columns as $col ) {
@@ -2290,7 +2310,7 @@ class Import {
             $limit  = 1000;
             while ( true ) {
                 $rows = $wpdb->get_results(
-                    "SELECT * FROM `{$table}` ORDER BY {$order} LIMIT {$limit} OFFSET {$offset}",
+                    'SELECT * FROM `' . str_replace( '`', '``', $table ) . "` ORDER BY {$order} LIMIT {$limit} OFFSET {$offset}",
                     ARRAY_A
                 );
                 if ( empty( $rows ) ) {
@@ -3010,7 +3030,7 @@ class Import {
         // alone — their plugins regenerate them.
         $allowed_keys = [ 'capabilities', 'user_level', 'user-settings', 'user-settings-time', 'persisted_preferences' ];
         $usermeta     = $new_prefix . 'usermeta';
-        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $usermeta ) ) === $usermeta ) {
+        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $usermeta ) ) ) === $usermeta ) {
             $like = $wpdb->esc_like( $old_prefix ) . '%';
             $rows = $wpdb->get_results(
                 $wpdb->prepare( "SELECT umeta_id, meta_key FROM `{$usermeta}` WHERE meta_key LIKE %s", $like )
@@ -3028,7 +3048,7 @@ class Import {
 
         // options: the roles are stored under "{prefix}user_roles".
         $options = $new_prefix . 'options';
-        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $options ) ) === $options ) {
+        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $options ) ) ) === $options ) {
             $res = $wpdb->update(
                 $options,
                 [ 'option_name' => $new_prefix . 'user_roles' ],
@@ -3397,7 +3417,7 @@ class Import {
     private static function turn_off_wordfence_captcha() {
         global $wpdb;
         $table = $wpdb->base_prefix . 'wfls_settings';
-        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) !== $table ) {
+        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) !== $table ) {
             return false;
         }
         $value = $wpdb->get_var( $wpdb->prepare( "SELECT `value` FROM `{$table}` WHERE `name` = %s", 'enable-auth-captcha' ) );
@@ -3866,19 +3886,26 @@ class Import {
     }
 
     /**
-     * Recursively delete a directory.
+     * Recursively deletes a directory. A symlink inside it is removed as a
+     * link, never followed: its target (anywhere on the disk) stays.
      */
     private static function delete_directory_recursive( $dir ) {
+        if ( is_link( $dir ) ) {
+            @unlink( $dir );
+            return;
+        }
         if ( ! is_dir( $dir ) ) {
             return;
         }
-        $it    = new \RecursiveDirectoryIterator( $dir, \RecursiveDirectoryIterator::SKIP_DOTS );
-        $files = new \RecursiveIteratorIterator( $it, \RecursiveIteratorIterator::CHILD_FIRST );
-        foreach ( $files as $file ) {
-            if ( $file->isDir() ) {
-                @rmdir( $file->getRealPath() );
+        foreach ( (array) @scandir( $dir ) as $item ) {
+            if ( $item === '.' || $item === '..' ) {
+                continue;
+            }
+            $path = $dir . '/' . $item;
+            if ( is_dir( $path ) && ! is_link( $path ) ) {
+                self::delete_directory_recursive( $path );
             } else {
-                @unlink( $file->getRealPath() );
+                @unlink( $path );
             }
         }
         @rmdir( $dir );
