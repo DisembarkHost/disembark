@@ -519,7 +519,10 @@
     }
     function paced(text, files) { var n = paceNote(files); progress(text + (n ? ' · ' + n : '')); }
     function paceBody(extra) { return Object.assign(t(), { paced: 1, pace: pace }, pace.budget ? { budget: pace.budget } : {}, extra || {}); }
-    function hasCode(e) { return !!(e && e.data && typeof e.data === 'object' && e.data.code); }
+    // WordPress's own answer when PHP dies mid-request (a time limit the
+    // host won't lift, memory) is a coded JSON 500 too, but it's the host
+    // cutting the request off, not a deliberate error from Disembark.
+    function hasCode(e) { return !!(e && e.data && typeof e.data === 'object' && e.data.code && e.data.code !== 'internal_server_error'); }
     // Worth asking again: dropped, timed out, busy, or cut off by the host.
     // A deliberate error from Disembark (a JSON error with a code) isn't,
     // except the source failing or not answering in time.
