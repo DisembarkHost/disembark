@@ -1019,8 +1019,11 @@
         if (info.multisite && info.multisite.length) rlog('The source is a multisite network. This site keeps its own wp-config.php, so add: ' + info.multisite.join(' '), 'err');
 
         step('snap');
-        var snap = pacing ? await budgeted('import/snapshot', t({ label: opts.label || '' }), function (r) { paced('Saving a rollback point\u2026 ' + D.fmt.num(r.tables_done || 0) + ' of ' + D.fmt.plural(r.tables_total || 0, 'table')); })
-          : await api.post('import/snapshot', t({ label: opts.label || '' }));
+        // Named for the site that came over (see srcLabel above).
+        var snapLabel = String(opts.label || ''), siteHost = kind === 'pull' && opts.site ? D.host(opts.site) : '';
+        if (siteHost && siteHost !== srcLabel) snapLabel = snapLabel.replace(siteHost, srcLabel);
+        var snap = pacing ? await budgeted('import/snapshot', t({ label: snapLabel }), function (r) { paced('Saving a rollback point\u2026 ' + D.fmt.num(r.tables_done || 0) + ' of ' + D.fmt.plural(r.tables_total || 0, 'table')); })
+          : await api.post('import/snapshot', t({ label: snapLabel }));
         progress('');
         rollbackId = importId;
         rlog('Rollback point saved (id ' + importId + ').', 'ok');
