@@ -63,6 +63,96 @@ class Import {
         return $this->import_id;
     }
 
+    /* ------------------------------------------------------------------
+     * Files only PHP can read
+     *
+     * Everything Disembark keeps lives under the public uploads folder, and
+     * index files only stop listings, not a direct GET. So restore points
+     * (full database dumps) and state that holds secrets are written as .php
+     * files that start with an exit line: a web server either runs them,
+     * and they stop before printing a byte, or refuses to serve .php source.
+     * The same format as Steps, Templates and the pull memory.
+     * ---------------------------------------------------------------- */
+
+    const PHP_EXIT = "<?php exit; ?>\n";
+
+    /** Writes $data behind the exit line, atomically. */
+    public static function write_protected( $file, $data ) {
+        $tmp = $file . '.tmp';
+        if ( @file_put_contents( $tmp, self::PHP_EXIT . $data ) === false ) {
+            @unlink( $tmp );
+            return false;
+        }
+        return @rename( $tmp, $file );
+    }
+
+    /** What write_protected() wrote (an older file without the exit line as is), or null. */
+    public static function read_protected( $file ) {
+        if ( ! is_file( $file ) ) {
+            return null;
+        }
+        $raw = (string) file_get_contents( $file );
+        return strpos( $raw, self::PHP_EXIT ) === 0 ? (string) substr( $raw, strlen( self::PHP_EXIT ) ) : $raw;
+    }
+
+    /**
+     * A restore point's metadata: rollback/meta.php, or meta.json from
+     * 2.9 and early 3.0 builds. Null when the folder holds no restore point.
+     */
+    public static function rollback_meta( $rollback_dir ) {
+        foreach ( [ 'meta.php', 'meta.json' ] as $name ) {
+            $raw = self::read_protected( rtrim( $rollback_dir, '/' ) . '/' . $name );
+            if ( $raw !== null ) {
+                $meta = json_decode( $raw, true );
+                return is_array( $meta ) ? $meta : [];
+            }
+        }
+        return null;
+    }
+
+    /** Whether the import folder $import_dir holds a restore point. */
+    public static function has_restore_point( $import_dir ) {
+        return is_file( "{$import_dir}/rollback/meta.php" ) || is_file( "{$import_dir}/rollback/meta.json" );
+    }
+
+    /** Saves this import's restore point metadata (an older meta.json goes). */
+    private function save_rollback_meta( $meta ) {
+        if ( self::write_protected( $this->rollback_path . '/meta.php', (string) json_encode( $meta, JSON_PRETTY_PRINT ) ) ) {
+            @unlink( $this->rollback_path . '/meta.json' );
+            return true;
+        }
+        return false;
+    }
+
+    /** A restore point's database dumps: *.db.php, plus *.db.txt / *.sql.txt from older builds. */
+    private static function rollback_sql_files( $rollback_dir ) {
+        $files = array_merge( glob( rtrim( $rollback_dir, '/' ) . '/*.db.php' ) ?: [], Backup::export_files( $rollback_dir ) );
+        sort( $files );
+        return $files;
+    }
+
+    /** Copies $from to $to behind the exit line. True when every byte arrived. */
+    private static function copy_protected( $from, $to ) {
+        $in  = @fopen( $from, 'rb' );
+        $tmp = $to . '.tmp';
+        $out = $in ? @fopen( $tmp, 'wb' ) : false;
+        if ( ! $in || ! $out ) {
+            if ( $in ) {
+                fclose( $in );
+            }
+            return false;
+        }
+        $ok = fwrite( $out, self::PHP_EXIT ) === strlen( self::PHP_EXIT ) && stream_copy_to_stream( $in, $out ) !== false;
+        fclose( $in );
+        $ok = fclose( $out ) && $ok;
+        clearstatcache();
+        if ( ! $ok || filesize( $tmp ) !== filesize( $from ) + strlen( self::PHP_EXIT ) || ! @rename( $tmp, $to ) ) {
+            @unlink( $tmp );
+            return false;
+        }
+        return true;
+    }
+
     /** Where this move lands when it isn't this site itself (see Target), or null. */
     public function target() {
         return Target::load( $this->import_path );
@@ -187,29 +277,34 @@ class Import {
             return new \WP_Error( 'no_tables', 'No tables found to snapshot.', [ 'status' => 500 ] );
         }
 
-        $backup   = new Backup( 'rollback-' . $this->import_id );
-        $file_url = $backup->database_export_batch( $all_tables );
+        // Exported under a random folder name (never one derived from the
+        // import id, which is shown in notifications and the CLI), then
+        // copied into the restore point behind the exit line.
+        $session     = 'rollback-' . bin2hex( random_bytes( 12 ) );
+        $backup_base = Storage::base_dir() . '/' . $session;
+        $backup      = new Backup( $session );
+        $file_url    = $backup->database_export_batch( $all_tables );
 
         if ( ! $file_url || is_wp_error( $file_url ) ) {
+            self::delete_directory_recursive( $backup_base );
             $why = is_wp_error( $file_url ) ? ' ' . $file_url->get_error_message() : '';
             return new \WP_Error( 'snapshot_failed', 'Failed to create database snapshot.' . $why . ' Nothing was changed.', [ 'status' => 500 ] );
         }
 
-        // Move the exported SQL to our rollback directory
-        $backup_base = wp_upload_dir()['basedir'] . '/disembark/rollback-' . $this->import_id;
-        $sql_files   = Backup::export_files( $backup_base );
-        foreach ( $sql_files as $sql_file ) {
-            $dest = $this->rollback_path . '/' . basename( $sql_file );
-            rename( $sql_file, $dest );
+        foreach ( Backup::export_files( $backup_base ) as $sql_file ) {
+            $dest = $this->rollback_path . '/' . preg_replace( '/\.(?:db|sql)\.txt$/', '', basename( $sql_file ) ) . '.db.php';
+            if ( ! self::copy_protected( $sql_file, $dest ) ) {
+                self::delete_directory_recursive( $backup_base );
+                return new \WP_Error( 'snapshot_failed', 'Failed to save the database snapshot (is the disk full?). Nothing was changed.', [ 'status' => 500 ] );
+            }
+            @unlink( $sql_file );
         }
 
         // Clean up the temporary export folder (and its listing guards).
-        if ( is_dir( $backup_base ) ) {
-            self::delete_directory_recursive( $backup_base );
-        }
+        self::delete_directory_recursive( $backup_base );
 
         $sql_sizes = [];
-        foreach ( Backup::export_files( $this->rollback_path ) as $sql_file ) {
+        foreach ( self::rollback_sql_files( $this->rollback_path ) as $sql_file ) {
             $sql_sizes[ basename( $sql_file ) ] = filesize( $sql_file );
         }
 
@@ -226,7 +321,9 @@ class Import {
             'deployed_files' => [],
             'backed_up_files' => [],
         ];
-        file_put_contents( $this->rollback_path . '/meta.json', json_encode( $meta, JSON_PRETTY_PRINT ) );
+        if ( ! $this->save_rollback_meta( $meta ) ) {
+            return new \WP_Error( 'snapshot_failed', 'Failed to save the rollback point. Nothing was changed.', [ 'status' => 500 ] );
+        }
 
         // A new subsite or tenant is made now, once the rollback point can
         // take it away again.
@@ -234,7 +331,7 @@ class Import {
             $made = $target->create( $this->staged_source() );
             $target->save( $this->import_path );
             $meta['target'] = [ 'kind' => $target->kind, 'id' => $target->id, 'prefix' => $target->prefix, 'created' => $target->created ];
-            file_put_contents( $this->rollback_path . '/meta.json', json_encode( $meta, JSON_PRETTY_PRINT ) );
+            $this->save_rollback_meta( $meta );
             if ( is_wp_error( $made ) ) {
                 return $made;
             }
@@ -1297,12 +1394,11 @@ class Import {
         }
 
         // Update rollback metadata with deployed files
-        $meta_file = $this->rollback_path . '/meta.json';
-        if ( file_exists( $meta_file ) ) {
-            $meta = json_decode( file_get_contents( $meta_file ), true );
+        $meta = self::rollback_meta( $this->rollback_path );
+        if ( $meta !== null ) {
             $meta['deployed_files']  = array_merge( $meta['deployed_files'] ?? [], $deployed );
             $meta['backed_up_files'] = array_merge( $meta['backed_up_files'] ?? [], $backed_up );
-            file_put_contents( $meta_file, json_encode( $meta, JSON_PRETTY_PRINT ) );
+            $this->save_rollback_meta( $meta );
         }
 
         return [
@@ -2006,7 +2102,7 @@ class Import {
         $report = [ 'files_rewritten' => 0, 'files_rewritten_list' => [], 'files_mentioning_source' => [], 'files_mentioning_total' => 0, 'elementor_css_cleared' => false ];
         // Deploying moves files out of staging, so the list of what this
         // import put in place comes from its rollback metadata.
-        $meta = is_file( $this->rollback_path . '/meta.json' ) ? json_decode( (string) file_get_contents( $this->rollback_path . '/meta.json' ), true ) : null;
+        $meta = self::rollback_meta( $this->rollback_path );
         $deployed = is_array( $meta ) ? array_unique( (array) ( $meta['deployed_files'] ?? [] ) ) : [];
         if ( ! $deployed ) {
             return $report;
@@ -2091,12 +2187,11 @@ class Import {
     public static function restore_points() {
         $points = [];
         foreach ( (array) glob( Storage::base_dir() . '/_import_*', GLOB_ONLYDIR ) as $dir ) {
-            $meta_file = $dir . '/rollback/meta.json';
-            if ( ! is_file( $meta_file ) ) {
+            $meta = self::rollback_meta( $dir . '/rollback' );
+            if ( $meta === null ) {
                 continue;
             }
-            $meta = json_decode( (string) file_get_contents( $meta_file ), true );
-            $meta = is_array( $meta ) ? $meta : [];
+            $meta_file = is_file( $dir . '/rollback/meta.php' ) ? $dir . '/rollback/meta.php' : $dir . '/rollback/meta.json';
             $size = 0;
             $it   = new \RecursiveIteratorIterator( new \RecursiveDirectoryIterator( $dir . '/rollback', \FilesystemIterator::SKIP_DOTS ) );
             foreach ( $it as $file ) {
@@ -2128,6 +2223,96 @@ class Import {
         }
         self::delete_directory_recursive( $this->import_path );
         return [ 'deleted' => true ];
+    }
+
+    /**
+     * Daily clean-up (Run registers the cron): everything a move or a backup
+     * left in the uploads folder that nobody has touched for $max_age. A
+     * move folder without a restore point goes completely (a failed backup
+     * restore leaves its staged database-*.sql there, with no pull state to
+     * find it by); one with a restore point keeps it and loses only what an
+     * unfinished move left (staged files, pull state). Backup and export
+     * session folders go too. The pull memory and restore points stay.
+     * Returns the folder names it cleaned.
+     */
+    public static function purge_stale( $max_age = DAY_IN_SECONDS ) {
+        $base   = Storage::base_dir();
+        $cutoff = time() - (int) $max_age;
+        $purged = [];
+        foreach ( (array) glob( $base . '/*', GLOB_ONLYDIR ) as $dir ) {
+            $name = basename( $dir );
+            if ( strpos( $name, '_import_' ) === 0 && ! is_link( $dir ) && self::has_restore_point( $dir ) ) {
+                ( new self( substr( $name, strlen( '_import_' ) ) ) )->protect_restore_point();
+            }
+            if ( is_link( $dir ) || $name === 'pulls' || self::newest_mtime( $dir ) > $cutoff ) {
+                continue;
+            }
+            if ( strpos( $name, '_import_' ) === 0 ) {
+                $id = substr( $name, strlen( '_import_' ) );
+                if ( ! preg_match( '/^[a-f0-9]+$/', $id ) ) {
+                    continue;
+                }
+                $leftovers = is_dir( "{$dir}/staging" ) || is_file( "{$dir}/pull.json" ) || is_file( "{$dir}/pull-secret.php" ) || glob( "{$dir}/token-guard*" );
+                if ( self::has_restore_point( $dir ) && ! $leftovers ) {
+                    continue;
+                }
+                ( new self( $id ) )->cancel( 'cleanup' );
+                $purged[] = $name;
+                continue;
+            }
+            self::delete_directory_recursive( $dir );
+            $purged[] = $name;
+        }
+        return $purged;
+    }
+
+    /**
+     * A restore point saved by 2.9 or an early 3.0 build keeps its dump as
+     * a plain .db.txt and its metadata as meta.json, both served to anyone
+     * who has the URL. Moves them behind the exit line, keeping the recorded
+     * sizes in step so rollback() still checks them.
+     */
+    public function protect_restore_point() {
+        $meta = self::rollback_meta( $this->rollback_path );
+        if ( $meta === null ) {
+            return false;
+        }
+        $changed = is_file( $this->rollback_path . '/meta.json' );
+        foreach ( Backup::export_files( $this->rollback_path ) as $legacy ) {
+            $name = preg_replace( '/\.(?:db|sql)\.txt$/', '', basename( $legacy ) ) . '.db.php';
+            if ( ! self::copy_protected( $legacy, $this->rollback_path . '/' . $name ) ) {
+                return false;
+            }
+            if ( isset( $meta['sql_files'][ basename( $legacy ) ] ) ) {
+                unset( $meta['sql_files'][ basename( $legacy ) ] );
+                $meta['sql_files'][ $name ] = filesize( $this->rollback_path . '/' . $name );
+            }
+            // Saved before the old copy goes, so a crash leaves a usable point.
+            if ( ! $this->save_rollback_meta( $meta ) ) {
+                @unlink( $this->rollback_path . '/' . $name );
+                return false;
+            }
+            @unlink( $legacy );
+            $changed = true;
+        }
+        if ( is_file( $this->rollback_path . '/meta.json' ) ) {
+            $this->save_rollback_meta( $meta );
+        }
+        return $changed;
+    }
+
+    /** The newest modification time of $dir and anything under it (links not followed). */
+    private static function newest_mtime( $dir ) {
+        $newest = (int) @filemtime( $dir );
+        foreach ( (array) @scandir( $dir ) as $item ) {
+            if ( $item === '.' || $item === '..' ) {
+                continue;
+            }
+            $path   = $dir . '/' . $item;
+            $stat   = @lstat( $path );
+            $newest = max( $newest, $stat ? (int) $stat['mtime'] : 0, is_dir( $path ) && ! is_link( $path ) ? self::newest_mtime( $path ) : 0 );
+        }
+        return $newest;
     }
 
     private static function contains_any( $value, $pairs ) {
@@ -2586,18 +2771,16 @@ class Import {
     public function rollback() {
         global $wpdb;
 
-        $meta_file = $this->rollback_path . '/meta.json';
-        if ( ! file_exists( $meta_file ) ) {
+        $meta = self::rollback_meta( $this->rollback_path );
+        if ( $meta === null ) {
             return new \WP_Error( 'no_rollback', 'No rollback data found for this import ID.', [ 'status' => 404 ] );
         }
-
-        $meta   = json_decode( file_get_contents( $meta_file ), true );
         $errors = [];
 
         // 1. Restore database from snapshot SQL. Validate the whole snapshot
         // before anything is dropped: a missing, truncated or unreadable
         // snapshot must leave the current database alone.
-        $sql_files = Backup::export_files( $this->rollback_path );
+        $sql_files = self::rollback_sql_files( $this->rollback_path );
         $check     = self::validate_snapshot( $sql_files, $meta );
         if ( is_wp_error( $check ) ) {
             return $check;
@@ -2714,16 +2897,17 @@ class Import {
 
         @unlink( $this->import_path . '/token-guard.json' );
         @unlink( $this->import_path . '/pull.json' );
+        @unlink( $this->import_path . '/pull-secret.php' );
 
         // Quiet mode turned on by this restore goes with it.
         $quiet_lifted = empty( $errors ) && Quiet::lift_for_rollback( (string) $this->import_id );
 
         // Remember the rollback so the restore points list can show it.
-        if ( empty( $errors ) && is_file( $this->rollback_path . '/meta.json' ) ) {
-            $saved = json_decode( (string) file_get_contents( $this->rollback_path . '/meta.json' ), true );
-            if ( is_array( $saved ) ) {
+        if ( empty( $errors ) ) {
+            $saved = self::rollback_meta( $this->rollback_path );
+            if ( $saved !== null ) {
                 $saved['rolled_back_at'] = time();
-                file_put_contents( $this->rollback_path . '/meta.json', json_encode( $saved, JSON_PRETTY_PRINT ) );
+                $this->save_rollback_meta( $saved );
             }
         }
 
@@ -2764,10 +2948,10 @@ class Import {
         if ( is_dir( $this->staging_path ) ) {
             self::delete_directory_recursive( $this->staging_path );
         }
-        foreach ( [ 'pull.json', 'token-guard.json', 'skip-rows.json', 'unchanged.json', 'delete-list.json', 'cancel' ] as $name ) {
+        foreach ( [ 'pull.json', 'pull-secret.php', 'token-guard.json', 'skip-rows.json', 'unchanged.json', 'delete-list.json', 'cancel' ] as $name ) {
             @unlink( $this->import_path . '/' . $name );
         }
-        $has_point = is_file( $this->rollback_path . '/meta.json' );
+        $has_point = self::has_restore_point( $this->import_path );
         if ( ! $has_point || $delete_restore_point ) {
             self::delete_directory_recursive( $this->import_path );
             $has_point = false;
@@ -2807,6 +2991,7 @@ class Import {
         // The pull state holds the source's full-access token; the token guard
         // is only needed while the import is in flight.
         @unlink( $this->import_path . '/pull.json' );
+        @unlink( $this->import_path . '/pull-secret.php' );
         @unlink( $this->import_path . '/token-guard.json' );
         @unlink( $this->import_path . '/unchanged.json' );
 
@@ -3148,6 +3333,10 @@ class Import {
         $handle = @fopen( $path, 'rb' );
         if ( ! $handle ) {
             return new \WP_Error( 'sql_unreadable', 'Could not read ' . basename( $path ) . '.', [ 'status' => 500 ] );
+        }
+        // A restore point's dump starts with the exit line (see copy_protected()).
+        if ( fread( $handle, strlen( self::PHP_EXIT ) ) !== self::PHP_EXIT ) {
+            rewind( $handle );
         }
         $scan  = self::sql_scanner();
         $count = 0;

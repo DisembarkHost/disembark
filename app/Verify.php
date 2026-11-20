@@ -89,7 +89,7 @@ class Verify {
     }
 
     private static function rolled_back( $dir ) {
-        $meta = is_file( "{$dir}/rollback/meta.json" ) ? json_decode( (string) file_get_contents( "{$dir}/rollback/meta.json" ), true ) : null;
+        $meta = Import::rollback_meta( "{$dir}/rollback" );
         return is_array( $meta ) && ! empty( $meta['rolled_back_at'] );
     }
 

@@ -8,7 +8,10 @@ namespace Disembark;
  * uses), stages it, and hands off to the Import pipeline. Browser-driven in
  * short steps so no single request has to transfer a whole site.
  *
- * State for a pull lives in the import directory as pull.json.
+ * State for a pull lives in the import directory as pull.json. Its secrets
+ * (the source's full-access token, and the session folder name that its
+ * exports sit under on the source) are kept apart in pull-secret.php, which
+ * the web server never serves (see Import::write_protected()).
  */
 class Pull {
 
@@ -16,6 +19,10 @@ class Pull {
     private $import_id;
     private $staging_public;
     private $state_file;
+    private $secret_file;
+
+    /** State keys that only ever live in pull-secret.php. */
+    const SECRETS = [ 'source_token', 'backup_token' ];
 
     public function __construct( $import_id = '' ) {
         $this->import         = new Import( $import_id );
@@ -23,6 +30,7 @@ class Pull {
         $base                 = wp_upload_dir()['basedir'] . '/disembark/_import_' . $this->import_id;
         $this->staging_public = $base . '/staging/public';
         $this->state_file     = $base . '/pull.json';
+        $this->secret_file    = $base . '/pull-secret.php';
     }
 
     public function get_import_id() {
@@ -30,18 +38,26 @@ class Pull {
     }
 
     private function state() {
-        if ( file_exists( $this->state_file ) ) {
-            $s = json_decode( file_get_contents( $this->state_file ), true );
-            if ( is_array( $s ) ) {
-                return $s;
-            }
+        $s = file_exists( $this->state_file ) ? json_decode( (string) file_get_contents( $this->state_file ), true ) : [];
+        $s = is_array( $s ) ? $s : [];
+        // A pull started by an older build kept them in pull.json; the next
+        // save moves them.
+        $secret = json_decode( (string) Import::read_protected( $this->secret_file ), true );
+        if ( is_array( $secret ) ) {
+            $s = array_merge( $s, array_intersect_key( $secret, array_flip( self::SECRETS ) ) );
         }
-        return [];
+        return $s;
     }
 
     private function save_state( $state ) {
         Storage::ensure_dir( dirname( $this->state_file ) );
-        file_put_contents( $this->state_file, wp_json_encode( $state ) );
+        $secret = array_intersect_key( (array) $state, array_flip( self::SECRETS ) );
+        if ( $secret ) {
+            Import::write_protected( $this->secret_file, (string) wp_json_encode( $secret ) );
+        } else {
+            @unlink( $this->secret_file );
+        }
+        file_put_contents( $this->state_file, wp_json_encode( array_diff_key( (array) $state, $secret ) ) );
     }
 
     /**
@@ -605,7 +621,7 @@ class Pull {
         $rollback = dirname( $this->state_file ) . '/rollback';
         if ( is_dir( $rollback ) ) {
             $previous = is_file( self::pull_file( $source ) ) ? (string) file_get_contents( self::pull_file( $source ) ) : null;
-            file_put_contents( $rollback . '/pull-memory.json', wp_json_encode( [ 'file' => self::pull_file( $source ), 'previous' => $previous ] ) );
+            Import::write_protected( $rollback . '/pull-memory.php', (string) wp_json_encode( [ 'file' => self::pull_file( $source ), 'previous' => $previous ] ) );
         }
         $body = wp_json_encode( [ 'source' => untrailingslashit( $source ), 'at' => time(), 'files' => $files ] );
         $tmp  = self::pull_file( $source ) . '.tmp';
@@ -617,11 +633,17 @@ class Pull {
 
     /** Called by a rollback: puts back what this site remembered before the move. */
     public static function restore_memory( $rollback_path ) {
-        $saved = $rollback_path . '/pull-memory.json';
+        $saved = $rollback_path . '/pull-memory.php';
+        if ( ! is_file( $saved ) ) {
+            $saved = $rollback_path . '/pull-memory.json'; // an older build's
+        }
         if ( ! is_file( $saved ) ) {
             return;
         }
-        $memory = json_decode( (string) file_get_contents( $saved ), true );
+        $memory = json_decode( (string) Import::read_protected( $saved ), true );
+        if ( ! is_array( $memory ) || ! array_key_exists( 'previous', $memory ) ) {
+            return;
+        }
         $file   = (string) ( $memory['file'] ?? '' );
         if ( $file === '' || strpos( wp_normalize_path( $file ), wp_normalize_path( self::pulls_dir() ) . '/' ) !== 0 ) {
             return;
@@ -644,7 +666,7 @@ class Pull {
         foreach ( (array) glob( Storage::base_dir() . '/_import_*', GLOB_ONLYDIR ) as $dir ) {
             $id         = substr( basename( $dir ), strlen( '_import_' ) );
             $state_file = $dir . '/pull.json';
-            $has_point  = is_file( $dir . '/rollback/meta.json' );
+            $has_point  = Import::has_restore_point( $dir );
             $touched    = max( (int) @filemtime( $dir ), (int) @filemtime( $dir . '/steps' ), (int) @filemtime( $state_file ) );
             if ( ! is_file( $state_file ) ) {
                 continue;
@@ -878,6 +900,7 @@ class Pull {
 
     public function cleanup_pull_state() {
         @unlink( $this->state_file );
+        @unlink( $this->secret_file );
         $list = $this->staging_dir() . '/file-list.json';
         @unlink( $list );
         return [ 'ok' => true ];
