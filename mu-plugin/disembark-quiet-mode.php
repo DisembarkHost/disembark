@@ -57,7 +57,34 @@ if ( ! class_exists( 'Disembark_Quiet_Mode' ) ) {
 			if ( $home === '' ) {
 				return false;
 			}
-			return self::address( $home ) === self::address( get_option( 'home' ) );
+			return self::address( $home ) === self::address( self::install_home() );
+		}
+
+		/**
+		 * The address of the whole install, which quiet mode is bound to. On a
+		 * network that's the main site's: every subsite came with the copy,
+		 * whatever its own address. On a WP Freighter install it's the primary
+		 * site's, so tenants with their own domains stay quiet too.
+		 */
+		public static function install_home() {
+			global $wpdb;
+			$prefix = '';
+			if ( is_multisite() && function_exists( 'get_main_site_id' ) ) {
+				$main = (int) get_main_site_id();
+				if ( $main > 0 && $main !== (int) get_current_blog_id() ) {
+					$prefix = $wpdb->get_blog_prefix( $main );
+				}
+			} elseif ( defined( 'TABLE_PREFIX' ) && is_string( TABLE_PREFIX ) && TABLE_PREFIX !== $wpdb->prefix && is_file( ABSPATH . 'wp-content/freighter.php' ) ) {
+				// A Freighter tenant: its bootstrap keeps the primary's prefix here.
+				$prefix = TABLE_PREFIX;
+			}
+			if ( $prefix !== '' && preg_match( '/^[A-Za-z0-9_]+$/', $prefix ) ) {
+				$home = $wpdb->get_var( "SELECT option_value FROM `{$prefix}options` WHERE option_name = 'home' LIMIT 1" );
+				if ( is_string( $home ) && $home !== '' ) {
+					return $home;
+				}
+			}
+			return (string) get_option( 'home' );
 		}
 
 		public static function boot() {
@@ -295,7 +322,7 @@ if ( ! class_exists( 'Disembark_Quiet_Mode' ) ) {
 				: ' Disembark isn\'t active: delete <code>' . esc_html( basename( __FILE__ ) ) . '</code> from the mu-plugins folder to turn it off.';
 			if ( ! self::active() ) {
 				echo '<div class="notice notice-info"><p><strong>Disembark quiet mode is standing down.</strong> It was turned on for '
-					. esc_html( self::address( $config['home'] ?? '' ) ) . ', and this site is now ' . esc_html( self::address( get_option( 'home' ) ) )
+					. esc_html( self::address( $config['home'] ?? '' ) ) . ', and this site is now ' . esc_html( self::address( self::install_home() ) )
 					. ', so emails, scheduled jobs and checkout run normally.' . $manage . '</p></div>';
 				return;
 			}

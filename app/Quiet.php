@@ -88,10 +88,21 @@ class Quiet {
         return ! is_wp_error( self::write( $config ) );
     }
 
-    /** The home address straight from the database (a restore just rewrote it). */
+    /**
+     * The home address straight from the database (a restore just rewrote
+     * it). Quiet mode covers the whole install, so on a network this is the
+     * main site's address and on a WP Freighter install the primary site's,
+     * the same address the mu-plugin compares with on every subsite or tenant.
+     */
     private static function current_home() {
         global $wpdb;
-        $home = $wpdb->get_var( "SELECT option_value FROM {$wpdb->options} WHERE option_name = 'home' LIMIT 1" );
+        $table = $wpdb->options;
+        if ( is_multisite() ) {
+            $table = $wpdb->get_blog_prefix( get_main_site_id() ) . 'options';
+        } elseif ( ( $primary = Scope::freighter_primary() ) !== '' ) {
+            $table = $primary . 'options';
+        }
+        $home = $wpdb->get_var( "SELECT option_value FROM `" . str_replace( '`', '``', $table ) . "` WHERE option_name = 'home' LIMIT 1" );
         return untrailingslashit( (string) ( $home ?: get_option( 'home' ) ) );
     }
 
