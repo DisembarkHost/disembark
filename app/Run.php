@@ -841,7 +841,7 @@ class Run {
         }
 
         // Security: Prevent directory traversal
-        if ( strpos( $new_name, '/' ) !== false || strpos( $new_name, '..' ) !== false ) {
+        if ( $new_name === '.' || strpos( $new_name, '/' ) !== false || strpos( $new_name, '\\' ) !== false || strpos( $new_name, '..' ) !== false ) {
             return new \WP_Error( 'invalid_name', 'Invalid file name.', [ 'status' => 400 ] );
         }
 
@@ -860,8 +860,12 @@ class Run {
             $old_full_path = realpath($core_dir . '/' . $old_path_relative);
         }
 
-        // Verify it exists and is safe
-        if ( !$old_full_path || ( !$this->path_within( $old_full_path, $base_dir ) && !$this->path_within( $old_full_path, $core_dir ) ) ) {
+        // Verify it exists and sits strictly inside the site: never the web
+        // root or WordPress's folder itself (old_path "." would name them).
+        $inside = function ( $root ) use ( $old_full_path ) {
+            return $root && $old_full_path !== $root && $this->path_within( $old_full_path, $root );
+        };
+        if ( ! $old_full_path || ( ! $inside( $base_dir ) && ! $inside( $core_dir ) ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid source file.', [ 'status' => 400 ] );
         }
 
