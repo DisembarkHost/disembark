@@ -1206,6 +1206,13 @@ class Run {
             $download_name = basename( $full_path );
         }
 
+        // Close PHP's output buffers first (WordPress, a cache or the host may
+        // have opened some): flush() doesn't empty them, so every piece
+        // echoed below piled up in memory and a file bigger than the memory
+        // limit (a 355 MB game file on Kinsta) killed the request.
+        while ( ob_get_level() > 0 && @ob_end_clean() ) {
+        }
+
         // Prepare headers
         header('Content-Description: File Transfer');
         header('Content-Type: application/octet-stream');
