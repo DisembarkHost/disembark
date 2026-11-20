@@ -170,7 +170,9 @@
         var view = isHtml
           ? h('iframe', { sandbox: '', style: { width: '100%', height: '420px', border: '1px solid var(--line)', borderRadius: '8px', background: '#fff' } })
           : h('pre', { class: 'mono', style: { whiteSpace: 'pre-wrap', maxHeight: '420px', overflow: 'auto', fontSize: '12.5px' } }, full.message || '');
-        if (isHtml) view.srcdoc = full.message;
+        // The sandbox stops scripts; the CSP stops remote images and other
+        // loads (tracking pixels would tell the sender the email was opened).
+        if (isHtml) view.srcdoc = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; style-src \'unsafe-inline\'; font-src data:">' + full.message;
         D.modal({ title: full.subject || '(no subject)', wide: true, body: h('div', { class: 'dsk-stack', style: { gap: '10px' } },
           h('div', { class: 'muted', style: { fontSize: '13px' } }, 'To ' + full.to + ' · held ' + D.fmt.date(full.time)), view) });
       }
