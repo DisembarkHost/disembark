@@ -26,9 +26,34 @@ class Notify {
     }
 
     private static function write( $import_id, $data ) {
-        $file = self::file( $import_id );
-        file_put_contents( $file, "<?php exit; ?>\n" . wp_json_encode( $data ) );
-        @unlink( self::file( $import_id, true ) );
+        if ( Import::write_protected( self::file( $import_id ), (string) wp_json_encode( $data ) ) ) {
+            @unlink( self::file( $import_id, true ) );
+        }
+    }
+
+    /**
+     * Moves a notify.json an older build wrote (a .json with the exit line
+     * in front, which a web server serves as text, webhook URLs and all)
+     * to notify.php, and deletes it. Safe to run again: the .php is written
+     * whole first, and a .json beside a .php is only the leftover of a run
+     * that stopped. True when no notify.json is left.
+     */
+    public static function protect_legacy( $import_id ) {
+        $old = self::file( $import_id, true );
+        if ( $old === '' || ! is_file( $old ) ) {
+            return true;
+        }
+        $new = self::file( $import_id );
+        if ( ! is_file( $new ) ) {
+            $raw = (string) file_get_contents( $old );
+            if ( strpos( $raw, '<?php' ) === 0 ) {
+                $raw = (string) substr( $raw, (int) strpos( $raw, "\n" ) + 1 );
+            }
+            if ( ! is_array( json_decode( $raw, true ) ) || ! Import::write_protected( $new, $raw ) ) {
+                return false;
+            }
+        }
+        return @unlink( $old );
     }
 
     /** Parses "a@example.com, https://hooks.slack.com/…" into emails and webhook URLs. */

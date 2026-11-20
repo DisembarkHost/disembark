@@ -26,6 +26,7 @@ class Run {
         // Daily clean-up of working files left behind (see purge()).
         add_action( self::PURGE_HOOK, [ __CLASS__, 'purge' ] );
         add_action( 'init', [ __CLASS__, 'schedule_purge' ] );
+        add_action( 'init', [ __CLASS__, 'upgrade_storage' ] );
 
         if ( defined( 'WP_CLI' ) && \WP_CLI ) {
             \WP_CLI::add_command( 'disembark', new class {}, [
@@ -44,6 +45,41 @@ class Run {
             \WP_CLI::add_command( 'disembark discard', [ 'Disembark\Command', 'discard' ] );
             \WP_CLI::add_command( 'disembark verify', [ 'Disembark\Command', 'verify' ] );
         }
+    }
+
+    /** The storage format this build writes (see upgrade_storage()). */
+    const STORAGE_VERSION = 3;
+
+    /**
+     * After an upgrade, the first load moves what older versions kept as
+     * plain files under uploads/disembark behind the exit line (see
+     * Import::protect_legacy_storage()). A few seconds at a time and one
+     * request at a time; the next load carries on until it's all done,
+     * then this is one option check. Safe to run again (a whole-site
+     * import replaces the options table, so it may).
+     */
+    public static function upgrade_storage() {
+        if ( (int) get_option( 'disembark_storage_version', 0 ) >= self::STORAGE_VERSION ) {
+            return;
+        }
+        $base = Storage::base_dir();
+        if ( is_dir( $base ) ) {
+            $lock = @fopen( $base . '/upgrade.lock', 'c' );
+            if ( ! $lock || ! flock( $lock, LOCK_EX | LOCK_NB ) ) {
+                if ( $lock ) {
+                    fclose( $lock );
+                }
+                return;
+            }
+            $done = Import::protect_legacy_storage( microtime( true ) + 5 );
+            flock( $lock, LOCK_UN );
+            fclose( $lock );
+            if ( ! $done ) {
+                return;
+            }
+            @unlink( $base . '/upgrade.lock' );
+        }
+        update_option( 'disembark_storage_version', self::STORAGE_VERSION, true );
     }
 
     /** Schedules the daily clean-up once per site. */

@@ -964,6 +964,41 @@ class Pull {
         return @rename( $tmp, self::pull_file( $source ) );
     }
 
+    /**
+     * The plain files an older build left in a move's folder ($dir), moved
+     * behind the exit line: the source's token and backup session in
+     * pull.json (2.9 kept them there until the database step, and a pull
+     * that stopped kept them for good), and a restore point's pull memory
+     * (pull-memory.json). The protected copy is written whole before the
+     * plain one changes, so a run that stops is finished by the next.
+     * True when nothing is left to move.
+     */
+    public static function protect_legacy_state( $dir ) {
+        $ok    = true;
+        $state = $dir . '/pull.json';
+        $data  = is_file( $state ) ? json_decode( (string) file_get_contents( $state ), true ) : null;
+        if ( is_array( $data ) && ( $secret = array_intersect_key( $data, array_flip( self::SECRETS ) ) ) ) {
+            $kept = json_decode( (string) Import::read_protected( $dir . '/pull-secret.php' ), true );
+            $ok   = Import::write_protected( $dir . '/pull-secret.php', (string) wp_json_encode( array_merge( $secret, is_array( $kept ) ? $kept : [] ) ) );
+            if ( $ok ) {
+                $tmp = $state . '.tmp';
+                $ok  = @file_put_contents( $tmp, wp_json_encode( array_diff_key( $data, $secret ) ) ) !== false && @rename( $tmp, $state );
+                if ( ! $ok ) {
+                    @unlink( $tmp );
+                }
+            }
+        }
+        $memory = $dir . '/rollback/pull-memory.json';
+        if ( is_file( $memory ) ) {
+            if ( is_file( $dir . '/rollback/pull-memory.php' ) || Import::write_protected( $dir . '/rollback/pull-memory.php', (string) file_get_contents( $memory ) ) ) {
+                @unlink( $memory );
+            } else {
+                $ok = false;
+            }
+        }
+        return $ok;
+    }
+
     /** Called by a rollback: puts back what this site remembered before the move. */
     public static function restore_memory( $rollback_path ) {
         $saved = $rollback_path . '/pull-memory.php';

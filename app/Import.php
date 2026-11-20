@@ -3822,6 +3822,110 @@ class Import {
         return $changed;
     }
 
+    /* ------------------------------------------------------------------
+     * Storage from earlier versions
+     *
+     * 2.9 and early 3.0 builds kept a restore point's dump and metadata,
+     * the files it saved, its pull memory, a move's notification settings
+     * (notify.json, webhook URLs included) and a pull's source token as
+     * plain files under uploads, which a web server hands to anyone with
+     * the URL (and a saved .php ran). The first load after an upgrade (see
+     * Run::upgrade_storage()) moves them behind the exit line and deletes
+     * the plain copies. Every file is written whole before its plain copy
+     * goes and what's done is skipped, so it can stop at any point (out of
+     * time, a killed request) and simply run again.
+     * ---------------------------------------------------------------- */
+
+    /** Moves every move folder's legacy files (see above) until $deadline. True when none are left. */
+    public static function protect_legacy_storage( $deadline ) {
+        $done = true;
+        foreach ( (array) glob( Storage::base_dir() . '/_import_*', GLOB_ONLYDIR ) as $dir ) {
+            $id = substr( basename( $dir ), strlen( '_import_' ) );
+            if ( is_link( $dir ) || ! preg_match( '/^[a-f0-9]+$/', $id ) ) {
+                continue;
+            }
+            if ( microtime( true ) >= $deadline ) {
+                return false;
+            }
+            if ( ! ( new self( $id ) )->protect_legacy_files( $deadline ) ) {
+                $done = false;
+            }
+        }
+        return $done;
+    }
+
+    /** This move folder's legacy files, protected (see protect_legacy_storage()). True when none are left. */
+    public function protect_legacy_files( $deadline ) {
+        // A rollback running right now reads the saved files: next time.
+        $busy = $this->import_path . '/rollback-state.php';
+        if ( is_file( $busy ) && (int) @filemtime( $busy ) > time() - HOUR_IN_SECONDS ) {
+            return false;
+        }
+        $done = Notify::protect_legacy( $this->import_id );
+        $done = Pull::protect_legacy_state( $this->import_path ) && $done;
+        if ( self::has_restore_point( $this->import_path ) ) {
+            $this->protect_restore_point();
+            if ( is_file( $this->rollback_path . '/meta.json' ) || Backup::export_files( $this->rollback_path ) ) {
+                $done = false;
+            }
+        }
+        return $this->protect_saved_files( $deadline ) && $done;
+    }
+
+    /**
+     * The files a restore point saved, each moved to its rollback name
+     * behind the exit line (see rollback_name()). 2.9 kept them under their
+     * own names; early 3.0 builds kept runnable ones under staged names,
+     * which is the same, and the rest under their own. True when done.
+     */
+    private function protect_saved_files( $deadline ) {
+        $root = $this->rollback_path . '/files';
+        if ( ! is_dir( $root ) || is_link( $root ) ) {
+            return true;
+        }
+        $paths = [];
+        $it    = new \RecursiveIteratorIterator( new \RecursiveDirectoryIterator( $root, \FilesystemIterator::SKIP_DOTS ) );
+        foreach ( $it as $file ) {
+            if ( ! $file->isLink() && $file->isFile() ) {
+                $paths[] = $file->getPathname();
+            }
+        }
+        foreach ( $paths as $path ) {
+            if ( microtime( true ) >= $deadline ) {
+                return false;
+            }
+            $rel = ltrim( str_replace( '\\', '/', substr( $path, strlen( $root ) ) ), '/' );
+            // What a copy that stopped left behind.
+            if ( preg_match( '/\.dsk\.php\.tmp$/', $rel ) ) {
+                if ( (int) @filemtime( $path ) < time() - HOUR_IN_SECONDS ) {
+                    @unlink( $path );
+                }
+                continue;
+            }
+            if ( substr( $rel, -strlen( self::STAGED_SUFFIX ) ) === self::STAGED_SUFFIX ) {
+                $in   = @fopen( $path, 'rb' );
+                $head = $in ? (string) fread( $in, strlen( self::PHP_EXIT ) ) : '';
+                if ( $in ) {
+                    fclose( $in );
+                }
+                // Already behind the exit line; one an older build staged
+                // without it gets it in front, in place.
+                if ( $head !== self::PHP_EXIT && ! self::copy_protected( $path, $path ) ) {
+                    return false;
+                }
+                continue;
+            }
+            $to = $root . '/' . self::rollback_name( $rel );
+            if ( ! file_exists( $to ) && ! self::copy_protected( $path, $to ) ) {
+                return false;
+            }
+            if ( ! @unlink( $path ) ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** The newest modification time of $dir and anything under it (links not followed). */
     private static function newest_mtime( $dir ) {
         $newest = (int) @filemtime( $dir );
