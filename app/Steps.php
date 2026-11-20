@@ -92,7 +92,7 @@ class Steps {
         if ( ! is_wp_error( $response ) ) {
             $response = rest_ensure_response( $response );
             if ( $response->get_status() < 400 && ! self::reported_errors( $response->get_data() ) ) {
-                $body = wp_json_encode( [ 'status' => $response->get_status(), 'data' => $response->get_data() ] );
+                $body = wp_json_encode( [ 'status' => $response->get_status(), 'data' => self::without_secrets( $response->get_data() ) ] );
                 if ( is_string( $body ) ) {
                     $tmp = $result_file . '.tmp';
                     if ( @file_put_contents( $tmp, "<?php exit; ?>\n" . $body ) !== false ) {
@@ -136,7 +136,24 @@ class Steps {
         }
         // Recorded by an earlier version, which also kept steps that
         // answered 200 with errors: those have to run again.
-        return self::reported_errors( $saved['data'] ) ? null : $saved;
+        if ( self::reported_errors( $saved['data'] ) ) {
+            return null;
+        }
+        $saved['data'] = self::without_secrets( $saved['data'] );
+        return $saved;
+    }
+
+    /**
+     * A step's answer as it is kept and replayed: never with the site's
+     * token (preflight returns it to the CLI). A replay or a resume can be
+     * asked for by a request that only got in with a token guard, which
+     * must not learn the token.
+     */
+    private static function without_secrets( $data ) {
+        if ( is_array( $data ) ) {
+            unset( $data['disembark_token'] );
+        }
+        return $data;
     }
 
     /**

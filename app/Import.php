@@ -212,7 +212,7 @@ class Import {
 
         $mysql_version = $wpdb->get_var( 'SELECT VERSION()' );
 
-        return [
+        $pre = [
             'db_prefix'          => $wpdb->prefix,
             'home_url'           => home_url(),
             'site_url'           => site_url(),
@@ -228,8 +228,15 @@ class Import {
             'profile'            => self::site_profile(),
             'php_version'        => phpversion(),
             'mysql_version'      => $mysql_version,
+            // Lets the CLI keep its access through the import (which
+            // replaces the options table). Never to a request that only got
+            // in with a token guard: that would hand out a newer token.
             'disembark_token'    => Token::read(),
         ];
+        if ( self::$guard_authenticated ) {
+            unset( $pre['disembark_token'] );
+        }
+        return $pre;
     }
 
     /**
@@ -453,6 +460,12 @@ class Import {
         if ( preg_match( '#^database-.*\.sql$#i', $base ) ) {
             return true;
         }
+        // Database exports (Database tab, backups) and anything in a
+        // Disembark folder: restore points, staged moves, token guards.
+        // Brought along, a source could plant its own token guard here.
+        if ( preg_match( '#\.(?:db|sql)\.txt$#i', $base ) || self::in_storage( $rel ) ) {
+            return true;
+        }
         if ( strpos( $rel, '/' ) === false && preg_match( '#\.sql$#i', $rel ) ) {
             return true;
         }
@@ -475,6 +488,22 @@ class Import {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Whether $rel (relative to a site root) is inside a Disembark working
+     * folder: this site's (Storage), or the usual places on the source
+     * (uploads/disembark, a subsite's uploads/sites/N/disembark, a tenant's
+     * content/N/uploads/disembark). Case-insensitive, for case-insensitive
+     * disks. Used for staged paths and for where Target puts them.
+     */
+    public static function in_storage( $rel ) {
+        $rel = strtolower( trim( (string) preg_replace( '#/+#', '/', str_replace( '\\', '/', (string) $rel ) ), '/' ) );
+        $own = strtolower( trim( Storage::relative_base_dir(), '/' ) );
+        if ( $own !== '' && ( $rel === $own || strpos( $rel, $own . '/' ) === 0 ) ) {
+            return true;
+        }
+        return (bool) preg_match( '#(?:^|/)uploads/(?:sites/\d+/)?disembark(?:/|$)#', $rel );
     }
 
     /** This plugin's folder relative to the site root ("wp-content/plugins/disembark/"), or ''. */
@@ -1820,18 +1849,20 @@ class Import {
             // one when the options table hasn't been replaced yet).
             $preserved_token = '';
             foreach ( [ $this->request_token, $current ] as $candidate ) {
-                if ( $candidate !== '' && hash_equals( $guard['sha256'], hash( 'sha256', $candidate ) ) ) {
+                if ( $candidate !== '' && self::guard_signed( $guard, $this->import_id, $candidate ) ) {
                     $preserved_token = $candidate;
                     break;
                 }
             }
         } else {
             $preserved_token = $current;
-            if ( $preserved_token !== '' ) {
+            $key             = self::guard_key();
+            if ( $preserved_token !== '' && $key !== '' ) {
                 $this->prepare_import_dir();
-                file_put_contents( $this->import_path . '/token-guard.json', wp_json_encode( [
-                    'sha256'     => hash( 'sha256', $preserved_token ),
-                    'created_at' => time(),
+                $created = time();
+                self::write_protected( $this->import_path . '/token-guard.php', (string) wp_json_encode( [
+                    'created_at' => $created,
+                    'mac'        => self::guard_mac( $key, $this->import_id, $created, $preserved_token ),
                 ] ) );
             }
         }
@@ -1908,38 +1939,102 @@ class Import {
         ];
     }
 
+    /** Set once a request got in with a token guard rather than the site's token (see preflight()). */
+    private static $guard_authenticated = false;
+
     /**
      * True when $token is the token this site had when import $import_id
      * started its SQL import, within the last day. Lets a restore that died
      * mid-import (leaving the source's token in the options table) still
      * finish or roll back with the token the dashboard or CLI holds.
+     *
+     * A guard only counts when this site wrote it: it is signed with this
+     * site's own key (see guard_key()), bound to the import's id and its
+     * time, and a guard dated in the future is refused. Disembark's folder
+     * is never deployed from a backup, so a source can't ship one either.
      */
     public static function token_guard_matches( $import_id, $token ) {
         if ( ! is_string( $token ) || $token === '' ) {
             return false;
         }
-        $guard = self::read_token_guard( $import_id );
-        return $guard !== null && hash_equals( $guard['sha256'], hash( 'sha256', $token ) );
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) );
+        $guard     = self::read_token_guard( $import_id );
+        if ( $guard === null || ! self::guard_signed( $guard, $import_id, $token ) ) {
+            return false;
+        }
+        self::$guard_authenticated = true;
+        return true;
     }
 
     /**
-     * The token guard for import $import_id when it exists and is under a day
-     * old, else null.
+     * Deletes every token guard and replaces the key that signs them, so no
+     * guard made before (for the old token) works any more. Called when the
+     * site's token is regenerated. Returns how many guards went.
+     */
+    public static function clear_token_guards() {
+        $count = 0;
+        foreach ( (array) glob( Storage::base_dir() . '/_import_*/token-guard.{php,json}', GLOB_BRACE ) as $file ) {
+            if ( @unlink( $file ) ) {
+                $count++;
+            }
+        }
+        @unlink( Storage::base_dir() . '/guard-key.php' );
+        return $count;
+    }
+
+    /**
+     * The token guard for import $import_id when it exists, is under a day
+     * old and isn't dated in the future, else null. Guards written by older
+     * builds (token-guard.json, unsigned) are never honoured.
      */
     private static function read_token_guard( $import_id ) {
         $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) );
         if ( $import_id === '' ) {
             return null;
         }
-        $file = Storage::base_dir() . "/_import_{$import_id}/token-guard.json";
-        if ( ! is_file( $file ) ) {
+        $guard = json_decode( (string) self::read_protected( Storage::base_dir() . "/_import_{$import_id}/token-guard.php" ), true );
+        if ( ! is_array( $guard ) || empty( $guard['mac'] ) || ! is_string( $guard['mac'] ) || empty( $guard['created_at'] ) ) {
             return null;
         }
-        $guard = json_decode( (string) file_get_contents( $file ), true );
-        if ( ! is_array( $guard ) || empty( $guard['sha256'] ) || ! is_string( $guard['sha256'] ) || empty( $guard['created_at'] ) || time() - (int) $guard['created_at'] > DAY_IN_SECONDS ) {
+        $age = time() - (int) $guard['created_at'];
+        if ( $age < -300 || $age > DAY_IN_SECONDS ) {
             return null;
         }
         return $guard;
+    }
+
+    private static function guard_signed( $guard, $import_id, $token ) {
+        $key = self::guard_key();
+        return $key !== '' && hash_equals( (string) $guard['mac'], self::guard_mac( $key, $import_id, (int) $guard['created_at'], $token ) );
+    }
+
+    private static function guard_mac( $key, $import_id, $created_at, $token ) {
+        return hash_hmac( 'sha256', $import_id . '|' . (int) $created_at . '|' . hash( 'sha256', (string) $token ), $key );
+    }
+
+    /**
+     * The key token guards are signed with: a random key in Disembark's
+     * folder plus this site's wp-config salts. Not wp_salt(): without salt
+     * constants it reads them from the options table, which is exactly what
+     * an import replaces, and a guard has to hold across that. '' when no key
+     * can be kept (then no guard is written or honoured).
+     */
+    private static function guard_key() {
+        $file = Storage::base_dir() . '/guard-key.php';
+        $key  = trim( (string) self::read_protected( $file ) );
+        if ( ! preg_match( '/^[a-f0-9]{64}$/', $key ) ) {
+            Storage::ensure_dir( Storage::base_dir() );
+            self::write_protected( $file, bin2hex( random_bytes( 32 ) ) );
+            // Whatever is there now, in case another request made one too.
+            $key = trim( (string) self::read_protected( $file ) );
+            if ( ! preg_match( '/^[a-f0-9]{64}$/', $key ) ) {
+                return '';
+            }
+        }
+        foreach ( [ 'AUTH_KEY', 'AUTH_SALT', 'SECURE_AUTH_KEY', 'SECURE_AUTH_SALT' ] as $constant ) {
+            $key .= defined( $constant ) ? (string) constant( $constant ) : '';
+        }
+        return $key;
     }
 
     /**
@@ -2895,6 +2990,7 @@ class Import {
             add_action( 'shutdown', 'wp_ob_end_flush_all', 1 );
         }
 
+        @unlink( $this->import_path . '/token-guard.php' );
         @unlink( $this->import_path . '/token-guard.json' );
         @unlink( $this->import_path . '/pull.json' );
         @unlink( $this->import_path . '/pull-secret.php' );
@@ -2948,7 +3044,7 @@ class Import {
         if ( is_dir( $this->staging_path ) ) {
             self::delete_directory_recursive( $this->staging_path );
         }
-        foreach ( [ 'pull.json', 'pull-secret.php', 'token-guard.json', 'skip-rows.json', 'unchanged.json', 'delete-list.json', 'cancel' ] as $name ) {
+        foreach ( [ 'pull.json', 'pull-secret.php', 'token-guard.php', 'token-guard.json', 'skip-rows.json', 'unchanged.json', 'delete-list.json', 'cancel' ] as $name ) {
             @unlink( $this->import_path . '/' . $name );
         }
         $has_point = self::has_restore_point( $this->import_path );
@@ -2992,6 +3088,7 @@ class Import {
         // is only needed while the import is in flight.
         @unlink( $this->import_path . '/pull.json' );
         @unlink( $this->import_path . '/pull-secret.php' );
+        @unlink( $this->import_path . '/token-guard.php' );
         @unlink( $this->import_path . '/token-guard.json' );
         @unlink( $this->import_path . '/unchanged.json' );
 

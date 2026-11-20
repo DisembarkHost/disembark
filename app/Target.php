@@ -288,6 +288,16 @@ class Target {
      * the whole install.
      */
     public function dest( $rel ) {
+        $to = $this->map( $rel );
+        // Never into a Disembark folder (its restore points, token guards)
+        // and never a database export.
+        if ( $to === null || Import::in_storage( $to[0] ) || preg_match( '#\.(?:db|sql)\.txt$#i', $to[0] ) ) {
+            return null;
+        }
+        return $to;
+    }
+
+    private function map( $rel ) {
         $rel = ltrim( (string) $rel, '/' );
         if ( strpos( $rel, 'wp-content/' ) !== 0 ) {
             return null;
