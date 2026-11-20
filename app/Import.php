@@ -1793,11 +1793,14 @@ class Import {
      */
     private function move_tables() {
         global $wpdb;
-        $tables = (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->base_prefix ) . '%' ) );
+        // On a network's main site the base prefix covers every subsite and
+        // the network's users and sites too: its own tables only.
+        $shared = (bool) Scope::install();
+        $tables = $shared ? self::own_tables() : (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->base_prefix ) . '%' ) );
         $file   = $this->import_path . '/imported-tables.json';
         if ( is_file( $file ) ) {
             $all    = array_flip( (array) $wpdb->get_col( 'SHOW TABLES' ) );
-            $extra  = array_filter( (array) json_decode( (string) file_get_contents( $file ), true ), function ( $t ) use ( $all ) { return is_string( $t ) && isset( $all[ $t ] ); } );
+            $extra  = array_filter( (array) json_decode( (string) file_get_contents( $file ), true ), function ( $t ) use ( $all, $shared ) { return is_string( $t ) && isset( $all[ $t ] ) && ! ( $shared && self::other_sites_table( $t ) ); } );
             $tables = array_merge( $tables, $extra );
         }
         // A catch-up leaves unchanged tables alone: they were rewritten on

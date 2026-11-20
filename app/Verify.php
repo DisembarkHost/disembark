@@ -321,9 +321,10 @@ class Verify {
             if ( self::$target && strpos( $table, (string) self::$target['prefix'] ) !== 0 ) {
                 continue; // another site's table
             }
-            // A whole-site move into a WP Freighter main site leaves its
-            // tenants' tables alone, so their mentions aren't leftovers.
-            if ( ! self::$target && preg_match( '/^stacked_(\d+)_/', $table, $m ) && 'stacked_' . $m[1] . '_' !== $wpdb->prefix && Scope::freighter_primary() !== '' ) {
+            // A whole-site move into a network's or WP Freighter install's
+            // main site leaves the other sites' tables (and the network's
+            // own) alone, so their mentions aren't leftovers.
+            if ( ! self::$target && Import::other_sites_table( $table ) ) {
                 continue;
             }
             $q       = '`' . str_replace( '`', '``', $table ) . '`';
