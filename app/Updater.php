@@ -9,12 +9,13 @@ class Updater {
     public $cache_allowed;
 
     public function __construct() {
-        // Only when the constant is true: define( 'DISEMBARK_DEV_MODE', false )
-        // must not switch off TLS checks for every request the site makes.
+        // DISEMBARK_DEV_MODE (local sites with self-signed certificates)
+        // relaxes TLS and internal-address checks for Disembark's own
+        // requests only, never for the rest of the site (plugin and theme
+        // downloads, other plugins' API calls).
         if ( defined( 'DISEMBARK_DEV_MODE' ) && DISEMBARK_DEV_MODE ) {
-            add_filter('https_ssl_verify', '__return_false');
-            add_filter('https_local_ssl_verify', '__return_false');
-            add_filter('http_request_host_is_external', '__return_true');
+            add_filter( 'http_request_args', [ __CLASS__, 'dev_mode_args' ], 10, 2 );
+            add_filter( 'http_request_host_is_external', [ __CLASS__, 'dev_mode_external' ], 10, 3 );
         }
         $this->plugin_slug   = 'disembark';
         $this->version       = '2.9.0';
@@ -24,6 +25,26 @@ class Updater {
         add_filter( 'plugins_api', [ $this, 'info' ], 30, 3 );
         add_filter( 'site_transient_update_plugins', [ $this, 'update' ] );
         add_action( 'upgrader_process_complete', [ $this, 'purge' ], 10, 2 );
+    }
+
+    /**
+     * True for a request to another site's Disembark API or to a file it
+     * made under uploads/disembark: the requests DISEMBARK_DEV_MODE covers.
+     */
+    public static function is_own_request( $url ) {
+        return (bool) preg_match( '#(/disembark/v1(/|\?|$)|[?&]rest_route=(/|%2F)disembark(/|%2F)v1|/uploads/disembark/)#i', (string) $url );
+    }
+
+    public static function dev_mode_args( $args, $url ) {
+        if ( self::is_own_request( $url ) ) {
+            $args['sslverify']          = false;
+            $args['reject_unsafe_urls'] = false;
+        }
+        return $args;
+    }
+
+    public static function dev_mode_external( $external, $host, $url = '' ) {
+        return self::is_own_request( $url ) ? true : $external;
     }
 
     public function request(){
