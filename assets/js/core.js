@@ -441,16 +441,23 @@
    * falls back to a form post to /stream-file so PHP streams it straight to
    * disk, without holding a big file in the browser's memory.
    */
-  D.downloadSiteFile = async function (url, name) {
+  /* o.stream: always go through /stream-file. o.deleteAfter: the server
+   * deletes the file once it has sent it (database exports). */
+  D.downloadSiteFile = async function (url, name, o) {
+    o = o || {};
     var ok = false;
-    try { ok = (await fetch(url, { method: 'HEAD', credentials: 'same-origin', cache: 'no-store' })).ok; } catch (e) { ok = false; }
+    if (!o.stream) {
+      try { ok = (await fetch(url, { method: 'HEAD', credentials: 'same-origin', cache: 'no-store' })).ok; } catch (e) { ok = false; }
+    }
     if (ok) { D.download(url, name); return 'direct'; }
     var path = new URL(url, location.href).pathname;
     var home = new URL(cfg.homeUrl, location.href).pathname.replace(/\/$/, '');
     if (home && path.indexOf(home + '/') === 0) path = path.slice(home.length);
     var form = h('form', { method: 'POST', action: apiUrl('stream-file'), style: { display: 'none' } },
       h('input', { type: 'hidden', name: 'token', value: D.store.state.token }),
-      h('input', { type: 'hidden', name: 'file', value: decodeURIComponent(path.replace(/^\//, '')) }));
+      h('input', { type: 'hidden', name: 'file', value: decodeURIComponent(path.replace(/^\//, '')) }),
+      name ? h('input', { type: 'hidden', name: 'download_name', value: name }) : null,
+      o.deleteAfter ? h('input', { type: 'hidden', name: 'delete_after', value: '1' }) : null);
     document.body.appendChild(form);
     form.submit();
     form.remove();

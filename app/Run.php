@@ -1042,10 +1042,19 @@ class Run {
             die('404 Not Found: File does not exist or is not readable.');
         }
         
+        // delete_after: a one-off database export from the Database section,
+        // removed once it has been sent in full so the dump doesn't stay in
+        // a public folder. Only Disembark's own export files qualify.
+        $delete_after = ! empty( $params['delete_after'] ) && $offset === 0 && $length === null && self::is_disposable_export( $full_path );
+        $download_name = isset( $params['download_name'] ) ? sanitize_file_name( (string) $params['download_name'] ) : '';
+        if ( $download_name === '' ) {
+            $download_name = basename( $full_path );
+        }
+
         // Prepare headers
         header('Content-Description: File Transfer');
         header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="' . basename($full_path) . '"');
+        header('Content-Disposition: attachment; filename="' . str_replace( '"', '', $download_name ) . '"');
         header('Expires: 0');
         header('Cache-Control: must-revalidate');
         header('Pragma: public');
@@ -1100,12 +1109,35 @@ class Run {
                 }
             }
             @fclose($file);
+            if ( $delete_after && connection_status() == 0 ) {
+                @unlink( $full_path );
+            }
         } else {
             header("HTTP/1.1 500 Internal Server Error");
             die('500 Internal Server Error: Could not open file for reading.');
         }
         
         exit;
+    }
+
+    /**
+     * True for a database export in a backup session folder (not a restore's
+     * folder, whose dumps are restore points): the files /stream-file may
+     * delete after sending.
+     */
+    private static function is_disposable_export( $path ) {
+        $base = realpath( Storage::base_dir() );
+        $dir  = dirname( $path );
+        if ( ! $base || dirname( $dir ) !== $base || strpos( basename( $dir ), '_import_' ) === 0 ) {
+            return false;
+        }
+        $name = basename( $path );
+        foreach ( [ Backup::EXPORT_EXT, '.sql.txt' ] as $ext ) {
+            if ( substr( $name, -strlen( $ext ) ) === $ext ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // --- Import / Restore Endpoint Callbacks ---
