@@ -2284,6 +2284,9 @@ class Import {
      * (or work) anywhere else. Matched against the first path segment under
      * mu-plugins/, case-insensitively, as a prefix.
      */
+    /** Table names (after the prefix) that hosting platforms keep for themselves: never dropped by a move. */
+    const HOST_TABLES = [ 'patchstack_', 'kinsta_', 'wpe_', 'wpengine_', 'sg_security_', 'gd_system_' ];
+
     const HOST_MU_PLUGINS = [
         'wpengine', 'wpe-', 'mu-plugin.php', 'slt-force-strong-passwords', 'force-strong-passwords', 'stop-long-comments',
         'kinsta-mu-plugins', 'gd-system-plugin', 'pantheon', 'wpcomsh', 'endurance-', 'flywheel', 'pressable',
@@ -4098,6 +4101,13 @@ class Import {
             }
             foreach ( $other as $p ) {
                 if ( strpos( $lower, $p ) === 0 ) {
+                    continue 2;
+                }
+            }
+            // The host's own tables (its firewall's, like the mu-plugins a
+            // move keeps) belong to this server, not to the site.
+            foreach ( self::HOST_TABLES as $host ) {
+                if ( strpos( substr( $lower, strlen( $prefix ) ), $host ) === 0 ) {
                     continue 2;
                 }
             }
