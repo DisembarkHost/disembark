@@ -103,14 +103,19 @@ class Pull {
     /**
      * A GET whose parameters (the token among them) ride in a JSON body: a
      * POST the source's REST server routes as GET. Falls back to a plain GET
-     * with the query string when the override was lost on the way (the
-     * GET-only route then answers 404, or a proxy 405).
+     * with the query string only when the override was lost on the way: the
+     * source's REST API then has no POST route there and says so
+     * (rest_no_route). Any other answer, a 404 or 405 included, is the
+     * source's real one, and the token never goes into a URL for it.
      */
     private function get_with_body( $url, $args ) {
         $args['headers']['X-HTTP-Method-Override'] = 'GET';
         $resp = $this->http( 'POST', $url, $args );
-        $code = is_wp_error( $resp ) ? 0 : (int) wp_remote_retrieve_response_code( $resp );
-        if ( $code !== 404 && $code !== 405 ) {
+        if ( is_wp_error( $resp ) || (int) wp_remote_retrieve_response_code( $resp ) !== 404 ) {
+            return $resp;
+        }
+        $error = json_decode( (string) wp_remote_retrieve_body( $resp ), true );
+        if ( ! is_array( $error ) || ( $error['code'] ?? '' ) !== 'rest_no_route' ) {
             return $resp;
         }
         $query = (array) json_decode( (string) $args['body'], true );
