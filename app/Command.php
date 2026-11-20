@@ -707,7 +707,7 @@ class Command {
         if ( ! empty( $r['errors'] ) ) {
             \WP_CLI::warning( count( $r['errors'] ) . ' problems: ' . implode( '; ', array_slice( $r['errors'], 0, 3 ) ) );
         }
-        $relogin = preg_match( '/^Before (restore|pull|push)/i', $point['label'] ) || ! empty( $point['deployed'] );
+        $relogin = ( preg_match( '/^Before (restore|pull|push)/i', $point['label'] ) || ! empty( $point['deployed'] ) ) && empty( $r['logins_kept'] );
         \WP_CLI::success( 'Rolled back to "' . $point['label'] . '".' . ( $relogin ? ' User accounts are back to this site\'s own, so log in with the credentials from before.' : '' ) );
     }
 

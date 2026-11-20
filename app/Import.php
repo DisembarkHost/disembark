@@ -332,45 +332,74 @@ class Import {
         $this->prepare_import_dir();
         Storage::ensure_dir( $this->rollback_path );
 
-        if ( $budget !== null ) {
-            return $this->snapshot_paced( $label, $budget );
+        // Without a budget (an older client), the whole restore point in
+        // this one request, the same way.
+        return $this->snapshot_paced( $label, $budget !== null ? $budget : DAY_IN_SECONDS );
+    }
+
+    /**
+     * The tables a restore point holds:
+     * - into a subsite or tenant, its own tables (none for a new one): the
+     *   rows the move adds to the install's shared tables (users, the
+     *   registry) are journaled and taken out again instead (see
+     *   Target::merge_users(), Target::undo());
+     * - the main site of a network or WP Freighter install, its own tables
+     *   (own_tables()): never a subsite's, a tenant's or the network's;
+     * - a plain site, every table in the database, as the import may
+     *   replace any of them.
+     */
+    private function snapshot_scope( $target ) {
+        global $wpdb;
+        if ( $target ) {
+            return $target->tables();
         }
+        return Scope::install() ? self::own_tables() : (array) $wpdb->get_col( 'SHOW TABLES' );
+    }
 
-        // Export all tables (into a subsite or tenant: its own, and the shared
-        // ones the move changes).
-        $target     = $this->target();
-        $all_tables = $target ? $target->snapshot_tables() : $wpdb->get_col( 'SHOW TABLES' );
-        if ( empty( $all_tables ) ) {
-            return new \WP_Error( 'no_tables', 'No tables found to snapshot.', [ 'status' => 500 ] );
+    /**
+     * This site's own tables: under its prefix, and not another site's of
+     * its install (a subsite's, a tenant's, the network's shared tables)
+     * or another WordPress's in the same database whose prefix starts with
+     * this one's (wp_ and wp_staging_).
+     */
+    public static function own_tables() {
+        global $wpdb;
+        $prefix = strtolower( (string) $wpdb->prefix );
+        $rows   = array_map( 'strval', (array) $wpdb->get_col( 'SHOW TABLES' ) );
+        if ( $prefix === '' ) {
+            return $rows;
         }
-
-        // Exported under a random folder name (never one derived from the
-        // import id, which is shown in notifications and the CLI), then
-        // copied into the restore point behind the exit line.
-        $session     = 'rollback-' . bin2hex( random_bytes( 12 ) );
-        $backup_base = Storage::base_dir() . '/' . $session;
-        $backup      = new Backup( $session );
-        $file_url    = $backup->database_export_batch( $all_tables );
-
-        if ( ! $file_url || is_wp_error( $file_url ) ) {
-            self::delete_directory_recursive( $backup_base );
-            $why = is_wp_error( $file_url ) ? ' ' . $file_url->get_error_message() : '';
-            return new \WP_Error( 'snapshot_failed', 'Failed to create database snapshot.' . $why . ' Nothing was changed.', [ 'status' => 500 ] );
-        }
-
-        foreach ( Backup::export_files( $backup_base ) as $sql_file ) {
-            $dest = $this->rollback_path . '/' . preg_replace( '/\.(?:db|sql)\.txt$/', '', basename( $sql_file ) ) . '.db.php';
-            if ( ! self::copy_protected( $sql_file, $dest ) ) {
-                self::delete_directory_recursive( $backup_base );
-                return new \WP_Error( 'snapshot_failed', 'Failed to save the database snapshot (is the disk full?). Nothing was changed.', [ 'status' => 500 ] );
+        $all   = array_flip( array_map( 'strtolower', $rows ) );
+        $other = [];
+        foreach ( array_keys( $all ) as $n ) {
+            if ( substr( $n, -7 ) === 'options' && ( $p = substr( $n, 0, -7 ) ) !== $prefix && strpos( $p, $prefix ) === 0 && isset( $all[ $p . 'posts' ] ) && ! self::other_sites_table( $n ) ) {
+                $other[] = $p;
             }
-            @unlink( $sql_file );
         }
+        $out = [];
+        foreach ( $rows as $table ) {
+            $lower = strtolower( $table );
+            if ( strpos( $lower, $prefix ) !== 0 || self::other_sites_table( $table ) ) {
+                continue;
+            }
+            foreach ( $other as $p ) {
+                if ( strpos( $lower, $p ) === 0 ) {
+                    continue 2;
+                }
+            }
+            $out[] = $table;
+        }
+        return $out;
+    }
 
-        // Clean up the temporary export folder (and its listing guards).
-        self::delete_directory_recursive( $backup_base );
-
-        return $this->snapshot_saved( $label, $all_tables, $target );
+    /** The tables this move's import created (all of them, also while it's still running). */
+    private function imported_tables() {
+        $names = (array) json_decode( (string) @file_get_contents( $this->import_path . '/imported-tables.json' ), true );
+        $state = json_decode( (string) self::read_protected( $this->import_path . '/sql-state.php' ), true );
+        if ( is_array( $state ) ) {
+            $names = array_merge( $names, array_keys( (array) ( $state['imported'] ?? [] ) ) );
+        }
+        return array_values( array_unique( array_filter( $names, 'is_string' ) ) );
     }
 
     /**
@@ -392,8 +421,10 @@ class Import {
             if ( $meta !== null && ! empty( $meta['sql_files'] ) ) {
                 return [ 'done' => true, 'rollback_id' => $this->import_id, 'tables' => count( (array) $meta['tables'] ), 'target' => $target ? $target->info() : null ];
             }
-            $all = $target ? $target->snapshot_tables() : $wpdb->get_col( 'SHOW TABLES' );
-            if ( empty( $all ) ) {
+            $all = $this->snapshot_scope( $target );
+            // A new subsite or tenant has no tables yet: an empty restore
+            // point still takes it away again.
+            if ( empty( $all ) && ! $target ) {
                 return new \WP_Error( 'no_tables', 'No tables found to snapshot.', [ 'status' => 500 ] );
             }
             // A catch-up that leaves unchanged tables alone saves only the
@@ -528,6 +559,11 @@ class Import {
             'deployed_files' => [],
             'backed_up_files' => [],
         ];
+        // Known before the new site exists, so a rollback never mistakes
+        // this for a whole-site restore point.
+        if ( $target ) {
+            $meta['target'] = [ 'kind' => $target->kind, 'id' => $target->id, 'prefix' => $target->prefix, 'created' => false ];
+        }
         if ( ! $this->save_rollback_meta( $meta ) ) {
             return new \WP_Error( 'snapshot_failed', 'Failed to save the rollback point. Nothing was changed.', [ 'status' => 500 ] );
         }
@@ -1263,7 +1299,7 @@ class Import {
                 error_log( "Disembark: import {$this->import_id} into {$target->kind} {$target->id} left out {$refused} statements outside the source's tables." );
             }
             if ( empty( $result['errors'] ) ) {
-                $result['users'] = $target->merge_users( $old_prefix );
+                $result['users'] = $target->merge_users( $old_prefix, null, $this->rollback_path . '/users-merge.php' );
             }
         } elseif ( $shared_main ) {
             $result['tables_other_sites'] = $foreign;
@@ -1271,7 +1307,7 @@ class Import {
                 $result['warnings'][] = "Left out {$foreign} tables that belong to other sites of this install.";
             }
             if ( $in_users && empty( $result['errors'] ) ) {
-                $result['users'] = Target::network_main()->merge_users( $old_prefix, array_values( $in_users ) );
+                $result['users'] = Target::network_main()->merge_users( $old_prefix, array_values( $in_users ), $this->rollback_path . '/users-merge.php' );
             }
         }
         if ( empty( $result['errors'] ) && $rows !== null ) {
@@ -2471,23 +2507,36 @@ class Import {
 
     /**
      * Whether $table belongs to another site of the install this site is
-     * the main site of: a subsite's (wp_5_*), the network's own (blogs,
-     * site, sitemeta, signups, users and the like), or a WP Freighter
-     * tenant's (stacked_8_*). False on a plain site.
+     * part of, or to the install as a whole: another subsite's (wp_5_*),
+     * the network's own (blogs, site, sitemeta, signups, users and the
+     * like), another WP Freighter tenant's (stacked_8_*), or, from a
+     * tenant, the main site's. False on a plain site.
      */
     public static function other_sites_table( $table ) {
         global $wpdb;
-        $lower = strtolower( (string) $table );
+        $lower  = strtolower( (string) $table );
+        $prefix = strtolower( (string) $wpdb->prefix );
         if ( is_multisite() ) {
             $base = strtolower( $wpdb->base_prefix );
+            if ( $prefix !== $base ) {
+                // A subsite: its own prefix is its own, the rest of the
+                // network's base prefix isn't.
+                return strpos( $lower, $prefix ) !== 0 && strpos( $lower, $base ) === 0;
+            }
             if ( strpos( $lower, $base ) !== 0 ) {
                 return false;
             }
             $rest = substr( $lower, strlen( $base ) );
             return (bool) preg_match( '/^\d+_/', $rest ) || in_array( $rest, array_merge( (array) $wpdb->global_tables, (array) $wpdb->ms_global_tables ), true );
         }
-        $primary = Scope::freighter_primary();
-        return $primary !== '' && preg_match( '/^stacked_(\d+)_/', $lower, $m ) && 'stacked_' . $m[1] . '_' !== strtolower( $wpdb->prefix );
+        $primary = strtolower( Scope::freighter_primary() );
+        if ( $primary === '' ) {
+            return false;
+        }
+        if ( preg_match( '/^stacked_(\d+)_/', $lower, $m ) ) {
+            return 'stacked_' . $m[1] . '_' !== $prefix;
+        }
+        return $prefix !== $primary && strpos( $lower, $primary ) === 0;
     }
 
     private static function transform_statements( $statements, $old_prefix = '', $new_prefix = '' ) {
@@ -3954,6 +4003,75 @@ class Import {
         return [ 'keys_changed' => $changed ];
     }
 
+    /** After a rollback's tables are back: drops the tables the move added (see rollback()). */
+    private function drop_added_tables( $meta ) {
+        global $wpdb;
+        $kept = array_flip( array_map( 'strval', (array) ( $meta['tables'] ?? [] ) ) );
+        if ( ! empty( $meta['target'] ) ) {
+            $only = (string) ( $meta['target']['prefix'] ?? '' );
+            if ( $only === '' ) {
+                return;
+            }
+            $owned = [];
+            foreach ( (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $only ) . '%' ) ) as $t ) {
+                // On a network, wp_1_ doesn't exist and wp_10_ starts with wp_1.
+                if ( ( $meta['target']['kind'] ?? '' ) === 'multisite' && preg_match( '/^' . preg_quote( $only, '/' ) . '\d+_/', (string) $t ) ) {
+                    continue;
+                }
+                $owned[ (string) $t ] = true;
+            }
+        } else {
+            // A restore point that doesn't list its tables can't tell added ones apart.
+            if ( empty( $meta['tables'] ) ) {
+                return;
+            }
+            $owned = array_flip( self::own_tables() );
+            foreach ( $this->imported_tables() as $t ) {
+                if ( ! self::other_sites_table( $t ) ) {
+                    $owned[ $t ] = true;
+                }
+            }
+        }
+        $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
+        foreach ( (array) $wpdb->get_results( 'SHOW FULL TABLES', ARRAY_N ) as $row ) {
+            if ( ! isset( $owned[ $row[0] ] ) || isset( $kept[ $row[0] ] ) ) {
+                continue;
+            }
+            $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
+            $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $row[0] ) . '`' );
+        }
+        $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
+    }
+
+    /** A WP Freighter main site's registry rows as they are now, or [] elsewhere. */
+    private function registry_rows() {
+        global $wpdb;
+        if ( Scope::freighter_primary() === '' || Scope::freighter_primary() !== $wpdb->prefix ) {
+            return [];
+        }
+        return (array) $wpdb->get_results( "SELECT option_name, option_value, autoload FROM `{$wpdb->options}` WHERE option_name IN ( 'stacked_sites', 'stacked_configurations' )", ARRAY_A );
+    }
+
+    /** Puts registry_rows() back over whatever the restored options table holds. */
+    private function put_registry_rows( $rows ) {
+        global $wpdb;
+        foreach ( (array) $rows as $row ) {
+            $name = (string) ( $row['option_name'] ?? '' );
+            if ( $name === '' ) {
+                continue;
+            }
+            if ( $wpdb->get_var( $wpdb->prepare( "SELECT option_id FROM `{$wpdb->options}` WHERE option_name = %s", $name ) ) ) {
+                $wpdb->update( $wpdb->options, [ 'option_value' => (string) $row['option_value'] ], [ 'option_name' => $name ] );
+            } else {
+                $wpdb->insert( $wpdb->options, [ 'option_name' => $name, 'option_value' => (string) $row['option_value'], 'autoload' => (string) ( $row['autoload'] ?? 'yes' ) ] );
+            }
+        }
+        if ( $rows ) {
+            wp_cache_delete( 'alloptions', 'options' );
+            wp_cache_delete( 'notoptions', 'options' );
+        }
+    }
+
     /**
      * Restores the destination to pre-import state using the rollback snapshot.
      */
@@ -3976,6 +4094,11 @@ class Import {
         if ( is_wp_error( $check ) ) {
             return $check;
         }
+
+        // The main site of a WP Freighter install keeps its registry as it
+        // is now (tenants made since the restore point included), not as
+        // its options table had it then.
+        $registry = ! empty( $meta['target'] ) ? [] : $this->registry_rows();
 
         if ( ! empty( $sql_files ) ) {
             // Each table is dropped just before the snapshot recreates it
@@ -4029,23 +4152,21 @@ class Import {
             $errors = $result['errors'];
 
             // Tables the restore added (the source's plugin tables) go only
-            // once the snapshot is fully back.
-            $only = ! empty( $meta['target']['prefix'] ) ? (string) $meta['target']['prefix'] : '';
-            if ( empty( $errors ) && ( ! empty( $meta['tables'] ) || $only !== '' ) ) {
-                $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
-                foreach ( (array) $wpdb->get_results( 'SHOW FULL TABLES', ARRAY_N ) as $row ) {
-                    // A move into a subsite or tenant only ever added its tables.
-                    if ( $only !== '' && ( strpos( $row[0], $only ) !== 0 || ( ( $meta['target']['kind'] ?? '' ) === 'multisite' && preg_match( '/^' . preg_quote( $only, '/' ) . '\d+_/', $row[0] ) ) ) ) {
-                        continue;
-                    }
-                    if ( ! in_array( $row[0], (array) $meta['tables'], true ) ) {
-                        $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
-                        $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $row[0] ) . "`" );
-                    }
-                }
-                $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
+            // once the snapshot is fully back, and only tables this site
+            // owns: a subsite's or tenant's own prefix, or this site's own
+            // tables and the ones this move imported. Never another site's
+            // of the install, one made after the restore point included.
+            if ( empty( $errors ) && empty( $meta['partial'] ) ) {
+                $this->drop_added_tables( $meta );
             }
+            $this->put_registry_rows( $registry );
             wp_cache_flush();
+        }
+
+        // Users the move created or gave a role on a network go again, and
+        // the roles it replaced come back (see Target::merge_users()).
+        if ( empty( $errors ) ) {
+            Target::undo_merge( $this->rollback_path . '/users-merge.php' );
         }
 
         // A catch-up pull's memory goes back to what it was before this move.
@@ -4147,6 +4268,9 @@ class Import {
             'files_restored'   => count( $backed_up ),
             'files_removed'    => count( array_diff( $deployed, $backed_up ) ),
             'quiet_mode_lifted' => $quiet_lifted,
+            // A move into a subsite or tenant, or into a network (whose
+            // users stay), leaves this site's logins as they were.
+            'logins_kept'      => ! empty( $meta['target'] ) || is_multisite(),
             'errors'           => $errors,
         ];
     }
@@ -4897,7 +5021,8 @@ class Import {
                 return $fail( basename( $file ) . ' is cut off' );
             }
         }
-        if ( empty( $creates ) ) {
+        // A new subsite's or tenant's restore point holds no tables.
+        if ( empty( $creates ) && ( ! empty( $meta['tables'] ) || empty( $meta['target'] ) ) ) {
             return $fail( 'the snapshot holds no tables' );
         }
         if ( $format >= 2 ) {

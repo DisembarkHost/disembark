@@ -23,9 +23,13 @@ namespace Disembark;
  *   posts, comments and orders renumbered to match;
  * - the address rewrite and the checks after the move cover that site.
  *
- * The rollback point holds the site's tables (none for a new one), the
- * network's users or Freighter's registry, so rolling back removes a new
- * site completely, folders included.
+ * The rollback point holds the site's own tables (none for a new one).
+ * What the move adds to the install's shared tables is taken out again
+ * row by row: the users it created or gave a role (journaled as the merge
+ * goes, see merge_users()), and a new site's row in the network's blogs or
+ * Freighter's registry (see undo()). So rolling back removes a new site
+ * completely, folders included, and leaves everything else in the install
+ * as it is now, sites made since included.
  */
 class Target {
 
@@ -425,32 +429,20 @@ class Target {
         return $out;
     }
 
-    /** Tables the rollback point holds: the site's, plus the shared ones the move changes. */
-    public function snapshot_tables() {
-        global $wpdb;
-        $tables = $this->tables();
-        if ( $this->kind === 'multisite' ) {
-            foreach ( [ 'users', 'usermeta', 'blogs', 'blogmeta' ] as $t ) {
-                $name = $wpdb->base_prefix . $t;
-                if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $name ) ) ) === $name ) {
-                    $tables[] = $name;
-                }
-            }
-        } else {
-            $tables[] = Scope::freighter_primary() . 'options';
-        }
-        return array_values( array_unique( $tables ) );
-    }
-
     /**
      * Merges the users a network subsite arrived with ({prefix}users and
      * {prefix}usermeta, imported beside its other tables, or the tables
      * $incoming names) into the network's users, renumbers the site's
      * content to match, and drops the copies.
      */
-    public function merge_users( $old_prefix, $incoming = null ) {
+    public function merge_users( $old_prefix, $incoming = null, $journal_file = '' ) {
         global $wpdb;
         $report = [ 'created' => 0, 'matched' => 0, 'renumbered' => 0 ];
+        // What the merge adds to the network's users and takes from them,
+        // one line per row as it goes, so a rollback takes exactly that
+        // out again (see undo_merge()): "u" a user it created, "m" a
+        // usermeta row it added, "d" a usermeta row it removed.
+        $journal = $journal_file !== '' ? Pace::journal_open( $journal_file ) : null;
         if ( $this->kind !== 'multisite' ) {
             return $report;
         }
@@ -463,7 +455,16 @@ class Target {
         }
         // Replacing a site: its old roles go, the incoming ones replace them.
         if ( $this->into !== 'new' ) {
-            $wpdb->query( "DELETE FROM `{$meta}` WHERE " . $this->own_meta_where() );
+            $where = $this->own_meta_where();
+            $last  = 0;
+            do {
+                $old_rows = (array) $wpdb->get_results( $wpdb->prepare( "SELECT * FROM `{$meta}` WHERE umeta_id > %d AND ( {$where} ) ORDER BY umeta_id LIMIT 1000", $last ), ARRAY_A );
+                foreach ( $old_rows as $r ) {
+                    $last = (int) $r['umeta_id'];
+                    Pace::journal_add( $journal, [ 'd' => $r ] );
+                }
+            } while ( count( $old_rows ) === 1000 );
+            $wpdb->query( "DELETE FROM `{$meta}` WHERE " . $where );
         }
         $map     = [];
         $created = [];
@@ -493,6 +494,7 @@ class Target {
             }
             $map[ $old ]       = (int) $wpdb->insert_id;
             $created[ $old ]   = true;
+            Pace::journal_add( $journal, [ 'u' => (int) $wpdb->insert_id ] );
             $report['created']++;
         }
 
@@ -527,7 +529,9 @@ class Target {
                 if ( ! isset( $created[ $old ] ) && ! $remapped ) {
                     continue;
                 }
-                $wpdb->insert( $meta, [ 'user_id' => $map[ $old ], 'meta_key' => $key, 'meta_value' => $r['meta_value'] ] );
+                if ( $wpdb->insert( $meta, [ 'user_id' => $map[ $old ], 'meta_key' => $key, 'meta_value' => $r['meta_value'] ] ) && ! isset( $created[ $old ] ) ) {
+                    Pace::journal_add( $journal, [ 'm' => (int) $wpdb->insert_id ] );
+                }
             }
         } while ( count( $rows ) === 1000 );
         foreach ( array_keys( $created ) as $old ) {
@@ -565,8 +569,54 @@ class Target {
         }
         $wpdb->query( "DROP TABLE IF EXISTS `{$in_users}`" );
         $wpdb->query( "DROP TABLE IF EXISTS `{$in_meta}`" );
+        if ( $journal ) {
+            fclose( $journal );
+        }
         wp_cache_flush();
         return $report;
+    }
+
+    /**
+     * Takes back what merge_users() did to the network's users, from its
+     * journal: the users it created go (with all their settings), the roles
+     * it gave existing users go, and the rows it removed come back. Safe to
+     * run twice. Returns how many rows it changed.
+     */
+    public static function undo_merge( $journal_file ) {
+        global $wpdb;
+        $records = Pace::journal_read( $journal_file );
+        if ( ! $records || ! is_multisite() ) {
+            return 0;
+        }
+        $users   = $wpdb->base_prefix . 'users';
+        $meta    = $wpdb->base_prefix . 'usermeta';
+        $created = [];
+        $added   = [];
+        $removed = [];
+        foreach ( $records as $r ) {
+            if ( isset( $r['u'] ) ) {
+                $created[] = (int) $r['u'];
+            } elseif ( isset( $r['m'] ) ) {
+                $added[] = (int) $r['m'];
+            } elseif ( isset( $r['d'] ) && is_array( $r['d'] ) ) {
+                $removed[] = $r['d'];
+            }
+        }
+        $changed = 0;
+        foreach ( array_chunk( $added, 500 ) as $ids ) {
+            $changed += (int) $wpdb->query( "DELETE FROM `{$meta}` WHERE umeta_id IN (" . implode( ',', array_map( 'intval', $ids ) ) . ')' );
+        }
+        foreach ( array_chunk( $created, 500 ) as $ids ) {
+            $in = implode( ',', array_map( 'intval', $ids ) );
+            $changed += (int) $wpdb->query( "DELETE FROM `{$meta}` WHERE user_id IN ({$in})" );
+            $changed += (int) $wpdb->query( "DELETE FROM `{$users}` WHERE ID IN ({$in})" );
+        }
+        foreach ( $removed as $r ) {
+            // Under its own id, so a second run finds it there and adds nothing.
+            $changed += (int) $wpdb->query( $wpdb->prepare( "INSERT IGNORE INTO `{$meta}` ( umeta_id, user_id, meta_key, meta_value ) VALUES ( %d, %d, %s, %s )", (int) $r['umeta_id'], (int) $r['user_id'], (string) $r['meta_key'], (string) $r['meta_value'] ) );
+        }
+        wp_cache_flush();
+        return $changed;
     }
 
     /* ------------------------------------------------------------------
@@ -680,13 +730,35 @@ class Target {
                 @rmdir( $root . '/content' );
             }
         }
+        // Its row in the install's registry goes, and nothing else there:
+        // the registry as it is now, with any site made since, stays.
+        global $wpdb;
         if ( $this->kind === 'freighter' ) {
+            if ( $this->created && $this->id !== '' ) {
+                $primary = Scope::freighter_primary();
+                $sites   = Scope::freighter_option( $primary, 'stacked_sites' );
+                if ( is_array( $sites ) ) {
+                    $kept = array_values( array_filter( $sites, function ( $site ) { return (string) ( $site['stacked_site_id'] ?? '' ) !== (string) $this->id; } ) );
+                    if ( count( $kept ) !== count( $sites ) ) {
+                        $wpdb->update( $primary . 'options', [ 'option_value' => serialize( $kept ) ], [ 'option_name' => 'stacked_sites' ] );
+                    }
+                }
+            }
             wp_cache_flush();
             self::refresh_freighter();
         } elseif ( $this->id !== '' ) {
             $site = get_site( (int) $this->id );
             if ( $site ) {
                 clean_blog_cache( $site );
+            }
+            if ( $this->created && (int) $this->id !== (int) get_main_site_id() ) {
+                $wpdb->delete( $wpdb->blogs, [ 'blog_id' => (int) $this->id ] );
+                if ( ! empty( $wpdb->blogmeta ) ) {
+                    $wpdb->delete( $wpdb->blogmeta, [ 'blog_id' => (int) $this->id ] );
+                }
+                if ( function_exists( 'wp_update_network_site_counts' ) ) {
+                    wp_update_network_site_counts();
+                }
             }
             wp_cache_flush();
         }
