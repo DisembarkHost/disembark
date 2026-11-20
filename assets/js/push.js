@@ -86,6 +86,20 @@
       back: back,
       done: function (outcome, ctx) {
         var target = api.preflight.home_url || st.site, href = D.safeHref(target);
+        // Into a new or replaced subsite or tenant there: that site, not the whole destination.
+        if (ctx.target) {
+          var tg = ctx.target, net = tg.kind === 'multisite', own = D.address(tg.home) !== D.address(target), open = own ? D.safeHref(tg.home) : '';
+          D.mount(outcome,
+            h('h3', null, D.icon('checkCircle'), (net ? 'Subsite ' : 'Tenant ') + tg.id + ' is ready'),
+            h('p', null, D.host(tg.home) + ' now holds a copy of this site. The rest of ' + D.host(target) + ' is as it was.'),
+            h('p', { style: { marginTop: '8px' } }, net ? 'This site\u2019s users joined the network there: they log in with their own passwords, and an account that was already there keeps its own.'
+              : 'It has its own users: log in to it with your credentials from ' + D.host(D.config.homeUrl) + (own ? '.' : ', from Tools \u2192 WP Freighter there.')),
+            h('div', { class: 'row' },
+              open ? h('a', { class: 'dsk-btn primary', href: open, target: '_blank', rel: 'noopener' }, 'Open ' + D.host(tg.home)) : null,
+              h('button', { class: 'dsk-btn', type: 'button', onclick: function (ev) { ctx.rollback(ev.currentTarget); } }, D.icon('restore'), 'Undo push')),
+            ctx.undoDetails());
+          return;
+        }
         D.mount(outcome,
           h('h3', null, D.icon('key'), 'Log in there with this site’s details'),
           h('p', null, D.host(target) + ' now holds a copy of this site, user accounts included, so log in there with your credentials from ', h('strong', null, D.host(D.config.homeUrl)), '.'),

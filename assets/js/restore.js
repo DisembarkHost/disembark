@@ -957,7 +957,7 @@
       var mins = Math.max(1, Math.round((Date.now() - startedAt) / 60000));
       capsText.textContent = KIND + ' finished \u00b7 ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + ' \u00b7 took ' + D.fmt.plural(mins, 'minute');
       if (bad) setTitle('Ashore, with', D.fmt.plural(verify.problems, 'problem') + '.'); else setTitle('Safely', 'ashore.');
-      sub.textContent = kind === 'push' ? dstLabel + ' now holds a copy of this site.' : (ctx.target ? D.host(ctx.target.home) : dstLabel) + ' now holds a copy of ' + srcLabel + '.';
+      sub.textContent = kind === 'push' ? (ctx.target ? D.host(ctx.target.home) : dstLabel) + ' now holds a copy of this site.' : (ctx.target ? D.host(ctx.target.home) : dstLabel) + ' now holds a copy of ' + srcLabel + '.';
       headK.textContent = 'Arrived.';
       setHead([bad ? 'Everything came across, but the checks after the move found something to look at (below). The restore point is kept if you\u2019d rather undo.' : 'Everything on the manifest came ashore. The restore point is kept in case you change your mind.'], bad ? D.fmt.plural(verify.problems, 'problem') : 'All 6 stops', bad ? 'warn' : 'ok');
       progress('');
