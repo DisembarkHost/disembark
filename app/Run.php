@@ -122,7 +122,7 @@ class Run {
      */
     public function register_admin_page() {
         add_management_page(
-            '',
+            'Disembark',
             'Disembark',
             User::menu_capability(),
             'disembark',
