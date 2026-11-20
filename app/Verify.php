@@ -150,7 +150,11 @@ class Verify {
         $list    = [];
         $reached = 0;
         $host    = strtolower( (string) wp_parse_url( self::$home !== '' ? self::$home : home_url(), PHP_URL_HOST ) );
-        $verify  = ! ( defined( 'DISEMBARK_DEV_MODE' ) && DISEMBARK_DEV_MODE );
+        // This site asking for its own public pages: like WordPress's own
+        // loopback requests (cron, the site health check), certificate
+        // checks follow https_local_ssl_verify (off by default), so a local
+        // or staging copy with a self-signed certificate is checked too.
+        $verify  = ! ( defined( 'DISEMBARK_DEV_MODE' ) && DISEMBARK_DEV_MODE ) && (bool) apply_filters( 'https_local_ssl_verify', false );
         foreach ( self::sample_urls( $login_url ) as $label => $url ) {
             $start = microtime( true );
             $hops  = 0;
