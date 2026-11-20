@@ -1101,11 +1101,18 @@ class Pull {
         if ( ! is_string( $url ) || ! preg_match( '#^https?://#', $url ) ) {
             return new \WP_Error( 'export_failed', 'Source did not return a database URL.', [ 'status' => 502 ] );
         }
-        $dest = $this->staging_public . '/database-pull.sql';
-        $dl   = $this->download_to( $url, $dest );
+        // Staged behind the exit line (see Import::staged_name()).
+        $dest = $this->staging_public . '/' . Import::staged_name( 'database-pull.sql' );
+        $tmp  = $this->fetch_source_file( $url );
         $this->cleanup_source_file( $url );
-        if ( is_wp_error( $dl ) ) {
-            return $dl;
+        if ( is_wp_error( $tmp ) ) {
+            return $tmp;
+        }
+        wp_mkdir_p( $this->staging_public );
+        $saved = Import::copy_protected( $tmp, $dest );
+        @unlink( $tmp );
+        if ( ! $saved ) {
+            return new \WP_Error( 'write_failed', 'Could not save the database in staging (is the disk full?).', [ 'status' => 500 ] );
         }
         // The database is the last thing pulled: clear this pull's working
         // folder on the source, then drop the source's full-access token,
@@ -1385,21 +1392,28 @@ class Pull {
      * The database, one batch per call: a group of tables up to
      * $batch_bytes, or, for a table bigger than that, a part of it by
      * primary key (a source that runs 3.0 or later). The dump is put
-     * together in staging and only takes its real name when whole. A
-     * source that can't export by parts gets the old single request.
+     * together in staging behind the exit line (database-pull.part.php),
+     * and only takes its staged name (database-pull.sql.php) when whole.
+     * A source that can't export by parts gets the old single request.
      */
     public function fetch_database_paced( $budget, $batch_bytes, $fingerprints = false, $skip_unchanged = false ) {
         $deadline   = Pace::deadline( $budget );
         $batch_bytes = max( 256 * KB_IN_BYTES, (int) $batch_bytes );
         $state_file = dirname( $this->state_file ) . '/database-state.php';
         $parts_dir  = $this->staging_public . '/.disembark-db-parts';
-        $part_file  = $parts_dir . '/database-pull.sql.part';
         $st         = json_decode( (string) Import::read_protected( $state_file ), true );
+        // Behind the exit line from the first byte. A pull an older build
+        // started keeps its plain names to the end.
+        $guarded    = ! is_array( $st ) || ! empty( $st['guarded'] );
+        $part_file  = $parts_dir . ( $guarded ? '/database-pull.part.php' : '/database-pull.sql.part' );
+        $dest       = $this->staging_public . '/' . ( $guarded ? Import::staged_name( 'database-pull.sql' ) : 'database-pull.sql' );
         $state      = $this->state();
         $schema_only = array_values( (array) ( $state['skip_rows'] ?? [] ) );
         if ( ! is_array( $st ) ) {
-            if ( ! empty( $state['db_done'] ) && file_exists( $this->staging_public . '/database-pull.sql' ) ) {
-                return [ 'done' => true, 'ok' => true, 'tables' => 0, 'bytes' => filesize( $this->staging_public . '/database-pull.sql' ), 'plan' => self::plan_summary( $this->plan() ) ];
+            foreach ( [ Import::staged_name( 'database-pull.sql' ), 'database-pull.sql' ] as $name ) {
+                if ( ! empty( $state['db_done'] ) && file_exists( $this->staging_public . '/' . $name ) ) {
+                    return [ 'done' => true, 'ok' => true, 'tables' => 0, 'bytes' => filesize( $this->staging_public . '/' . $name ), 'plan' => self::plan_summary( $this->plan() ) ];
+                }
             }
             $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->source_session() ], 'POST', max( 10, (int) ceil( Pace::left( $deadline ) ) ) );
             if ( is_wp_error( $pre ) ) {
@@ -1422,7 +1436,7 @@ class Pull {
             foreach ( (array) ( $state['tables'] ?? [] ) as $t ) {
                 $info[ (string) $t['name'] ] = [ (int) ( $t['size'] ?? 0 ), (int) ( $t['rows'] ?? 0 ) ];
             }
-            $st = [ 't' => 0, 'part' => null, 'bytes' => 0, 'tables' => [] ];
+            $st = [ 't' => 0, 'part' => null, 'bytes' => strlen( Import::PHP_EXIT ), 'tables' => [], 'guarded' => 1 ];
             foreach ( $tables as $name ) {
                 $st['tables'][] = [ (string) $name, $info[ (string) $name ][0] ?? 0, $info[ (string) $name ][1] ?? 0 ];
             }
@@ -1431,7 +1445,7 @@ class Pull {
             // next time rather than skipped by mistake.
             $st['fp'] = $fingerprints && ! $this->import->target() ? $this->plan_init( $pre, $st['tables'], $schema_only, $skip_unchanged ) : null;
             wp_mkdir_p( $parts_dir );
-            @file_put_contents( $part_file, '' );
+            @file_put_contents( $part_file, Import::PHP_EXIT );
             Import::write_protected( $state_file, (string) wp_json_encode( $st ) );
         }
         $save = function () use ( &$st, $state_file ) {
@@ -1464,7 +1478,6 @@ class Pull {
         // Whole: the dump takes its name, and the source's session and token
         // go, unless skipped tables still have to be checked once more at
         // the end (see settle()).
-        $dest = $this->staging_public . '/database-pull.sql';
         if ( ! @rename( $part_file, $dest ) ) {
             return new \WP_Error( 'write_failed', 'Could not save the database in staging (is the disk full?).', [ 'status' => 500 ] );
         }
@@ -1817,6 +1830,11 @@ class Pull {
         ] );
     }
 
+    /** The catch-up recheck's dump: behind the exit line, unless an older build started it. */
+    private static function recheck_name( $st ) {
+        return ! isset( $st['x'] ) || ! empty( $st['x']['guarded'] ) ? 'recheck.sql.php' : 'recheck.sql';
+    }
+
     /**
      * After the address rewrite: fingerprints the skipped tables on the
      * source once more and copies again any that changed during the move
@@ -1880,15 +1898,16 @@ class Pull {
             foreach ( (array) ( $state['tables'] ?? [] ) as $t ) {
                 $info[ (string) $t['name'] ] = [ (int) ( $t['size'] ?? 0 ), (int) ( $t['rows'] ?? 0 ) ];
             }
-            $st['x'] = [ 't' => 0, 'part' => null, 'bytes' => 0, 'tables' => array_map( function ( $t ) use ( $info ) { return [ $t, $info[ $t ][0] ?? 0, $info[ $t ][1] ?? 0 ]; }, $st['changed'] ) ];
+            // Behind the exit line, like the pull's own dump.
+            $st['x'] = [ 't' => 0, 'part' => null, 'bytes' => strlen( Import::PHP_EXIT ), 'tables' => array_map( function ( $t ) use ( $info ) { return [ $t, $info[ $t ][0] ?? 0, $info[ $t ][1] ?? 0 ]; }, $st['changed'] ), 'guarded' => 1 ];
             wp_mkdir_p( $parts );
-            @file_put_contents( $parts . '/recheck.sql', '' );
+            @file_put_contents( $parts . '/' . self::recheck_name( $st ), Import::PHP_EXIT );
             $st['phase'] = 'fetch';
             $save();
         }
         if ( $st['phase'] === 'fetch' ) {
             while ( $st['x']['t'] < count( $st['x']['tables'] ) ) {
-                $b = $this->export_batch( $st['x'], $parts . '/recheck.sql', 16 * MB_IN_BYTES, (array) ( $state['skip_rows'] ?? [] ), $state, max( 10, (int) ceil( Pace::left( $deadline ) ) ) );
+                $b = $this->export_batch( $st['x'], $parts . '/' . self::recheck_name( $st ), 16 * MB_IN_BYTES, (array) ( $state['skip_rows'] ?? [] ), $state, max( 10, (int) ceil( Pace::left( $deadline ) ) ) );
                 if ( is_wp_error( $b ) ) {
                     return $b;
                 }
@@ -1902,7 +1921,7 @@ class Pull {
         }
         if ( $st['phase'] === 'import' ) {
             global $wpdb;
-            $sq = $import->import_staged_sql( 'public/.disembark-db-parts/recheck.sql', (string) ( $state['source_prefix'] ?? '' ), (string) $wpdb->prefix, Pace::left( $deadline ), true );
+            $sq = $import->import_staged_sql( 'public/.disembark-db-parts/' . self::recheck_name( $st ), (string) ( $state['source_prefix'] ?? '' ), (string) $wpdb->prefix, Pace::left( $deadline ), true );
             if ( is_wp_error( $sq ) ) {
                 return $sq;
             }
@@ -1923,7 +1942,7 @@ class Pull {
             if ( isset( $sr['done'] ) && ! $sr['done'] ) {
                 return $more( 'Rewriting addresses in the tables that changed' );
             }
-            @unlink( $parts . '/recheck.sql' );
+            @unlink( $parts . '/' . self::recheck_name( $st ) );
             $st['phase'] = 'cleanup';
             $save();
         }

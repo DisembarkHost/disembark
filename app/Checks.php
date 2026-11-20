@@ -129,7 +129,7 @@ class Checks {
                             continue;
                         }
                         $rel = ltrim( str_replace( '\\', '/', substr( $file->getPathname(), strlen( $root ) ) ), '/' );
-                        if ( preg_match( '/^database-.*\.sql$/', $rel ) ) {
+                        if ( preg_match( '/^database-.*\.sql(?:\.php)?$/', $rel ) ) {
                             $db_in += $file->getSize();
                             continue;
                         }

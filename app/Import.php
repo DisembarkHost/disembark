@@ -132,7 +132,7 @@ class Import {
     }
 
     /** Copies $from to $to behind the exit line. True when every byte arrived. */
-    private static function copy_protected( $from, $to ) {
+    public static function copy_protected( $from, $to ) {
         $in  = @fopen( $from, 'rb' );
         $tmp = $to . '.tmp';
         $out = $in ? @fopen( $tmp, 'wb' ) : false;
@@ -828,11 +828,22 @@ class Import {
      * or isn't served; it is never the source's code, and never a .htaccess.
      * Apache maps every extension of a name (x.php.jpg runs as PHP), hence
      * the encoding rather than a suffix alone. Every name that ends in
-     * .dsk.php is itself encoded, so the mapping is exact. Restore points
-     * keep the files a move replaced the same way.
+     * .dsk.php is itself encoded, so the mapping is exact.
+     *
+     * A staged database dump (database-<name>.sql, as backup zips and the
+     * CLI carry it) waits as database-<name>.sql.php, behind the same exit
+     * line: a full copy of a database (password hashes, the source's
+     * token) at a URL. The import reads past the exit line. A file that
+     * really is called database-x.sql.php is runnable, so it's staged as
+     * database-x%2Esql%2Ephp.dsk.php and the mapping stays exact.
      * ---------------------------------------------------------------- */
 
     const STAGED_SUFFIX = '.dsk.php';
+
+    /** Whether $base (a file name) is a database dump as backups stage it. */
+    private static function dump_name( $base ) {
+        return (bool) preg_match( '/^database-.*\.sql$/i', (string) $base );
+    }
 
     /** Whether a file named $name could run, or change what runs, on a web server. */
     private static function runnable_name( $name ) {
@@ -845,6 +856,9 @@ class Import {
         $cut  = strrpos( $rel, '/' );
         $dir  = $cut === false ? '' : substr( $rel, 0, $cut + 1 );
         $base = $cut === false ? $rel : substr( $rel, $cut + 1 );
+        if ( self::dump_name( $base ) ) {
+            return $rel . '.php';
+        }
         if ( $base === '' || ( ! self::runnable_name( $base ) && substr( $base, -strlen( self::STAGED_SUFFIX ) ) !== self::STAGED_SUFFIX ) ) {
             return $rel;
         }
@@ -854,6 +868,9 @@ class Import {
     /** The real name of a staged path (the reverse of staged_name()). */
     public static function unstaged_name( $rel ) {
         $rel = (string) $rel;
+        if ( substr( $rel, -4 ) === '.php' && self::dump_name( basename( substr( $rel, 0, -4 ) ) ) ) {
+            return substr( $rel, 0, -4 );
+        }
         if ( substr( $rel, -strlen( self::STAGED_SUFFIX ) ) !== self::STAGED_SUFFIX ) {
             return $rel;
         }
@@ -1051,7 +1068,9 @@ class Import {
         if ( ! self::is_safe_relative_path( $sql_file ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid SQL file path.', [ 'status' => 400 ] );
         }
-        $path = $this->staging_path . '/' . $sql_file;
+        // Under its staged name (database-x.sql.php, behind the exit line)
+        // or, staged by an older build, its own.
+        $path = self::staged_file( $this->staging_path, $sql_file );
         if ( ! file_exists( $path ) ) {
             return new \WP_Error( 'not_found', 'Staged SQL file not found.', [ 'status' => 404 ] );
         }
@@ -1717,9 +1736,10 @@ class Import {
     public function staged_info() {
         $sql_rel = null;
         foreach ( [ '/public', '' ] as $sub ) {
-            $matches = glob( $this->staging_path . $sub . '/database-*.sql' );
+            // Staged as database-x.sql.php; an older build left database-x.sql.
+            $matches = array_merge( glob( $this->staging_path . $sub . '/database-*.sql.php' ) ?: [], glob( $this->staging_path . $sub . '/database-*.sql' ) ?: [] );
             if ( ! empty( $matches ) ) {
-                $sql_rel = ltrim( str_replace( '\\', '/', substr( $matches[0], strlen( $this->staging_path ) ) ), '/' );
+                $sql_rel = self::unstaged_name( ltrim( str_replace( '\\', '/', substr( $matches[0], strlen( $this->staging_path ) ) ), '/' ) );
                 break;
             }
         }
@@ -5467,12 +5487,13 @@ function pclzip_pre_extract_guard( $event, &$header ) {
 }
 
 /**
- * PclZip post-extract callback: a file extracted under its staged name gets
- * the exit line in front, as the ZipArchive branch writes it.
+ * PclZip post-extract callback: a file extracted under its staged name (a
+ * runnable file, a database dump) gets the exit line in front, as the
+ * ZipArchive branch writes it.
  */
 function pclzip_post_extract_staged( $event, &$header ) {
     $file = isset( $header['filename'] ) ? (string) $header['filename'] : '';
-    if ( ! empty( $header['folder'] ) || substr( $file, -strlen( Import::STAGED_SUFFIX ) ) !== Import::STAGED_SUFFIX || ! is_file( $file ) ) {
+    if ( ! empty( $header['folder'] ) || Import::unstaged_name( $file ) === $file || ! is_file( $file ) ) {
         return 1;
     }
     $data = (string) file_get_contents( $file );
