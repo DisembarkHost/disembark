@@ -862,7 +862,9 @@
       catchUpInfo = fin.catch_up || null;
       if (fin.catch_up) {
         var cu = fin.catch_up;
-        rlog('Catching up: ' + D.fmt.plural(cu.changed, 'file') + ' new or changed since the last pull (' + D.fmt.date(cu.since) + '), ' + D.fmt.plural(cu.removed, 'file') + ' removed on the source. ' + D.fmt.plural(cu.unchanged, 'unchanged file') + ' stay as they are.');
+        var lb = cu.left_before;
+        rlog('Catching up: ' + (lb === null || lb === undefined ? D.fmt.plural(cu.changed, 'file') + ' new, changed or left behind since the last pull (' + D.fmt.date(cu.since) + '), '
+          : D.fmt.plural(cu.changed, 'file') + ' new or changed since the last pull (' + D.fmt.date(cu.since) + '), ' + (lb ? D.fmt.plural(lb, 'file') + ' that pull left behind (What to bring decides again), ' : '')) + D.fmt.plural(cu.removed, 'file') + ' removed on the source. ' + D.fmt.plural(cu.unchanged, 'unchanged file') + ' stay as they are.');
         if (cu.approx) rlog('The source runs an older Disembark that doesn\u2019t report file times, so files were compared by size only.', 'dim');
       } else {
         if (fin.catch_up === false) rlog('Nothing is remembered from an earlier pull of this source, so everything comes across.', 'dim');

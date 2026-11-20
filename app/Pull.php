@@ -784,8 +784,15 @@ class Pull {
             $changed = [];
             $kept    = [];
             $approx  = false;
+            // Files the last pull left behind aren't on this site, so they
+            // count as not here yet, but they aren't new: told apart.
+            $left    = isset( $last['left_out'] ) ? (array) $last['left_out'] : null;
+            $behind  = 0;
             foreach ( $files as $f ) {
                 $old = $before[ $f['name'] ] ?? null;
+                if ( $old === null && $left !== null && self::was_left_out( $f['name'], $left ) ) {
+                    $behind++;
+                }
                 if ( $old === null || (int) $old[0] !== (int) $f['size'] ) {
                     $changed[] = $f;
                     continue;
@@ -803,7 +810,7 @@ class Pull {
             $removed = array_values( array_filter( array_keys( $before ), function ( $name ) use ( $now ) { return ! isset( $now[ $name ] ); } ) );
             file_put_contents( dirname( $this->state_file ) . '/unchanged.json', wp_json_encode( $kept ) );
             file_put_contents( dirname( $this->state_file ) . '/delete-list.json', wp_json_encode( $removed ) );
-            $state['catch_up_info'] = [ 'since' => (int) $last['at'], 'changed' => count( $changed ), 'unchanged' => count( $kept ), 'removed' => count( $removed ), 'approx' => $approx ];
+            $state['catch_up_info'] = [ 'since' => (int) $last['at'], 'changed' => count( $changed ) - $behind, 'left_before' => $left === null ? null : $behind, 'unchanged' => count( $kept ), 'removed' => count( $removed ), 'approx' => $approx ];
             $result['catch_up']     = $state['catch_up_info'];
             $files                  = $changed;
         } elseif ( ! empty( $state['catch_up'] ) ) {
@@ -834,6 +841,12 @@ class Pull {
     }
 
     /** [ source, at, files: { name: [size, mtime|null] } ] or null. */
+    /** Whether $name sat in what a pull left behind ({ paths, names }). */
+    private static function was_left_out( $name, $left ) {
+        $names = array_flip( array_map( 'strval', (array) ( $left['names'] ?? [] ) ) );
+        return isset( $names[ basename( (string) $name ) ] ) || Skips::inside( (string) $name, array_map( 'strval', (array) ( $left['paths'] ?? [] ) ) );
+    }
+
     public static function last_pull( $source ) {
         $file = self::pull_file( $source );
         if ( ! is_file( $file ) ) {
@@ -894,6 +907,9 @@ class Pull {
             Import::write_protected( $rollback . '/pull-memory.php', (string) wp_json_encode( [ 'file' => self::pull_file( $source ), 'previous' => $previous ] ) );
         }
         $memory = [ 'source' => untrailingslashit( $source ), 'at' => time(), 'files' => $files ];
+        // What "What to bring" left behind, so the next catch-up can say
+        // those files aren't new.
+        $memory['left_out'] = [ 'paths' => (array) ( $state['left_out']['paths'] ?? [] ), 'names' => (array) ( $state['left_out']['names'] ?? [] ) ];
         // Both sides' table fingerprints, for skipping unchanged tables next time.
         $fps = json_decode( (string) Import::read_protected( dirname( $this->state_file ) . '/fingerprints.php' ), true );
         if ( is_array( $fps ) && ! empty( $fps['tables'] ) ) {

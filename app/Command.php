@@ -285,7 +285,12 @@ class Command {
         if ( ! empty( $fin['catch_up'] ) ) {
             $cu = $fin['catch_up'];
             $summary['catch_up'] = $cu;
-            $this->say( '      Catching up: ' . number_format( (int) $cu['changed'] ) . ' files new or changed since the last pull (' . wp_date( 'Y-m-d H:i', (int) $cu['since'] ) . '), ' . number_format( (int) $cu['removed'] ) . ' removed on the source, ' . number_format( (int) $cu['unchanged'] ) . ' unchanged.' . ( ! empty( $cu['approx'] ) ? ' (The source sends no file times, so files were compared by size.)' : '' ) );
+            $since = ' since the last pull (' . wp_date( 'Y-m-d H:i', (int) $cu['since'] ) . ')';
+            $this->say( '      Catching up: ' . ( ! isset( $cu['left_before'] ) || $cu['left_before'] === null
+                // Remembered by an older build: left-behind files can't be told apart.
+                ? self::plural( (int) $cu['changed'], 'file' ) . ' new, changed or left behind' . $since
+                : self::plural( (int) $cu['changed'], 'file' ) . ' new or changed' . $since . ( $cu['left_before'] ? ', ' . self::plural( (int) $cu['left_before'], 'file' ) . ' that pull left behind (What to bring decides again)' : '' ) )
+                . ', ' . number_format( (int) $cu['removed'] ) . ' removed on the source, ' . number_format( (int) $cu['unchanged'] ) . ' unchanged.' . ( ! empty( $cu['approx'] ) ? ' (The source sends no file times, so files were compared by size.)' : '' ) );
         } elseif ( isset( $fin['catch_up'] ) ) {
             $this->say( '      Nothing is remembered from an earlier pull of this source, so everything comes across.' );
         }

@@ -245,7 +245,7 @@
             h('span', { class: 'dsk-tag warn', style: { marginBottom: '10px' } }, D.icon('alert'), 'Waiting on you'),
             h('h2', { style: { fontSize: '32px', lineHeight: 1 } }, 'What to ', h('em', { class: 'hl' }, 'bring?')),
             h('p', { class: 'muted', style: { marginTop: '10px' } }, o.catchUp
-              ? 'Catching up: ' + D.fmt.plural(c.files || 0, 'file') + ' (' + D.fmt.size(c.bytes || 0) + ') on ' + D.host(o.source || '') + ' are new or changed since the last pull, and all ' + D.fmt.plural((c.tables || []).length, 'table') + ' come across again. The usual things to leave behind are ticked. Nothing has been copied yet.'
+              ? 'Catching up: ' + D.fmt.plural(c.files || 0, 'file') + ' (' + D.fmt.size(c.bytes || 0) + ') on ' + D.host(o.source || '') + ' aren\u2019t here from the last pull (new, changed, or left behind by it), and all ' + D.fmt.plural((c.tables || []).length, 'table') + ' come across again. The usual things to leave behind are ticked. Nothing has been copied yet.'
               : D.host(o.source || '') + ' holds ' + D.fmt.plural(c.files || 0, 'file') + ' (' + D.fmt.size(c.bytes || 0) + ') and ' + D.fmt.plural((c.tables || []).length, 'table') + '. The usual things to leave behind are ticked. Nothing has been copied yet.')),
           h('div', { class: 'dsk-row' }, h('label', { class: 'muted' }, 'Start from'), startSel,
             h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: saveTemplate }, D.icon('plus'), 'Save as template'), delBtn),
