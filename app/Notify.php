@@ -179,7 +179,9 @@ class Notify {
         } else {
             $body = [ 'event' => 'disembark.move.' . $event, 'text' => $text, 'site' => home_url(), 'details' => $details ];
         }
-        $response = wp_remote_post( $url, [ 'timeout' => 15, 'sslverify' => ! ( defined( 'DISEMBARK_DEV_MODE' ) && DISEMBARK_DEV_MODE ), 'headers' => [ 'Content-Type' => 'application/json' ], 'body' => wp_json_encode( $body ) ] );
+        // wp_safe_remote_post: a webhook URL can't point at this server or
+        // the private network behind it (and redirects are checked too).
+        $response = wp_safe_remote_post( $url, [ 'timeout' => 15, 'headers' => [ 'Content-Type' => 'application/json' ], 'body' => wp_json_encode( $body ) ] );
         if ( is_wp_error( $response ) ) {
             return $response->get_error_message();
         }
