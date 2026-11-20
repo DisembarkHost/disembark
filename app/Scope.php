@@ -622,6 +622,11 @@ class Scope {
                 return $row;
             }
             $key = (string) $row[ $k ];
+            // Where the user stands in the network (their home site, the
+            // domain they signed up on): nothing outside the network uses them.
+            if ( $key === 'primary_blog' || $key === 'source_domain' ) {
+                return null;
+            }
             if ( strpos( $key, $this->base ) === 0 ) {
                 $rest = substr( $key, strlen( $this->base ) );
                 if ( preg_match( '/^(\d+)_/', $rest, $m ) && isset( $this->blog_ids[ (int) $m[1] ] ) ) {
