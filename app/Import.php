@@ -1880,6 +1880,7 @@ class Import {
         $deployed  = [];
         $errors    = [];
         $backed_up = [];
+        $created   = [];
         $kept      = [];
         $own_kept  = 0; // files this site keeps its own copy of (see below)
 
@@ -1910,6 +1911,9 @@ class Import {
             if ( isset( $out['d'] ) ) {
                 $deployed[] = $out['d'];
             }
+            if ( isset( $out['c'] ) ) {
+                $created = array_merge( $created, (array) $out['c'] );
+            }
             if ( isset( $out['b'] ) ) {
                 $backed_up[] = $out['b'];
             }
@@ -1926,7 +1930,7 @@ class Import {
                 $shared_kept[ $out['s'] ] = true;
             }
         }
-        return $this->deploy_finish( $web_root, $target, $keep_host_files, $deployed, $backed_up, $errors, $own_kept, $kept, $shared_kept );
+        return $this->deploy_finish( $web_root, $target, $keep_host_files, $deployed, $backed_up, $errors, $own_kept, $kept, $shared_kept, $created );
     }
 
     /** Where staged files sit: staging, or its public/ folder when a whole-snapshot zip nests the site there. */
@@ -2021,10 +2025,18 @@ class Import {
             $out['b'] = $relative_path;
         }
 
-        // Create destination directory
+        // Create destination directory, remembering each folder it adds
+        // (a rollback removes those, and only those, once they're empty).
         $dest_dir = dirname( $dest );
         if ( ! is_dir( $dest_dir ) ) {
+            $created = [];
+            for ( $d = dirname( $relative_path ); $d !== '.' && $d !== '' && ! is_dir( $web_root . '/' . $d ); $d = dirname( $d ) ) {
+                $created[] = $d;
+            }
             mkdir( $dest_dir, 0755, true );
+            if ( $created ) {
+                $out['c'] = $created;
+            }
         }
 
         // Move file (a staged name gets its real one back)
@@ -2075,7 +2087,7 @@ class Import {
         }
 
         // Every file has been seen (or the move was cancelled): add up the journal.
-        $deployed = $backed_up = $errors = [];
+        $deployed = $backed_up = $errors = $created = [];
         $own_kept = 0;
         $kept = $shared_kept = [];
         if ( $stopped ) {
@@ -2091,6 +2103,9 @@ class Import {
             if ( isset( $rec['e'] ) ) {
                 $errors[] = (string) $rec['e'];
             }
+            if ( isset( $rec['c'] ) ) {
+                $created = array_merge( $created, (array) $rec['c'] );
+            }
             if ( ! empty( $rec['k'] ) ) {
                 $own_kept++;
             }
@@ -2101,7 +2116,7 @@ class Import {
                 $shared_kept[ (string) $rec['s'] ] = true;
             }
         }
-        $result = $this->deploy_finish( $web_root, $target, $keep_host_files, array_values( array_unique( $deployed ) ), array_values( array_unique( $backed_up ) ), $errors, $own_kept, $kept, $shared_kept );
+        $result = $this->deploy_finish( $web_root, $target, $keep_host_files, array_values( array_unique( $deployed ) ), array_values( array_unique( $backed_up ) ), $errors, $own_kept, $kept, $shared_kept, $created );
         @unlink( $journal_f );
         @unlink( $list_file );
         $result['done'] = true;
@@ -2128,6 +2143,12 @@ class Import {
             if ( isset( $rec['b'] ) ) {
                 $meta['backed_up_files'][] = (string) $rec['b'];
             }
+            if ( isset( $rec['c'] ) ) {
+                $meta['created_dirs'] = array_merge( (array) ( $meta['created_dirs'] ?? [] ), (array) $rec['c'] );
+            }
+        }
+        if ( isset( $meta['created_dirs'] ) ) {
+            $meta['created_dirs'] = array_values( array_unique( $meta['created_dirs'] ) );
         }
         $meta['deployed_files']  = array_values( array_unique( (array) ( $meta['deployed_files'] ?? [] ) ) );
         $meta['backed_up_files'] = array_values( array_unique( (array) ( $meta['backed_up_files'] ?? [] ) ) );
@@ -2138,7 +2159,7 @@ class Import {
     }
 
     /** The end of a deploy: a catch-up's removals, the restore point's lists, and the answer. */
-    private function deploy_finish( $web_root, $target, $keep_host_files, $deployed, $backed_up, $errors, $own_kept, $kept, $shared_kept ) {
+    private function deploy_finish( $web_root, $target, $keep_host_files, $deployed, $backed_up, $errors, $own_kept, $kept, $shared_kept, $created = [] ) {
         // A catch-up pull removes files that were brought by the last pull
         // and are gone from the source now. Each is backed up first, so a
         // rollback puts it back.
@@ -2180,6 +2201,7 @@ class Import {
         if ( $meta !== null ) {
             $meta['deployed_files']  = array_values( array_unique( array_merge( $meta['deployed_files'] ?? [], $deployed ) ) );
             $meta['backed_up_files'] = array_values( array_unique( array_merge( $meta['backed_up_files'] ?? [], $backed_up ) ) );
+            $meta['created_dirs']    = array_values( array_unique( array_merge( (array) ( $meta['created_dirs'] ?? [] ), (array) $created ) ) );
             $this->save_rollback_meta( $meta );
         }
 
@@ -3838,16 +3860,30 @@ class Import {
 
         // Folders the move created (a plugin it brought, a WP Freighter
         // install's content/<id>) go too once empty. rmdir() never removes a
-        // folder that still holds anything; WordPress's own folders and the
-        // ones directly in wp-content stay even when empty.
+        // folder that still holds anything.
         $content = ltrim( substr( wp_normalize_path( WP_CONTENT_DIR ), strlen( wp_normalize_path( $web_root ) ) ), '/' );
         $keep    = function ( $dir ) use ( $content ) {
             return in_array( $dir, [ 'wp-admin', 'wp-includes', 'wp-content', $content ], true ) || dirname( $dir ) === $content || dirname( $dir ) === 'wp-content';
         };
-        krsort( $emptied );
-        foreach ( array_keys( $emptied ) as $dir ) {
-            while ( $dir !== '.' && $dir !== '' && ! $keep( $dir ) && @rmdir( $web_root . '/' . $dir ) ) {
-                $dir = dirname( $dir );
+        if ( isset( $meta['created_dirs'] ) ) {
+            // The deploy recorded the folders it added: those go (deepest
+            // first, once empty), and folders that were here before stay,
+            // empty or not.
+            $dirs = array_filter( (array) $meta['created_dirs'], function ( $dir ) {
+                return self::is_safe_relative_path( (string) $dir ) && ! in_array( (string) $dir, [ 'wp-admin', 'wp-includes', 'wp-content' ], true );
+            } );
+            usort( $dirs, function ( $a, $b ) { return substr_count( $b, '/' ) - substr_count( $a, '/' ) ?: strcmp( $b, $a ); } );
+            foreach ( $dirs as $dir ) {
+                @rmdir( $web_root . '/' . $dir );
+            }
+        } else {
+            // A restore point from an earlier build: folders that end up
+            // empty go, walking up, short of the ones above.
+            krsort( $emptied );
+            foreach ( array_keys( $emptied ) as $dir ) {
+                while ( $dir !== '.' && $dir !== '' && ! $keep( $dir ) && @rmdir( $web_root . '/' . $dir ) ) {
+                    $dir = dirname( $dir );
+                }
             }
         }
 
