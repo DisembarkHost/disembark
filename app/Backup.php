@@ -377,6 +377,7 @@ class Backup {
 
     public function database_export( $table, $parts = 0, $rows_per_part = 0 ) {
         global $wpdb;
+        self::prepare_escaping();
         $select_row_limit = 1000;
         $rows_start       = 0;
         $insert_sql       = "";
@@ -505,6 +506,7 @@ class Backup {
      */
     public function database_export_batch( $tables = [], $schema_only = [], $shared_rows = false ) {
         global $wpdb;
+        self::prepare_escaping();
         // Tables exported as structure only: a move leaving their rows behind.
         $schema_only = array_flip( array_map( 'strval', (array) $schema_only ) );
         // One site of a shared install: tables by the names it exports them
@@ -1097,9 +1099,56 @@ class Backup {
         return "INSERT INTO `{$table}` VALUES(" . implode( ', ', $values ) . ");\n";
     }
 
+    /**
+     * Escapes a value for a quoted SQL string in an export. The importer reads
+     * dumps with backslash escapes, so they must be written that way whatever
+     * the server's sql_mode: with NO_BACKSLASH_ESCAPES on, MySQL's own escaping
+     * only doubles quotes and leaves backslashes, and a value like
+     * \'); UPDATE … would split into a statement of its own on import.
+     */
     public static function db_escape( $sql ) {
         global $wpdb;
-        return mysqli_real_escape_string( $wpdb->dbh, $sql );
+        if ( self::$escape_native === null ) {
+            self::$escape_native = $wpdb->dbh instanceof \mysqli && self::backslash_escapes_on();
+        }
+        if ( self::$escape_native ) {
+            return mysqli_real_escape_string( $wpdb->dbh, (string) $sql );
+        }
+        return strtr( (string) $sql, [
+            '\\'   => '\\\\',
+            "\0"  => '\\0',
+            "\n"  => '\\n',
+            "\r"  => '\\r',
+            "'"   => "\\'",
+            '"'   => '\\"',
+            "\x1a" => '\\Z',
+        ] );
+    }
+
+    /** Whether the connection escapes with backslashes (null: not checked yet). */
+    private static $escape_native = null;
+
+    /**
+     * Takes NO_BACKSLASH_ESCAPES out of this session's sql_mode and checks it
+     * worked. Called at the start of every export; when the mode can't be
+     * changed, db_escape() writes backslash escapes itself.
+     */
+    private static function backslash_escapes_on() {
+        global $wpdb;
+        $has = function () use ( $wpdb ) {
+            return stripos( (string) $wpdb->get_var( 'SELECT @@SESSION.sql_mode' ), 'NO_BACKSLASH_ESCAPES' ) !== false;
+        };
+        if ( ! $has() ) {
+            return true;
+        }
+        $wpdb->query( "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','))" );
+        return ! $has();
+    }
+
+    /** Re-checks the session's escaping before an export. */
+    private static function prepare_escaping() {
+        self::$escape_native = null;
+        self::db_escape( '' );
     }
 
     function list_manifest() {
