@@ -1212,6 +1212,12 @@ class Import {
             // drop one of the source's own tables run (see target_statement()).
             if ( $target ) {
                 $verdict = self::target_statement( $statement, $old_prefix );
+                // One that would be refused anyway, for a reason worth
+                // stopping for (see below), stops the import instead.
+                if ( $verdict === 'refused' && ! $dry && ( $problem = self::reach_problem( $statement, (string) $old_prefix ) ) ) {
+                    $run['errors'][] = $problem;
+                    return false;
+                }
                 if ( $verdict === 'foreign_create' ) {
                     $foreign++;
                 } elseif ( $verdict === 'refused' ) {
@@ -1221,6 +1227,13 @@ class Import {
                 if ( $verdict !== 'ok' ) {
                     return true;
                 }
+            }
+            // A storage engine or foreign key that reaches outside this
+            // site's tables ends the import before the statement runs: the
+            // copies go and the live tables stay (see reach_problem()).
+            if ( ! $dry && ( $problem = self::reach_problem( $statement, (string) $old_prefix, $shared_main, (string) $old_prefix, (string) $new_prefix ) ) ) {
+                $run['errors'][] = $problem;
+                return false;
             }
             $transformed_statements = self::transform_statements( [ $statement ], $old_prefix, $new_prefix );
             if ( $shared_main ) {
@@ -2729,13 +2742,6 @@ class Import {
                 if ( preg_match( '/\b(SELECT|UNION|RENAME|LIKE|EXCHANGE|TABLE|TABLESPACE|DISCARD|OUTFILE|DUMPFILE|LOAD_FILE|DIRECTORY|CONNECTION|TABLE_TYPE|TABNAME|FILE_NAME|TRIGGER|PROCEDURE|FUNCTION|EVENT|GRANT|HANDLER|CALL|EXECUTE|PREPARE|DATABASE|SCHEMA|INTO)\b|;|`i`\s*\.|\.\s*`i`/i', $rest ) ) {
                     return 'refused';
                 }
-                if ( preg_match_all( '/\bENGINE\s*=?\s*(\w+)/i', $rest, $engines ) ) {
-                    foreach ( $engines[1] as $engine ) {
-                        if ( ! in_array( strtolower( $engine ), [ 'innodb', 'myisam', 'aria', 'memory', 'heap', 'archive', 'rocksdb', 'tokudb' ], true ) ) {
-                            return 'refused';
-                        }
-                    }
-                }
             }
             if ( strpos( $m[1], $prefix ) !== 0 ) {
                 return $kind === 'create' ? 'foreign_create' : 'foreign';
@@ -2772,6 +2778,85 @@ class Import {
         return (bool) preg_match( '/^SET\s+' . $part . '(?:\s*,\s*' . $part . ')*\s*;?\s*$/i', trim( $sql ) );
     }
 
+    /** Storage engines a dump may create tables with: none that reaches outside the database (FEDERATED, CONNECT, SPIDER, S3), reads other tables (MRG_MyISAM) or files on the server (CSV, CONNECT). */
+    const ALLOWED_ENGINES = [ 'innodb', 'myisam', 'aria', 'memory', 'heap', 'archive', 'rocksdb', 'tokudb' ];
+
+    /**
+     * Why a dump's CREATE TABLE or ALTER TABLE mustn't run here, or null.
+     * Refused in every import, not only into a subsite or tenant:
+     * - a storage engine outside ALLOWED_ENGINES, or one given as a quoted
+     *   or backticked name (MySQL takes ENGINE='CONNECT' too);
+     * - a foreign key to a table in another database;
+     * - from one of the incoming site's tables (named with $prefix, the
+     *   source's prefix that the import remaps), a foreign key to a table
+     *   without it. '' when the backup doesn't record its prefix: then only
+     *   the other-database rule applies. A table of another prefix that a
+     *   whole-site dump carries along (a second install in the source's
+     *   database) may point at its own kind, as it may be created anyway;
+     * - on a network's or WP Freighter install's main site ($shared; $old,
+     *   $new: the prefix remap), a foreign key to another site's table or
+     *   the network's (other_sites_table()).
+     * The text is read the way MySQL lexes it (sql_skeleton()), so a
+     * keyword inside a string or comment doesn't count, and one hidden in
+     * an executable comment does.
+     */
+    private static function reach_problem( $statement, $prefix, $shared = false, $old = '', $new = '' ) {
+        $sql = self::sql_skeleton( trim( self::strip_leading_comments( (string) $statement ) ), true );
+        if ( $sql === null || ! preg_match( '/^\s*(CREATE\s+(?:TEMPORARY\s+)?TABLE|ALTER\s+(?:ONLINE\s+|IGNORE\s+)*TABLE)\b/i', $sql, $head ) ) {
+            return null;
+        }
+        $name  = self::statement_table( $statement );
+        $table = $name !== null ? $name : 'a table';
+        $remap = function ( $t ) use ( $old, $new ) {
+            return $old !== '' && $new !== '' && stripos( $t, $old ) === 0 ? $new . substr( $t, strlen( $old ) ) : $t;
+        };
+        if ( $shared && $name !== null && self::other_sites_table( $remap( $name ) ) ) {
+            return null; // left out on the way in (see import_staged_sql())
+        }
+        $own = $prefix === '' || $name === null || stripos( $name, $prefix ) === 0;
+        $ident = '(?:`(?:[^`]|``)+`|[A-Za-z0-9_$]+)';
+        // Table options follow the column list; columns may be called "engine".
+        $opts = $sql;
+        if ( stripos( $head[1], 'CREATE' ) === 0 && ( $open = strpos( $sql, '(' ) ) !== false ) {
+            $depth = 0;
+            for ( $i = $open, $n = strlen( $sql ); $i < $n; $i++ ) {
+                if ( $sql[ $i ] === '(' ) {
+                    $depth++;
+                } elseif ( $sql[ $i ] === ')' && --$depth === 0 ) {
+                    $opts = substr( $sql, $i + 1 );
+                    break;
+                }
+            }
+        }
+        if ( preg_match_all( '/\bENGINE\b\s*(?:=\s*)?(' . $ident . '|\'\'|\S+)/i', $opts, $engines ) ) {
+            foreach ( $engines[1] as $engine ) {
+                if ( ! preg_match( '/^[A-Za-z0-9_]+$/', $engine ) ) {
+                    return "The incoming database names the storage engine of {$table} in quotes, so this can't tell which one it is, and a move doesn't accept it. Nothing was imported from it.";
+                }
+                if ( ! in_array( strtolower( $engine ), self::ALLOWED_ENGINES, true ) ) {
+                    return "The incoming database creates {$table} with the {$engine} storage engine, which a move doesn't accept (engines like it can reach other servers, files or tables; InnoDB, MyISAM, Aria, MEMORY, ARCHIVE, RocksDB and TokuDB are fine). Nothing was imported from it.";
+                }
+            }
+        }
+        if ( preg_match_all( '/\bREFERENCES\s+(' . $ident . ')(\s*\.\s*' . $ident . ')?/i', $sql, $refs, PREG_SET_ORDER ) ) {
+            foreach ( $refs as $ref ) {
+                $parent = str_replace( '``', '`', trim( $ref[1], '`' ) );
+                if ( ! empty( $ref[2] ) ) {
+                    return "The incoming database gives {$table} a foreign key to a table in another database ({$parent}." . trim( ltrim( trim( $ref[2] ), '.' ), " `" ) . "), so a move doesn't accept it. Nothing was imported from it.";
+                }
+                if ( $own && $prefix !== '' && stripos( $parent, $prefix ) !== 0 ) {
+                    return "The incoming database gives {$table} a foreign key to {$parent}, a table outside the incoming site's own ({$prefix}*), so a move doesn't accept it. Nothing was imported from it.";
+                }
+                if ( $shared ) {
+                    $mapped = $remap( $parent );
+                    if ( self::other_sites_table( $mapped ) ) {
+                        return "The incoming database gives {$table} a foreign key to {$mapped}, which here belongs to another site of this install or to the install itself, so a move doesn't accept it. Nothing was imported from it.";
+                    }
+                }
+            }
+        }
+        return null;
+    }
 
     /**
      * SET statements a dump may run into a subsite or tenant: user variables,
@@ -2816,9 +2901,9 @@ class Import {
      * own lexing (backslash escapes, doubled quotes, "-- " with any space or
      * control character, "#"), so a keyword hidden in a comment or a string
      * as this reads it is hidden from MySQL too. Null when it ends inside a
-     * string or comment.
+     * string or comment. $keep_names: backticked names stay as they are.
      */
-    private static function sql_skeleton( $sql ) {
+    private static function sql_skeleton( $sql, $keep_names = false ) {
         $out  = '';
         $len  = strlen( $sql );
         $i    = 0;
@@ -2891,7 +2976,7 @@ class Import {
                     }
                     break;
                 }
-                $out .= '`i`';
+                $out .= $keep_names ? substr( $sql, $i, $j - $i + 1 ) : '`i`';
                 $i    = $j + 1;
             } else {
                 $out .= $c;
@@ -2911,7 +2996,16 @@ class Import {
         // Split into individual statements with a quote/comment-aware scanner.
         // A column value may legitimately contain ";" (or ";\n"), so splitting
         // on the delimiter naively would cut a statement mid-value.
-        return $this->execute_statements( self::split_sql_statements( $sql_content ) );
+        $statements = self::split_sql_statements( $sql_content );
+        // The client remapped the prefix already: this site's own. Nothing
+        // in the batch runs when one statement reaches outside it.
+        global $wpdb;
+        foreach ( $statements as $statement ) {
+            if ( $problem = self::reach_problem( $statement, (string) $wpdb->prefix, (bool) Scope::install() ) ) {
+                return new \WP_Error( 'sql_refused', $problem, [ 'status' => 400 ] );
+            }
+        }
+        return $this->execute_statements( $statements );
     }
 
     /**
