@@ -235,7 +235,7 @@
       return h('section', { class: 'dsk-card dsk-panel' },
         h('div', { class: 'dsk-panel-body' }, h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null,
           h('strong', null, 'This ' + one + ' can’t be replaced from here.'),
-          D.config.refused || ('Run the move from the main site’s Disembark and pick “Replace” there.')))));
+          String(D.config.refused || 'Run the move from the main site’s Disembark and pick “Replace” there.').replace(/ Nothing here was changed\.$/, '')))));
     }
     if (k === 'pull' || k === 'push') { body.push(connectField()); ready = !!S.connect; why = 'Paste a connect line first'; }
     else { body.push(zipField()); ready = !!S.file; why = 'Choose a backup zip first'; }
