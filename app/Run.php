@@ -1061,6 +1061,10 @@ class Run {
         }
 
         $schema_only = is_array( $request['schema_only'] ) ? array_values( array_filter( $request['schema_only'], 'is_string' ) ) : [];
+        // Part of one large table, by primary key (a paced pull, see Pace).
+        if ( is_array( $request['part'] ) ) {
+            return ( new Backup( $backup_token ) )->export_table_part( (string) reset( $tables ), $request['part'], $schema_only, ! empty( $request['shared_rows'] ) );
+        }
         return ( new Backup( $backup_token ) )->database_export_batch( $tables, $schema_only, ! empty( $request['shared_rows'] ) );
     }
 
@@ -1227,6 +1231,21 @@ class Run {
         return false;
     }
 
+    /**
+     * The time budget a paced step was asked to keep to (see Pace), or null
+     * for the old behavior (the whole step in one request). Also keeps the
+     * pace the client has learned with the move, for a resume.
+     */
+    private static function paced( $params ) {
+        if ( empty( $params['paced'] ) ) {
+            return null;
+        }
+        if ( ! empty( $params['pace'] ) && ! empty( $params['import_id'] ) ) {
+            Pace::remember( $params['import_id'], (array) $params['pace'] );
+        }
+        return Pace::budget( $params['budget'] ?? null );
+    }
+
     // --- Import / Restore Endpoint Callbacks ---
 
     function import_preflight( $request ) {
@@ -1266,7 +1285,7 @@ class Run {
             return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
         }
         $import = new Import( $import_id );
-        return $import->snapshot( (string) ( $params['label'] ?? '' ) );
+        return $import->snapshot( (string) ( $params['label'] ?? '' ), self::paced( $params ) );
     }
 
     /** A new backup session id for the dashboard (see Storage::new_session()). */
@@ -1437,7 +1456,7 @@ class Run {
         }
 
         $import = new Import( $import_id );
-        return $import->extract_staged_zip( $file_path );
+        return $import->extract_staged_zip( $file_path, self::paced( $params ) );
     }
 
     function import_deploy_files( $request ) {
@@ -1456,7 +1475,7 @@ class Run {
         // and cache drop-ins in place; false brings the source's over too.
         $keep   = ! array_key_exists( 'keep_host_files', $params ) || ! empty( $params['keep_host_files'] );
         $import = new Import( $import_id );
-        return $import->deploy_files( $files, $keep );
+        return $import->deploy_files( $files, $keep, self::paced( $params ) );
     }
 
     function import_sql( $request ) {
@@ -1569,6 +1588,14 @@ class Run {
         if ( empty( $import_id ) ) {
             return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
         }
+        $budget = self::paced( $params );
+        if ( $budget !== null ) {
+            // One file in byte ranges, or one batch sized by the client.
+            if ( ! empty( $params['range'] ) ) {
+                return ( new Pull( $import_id ) )->fetch_file_part( $offset, $budget, (int) ( $params['chunk'] ?? 0 ) );
+            }
+            return ( new Pull( $import_id ) )->fetch_files_paced( $offset, max( 1, $count ), (int) ( $params['max_bytes'] ?? 0 ), $budget );
+        }
         return ( new Pull( $import_id ) )->fetch_files( $offset, $count );
     }
 
@@ -1580,6 +1607,10 @@ class Run {
         $import_id = $params['import_id'] ?? '';
         if ( empty( $import_id ) ) {
             return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        $budget = self::paced( $params );
+        if ( $budget !== null ) {
+            return ( new Pull( $import_id ) )->fetch_database_paced( $budget, (int) ( $params['batch_bytes'] ?? 8 * MB_IN_BYTES ) );
         }
         return ( new Pull( $import_id ) )->fetch_database();
     }
@@ -1611,7 +1642,7 @@ class Run {
             return new \WP_Error( 'not_found', 'That move has already finished or was cleaned up.', [ 'status' => 404 ] );
         }
         @unlink( Storage::base_dir() . "/_import_{$import_id}/cancel" );
-        return [ 'move' => $found, 'steps' => (object) Steps::results( $import_id ) ];
+        return [ 'move' => $found, 'steps' => (object) Steps::results( $import_id ), 'pace' => Pace::recall( $import_id ) ];
     }
 
     /** Sources this site has pulled from, for catch-up pulls. */
@@ -1748,7 +1779,7 @@ class Run {
         }
         return ( new Import( $import_id ) )
             ->set_request_token( User::request_token( $request ) )
-            ->import_staged_sql( $sql_file, $old_prefix, $new_prefix );
+            ->import_staged_sql( $sql_file, $old_prefix, $new_prefix, self::paced( $params ) );
     }
 
     function import_search_replace( $request ) {
@@ -1772,7 +1803,7 @@ class Run {
         // A move rewrites every spelling of the old address and the old
         // server's paths, and fixes the text files it brought in (uploads).
         if ( $import_id !== '' && ! $tables ) {
-            return $import->move_search_replace( $from, $to );
+            return $import->move_search_replace( $from, $to, self::paced( $params ) );
         }
         return $import->search_replace( $from, $to, $tables );
     }

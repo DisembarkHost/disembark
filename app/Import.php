@@ -223,6 +223,12 @@ class Import {
             'upload_chunk_bytes' => self::upload_chunk_bytes(),
             // Steps sent with a request_id are safe to retry (see Steps).
             'resumable'          => true,
+            // Long steps can stop and carry on, and the client paces the
+            // move to the host (see Pace): steps take a time budget, the
+            // pull's batches are sized as the host allows, and a source
+            // exports large tables in parts.
+            'pacing'             => 1,
+            'budget'             => Pace::default_budget(),
             'max_execution_time' => ini_get( 'max_execution_time' ),
             'tables'             => $tables,
             'profile'            => self::site_profile(),
@@ -270,11 +276,15 @@ class Import {
     /**
      * Creates a rollback snapshot of the destination database and file manifest.
      */
-    public function snapshot( $label = '' ) {
+    public function snapshot( $label = '', $budget = null ) {
         global $wpdb;
 
         $this->prepare_import_dir();
         Storage::ensure_dir( $this->rollback_path );
+
+        if ( $budget !== null ) {
+            return $this->snapshot_paced( $label, $budget );
+        }
 
         // Export all tables (into a subsite or tenant: its own, and the shared
         // ones the move changes).
@@ -310,6 +320,88 @@ class Import {
         // Clean up the temporary export folder (and its listing guards).
         self::delete_directory_recursive( $backup_base );
 
+        return $this->snapshot_saved( $label, $all_tables, $target );
+    }
+
+    /**
+     * The restore point, a piece at a time (see Pace): each call exports
+     * until its budget, straight into the restore point's dump (behind the
+     * exit line, under a name rollback() doesn't read until it's whole), and
+     * remembers the table and row it stopped at. The call that writes the
+     * last row saves the restore point.
+     */
+    private function snapshot_paced( $label, $budget ) {
+        global $wpdb;
+        $deadline   = Pace::deadline( $budget );
+        $state_file = $this->rollback_path . '/snapshot-state.php';
+        $state      = json_decode( (string) self::read_protected( $state_file ), true );
+        $target     = $this->target();
+        if ( ! is_array( $state ) ) {
+            // Asked again after it finished (a lost answer): the same answer.
+            $meta = self::rollback_meta( $this->rollback_path );
+            if ( $meta !== null && ! empty( $meta['sql_files'] ) ) {
+                return [ 'done' => true, 'rollback_id' => $this->import_id, 'tables' => count( (array) $meta['tables'] ), 'target' => $target ? $target->info() : null ];
+            }
+            $tables = $target ? $target->snapshot_tables() : $wpdb->get_col( 'SHOW TABLES' );
+            if ( empty( $tables ) ) {
+                return new \WP_Error( 'no_tables', 'No tables found to snapshot.', [ 'status' => 500 ] );
+            }
+            $state = [ 'tables' => array_values( $tables ), 'name' => 'batch-' . md5( implode( ',', $tables ) ), 'cur' => [], 'size' => 0 ];
+        }
+        $part = $this->rollback_path . '/' . $state['name'] . '.db.php.part';
+        $fail = function ( $why ) use ( $part, $state_file ) {
+            @unlink( $part );
+            @unlink( $state_file );
+            return new \WP_Error( 'snapshot_failed', 'Failed to create database snapshot. ' . $why . ' Nothing was changed.', [ 'status' => 500 ] );
+        };
+        $handle = @fopen( $part, 'c+b' );
+        if ( ! $handle ) {
+            return $fail( 'Could not write the restore point (is the disk full?).' );
+        }
+        if ( (int) $state['size'] === 0 ) {
+            ftruncate( $handle, 0 );
+            if ( fwrite( $handle, self::PHP_EXIT . "SET FOREIGN_KEY_CHECKS = 0;\nSET UNIQUE_CHECKS = 0;\n" ) === false ) {
+                fclose( $handle );
+                return $fail( 'Could not write the restore point (is the disk full?).' );
+            }
+        } else {
+            // Whatever a killed call wrote after its last checkpoint goes.
+            ftruncate( $handle, (int) $state['size'] );
+        }
+        fseek( $handle, 0, SEEK_END );
+        $save = function ( $cur ) use ( $handle, &$state, $state_file ) {
+            fflush( $handle );
+            $state['cur']  = $cur;
+            $state['size'] = ftell( $handle );
+            self::write_protected( $state_file, (string) wp_json_encode( $state ) );
+        };
+        $save( $state['cur'] );
+        $cur  = (array) $state['cur'];
+        $done = Backup::export_tables_until( $handle, $cur, $state['tables'], [ 'deadline' => $deadline, 'checkpoint' => $save ] );
+        if ( is_wp_error( $done ) ) {
+            fclose( $handle );
+            return $fail( $done->get_error_message() );
+        }
+        if ( ! $done ) {
+            $save( $cur );
+            fclose( $handle );
+            return [ 'done' => false, 'tables_done' => (int) ( $cur['t'] ?? 0 ), 'tables_total' => count( $state['tables'] ) ];
+        }
+        $ok = fwrite( $handle, "SET FOREIGN_KEY_CHECKS = 1;\nSET UNIQUE_CHECKS = 1;\n" . Backup::EXPORT_COMPLETE_MARKER . "\n" ) !== false;
+        $ok = fclose( $handle ) && $ok;
+        if ( ! $ok || ! @rename( $part, $this->rollback_path . '/' . $state['name'] . '.db.php' ) ) {
+            return $fail( 'Could not finish the restore point (is the disk full?).' );
+        }
+        @unlink( $state_file );
+        $result = $this->snapshot_saved( $label, $state['tables'], $target );
+        if ( is_array( $result ) ) {
+            $result['done'] = true;
+        }
+        return $result;
+    }
+
+    /** Records a restore point whose dumps are in place, and makes a new subsite or tenant. */
+    private function snapshot_saved( $label, $all_tables, $target ) {
         $sql_sizes = [];
         foreach ( self::rollback_sql_files( $this->rollback_path ) as $sql_file ) {
             $sql_sizes[ basename( $sql_file ) ] = filesize( $sql_file );
@@ -383,13 +475,37 @@ class Import {
      * Extracts a ZIP that was uploaded in chunks (reassembled into staging by
      * upload_chunk) and removes it. Lets large sites avoid a single huge POST.
      */
-    public function extract_staged_zip( $file_path ) {
+    public function extract_staged_zip( $file_path, $budget = null ) {
         if ( ! self::is_safe_relative_path( $file_path ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid file path.', [ 'status' => 400 ] );
         }
         $zip_path = $this->staging_path . '/' . $file_path;
+        $state_f  = $this->import_path . '/extract-state.php';
         if ( ! file_exists( $zip_path ) ) {
+            // Asked again after it finished (a lost answer).
+            if ( $budget !== null && ! is_file( $state_f ) && is_dir( $this->staging_path ) && $this->count_staged_files() > 0 ) {
+                return [ 'success' => true, 'done' => true, 'files_staged' => $this->count_staged_files() ];
+            }
             return new \WP_Error( 'not_found', 'Staged ZIP not found.', [ 'status' => 404 ] );
+        }
+        if ( $budget !== null ) {
+            // A piece at a time (see Pace): entries until the budget, then
+            // the next call starts at the entry after.
+            $state  = json_decode( (string) self::read_protected( $state_f ), true );
+            $from   = is_array( $state ) && ( $state['zip'] ?? '' ) === $file_path ? (int) $state['next'] : 0;
+            $result = self::extract_zip_into( $zip_path, $this->staging_path, [ 'from' => $from, 'deadline' => Pace::deadline( $budget ), 'checkpoint' => function ( $next ) use ( $state_f, $file_path ) {
+                self::write_protected( $state_f, (string) wp_json_encode( [ 'zip' => $file_path, 'next' => $next ] ) );
+            } ] );
+            if ( is_array( $result ) ) {
+                self::write_protected( $state_f, (string) wp_json_encode( [ 'zip' => $file_path, 'next' => $result['next'] ] ) );
+                return [ 'success' => true, 'done' => false, 'entries_done' => $result['next'], 'entries_total' => $result['total'] ];
+            }
+            @unlink( $state_f );
+            if ( is_wp_error( $result ) ) {
+                return $result;
+            }
+            @unlink( $zip_path );
+            return [ 'success' => true, 'done' => true, 'files_staged' => $this->count_staged_files() ];
         }
         $result = $this->extract_zip_file( $zip_path );
         @unlink( $zip_path );
@@ -417,7 +533,10 @@ class Import {
      * ZipArchive, falling back to PclZip. Shared with Pull. Returns true or
      * WP_Error.
      */
-    public static function extract_zip_into( $zip_path, $root ) {
+    public static function extract_zip_into( $zip_path, $root, $opts = [] ) {
+        $from     = (int) ( $opts['from'] ?? 0 );
+        $deadline = (float) ( $opts['deadline'] ?? 0 );
+        $strict   = ! empty( $opts['strict'] ) || $deadline > 0;
         $zip = class_exists( 'ZipArchive' ) ? new \ZipArchive() : null;
         if ( ! $zip || $zip->open( $zip_path ) !== true ) {
             if ( ! class_exists( 'PclZip' ) ) {
@@ -433,41 +552,53 @@ class Import {
         }
         // Entry by entry, skipping any name that could escape staging
         // (zip-slip); extractTo() on the whole archive would honour "../".
-        $plain    = [];
-        $disguise = [];
-        for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+        // With a deadline (see Pace) it stops between entries once that has
+        // passed and says where to start next time.
+        $failed = [];
+        $total  = $zip->numFiles;
+        $saved  = microtime( true );
+        for ( $i = $from; $i < $total; $i++ ) {
+            if ( $deadline > 0 && $i > $from && microtime( true ) >= $deadline ) {
+                $zip->close();
+                return [ 'next' => $i, 'total' => $total ];
+            }
+            // Now and then, where a killed request got to.
+            if ( ! empty( $opts['checkpoint'] ) && microtime( true ) - $saved >= 1 ) {
+                $saved = microtime( true );
+                call_user_func( $opts['checkpoint'], $i );
+            }
             $name = $zip->getNameIndex( $i );
             if ( $name === false || ! self::is_safe_relative_path( $name ) ) {
                 continue;
             }
-            if ( substr( $name, -1 ) !== '/' && self::staged_name( $name ) !== $name ) {
-                $disguise[] = $name;
-            } else {
-                $plain[] = $name;
+            Pace::tick();
+            if ( substr( $name, -1 ) === '/' || self::staged_name( $name ) === $name ) {
+                if ( ! $zip->extractTo( $root, $name ) ) {
+                    $failed[] = $name;
+                }
+                continue;
             }
-        }
-        if ( $plain ) {
-            $zip->extractTo( $root, $plain );
-        }
-        foreach ( $disguise as $name ) {
             $dest = rtrim( $root, '/' ) . '/' . self::staged_name( $name );
             if ( ! is_dir( dirname( $dest ) ) ) {
                 wp_mkdir_p( dirname( $dest ) );
             }
             $in  = $zip->getStream( $name );
             $out = $in ? @fopen( $dest, 'wb' ) : false;
-            if ( $in && $out ) {
-                fwrite( $out, self::PHP_EXIT );
-                stream_copy_to_stream( $in, $out );
-            }
+            $ok  = $in && $out && fwrite( $out, self::PHP_EXIT ) !== false && stream_copy_to_stream( $in, $out ) !== false;
             if ( $in ) {
                 fclose( $in );
             }
             if ( $out ) {
-                fclose( $out );
+                $ok = fclose( $out ) && $ok;
+            }
+            if ( ! $ok ) {
+                $failed[] = $name;
             }
         }
         $zip->close();
+        if ( $failed && $strict ) {
+            return new \WP_Error( 'extract_failed', 'Could not extract ' . count( $failed ) . ' files from the ZIP (first: ' . $failed[0] . '). Is the disk full?', [ 'status' => 500 ] );
+        }
         return true;
     }
 
@@ -693,8 +824,14 @@ class Import {
      * Imports a SQL dump already sitting in staging (dashboard flow — the client
      * never holds the SQL). Applies the same identifier prefix remap and
      * DROP-before-CREATE the CLI does, then runs it.
+     *
+     * With a $budget (seconds, see Pace), it works until the budget runs out
+     * and answers { done: false }; the next call carries on from the byte
+     * offset it stopped at (always a statement boundary). The tables are
+     * still built as copies and swapped in once, by the call that reaches
+     * the end of the dump. Without one, the whole dump runs in this request.
      */
-    public function import_staged_sql( $sql_file, $old_prefix = '', $new_prefix = '' ) {
+    public function import_staged_sql( $sql_file, $old_prefix = '', $new_prefix = '', $budget = null ) {
         if ( ! self::is_safe_relative_path( $sql_file ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid SQL file path.', [ 'status' => 400 ] );
         }
@@ -726,16 +863,84 @@ class Import {
             }
             $new_prefix = $target->prefix;
         }
-        $foreign  = 0;
-        $refused  = 0;
-        $run    = $this->begin_statements();
-        $count  = 0;
-        $swap     = self::swap_start();
+
+        // Where an earlier call of a paced import stopped (see Pace).
+        $paced        = $budget !== null;
+        $deadline     = $paced ? Pace::deadline( $budget ) : 0;
+        $state_file   = $this->import_path . '/sql-state.php';
+        $journal_file = $this->import_path . '/sql-journal.php';
+        $saved        = $paced ? json_decode( (string) Import::read_protected( $state_file ), true ) : null;
+        if ( ! is_array( $saved ) || ( $saved['file'] ?? '' ) !== $sql_file || (int) ( $saved['size'] ?? -1 ) !== (int) filesize( $path ) ) {
+            $saved = null;
+            @unlink( $state_file );
+            @unlink( $journal_file );
+        }
+        $start = $saved ? (int) $saved['offset'] : 0;
+        // A call that was killed got past its last checkpoint: the journal
+        // says how far. Statements up to there are read again only to
+        // rebuild what this import keeps track of, not run again.
+        $replay_to = 0;
+        $last      = $saved ? Pace::journal_last( $journal_file ) : null;
+        if ( $last && (int) ( $last['o'] ?? 0 ) > $start ) {
+            $replay_to = (int) $last['o'];
+        }
+
+        $foreign  = $saved ? (int) $saved['foreign'] : 0;
+        $refused  = $saved ? (int) $saved['refused'] : 0;
+        $run      = $this->begin_statements();
+        $count    = $saved ? (int) $saved['count'] : 0;
+        $swap     = $saved ? $saved['swap'] : self::swap_start();
         $compat   = self::db_compat();
-        $expected = [];
-        $imported = [];
-        $read     = self::each_sql_statement_in_file( $path, function ( $statement ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, &$imported, $old_prefix, $new_prefix, $skip_rows, $target ) {
-            if ( ++$count % 500 === 0 && $this->cancelled() ) {
+        if ( $saved ) {
+            $compat = array_merge( $compat, array_intersect_key( (array) $saved['compat'], array_flip( [ 'converted', 'definers_removed', 'map' ] ) ) );
+            $run['statements_executed'] = (int) $saved['executed'];
+            $run['warnings']            = (array) ( $saved['warnings'] ?? [] );
+        }
+        $expected = $saved ? (array) $saved['expected'] : [];
+        $imported = $saved ? (array) $saved['imported'] : [];
+        $journal  = $paced ? Pace::journal_open( $journal_file ) : null;
+        $stop_at  = 0;
+        $tolerant = $replay_to > 0;
+        // Rows go in many at a time: a dump has one INSERT per row, and one
+        // round trip per row is most of an import's time. Consecutive
+        // inserts into the same table become one statement (up to 1 MB,
+        // under the server's max_allowed_packet), run before anything else.
+        global $wpdb;
+        $packet  = (int) $wpdb->get_var( 'SELECT @@max_allowed_packet' );
+        $max     = (int) max( 65536, min( 1048576, $packet > 0 ? $packet / 2 : 1048576 ) );
+        $pending = null;
+        $exec    = function ( $sql ) use ( &$run, &$tolerant, $paced ) {
+            $before = count( $run['errors'] );
+            if ( ! $this->run_statement( $sql, $run ) ) {
+                return false;
+            }
+            // The statement a killed call may have run just before it died
+            // (it couldn't record it): rows or a table already there are fine.
+            if ( $tolerant && count( $run['errors'] ) > $before && preg_match( '/Duplicate entry|already exists/i', (string) $run['errors'][ $before ] ) ) {
+                array_splice( $run['errors'], $before );
+            }
+            $tolerant = false;
+            // Paced, the first error ends the import: the copies go and
+            // nothing here changes (going on would only spend the budget).
+            return ! ( $paced && $run['errors'] );
+        };
+        $flush = function () use ( &$pending, $exec, $journal, $paced ) {
+            if ( ! $pending ) {
+                return true;
+            }
+            $batch   = $pending;
+            $pending = null;
+            if ( ! $exec( $batch['head'] . implode( ',', $batch['rows'] ) ) ) {
+                return false;
+            }
+            if ( $paced ) {
+                Pace::journal_add( $journal, [ 'o' => $batch['end'] ] );
+            }
+            return true;
+        };
+        $read     = self::each_sql_statement_in_file( $path, function ( $statement, $end ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, &$imported, &$stop_at, &$pending, $exec, $flush, $max, $old_prefix, $new_prefix, $skip_rows, $target, $paced, $deadline, $replay_to, $journal ) {
+            $dry = $end <= $replay_to;
+            if ( ++$count % 500 === 0 && ! $dry && $this->cancelled() ) {
                 $run['errors'][] = 'Cancelled.';
                 return false;
             }
@@ -777,15 +982,87 @@ class Import {
                 }
             }
             foreach ( self::swap_statements( $transformed_statements, $swap ) as $transformed ) {
-                if ( ! $this->run_statement( self::compat_statement( $transformed, $compat ), $run ) ) {
+                $sql = self::compat_statement( $transformed, $compat );
+                if ( $dry ) {
+                    continue;
+                }
+                if ( strlen( $sql ) < $max && preg_match( '/^(INSERT\s+INTO\s+`(?:[^`]|``)+`\s+VALUES\s*)(\(.*\))\s*$/s', $sql, $im ) ) {
+                    if ( $pending && ( $pending['head'] !== $im[1] || $pending['bytes'] + strlen( $im[2] ) >= $max || count( $pending['rows'] ) >= 2000 ) && ! $flush() ) {
+                        return false;
+                    }
+                    if ( ! $pending ) {
+                        $pending = [ 'head' => $im[1], 'rows' => [], 'bytes' => strlen( $im[1] ) ];
+                    }
+                    $pending['rows'][] = $im[2];
+                    $pending['bytes'] += strlen( $im[2] ) + 1;
+                    $pending['end']    = $end;
+                    continue;
+                }
+                if ( ! $flush() || ! $exec( $sql ) ) {
+                    return false;
+                }
+            }
+            if ( $dry ) {
+                return true;
+            }
+            if ( $paced ) {
+                if ( ! $pending ) {
+                    Pace::journal_add( $journal, [ 'o' => $end ] );
+                }
+                if ( microtime( true ) >= $deadline && empty( $run['errors'] ) ) {
+                    if ( ! $flush() ) {
+                        return false;
+                    }
+                    $stop_at = $end;
                     return false;
                 }
             }
             return true;
-        } );
+        }, $start );
+        // The last rows of the dump.
+        if ( ! is_wp_error( $read ) && empty( $run['errors'] ) ) {
+            $flush();
+        }
+        if ( $journal ) {
+            fclose( $journal );
+        }
         if ( is_wp_error( $read ) ) {
             $run['errors'][] = $read->get_error_message();
         }
+
+        // Out of time: keep everything for the next call.
+        if ( $stop_at > 0 && empty( $run['errors'] ) ) {
+            $this->prepare_import_dir();
+            Import::write_protected( $state_file, (string) wp_json_encode( [
+                'file'     => $sql_file,
+                'size'     => filesize( $path ),
+                'offset'   => $stop_at,
+                'count'    => $count,
+                'executed' => $run['statements_executed'],
+                'warnings' => $run['warnings'] ?? [],
+                'foreign'  => $foreign,
+                'refused'  => $refused,
+                'swap'     => $swap,
+                'compat'   => array_intersect_key( $compat, array_flip( [ 'converted', 'definers_removed', 'map' ] ) ),
+                'expected' => $expected,
+                'imported' => $imported,
+            ] ) );
+            // Everything in the journal is in the checkpoint now.
+            @unlink( $journal_file );
+            global $wpdb;
+            $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
+            $wpdb->query( 'SET UNIQUE_CHECKS = 1' );
+            return [
+                'done'                => false,
+                'bytes_done'          => $stop_at,
+                'bytes_total'         => (int) filesize( $path ),
+                'statements_executed' => $run['statements_executed'],
+                'errors'              => [],
+            ];
+        }
+        @unlink( $state_file );
+        @unlink( $journal_file );
+
         // Only a clean import replaces this site's tables. Otherwise the copies
         // go and the live tables stay exactly as they were.
         if ( empty( $run['errors'] ) ) {
@@ -804,6 +1081,9 @@ class Import {
         // token is written back into the options table.
         $rows   = empty( $run['errors'] ) ? $this->check_rows( $expected ) : null;
         $result = $this->end_statements( $run );
+        if ( $paced ) {
+            $result['done'] = true;
+        }
         $result['tables_swapped']     = $swapped;
         $result['tables_direct']      = array_keys( $swap['direct'] );
         $result['database_unchanged'] = ! empty( $result['errors'] ) && empty( $swap['direct'] );
@@ -1174,7 +1454,7 @@ class Import {
      * (url_variants()), plus the old server's paths. Also rewrites the old
      * address in text files under uploads (rewrite_files()).
      */
-    public function move_search_replace( $from, $to ) {
+    public function move_search_replace( $from, $to, $budget = null ) {
         $source = $this->staged_source();
         $target = $this->target();
         if ( $target ) {
@@ -1187,9 +1467,13 @@ class Import {
         if ( ! $tables ) {
             return [ 'tables' => 0, 'rows_changed' => 0, 'cells_changed' => 0, 'by_table' => [], 'samples' => [], 'paths' => [], 'moved' => [] ];
         }
-        $moved  = self::scope_pairs( $source, $to, $target ) + self::target_pairs( $source, $target );
-        $result = $this->search_replace( $from, $to, $tables, false, [ 'variants' => true, 'extra' => self::path_pairs( $source ) + $moved ] );
-        if ( is_wp_error( $result ) ) {
+        $moved   = self::scope_pairs( $source, $to, $target ) + self::target_pairs( $source, $target );
+        $options = [ 'variants' => true, 'extra' => self::path_pairs( $source ) + $moved ];
+        if ( $budget !== null ) {
+            $options['budget'] = $budget;
+        }
+        $result = $this->search_replace( $from, $to, $tables, false, $options );
+        if ( is_wp_error( $result ) || ( isset( $result['done'] ) && ! $result['done'] ) ) {
             return $result;
         }
         $result['paths'] = self::path_pairs( $source );
@@ -1481,8 +1765,16 @@ class Import {
     /**
      * Deploys files from staging to their final WordPress paths.
      * Backs up originals for rollback tracking.
+     *
+     * With a $budget (seconds, see Pace) and ["*"], it places files until the
+     * budget runs out and answers { done: false }; the next call carries on
+     * from the next file. Each file placed is journaled as it goes, so a
+     * killed call loses nothing and a rollback still finds every file.
      */
-    public function deploy_files( $files, $keep_host_files = true ) {
+    public function deploy_files( $files, $keep_host_files = true, $budget = null ) {
+        if ( $budget !== null && count( $files ) === 1 && $files[0] === '*' ) {
+            return $this->deploy_files_paced( $keep_host_files, $budget );
+        }
         $web_root  = dirname( WP_CONTENT_DIR );
         $deployed  = [];
         $errors    = [];
@@ -1495,10 +1787,8 @@ class Import {
         // public/, so treat that as the staging root when present.
         $staging_root = $this->staging_path;
         if ( count( $files ) === 1 && $files[0] === '*' ) {
-            if ( is_dir( $this->staging_path . '/public/wp-includes' ) || is_dir( $this->staging_path . '/public/wp-content' ) ) {
-                $staging_root = $this->staging_path . '/public';
-            }
-            $files = $this->list_staged_files( $staging_root );
+            $staging_root = $this->staging_root();
+            $files        = $this->list_staged_files( $staging_root );
         }
 
         // Into a subsite or tenant: each file goes to its folders, and a
@@ -1515,92 +1805,237 @@ class Import {
                 $errors[] = 'Cancelled.';
                 break;
             }
-            if ( ! self::is_safe_relative_path( $relative_path ) ) {
-                $errors[] = "Unsafe path skipped: {$relative_path}";
-                continue;
+            $out = $this->place_file( $relative_path, $staging_root, $web_root, $target, $keep_host_files, $pool_seen );
+            if ( isset( $out['d'] ) ) {
+                $deployed[] = $out['d'];
             }
-            $relative_path = self::normalize_rel( $relative_path );
+            if ( isset( $out['b'] ) ) {
+                $backed_up[] = $out['b'];
+            }
+            if ( isset( $out['e'] ) ) {
+                $errors[] = $out['e'];
+            }
+            if ( ! empty( $out['k'] ) ) {
+                $own_kept++;
+            }
+            if ( isset( $out['h'] ) ) {
+                $kept[ $out['h'] ] = true;
+            }
+            if ( isset( $out['s'] ) ) {
+                $shared_kept[ $out['s'] ] = true;
+            }
+        }
+        return $this->deploy_finish( $web_root, $target, $keep_host_files, $deployed, $backed_up, $errors, $own_kept, $kept, $shared_kept );
+    }
 
-            $source = self::staged_file( $staging_root, $relative_path );
-            $dest   = $web_root . '/' . $relative_path;
-            if ( $target ) {
-                if ( self::never_deploy( $relative_path ) ) {
-                    continue;
-                }
-                $to = $target->dest( $relative_path );
-                if ( $to === null ) {
-                    continue;
-                }
-                list( $mapped, $may_replace ) = $to;
-                $pool = $target->pool_folder( $mapped );
-                if ( $pool !== '' ) {
-                    if ( ! isset( $pool_seen[ $pool ] ) ) {
-                        $pool_seen[ $pool ] = is_dir( $web_root . '/' . $pool );
-                    }
-                    if ( $pool_seen[ $pool ] ) {
-                        $shared_kept[ $pool ] = true;
-                        continue;
-                    }
-                } elseif ( ! $may_replace && file_exists( $web_root . '/' . $mapped ) ) {
-                    continue;
-                }
-                $relative_path = $mapped;
-                $dest          = $web_root . '/' . $mapped;
-            }
+    /** Where staged files sit: staging, or its public/ folder when a whole-snapshot zip nests the site there. */
+    private function staging_root() {
+        if ( is_dir( $this->staging_path . '/public/wp-includes' ) || is_dir( $this->staging_path . '/public/wp-content' ) ) {
+            return $this->staging_path . '/public';
+        }
+        return $this->staging_path;
+    }
 
-            if ( ! file_exists( $source ) ) {
-                $errors[] = "Source not found: {$relative_path}";
-                continue;
-            }
+    /**
+     * Places one staged file. Returns what happened: d (deployed path),
+     * b (backed up first), e (error), k (this site keeps its own copy),
+     * h (a host file kept), s (a shared plugin or theme folder kept).
+     * $resumed: the first file after a killed call, which may have been
+     * moved already.
+     */
+    private function place_file( $relative_path, $staging_root, $web_root, $target, $keep_host_files, &$pool_seen, $resumed = false ) {
+        if ( ! self::is_safe_relative_path( $relative_path ) ) {
+            return [ 'e' => "Unsafe path skipped: {$relative_path}" ];
+        }
+        Pace::tick();
+        $relative_path = self::normalize_rel( $relative_path );
 
-            // Skip wp-config.php (in any case: one disk is case-insensitive)
-            if ( strtolower( basename( $relative_path ) ) === 'wp-config.php' ) {
-                continue;
-            }
-            // Never put a database dump (or Disembark's own working files) in
-            // the web root, even when a client lists it explicitly.
+        $source = self::staged_file( $staging_root, $relative_path );
+        $dest   = $web_root . '/' . $relative_path;
+        if ( $target ) {
             if ( self::never_deploy( $relative_path ) ) {
-                if ( self::own_plugin_path( $relative_path ) ) {
-                    $own_kept++;
+                return [];
+            }
+            $to = $target->dest( $relative_path );
+            if ( $to === null ) {
+                return [];
+            }
+            list( $mapped, $may_replace ) = $to;
+            $pool = $target->pool_folder( $mapped );
+            if ( $pool !== '' ) {
+                if ( ! isset( $pool_seen[ $pool ] ) ) {
+                    $pool_seen[ $pool ] = is_dir( $web_root . '/' . $pool );
                 }
-                continue;
-            }
-            // Leave the destination's host setup alone: its mu-plugins and
-            // cache drop-ins belong to the server, not the site being moved.
-            if ( $keep_host_files ) {
-                $host = self::host_file( $relative_path, $web_root );
-                if ( $host !== '' ) {
-                    $kept[ $host ] = true;
-                    $own_kept++;
-                    continue;
+                if ( $pool_seen[ $pool ] ) {
+                    return [ 's' => $pool ];
                 }
+            } elseif ( ! $may_replace && file_exists( $web_root . '/' . $mapped ) ) {
+                return [];
             }
+            $relative_path = $mapped;
+            $dest          = $web_root . '/' . $mapped;
+        }
 
-            // Backup original if it exists
-            if ( file_exists( $dest ) ) {
-                $backup_dest = $this->rollback_path . '/files/' . self::staged_name( $relative_path );
-                $backup_dir  = dirname( $backup_dest );
-                if ( ! is_dir( $backup_dir ) ) {
-                    mkdir( $backup_dir, 0755, true );
+        if ( ! file_exists( $source ) ) {
+            // A killed call moved it, then died before saying so.
+            if ( $resumed && file_exists( $dest ) ) {
+                $out = [ 'd' => $relative_path ];
+                if ( file_exists( self::staged_file( $this->rollback_path . '/files', $relative_path ) ) ) {
+                    $out['b'] = $relative_path;
                 }
-                self::put_staged( $dest, $backup_dest, $relative_path );
-                $backed_up[] = $relative_path;
+                return $out;
             }
+            return [ 'e' => "Source not found: {$relative_path}" ];
+        }
 
-            // Create destination directory
-            $dest_dir = dirname( $dest );
-            if ( ! is_dir( $dest_dir ) ) {
-                mkdir( $dest_dir, 0755, true );
-            }
-
-            // Move file (a staged name gets its real one back)
-            if ( self::take_staged( $source, $dest ) ) {
-                $deployed[] = $relative_path;
-            } else {
-                $errors[] = "Failed to deploy: {$relative_path}";
+        // Skip wp-config.php (in any case: one disk is case-insensitive)
+        if ( strtolower( basename( $relative_path ) ) === 'wp-config.php' ) {
+            return [];
+        }
+        // Never put a database dump (or Disembark's own working files) in
+        // the web root, even when a client lists it explicitly.
+        if ( self::never_deploy( $relative_path ) ) {
+            return self::own_plugin_path( $relative_path ) ? [ 'k' => 1 ] : [];
+        }
+        // Leave the destination's host setup alone: its mu-plugins and
+        // cache drop-ins belong to the server, not the site being moved.
+        if ( $keep_host_files ) {
+            $host = self::host_file( $relative_path, $web_root );
+            if ( $host !== '' ) {
+                return [ 'h' => $host, 'k' => 1 ];
             }
         }
 
+        $out = [];
+        // Backup original if it exists
+        if ( file_exists( $dest ) ) {
+            $backup_dest = $this->rollback_path . '/files/' . self::staged_name( $relative_path );
+            $backup_dir  = dirname( $backup_dest );
+            if ( ! is_dir( $backup_dir ) ) {
+                mkdir( $backup_dir, 0755, true );
+            }
+            self::put_staged( $dest, $backup_dest, $relative_path );
+            $out['b'] = $relative_path;
+        }
+
+        // Create destination directory
+        $dest_dir = dirname( $dest );
+        if ( ! is_dir( $dest_dir ) ) {
+            mkdir( $dest_dir, 0755, true );
+        }
+
+        // Move file (a staged name gets its real one back)
+        if ( self::take_staged( $source, $dest ) ) {
+            $out['d'] = $relative_path;
+        } else {
+            $out['e'] = "Failed to deploy: {$relative_path}";
+        }
+        return $out;
+    }
+
+    /** Paced deploy (see deploy_files()). */
+    private function deploy_files_paced( $keep_host_files, $budget ) {
+        $deadline  = Pace::deadline( $budget );
+        $web_root  = dirname( WP_CONTENT_DIR );
+        $list_file = $this->import_path . '/deploy-list.php';
+        $journal_f = $this->import_path . '/deploy-journal.php';
+        $list      = json_decode( (string) self::read_protected( $list_file ), true );
+        if ( ! is_array( $list ) ) {
+            $root = $this->staging_root();
+            $list = [ 'root' => $root, 'files' => $this->list_staged_files( $root ) ];
+            @unlink( $journal_f );
+            $this->prepare_import_dir();
+            self::write_protected( $list_file, (string) wp_json_encode( $list ) );
+        }
+        $files   = (array) $list['files'];
+        $total   = count( $files );
+        $last    = Pace::journal_last( $journal_f );
+        $i       = $last ? (int) $last['i'] + 1 : 0;
+        $resumed = $last !== null || $i === 0 && is_file( $journal_f );
+        $target  = $this->target();
+        $journal = Pace::journal_open( $journal_f );
+        $pool_seen = [];
+        $first   = true;
+        $stopped = false;
+        for ( ; $i < $total; $i++ ) {
+            if ( ! $first && ( microtime( true ) >= $deadline || ( $i % 1000 === 0 && $this->cancelled() ) ) ) {
+                $stopped = true;
+                break;
+            }
+            $out = $this->place_file( $files[ $i ], $list['root'], $web_root, $target, $keep_host_files, $pool_seen, $first && $resumed );
+            $first = false;
+            Pace::journal_add( $journal, [ 'i' => $i ] + $out );
+        }
+        fclose( $journal );
+        if ( $stopped && ! $this->cancelled() ) {
+            return [ 'done' => false, 'placed' => $i, 'total' => $total, 'errors' => [] ];
+        }
+
+        // Every file has been seen (or the move was cancelled): add up the journal.
+        $deployed = $backed_up = $errors = [];
+        $own_kept = 0;
+        $kept = $shared_kept = [];
+        if ( $stopped ) {
+            $errors[] = 'Cancelled.';
+        }
+        foreach ( Pace::journal_read( $journal_f ) as $rec ) {
+            if ( isset( $rec['d'] ) ) {
+                $deployed[] = (string) $rec['d'];
+            }
+            if ( isset( $rec['b'] ) ) {
+                $backed_up[] = (string) $rec['b'];
+            }
+            if ( isset( $rec['e'] ) ) {
+                $errors[] = (string) $rec['e'];
+            }
+            if ( ! empty( $rec['k'] ) ) {
+                $own_kept++;
+            }
+            if ( isset( $rec['h'] ) ) {
+                $kept[ (string) $rec['h'] ] = true;
+            }
+            if ( isset( $rec['s'] ) ) {
+                $shared_kept[ (string) $rec['s'] ] = true;
+            }
+        }
+        $result = $this->deploy_finish( $web_root, $target, $keep_host_files, array_values( array_unique( $deployed ) ), array_values( array_unique( $backed_up ) ), $errors, $own_kept, $kept, $shared_kept );
+        @unlink( $journal_f );
+        @unlink( $list_file );
+        $result['done'] = true;
+        return $result;
+    }
+
+    /**
+     * Folds a paced deploy's journal into the restore point (a move that
+     * stopped mid-deploy), so a rollback finds every file it placed.
+     */
+    private function merge_deploy_journal() {
+        $journal_f = $this->import_path . '/deploy-journal.php';
+        if ( ! is_file( $journal_f ) ) {
+            return;
+        }
+        $meta = self::rollback_meta( $this->rollback_path );
+        if ( $meta === null ) {
+            return;
+        }
+        foreach ( Pace::journal_read( $journal_f ) as $rec ) {
+            if ( isset( $rec['d'] ) ) {
+                $meta['deployed_files'][] = (string) $rec['d'];
+            }
+            if ( isset( $rec['b'] ) ) {
+                $meta['backed_up_files'][] = (string) $rec['b'];
+            }
+        }
+        $meta['deployed_files']  = array_values( array_unique( (array) ( $meta['deployed_files'] ?? [] ) ) );
+        $meta['backed_up_files'] = array_values( array_unique( (array) ( $meta['backed_up_files'] ?? [] ) ) );
+        if ( $this->save_rollback_meta( $meta ) ) {
+            @unlink( $journal_f );
+            @unlink( $this->import_path . '/deploy-list.php' );
+        }
+    }
+
+    /** The end of a deploy: a catch-up's removals, the restore point's lists, and the answer. */
+    private function deploy_finish( $web_root, $target, $keep_host_files, $deployed, $backed_up, $errors, $own_kept, $kept, $shared_kept ) {
         // A catch-up pull removes files that were brought by the last pull
         // and are gone from the source now. Each is backed up first, so a
         // rollback puts it back.
@@ -1640,8 +2075,8 @@ class Import {
         // Update rollback metadata with deployed files
         $meta = self::rollback_meta( $this->rollback_path );
         if ( $meta !== null ) {
-            $meta['deployed_files']  = array_merge( $meta['deployed_files'] ?? [], $deployed );
-            $meta['backed_up_files'] = array_merge( $meta['backed_up_files'] ?? [], $backed_up );
+            $meta['deployed_files']  = array_values( array_unique( array_merge( $meta['deployed_files'] ?? [], $deployed ) ) );
+            $meta['backed_up_files'] = array_values( array_unique( array_merge( $meta['backed_up_files'] ?? [], $backed_up ) ) );
             $this->save_rollback_meta( $meta );
         }
 
@@ -2270,7 +2705,13 @@ class Import {
      * @param array    $options variants: also rewrite the old address's other
      *                          spellings (see url_variants()), as a move does;
      *                          extra: more plain from => to pairs (the old
-     *                          server's file paths).
+     *                          server's file paths);
+     *                          budget: seconds (see Pace). It stops once
+     *                          they're spent and answers { done: false }, and
+     *                          the next call carries on at the table and
+     *                          primary key it stopped at. Every row it
+     *                          changes is journaled, so a killed call never
+     *                          rewrites a row twice.
      */
     public function search_replace( $from, $to, $tables = [], $dry_run = false, $options = [] ) {
         global $wpdb;
@@ -2284,28 +2725,63 @@ class Import {
         if ( ! $pairs ) {
             return [ 'tables' => 0, 'rows_changed' => 0, 'cells_changed' => 0, 'by_table' => [], 'samples' => [] ];
         }
-        $by_table = [];
-        $samples  = [];
+        $samples = [];
 
         if ( empty( $tables ) ) {
             $tables = $wpdb->get_col( 'SHOW TABLES' );
         }
 
+        $paced        = isset( $options['budget'] ) && ! $dry_run;
+        $deadline     = $paced ? Pace::deadline( $options['budget'] ) : 0;
+        $state_file   = $this->import_path . '/replace-state.php';
+        $journal_file = $this->import_path . '/replace-journal.php';
+        $st           = $paced ? json_decode( (string) self::read_protected( $state_file ), true ) : null;
+        if ( ! is_array( $st ) ) {
+            $st = [ 'tables' => array_values( array_map( 'strval', $tables ) ), 't' => 0, 'key' => null, 'offset' => 0, 'seen' => 0, 'rows' => 0, 'cells' => 0, 'by_table' => [] ];
+            @unlink( $journal_file );
+        } else {
+            // A killed call changed rows after its last checkpoint.
+            $last = Pace::journal_last( $journal_file );
+            if ( $last && ( (int) $last['t'] > (int) $st['t'] || ( (int) $last['t'] === (int) $st['t'] && (int) $last['o'] > (int) $st['offset'] ) ) ) {
+                if ( (int) $last['t'] > (int) $st['t'] ) {
+                    $st['seen'] += (int) $last['t'] - (int) $st['t'];
+                }
+                $st['t']      = (int) $last['t'];
+                $st['key']    = $last['k'];
+                $st['offset'] = (int) $last['o'];
+                $st['rows']   = (int) $last['r'];
+                $st['cells']  = (int) $last['c'];
+                $table_now    = (string) ( $st['tables'][ $st['t'] ] ?? '' );
+                if ( $table_now !== '' ) {
+                    $st['by_table'][ $table_now ] = (int) $last['n'];
+                }
+            }
+        }
+        $tables        = $st['tables'];
+        $by_table      = (array) $st['by_table'];
+        $rows_changed  = (int) $st['rows'];
+        $cells_changed = (int) $st['cells'];
+        $tables_seen   = (int) $st['seen'];
+
         $needles = self::needles( $pairs );
         self::$base64_needles = $from !== $to ? self::base64_needles_for( $from, ! empty( $options['variants'] ) ) : [];
+        $journal = $paced ? Pace::journal_open( $journal_file ) : null;
+        $stopped = false;
+        $worked  = false;
 
-        $rows_changed  = 0;
-        $cells_changed = 0;
-        $tables_seen   = 0;
-
-        foreach ( $tables as $table ) {
+        for ( $ti = (int) $st['t']; $ti < count( $tables ); $ti++ ) {
             // Only touch real tables on this database.
-            $table  = (string) $table;
+            $table  = (string) $tables[ $ti ];
+            $resume = $ti === (int) $st['t'];
+            $last_key = $resume ? $st['key'] : null;
+            $offset   = $resume ? (int) $st['offset'] : 0;
             $exists = $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) );
             if ( $exists !== $table ) {
                 continue;
             }
-            $tables_seen++;
+            if ( ! $resume || ( $last_key === null && $offset === 0 ) ) {
+                $tables_seen++;
+            }
 
             $columns     = $wpdb->get_results( 'SHOW COLUMNS FROM `' . str_replace( '`', '``', $table ) . '`' );
             $column_names = [];
@@ -2321,15 +2797,26 @@ class Import {
                 continue;
             }
 
-            // Page in primary-key order so no row is skipped or seen twice.
+            // Page in primary-key order so no row is skipped or seen twice:
+            // after the last key with a one-column key (a later call starts
+            // there), by offset otherwise.
             $order  = implode( ', ', array_map( function ( $pk ) { return '`' . str_replace( '`', '``', $pk ) . '`'; }, $primary_keys ) );
-            $offset = 0;
+            $keyset = $paced && count( $primary_keys ) === 1;
             $limit  = 1000;
             while ( true ) {
-                $rows = $wpdb->get_results(
-                    'SELECT * FROM `' . str_replace( '`', '``', $table ) . "` ORDER BY {$order} LIMIT {$limit} OFFSET {$offset}",
-                    ARRAY_A
-                );
+                if ( $paced && $worked && microtime( true ) >= $deadline ) {
+                    $stopped = true;
+                    break 2;
+                }
+                if ( $keyset && $last_key !== null ) {
+                    $rows = $wpdb->get_results( $wpdb->prepare( 'SELECT * FROM `' . str_replace( '`', '``', $table ) . '` WHERE ' . $order . " > %s ORDER BY {$order} LIMIT {$limit}", $last_key ), ARRAY_A );
+                } else {
+                    $rows = $wpdb->get_results(
+                        'SELECT * FROM `' . str_replace( '`', '``', $table ) . "` ORDER BY {$order} LIMIT {$limit} OFFSET {$offset}",
+                        ARRAY_A
+                    );
+                }
+                $worked = true;
                 if ( empty( $rows ) ) {
                     break;
                 }
@@ -2346,8 +2833,6 @@ class Import {
                         $replaced = self::replace_in_value( $value, $pairs );
                         if ( $replaced !== $value ) {
                             $update[ $column ] = $replaced;
-                            $cells_changed++;
-                            $by_table[ $table ] = ( $by_table[ $table ] ?? 0 ) + 1;
                             if ( $dry_run && count( $samples ) < 25 ) {
                                 $samples[] = [
                                     'table'  => $table,
@@ -2359,28 +2844,55 @@ class Import {
                             }
                         }
                     }
-
-                    if ( ! empty( $update ) && $dry_run ) {
+                    $offset++;
+                    if ( $keyset ) {
+                        $last_key = $row[ $primary_keys[0] ];
+                    }
+                    if ( empty( $update ) ) {
+                        continue;
+                    }
+                    $cells_changed     += count( $update );
+                    $by_table[ $table ] = ( $by_table[ $table ] ?? 0 ) + count( $update );
+                    if ( $dry_run ) {
                         $rows_changed++;
-                    } elseif ( ! empty( $update ) ) {
-                        $where = [];
-                        foreach ( $primary_keys as $pk ) {
-                            $where[ $pk ] = $row[ $pk ];
-                        }
-                        $result = $wpdb->update( $table, $update, $where );
-                        if ( $result !== false && $result > 0 ) {
-                            $rows_changed++;
-                        }
+                        continue;
+                    }
+                    $where = [];
+                    foreach ( $primary_keys as $pk ) {
+                        $where[ $pk ] = $row[ $pk ];
+                    }
+                    $result = $wpdb->update( $table, $update, $where );
+                    if ( $result !== false && $result > 0 ) {
+                        $rows_changed++;
+                    }
+                    if ( $paced ) {
+                        Pace::journal_add( $journal, [ 't' => $ti, 'k' => $last_key, 'o' => $offset, 'r' => $rows_changed, 'c' => $cells_changed, 'n' => $by_table[ $table ] ] );
                     }
                 }
-
-                $offset += $limit;
+                if ( count( $rows ) < $limit ) {
+                    break;
+                }
             }
         }
-
+        if ( $journal ) {
+            fclose( $journal );
+        }
         self::$base64_needles = [];
+
+        if ( $stopped ) {
+            if ( $last_key === null && $offset === 0 ) {
+                $tables_seen--; // counted again when the next call starts it
+            }
+            self::write_protected( $state_file, (string) wp_json_encode( [ 'tables' => $tables, 't' => $ti, 'key' => $last_key, 'offset' => $offset, 'seen' => $tables_seen, 'rows' => $rows_changed, 'cells' => $cells_changed, 'by_table' => $by_table ] ) );
+            @unlink( $journal_file );
+            return [ 'done' => false, 'table' => $table, 'tables_done' => $ti, 'tables_total' => count( $tables ), 'cells_changed' => $cells_changed ];
+        }
+        if ( $paced ) {
+            @unlink( $state_file );
+            @unlink( $journal_file );
+        }
         arsort( $by_table );
-        return [
+        $out = [
             'tables'        => $tables_seen,
             'rows_changed'  => $rows_changed,
             'cells_changed' => $cells_changed,
@@ -2388,6 +2900,10 @@ class Import {
             'samples'       => $samples,
             'dry_run'       => (bool) $dry_run,
         ];
+        if ( $paced ) {
+            $out['done'] = true;
+        }
+        return $out;
     }
 
     /**
@@ -3087,6 +3603,8 @@ class Import {
     public function rollback() {
         global $wpdb;
 
+        // A paced deploy that stopped partway journaled what it placed.
+        $this->merge_deploy_journal();
         $meta = self::rollback_meta( $this->rollback_path );
         if ( $meta === null ) {
             return new \WP_Error( 'no_rollback', 'No rollback data found for this import ID.', [ 'status' => 404 ] );
@@ -3260,6 +3778,8 @@ class Import {
             return [ 'ok' => true, 'stopping' => true ];
         }
         ( new Pull( $this->import_id ) )->cleanup_source();
+        $this->merge_deploy_journal();
+        $this->remove_pace_files();
         if ( is_dir( $this->staging_path ) ) {
             self::delete_directory_recursive( $this->staging_path );
         }
@@ -3272,6 +3792,17 @@ class Import {
             $has_point = false;
         }
         return [ 'ok' => true, 'restore_point_kept' => $has_point ];
+    }
+
+    /** The working files of paced steps (see Pace), once a move is done or cancelled. */
+    private function remove_pace_files() {
+        $this->merge_deploy_journal();
+        foreach ( [ 'sql-state.php', 'sql-journal.php', 'deploy-list.php', 'deploy-journal.php', 'replace-state.php', 'replace-journal.php', 'extract-state.php', 'fetched.php', 'fetched.lock', 'database-state.php', 'pace.php', 'rollback/snapshot-state.php' ] as $name ) {
+            @unlink( $this->import_path . '/' . $name );
+        }
+        foreach ( (array) glob( $this->rollback_path . '/*.db.php.part' ) as $part ) {
+            @unlink( $part );
+        }
     }
 
     public function finalize() {
@@ -3310,6 +3841,7 @@ class Import {
         @unlink( $this->import_path . '/token-guard.php' );
         @unlink( $this->import_path . '/token-guard.json' );
         @unlink( $this->import_path . '/unchanged.json' );
+        $this->remove_pace_files();
 
         // Flush rewrite rules (a subsite or tenant had its own cleared)
         if ( ! $target ) {
@@ -3645,20 +4177,28 @@ class Import {
      * $callback returns false to stop early. Returns a summary
      * (statements, ended_cleanly, stopped) or WP_Error if the file can't be read.
      */
-    private static function each_sql_statement_in_file( $path, $callback ) {
+    private static function each_sql_statement_in_file( $path, $callback, $start = 0 ) {
         $handle = @fopen( $path, 'rb' );
         if ( ! $handle ) {
             return new \WP_Error( 'sql_unreadable', 'Could not read ' . basename( $path ) . '.', [ 'status' => 500 ] );
         }
-        // A restore point's dump starts with the exit line (see copy_protected()).
-        if ( fread( $handle, strlen( self::PHP_EXIT ) ) !== self::PHP_EXIT ) {
+        $scan = self::sql_scanner();
+        if ( $start > 0 ) {
+            // Carrying on from a statement boundary an earlier call recorded.
+            fseek( $handle, (int) $start );
+            $scan['fed'] = (int) $start;
+        } elseif ( fread( $handle, strlen( self::PHP_EXIT ) ) !== self::PHP_EXIT ) {
+            // A restore point's dump starts with the exit line (see copy_protected()).
             rewind( $handle );
+        } else {
+            $scan['fed'] = strlen( self::PHP_EXIT );
         }
-        $scan  = self::sql_scanner();
         $count = 0;
-        $emit  = function ( $statement ) use ( $callback, &$count ) {
+        // The callback also gets the byte offset just past the statement,
+        // where a later call can start again.
+        $emit  = function ( $statement, $end = 0 ) use ( $callback, &$count ) {
             $count++;
-            return $callback( $statement ) !== false;
+            return $callback( $statement, $end ) !== false;
         };
         while ( ! $scan['stopped'] && ! feof( $handle ) ) {
             $chunk = fread( $handle, 1048576 );
@@ -3680,7 +4220,7 @@ class Import {
     }
 
     private static function sql_scanner() {
-        return [ 'buf' => '', 'cur' => '', 'state' => 'normal', 'stopped' => false, 'ended_cleanly' => false ];
+        return [ 'buf' => '', 'cur' => '', 'state' => 'normal', 'stopped' => false, 'ended_cleanly' => false, 'fed' => 0, 'pos' => 0 ];
     }
 
     /**
@@ -3697,11 +4237,14 @@ class Import {
         $i     = 0;
         $state = $scan['state'];
         $cur   = $scan['cur'];
+        // The file offset of $s[0], so each statement's end can be reported.
+        $base         = ( $scan['fed'] ?? 0 ) - strlen( $scan['buf'] );
+        $scan['fed']  = ( $scan['fed'] ?? 0 ) + strlen( $data );
 
         $flush = function () use ( &$cur, &$scan, $emit ) {
             $statement = trim( $cur );
             $cur       = '';
-            if ( $statement !== '' && ! $emit( $statement ) ) {
+            if ( $statement !== '' && ! $emit( $statement, $scan['pos'] ) ) {
                 $scan['stopped'] = true;
             }
         };
@@ -3745,6 +4288,7 @@ class Import {
                     if ( $ch === '`' ) { $state = 'backtick'; $cur .= $ch; $i++; break; }
                     if ( $ch === ';' ) {
                         $i++;
+                        $scan['pos'] = $base + $i;
                         $flush();
                         break;
                     }
@@ -3833,6 +4377,7 @@ class Import {
         if ( $final && ! $scan['stopped'] ) {
             // A dump that ends inside a quote or block comment was cut off.
             $scan['ended_cleanly'] = ( $state === 'normal' || $state === 'line_comment' );
+            $scan['pos']           = $base + $len;
             $flush();
         }
     }

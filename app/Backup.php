@@ -684,6 +684,189 @@ class Backup {
     }
 
     /**
+     * One part of a large table, for a paced pull: at most $part['rows']
+     * rows after the key $part['after'] (or from row $part['offset'] when
+     * the table has no one-column key), with the table's CREATE when
+     * $part['head'] is set. The puller closes the table and counts its rows.
+     * Returns { url, rows, key, offset, done } or WP_Error.
+     */
+    public function export_table_part( $table, $part, $schema_only = [], $shared_rows = false ) {
+        $scope = Scope::active();
+        if ( $table === '' || ( $scope && ! isset( $scope->tables()[ $table ] ) ) ) {
+            return new \WP_Error( 'missing_tables', 'No table to export.', [ 'status' => 400 ] );
+        }
+        $after  = isset( $part['after'] ) && ( is_string( $part['after'] ) || is_numeric( $part['after'] ) ) ? (string) $part['after'] : null;
+        $offset = max( 0, (int) ( $part['offset'] ?? 0 ) );
+        $rows   = max( 1, min( 1000000, (int) ( $part['rows'] ?? 10000 ) ) );
+        $name   = 'part-' . md5( $table . '|' . $after . '|' . $offset . '|' . $rows ) . self::EXPORT_EXT;
+        $file   = "{$this->backup_path}/{$name}";
+        $handle = @fopen( $file, 'wb' );
+        if ( ! $handle ) {
+            return new \WP_Error( 'export_failed', 'Could not create the database export file.', [ 'status' => 500 ] );
+        }
+        $cur  = [ 't' => 0, 'started' => empty( $part['head'] ), 'key' => $after, 'offset' => $offset, 'rows' => 0 ];
+        $done = self::export_tables_until( $handle, $cur, [ $table ], [ 'max_rows' => $rows, 'footer' => false, 'schema_only' => $schema_only, 'shared_rows' => $shared_rows ] );
+        $ok   = fclose( $handle );
+        if ( is_wp_error( $done ) || ! $ok ) {
+            @unlink( $file );
+            return is_wp_error( $done ) ? $done : new \WP_Error( 'export_failed', 'Could not finish writing the database export.', [ 'status' => 500 ] );
+        }
+        return [ 'url' => "{$this->backup_url}/{$name}", 'rows' => (int) $cur['rows'], 'key' => $cur['key'], 'offset' => (int) $cur['offset'], 'done' => (bool) $done ];
+    }
+
+    /**
+     * Exports $tables into the open file $handle in pieces, carrying on from
+     * $cur and stopping between pieces of 1,000 rows once $opts['deadline']
+     * (a microtime) has passed or $opts['max_rows'] rows are written. The
+     * same dump database_export_batch() writes, table by table, so the paced
+     * restore point and a source's part exports use it.
+     *
+     * $cur: [ t: table index, started: CREATE written, key: last key (one
+     * column keys), offset: rows read (other keys), rows: rows exported in
+     * this table ]. $opts: deadline, max_rows, schema_only (names),
+     * footer (false: leave out the table's closing lines, for a part of a
+     * table whose closing lines the caller writes), checkpoint (called
+     * after each piece is written, to save $cur).
+     *
+     * Returns true when every table is done, false when it stopped early,
+     * or WP_Error.
+     */
+    public static function export_tables_until( $handle, array &$cur, $tables, $opts = [] ) {
+        global $wpdb;
+        self::prepare_escaping();
+        $scope       = Scope::active();
+        $deadline    = (float) ( $opts['deadline'] ?? 0 );
+        $max_rows    = (int) ( $opts['max_rows'] ?? 0 );
+        $schema_only = array_flip( array_map( 'strval', (array) ( $opts['schema_only'] ?? [] ) ) );
+        $footer      = ! array_key_exists( 'footer', $opts ) || $opts['footer'];
+        $checkpoint  = $opts['checkpoint'] ?? null;
+        $written     = 0;
+        $progress    = false;
+        $cur        += [ 't' => 0, 'started' => false, 'key' => null, 'offset' => 0, 'rows' => 0 ];
+        $write       = function ( $data ) use ( $handle ) {
+            return $data === '' || fwrite( $handle, $data ) === strlen( $data );
+        };
+        $disk_full = new \WP_Error( 'export_failed', 'Could not write the database export (disk full?).', [ 'status' => 500 ] );
+        $wpdb->query( 'SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ' );
+        $wpdb->query( 'START TRANSACTION WITH CONSISTENT SNAPSHOT' );
+        $tables = array_values( $tables );
+        while ( $cur['t'] < count( $tables ) ) {
+            $table = (string) $tables[ $cur['t'] ];
+            $real  = $scope ? (string) $scope->real( $table ) : $table;
+            if ( ! $cur['started'] ) {
+                $create = $wpdb->get_results( 'SHOW CREATE TABLE ' . self::ident( $real ), ARRAY_N );
+                if ( empty( $create[0][1] ) ) {
+                    $wpdb->query( 'COMMIT' );
+                    return new \WP_Error( 'export_failed', "Could not read the structure of table {$table}.", [ 'status' => 500 ] );
+                }
+                $sql = $scope ? $scope->create( $create[0][1], $table, $real ) : $create[0][1];
+                if ( self::is_view_definition( $sql ) ) {
+                    if ( ! $write( 'DROP VIEW IF EXISTS ' . self::ident( $table ) . ";\n" . str_replace( "\n", ' ', $sql ) . ";\n" ) ) {
+                        $wpdb->query( 'COMMIT' );
+                        return $disk_full;
+                    }
+                    $cur = [ 't' => $cur['t'] + 1, 'started' => false, 'key' => null, 'offset' => 0, 'rows' => 0 ];
+                    continue;
+                }
+                if ( ! $write( str_replace( "\n", '', $sql ) . ";\n/*!40000 ALTER TABLE " . self::ident( $table ) . " DISABLE KEYS */;\n" ) ) {
+                    $wpdb->query( 'COMMIT' );
+                    return $disk_full;
+                }
+                $cur['started'] = true;
+                $progress       = true;
+            }
+            $keys   = self::primary_key_columns( $real );
+            $keyset = count( $keys ) === 1;
+            $where  = $scope ? $scope->where( $table ) : '';
+            $no_rows = isset( $schema_only[ $table ] ) || ( $scope && in_array( $table, $scope->shared_tables(), true ) && empty( $opts['shared_rows'] ) );
+            $cols    = null;
+            while ( ! $no_rows ) {
+                // Always some progress per call, however late it started.
+                if ( ( $deadline > 0 && $progress && microtime( true ) >= $deadline ) || ( $max_rows > 0 && $written >= $max_rows ) ) {
+                    $wpdb->query( 'COMMIT' );
+                    return false;
+                }
+                $limit = $max_rows > 0 ? min( 1000, $max_rows - $written ) : 1000;
+                if ( $keyset && $cur['key'] !== null ) {
+                    $query = $wpdb->prepare( 'SELECT * FROM ' . self::ident( $real ) . ' WHERE ' . self::ident( $keys[0] ) . ' > %s' . ( $where !== '' ? " AND ({$where})" : '' ) . self::order_by_primary_key( $real ) . ' LIMIT %d', $cur['key'], $limit );
+                } else {
+                    $query = 'SELECT * FROM ' . self::ident( $real ) . ( $where !== '' ? " WHERE {$where}" : '' ) . self::order_by_primary_key( $real ) . ' LIMIT ' . (int) $cur['offset'] . ',' . (int) $limit;
+                }
+                $rows = $wpdb->get_results( $query, ARRAY_N );
+                if ( $wpdb->last_error ) {
+                    $error = $wpdb->last_error;
+                    $wpdb->query( 'COMMIT' );
+                    return new \WP_Error( 'export_failed', "Could not read rows from table {$table}: " . substr( $error, 0, 200 ), [ 'status' => 500 ] );
+                }
+                $cols = (array) $wpdb->get_col_info( 'name' );
+                if ( empty( $rows ) ) {
+                    break;
+                }
+                $key_pos = $keyset ? array_search( $keys[0], $cols, true ) : false;
+                $sql     = '';
+                foreach ( $rows as $row ) {
+                    if ( $scope ) {
+                        $row = $scope->row( $table, $cols, $row );
+                        if ( $row === null ) {
+                            continue;
+                        }
+                    }
+                    $sql .= self::insert_line( $table, $row );
+                    $cur['rows']++;
+                }
+                if ( ! $write( $sql ) ) {
+                    $wpdb->query( 'COMMIT' );
+                    return $disk_full;
+                }
+                $fetched        = count( $rows );
+                $written       += $fetched;
+                $progress       = true;
+                $cur['offset'] += $fetched;
+                if ( $keyset && $key_pos !== false ) {
+                    $cur['key'] = $rows[ $fetched - 1 ][ $key_pos ];
+                } elseif ( $keyset ) {
+                    $keyset = false; // couldn't find the key column: by offset from here
+                }
+                if ( $checkpoint ) {
+                    $checkpoint( $cur );
+                }
+                if ( $fetched < $limit && ( $max_rows <= 0 || $written < $max_rows ) ) {
+                    break;
+                }
+            }
+            $tail = '';
+            if ( ! $no_rows && $scope ) {
+                foreach ( $scope->extra_rows( $table, $cols ?: (array) $wpdb->get_col( 'SHOW COLUMNS FROM ' . self::ident( $real ) ) ) as $row ) {
+                    $tail .= self::insert_line( $table, $row );
+                    $cur['rows']++;
+                }
+            }
+            if ( $footer ) {
+                $tail .= '/*!40000 ALTER TABLE ' . self::ident( $table ) . " ENABLE KEYS */;\n";
+                if ( ! $no_rows ) {
+                    $tail .= "SET @disembark_rows = '" . self::db_escape( $table ) . ':' . (int) $cur['rows'] . "';\n";
+                }
+            }
+            if ( ! $write( $tail ) ) {
+                $wpdb->query( 'COMMIT' );
+                return $disk_full;
+            }
+            if ( ! $footer ) {
+                // The last part of a table: the caller closes it.
+                $cur['finished'] = true;
+                $wpdb->query( 'COMMIT' );
+                return true;
+            }
+            $cur = [ 't' => $cur['t'] + 1, 'started' => false, 'key' => null, 'offset' => 0, 'rows' => 0 ];
+            if ( $checkpoint ) {
+                $checkpoint( $cur );
+            }
+        }
+        $wpdb->query( 'COMMIT' );
+        return true;
+    }
+
+    /**
      * Last statement of every batch export. A harmless SQL statement rather
      * than a comment, so older importers that run every statement don't error.
      */
@@ -988,6 +1171,7 @@ class Backup {
             if ( $this->zip_object->open( $zip_name, \ZipArchive::CREATE ) === TRUE ) {
                 foreach( $files as $file_obj ) {
                     if ( !is_array($file_obj) || empty($file_obj['name']) ) continue;
+                    Pace::tick();
                     $file_relative_path = $file_obj['name'];
                     $real               = $scope ? $scope->file_in( $file_relative_path ) : $file_relative_path;
                     if ( strpos( '/' . $real . '/', '/../' ) !== false ) {
@@ -1016,6 +1200,7 @@ class Backup {
             $core_files = [];
             foreach( $files as $file_obj ) {
                 if ( !is_array($file_obj) || empty($file_obj['name']) ) continue;
+                Pace::tick();
                 $file_relative_path = (string) $file_obj['name'];
                 // Same rule as the ZipArchive branch: nothing outside the site.
                 if ( strpos( '/' . str_replace( '\\', '/', $file_relative_path ) . '/', '/../' ) !== false ) {

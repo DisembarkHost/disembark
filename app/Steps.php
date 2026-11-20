@@ -69,7 +69,9 @@ class Steps {
             // No lock possible (read-only uploads?): behave as before.
             return $work();
         }
-        $deadline = time() + self::WAIT_SECONDS;
+        // Waiting counts against the time a host lets a request live, so
+        // never more than half of it (see Pace).
+        $deadline = time() + (int) max( 2, min( self::WAIT_SECONDS, Pace::default_budget() / 2 ) );
         while ( ! flock( $lock, LOCK_EX | LOCK_NB ) ) {
             if ( time() >= $deadline ) {
                 fclose( $lock );

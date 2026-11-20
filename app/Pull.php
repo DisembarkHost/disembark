@@ -173,6 +173,16 @@ class Pull {
         return $resp;
     }
 
+    /**
+     * A request that timed out or whose connection dropped (cURL 7, 18, 28,
+     * 52, 55, 56): the source may answer the next one. Never a refused
+     * address, which stays an error.
+     */
+    private static function dropped( $error ) {
+        return is_wp_error( $error ) && $error->get_error_code() === 'http_request_failed'
+            && (bool) preg_match( '/cURL error (?:7|18|28|52|55|56):|timed out/i', $error->get_error_message() );
+    }
+
     /** The exception WordPress turns into a WP_Error when thrown inside a request. */
     private static function request_exception( $message ) {
         if ( class_exists( '\WpOrg\Requests\Exception' ) ) {
@@ -268,13 +278,27 @@ class Pull {
             'body'    => wp_json_encode( $body ),
         ];
 
-        if ( strtoupper( $method ) === 'GET' ) {
-            $resp = $this->get_with_body( $url, $args );
-        } else {
-            $resp = $this->http( 'POST', $url, $args );
+        // A source on a cheap host fails a request now and then (a 503, a
+        // dropped connection): asked again twice, after a second and two.
+        for ( $try = 0; ; $try++ ) {
+            if ( strtoupper( $method ) === 'GET' ) {
+                $resp = $this->get_with_body( $url, $args );
+            } else {
+                $resp = $this->http( 'POST', $url, $args );
+            }
+            $busy = ! is_wp_error( $resp ) && in_array( (int) wp_remote_retrieve_response_code( $resp ), [ 429, 503 ], true );
+            if ( $try >= 2 || ! ( $busy || ( is_wp_error( $resp ) && self::dropped( $resp ) && $timeout <= 120 ) ) ) {
+                break;
+            }
+            sleep( $try + 1 );
         }
 
         if ( is_wp_error( $resp ) ) {
+            // Timed out or dropped: worth trying again, so a 504 (the
+            // client paces the move to it, see Pace).
+            if ( self::dropped( $resp ) ) {
+                return new \WP_Error( 'source_unreachable', "The source didn't answer {$endpoint} in time (" . substr( $resp->get_error_message(), 0, 160 ) . ').', [ 'status' => 504 ] );
+            }
             return $resp;
         }
         $code = wp_remote_retrieve_response_code( $resp );
@@ -282,7 +306,9 @@ class Pull {
         if ( $code !== 200 ) {
             // Don't echo the remote body back to the browser — it can contain
             // internal details from the source (or whatever answered for it).
-            return new \WP_Error( 'source_error', "Source responded {$code} for {$endpoint}.", [ 'status' => 502 ] );
+            // A source that is busy (503, 429) says so to the client, which
+            // waits before asking again.
+            return new \WP_Error( 'source_error', "Source responded {$code} for {$endpoint}.", [ 'status' => in_array( (int) $code, [ 429, 503 ], true ) ? (int) $code : 502, 'source_status' => (int) $code ] );
         }
         $decoded = json_decode( $raw );
         // Some endpoints return a raw URL string, not JSON.
@@ -299,14 +325,14 @@ class Pull {
      * from the source's responses, so they are untrusted input. Returns the
      * temp path or WP_Error.
      */
-    private function guarded_download( $url ) {
+    private function guarded_download( $url, $timeout = 600 ) {
         if ( ! is_string( $url ) || ! preg_match( '#^https?://#i', $url ) ) {
             return new \WP_Error( 'invalid_url', 'Refusing to download a non-http(s) URL from the source.', [ 'status' => 502 ] );
         }
         if ( $this->sslverify() && ( ! wp_http_validate_url( $url ) || is_wp_error( self::public_address( $url ) ) ) ) {
             return new \WP_Error( 'invalid_url', 'Refusing to download an unsafe URL from the source.', [ 'status' => 502 ] );
         }
-        return $this->download( 'GET', $url, [] );
+        return $this->download( 'GET', $url, [ 'timeout' => $timeout ] );
     }
 
     /**
@@ -351,12 +377,12 @@ class Pull {
      * endpoint, which serves the same file through PHP. Returns the temp path
      * or WP_Error.
      */
-    private function fetch_source_file( $url ) {
-        $tmp = $this->guarded_download( $url );
+    private function fetch_source_file( $url, $timeout = 600 ) {
+        $tmp = $this->guarded_download( $url, $timeout );
         if ( ! is_wp_error( $tmp ) || in_array( $tmp->get_error_code(), [ 'invalid_url', 'unsafe_url', 'disk_full' ], true ) ) {
             return $tmp;
         }
-        $streamed = $this->stream_from_source( $url );
+        $streamed = $this->stream_from_source( $url, $timeout );
         return is_wp_error( $streamed ) ? $tmp : $streamed;
     }
 
@@ -365,7 +391,7 @@ class Pull {
      * (token-authenticated, every v2 source has it). Only for URLs on the
      * source's own host. Returns the temp path or WP_Error.
      */
-    private function stream_from_source( $url ) {
+    private function stream_from_source( $url, $timeout = 600 ) {
         $state = $this->state();
         $base  = $state['source_url'] ?? '';
         $host  = is_string( $url ) ? strtolower( (string) parse_url( $url, PHP_URL_HOST ) ) : '';
@@ -384,6 +410,7 @@ class Pull {
         }
 
         $tmp = $this->download( 'POST', $this->source_endpoint( '/stream-file' ), [
+            'timeout' => $timeout,
             'headers' => [ 'Content-Type' => 'application/json' ],
             'body'    => wp_json_encode( [ 'token' => $state['source_token'] ?? '', 'file' => $relative ] ),
         ] );
@@ -396,8 +423,8 @@ class Pull {
     /**
      * Downloads a URL to a local path (streamed to disk).
      */
-    private function download_to( $url, $dest_path ) {
-        $tmp = $this->fetch_source_file( $url );
+    private function download_to( $url, $dest_path, $timeout = 600 ) {
+        $tmp = $this->fetch_source_file( $url, $timeout );
         if ( is_wp_error( $tmp ) ) {
             return $tmp;
         }
@@ -452,9 +479,16 @@ class Pull {
         foreach ( [ 'body', 'query' ] as $how ) {
             foreach ( [ 'pretty', 'rest_route' ] as $candidate ) {
                 $url  = $source_url . ( $candidate === 'rest_route' ? '/?rest_route=/disembark/v1/database' : '/wp-json/disembark/v1/database' );
-                $resp = $how === 'body'
-                    ? $this->http( 'POST', $url, [ 'timeout' => 60, 'headers' => [ 'Content-Type' => 'application/json', 'X-HTTP-Method-Override' => 'GET' ], 'body' => wp_json_encode( [ 'token' => $source_token ] ) ] )
-                    : $this->http( 'GET', $url . ( $candidate === 'rest_route' ? '&' : '?' ) . 'token=' . rawurlencode( $source_token ), [ 'timeout' => 60 ] );
+                for ( $try = 0; $try < 3; $try++ ) {
+                    $resp = $how === 'body'
+                        ? $this->http( 'POST', $url, [ 'timeout' => 60, 'headers' => [ 'Content-Type' => 'application/json', 'X-HTTP-Method-Override' => 'GET' ], 'body' => wp_json_encode( [ 'token' => $source_token ] ) ] )
+                        : $this->http( 'GET', $url . ( $candidate === 'rest_route' ? '&' : '?' ) . 'token=' . rawurlencode( $source_token ), [ 'timeout' => 60 ] );
+                    // Busy for a moment: ask again rather than try another address.
+                    if ( is_wp_error( $resp ) || ! in_array( (int) wp_remote_retrieve_response_code( $resp ), [ 429, 503 ], true ) ) {
+                        break;
+                    }
+                    sleep( $try + 1 );
+                }
                 if ( ! is_wp_error( $resp ) && wp_remote_retrieve_response_code( $resp ) === 200 ) {
                     $tables = json_decode( wp_remote_retrieve_body( $resp ) );
                     if ( ! empty( $tables ) && is_array( $tables ) ) {
@@ -483,6 +517,9 @@ class Pull {
 
         // Source metadata (v2.8 sources expose /import/preflight).
         $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->source_session() ], 'POST' );
+        if ( is_wp_error( $pre ) && in_array( (int) ( $pre->get_error_data()['status'] ?? 0 ), [ 429, 502, 503, 504 ], true ) ) {
+            return $pre; // busy for longer than the retries: the client asks again
+        }
 
         // A network or WP Freighter install: bring one site of it when one
         // was named, or when the address reached one site (a subsite, a
@@ -566,6 +603,9 @@ class Pull {
         }
         // Table sizes (for a size estimate) from /database.
         $db = $this->source_request( '/database', [], 'GET' );
+        if ( is_wp_error( $db ) && in_array( (int) ( $db->get_error_data()['status'] ?? 0 ), [ 429, 502, 503, 504 ], true ) ) {
+            return $db;
+        }
         $table_info = [];
         if ( is_array( $db ) ) {
             foreach ( $db as $row ) {
@@ -861,7 +901,7 @@ class Pull {
                 'move'           => (array) ( $state['move'] ?? [] ),
                 'catch_up'       => ! empty( $state['catch_up'] ),
                 'files_total'    => (int) ( $state['total_files'] ?? 0 ),
-                'files_fetched'  => (int) ( $state['fetched'] ?? 0 ),
+                'files_fetched'  => is_file( $dir . '/fetched.php' ) ? Pace::ranges_count( json_decode( (string) Import::read_protected( $dir . '/fetched.php' ), true ) ) : (int) ( $state['fetched'] ?? 0 ),
                 'database'       => ! empty( $state['db_done'] ),
                 'rollback_point' => $has_point,
             ];
@@ -956,6 +996,422 @@ class Pull {
         $state['db_done'] = true;
         $this->save_state( $state );
         return [ 'ok' => true, 'tables' => count( $tables ), 'bytes' => filesize( $dest ) ];
+    }
+
+    /* ------------------------------------------------------------------
+     * Paced pulls (see Pace)
+     *
+     * The client sizes each batch to the host: how many files (and bytes)
+     * the source zips at once, how much of the database it exports at once.
+     * Batches may run side by side and in any order, so each one is
+     * extracted in a folder of its own and its files moved into staging
+     * whole (a file in staging is never half written), and the batches that
+     * arrived are kept as ranges of the file list. Every answer carries
+     * those ranges: the client takes what is left from them, never from
+     * what it asked for, so a resumed move or a replayed answer can't skip
+     * a file.
+     * ---------------------------------------------------------------- */
+
+    /** The file indexes that have arrived: [ [start, end), ... ]. */
+    private function fetched_ranges() {
+        $ranges = json_decode( (string) Import::read_protected( dirname( $this->state_file ) . '/fetched.php' ), true );
+        return is_array( $ranges ) ? $ranges : [];
+    }
+
+    /** Records [start, end) as arrived (under a lock: batches run side by side). Returns the ranges. */
+    private function record_fetched( $start, $end ) {
+        $dir  = dirname( $this->state_file );
+        $lock = @fopen( $dir . '/fetched.lock', 'c' );
+        if ( $lock ) {
+            flock( $lock, LOCK_EX );
+        }
+        $ranges = Pace::ranges_add( $this->fetched_ranges(), $start, $end );
+        Import::write_protected( $dir . '/fetched.php', (string) wp_json_encode( $ranges ) );
+        if ( $lock ) {
+            flock( $lock, LOCK_UN );
+            fclose( $lock );
+        }
+        return $ranges;
+    }
+
+    /** What a paced fetch answers besides its own details: overall progress. */
+    private function fetch_progress( $total, $ranges = null ) {
+        $ranges  = $ranges === null ? $this->fetched_ranges() : $ranges;
+        $fetched = min( (int) $total, Pace::ranges_count( $ranges ) );
+        return [ 'fetched' => $fetched, 'total' => (int) $total, 'done' => $fetched >= (int) $total, 'ranges' => $ranges ];
+    }
+
+    /** The scanned file list (after "What to bring"), or WP_Error. */
+    private function file_list() {
+        $state = $this->state();
+        if ( empty( $state['file_list'] ) || ! file_exists( $state['file_list'] ) ) {
+            return new \WP_Error( 'no_file_list', 'Run the scan step first.', [ 'status' => 400 ] );
+        }
+        $all = json_decode( (string) file_get_contents( $state['file_list'] ), true );
+        return is_array( $all ) ? $all : [];
+    }
+
+    /** A source request that timed out or dropped, as a 504 the client tries again; other errors as they are. */
+    private static function paced_error( $error ) {
+        return self::dropped( $error ) ? new \WP_Error( 'source_unreachable', 'The source took too long to answer (' . substr( $error->get_error_message(), 0, 160 ) . ').', [ 'status' => 504 ] ) : $error;
+    }
+
+    /**
+     * One batch: files $offset.. (at most $count, and no more than
+     * $max_bytes once there's one), zipped by the source, downloaded and
+     * extracted. Within $budget seconds where it can (the source's zip and
+     * the download get only what is left of it).
+     */
+    public function fetch_files_paced( $offset, $count, $max_bytes, $budget ) {
+        if ( $this->import->cancelled() ) {
+            return new \WP_Error( 'cancelled', 'Cancelled.', [ 'status' => 409 ] );
+        }
+        $deadline = Pace::deadline( $budget );
+        $all      = $this->file_list();
+        if ( is_wp_error( $all ) ) {
+            return $all;
+        }
+        $total  = count( $all );
+        $offset = max( 0, (int) $offset );
+        $count  = max( 1, (int) $count );
+        $batch  = [];
+        $bytes  = 0;
+        for ( $i = $offset; $i < min( $total, $offset + $count ); $i++ ) {
+            $size = (int) ( $all[ $i ]['size'] ?? 0 );
+            if ( $batch && $max_bytes > 0 && $bytes + $size > $max_bytes ) {
+                break;
+            }
+            $batch[] = $all[ $i ];
+            $bytes  += $size;
+        }
+        if ( ! $batch ) {
+            return [ 'offset' => $offset, 'count' => 0, 'bytes' => 0 ] + $this->fetch_progress( $total );
+        }
+
+        $url = $this->source_request( '/zip-sync-files', [ 'files' => array_values( $batch ) ], 'POST', max( 10, (int) ceil( Pace::left( $deadline ) ) ) );
+        if ( is_wp_error( $url ) ) {
+            return self::paced_error( $url );
+        }
+        if ( ! is_string( $url ) || ! preg_match( '#^https?://#', $url ) ) {
+            return new \WP_Error( 'zip_failed', 'Source did not return a zip URL.', [ 'status' => 502 ] );
+        }
+        $id   = bin2hex( random_bytes( 8 ) );
+        $work = $this->staging_dir() . '/_batches';
+        wp_mkdir_p( $work );
+        $zip_path = "{$work}/{$id}.zip";
+        $dl       = $this->download_to( $url, $zip_path, max( 10, (int) ceil( Pace::left( $deadline ) ) ) );
+        $this->cleanup_source_file( $url );
+        if ( is_wp_error( $dl ) ) {
+            @unlink( $zip_path );
+            return self::paced_error( $dl );
+        }
+        $dir  = "{$work}/{$id}";
+        $done = Import::extract_zip_into( $zip_path, $dir, [ 'strict' => true ] );
+        @unlink( $zip_path );
+        if ( is_wp_error( $done ) ) {
+            self::remove_tree( $dir );
+            return new \WP_Error( 'extract_failed', 'Could not extract a batch from the source: ' . $done->get_error_message(), [ 'status' => 500 ] );
+        }
+        $moved = self::move_tree( $dir, $this->staging_public );
+        self::remove_tree( $dir );
+        if ( is_wp_error( $moved ) ) {
+            return $moved;
+        }
+        $ranges = $this->record_fetched( $offset, $offset + count( $batch ) );
+        return [ 'offset' => $offset, 'count' => count( $batch ), 'bytes' => $bytes ] + $this->fetch_progress( $total, $ranges );
+    }
+
+    /**
+     * One file in byte ranges, for a file no batch could bring (too big or
+     * too slow for the source to zip in time): read straight from the
+     * source's /stream-file a piece at a time, until $budget seconds are
+     * spent; the next call carries on from the byte it reached.
+     */
+    public function fetch_file_part( $offset, $budget, $chunk = 0 ) {
+        if ( $this->import->cancelled() ) {
+            return new \WP_Error( 'cancelled', 'Cancelled.', [ 'status' => 409 ] );
+        }
+        $deadline = Pace::deadline( $budget );
+        $all      = $this->file_list();
+        if ( is_wp_error( $all ) ) {
+            return $all;
+        }
+        $total = count( $all );
+        $file  = $all[ (int) $offset ] ?? null;
+        if ( ! $file ) {
+            return [ 'file_done' => true ] + $this->fetch_progress( $total );
+        }
+        $state = $this->state();
+        $name  = (string) $file['name'];
+        if ( ! empty( $state['site'] ) || ! Import::is_safe_relative_path( $name ) ) {
+            return new \WP_Error( 'no_ranges', 'This file can only come across in a batch.', [ 'status' => 400 ] );
+        }
+        $chunk = (int) $chunk > 0 ? max( 256 * KB_IN_BYTES, min( 64 * MB_IN_BYTES, (int) $chunk ) ) : 8 * MB_IN_BYTES;
+        $work  = $this->staging_dir() . '/_parts';
+        wp_mkdir_p( $work );
+        $key        = md5( $name );
+        $part       = "{$work}/{$key}.part";
+        $state_file = "{$work}/{$key}.php";
+        $got        = (int) ( json_decode( (string) Import::read_protected( $state_file ), true )['got'] ?? 0 );
+        $h          = @fopen( $part, 'c+b' );
+        if ( ! $h ) {
+            return new \WP_Error( 'write_failed', 'Could not write to staging (is the disk full?).', [ 'status' => 500 ] );
+        }
+        ftruncate( $h, $got );
+        fseek( $h, $got );
+        $size = (int) ( $file['size'] ?? 0 );
+        $eof  = false;
+        do {
+            $tmp = $this->download( 'POST', $this->source_endpoint( '/stream-file' ), [
+                'timeout' => max( 10, (int) ceil( Pace::left( $deadline ) ) ),
+                'headers' => [ 'Content-Type' => 'application/json' ],
+                'body'    => wp_json_encode( [ 'token' => $state['source_token'] ?? '', 'file' => $name, 'offset' => $got, 'length' => $chunk ] ),
+            ] );
+            if ( is_wp_error( $tmp ) ) {
+                fclose( $h );
+                return self::paced_error( $tmp );
+            }
+            $in = @fopen( $tmp, 'rb' );
+            $n  = $in ? stream_copy_to_stream( $in, $h ) : false;
+            if ( $in ) {
+                fclose( $in );
+            }
+            @unlink( $tmp );
+            if ( $n === false ) {
+                fclose( $h );
+                return new \WP_Error( 'write_failed', 'Could not write to staging (is the disk full?).', [ 'status' => 500 ] );
+            }
+            fflush( $h );
+            $got += $n;
+            Import::write_protected( $state_file, (string) wp_json_encode( [ 'got' => $got ] ) );
+            $eof = $n < $chunk || ( $size > 0 && $got >= $size );
+        } while ( ! $eof && microtime( true ) < $deadline );
+        fclose( $h );
+        if ( ! $eof ) {
+            return [ 'file_done' => false, 'got' => $got, 'size' => $size ] + $this->fetch_progress( $total );
+        }
+
+        // Whole: into staging under its staged name (see Import::staged_name()).
+        $dest = $this->staging_public . '/' . Import::staged_name( $name );
+        if ( ! self::make_dir( dirname( $dest ) ) ) {
+            return new \WP_Error( 'write_failed', 'Could not write to staging (is the disk full?).', [ 'status' => 500 ] );
+        }
+        if ( Import::staged_name( $name ) !== $name ) {
+            $in  = @fopen( $part, 'rb' );
+            $out = $in ? @fopen( $dest . '.tmp', 'wb' ) : false;
+            $ok  = $in && $out && fwrite( $out, Import::PHP_EXIT ) !== false && stream_copy_to_stream( $in, $out ) !== false;
+            if ( $in ) {
+                fclose( $in );
+            }
+            if ( $out ) {
+                $ok = fclose( $out ) && $ok;
+            }
+            $ok = $ok && @rename( $dest . '.tmp', $dest );
+            @unlink( $part );
+        } else {
+            $ok = @rename( $part, $dest );
+        }
+        if ( ! $ok ) {
+            return new \WP_Error( 'write_failed', 'Could not write to staging (is the disk full?).', [ 'status' => 500 ] );
+        }
+        @unlink( $state_file );
+        $ranges = $this->record_fetched( (int) $offset, (int) $offset + 1 );
+        return [ 'file_done' => true, 'got' => $got, 'size' => $size ] + $this->fetch_progress( $total, $ranges );
+    }
+
+    /** mkdir -p that doesn't mind another request making the same folder at the same moment. */
+    private static function make_dir( $dir ) {
+        if ( is_dir( $dir ) ) {
+            return true;
+        }
+        @mkdir( $dir, 0755, true );
+        clearstatcache( true, $dir );
+        return is_dir( $dir );
+    }
+
+    /** Moves every file under $from to the same place under $to (each one whole, by rename). */
+    private static function move_tree( $from, $to ) {
+        if ( ! is_dir( $from ) ) {
+            return true;
+        }
+        $it = new \RecursiveIteratorIterator( new \RecursiveDirectoryIterator( $from, \RecursiveDirectoryIterator::SKIP_DOTS ) );
+        foreach ( $it as $file ) {
+            if ( ! $file->isFile() ) {
+                continue;
+            }
+            $rel  = ltrim( str_replace( '\\', '/', substr( $file->getPathname(), strlen( $from ) ) ), '/' );
+            $dest = $to . '/' . $rel;
+            if ( ! self::make_dir( dirname( $dest ) ) || ! @rename( $file->getPathname(), $dest ) ) {
+                return new \WP_Error( 'write_failed', "Could not move {$rel} into staging (is the disk full?).", [ 'status' => 500 ] );
+            }
+        }
+        return true;
+    }
+
+    private static function remove_tree( $dir ) {
+        if ( ! is_dir( $dir ) ) {
+            return;
+        }
+        $it = new \RecursiveIteratorIterator( new \RecursiveDirectoryIterator( $dir, \RecursiveDirectoryIterator::SKIP_DOTS ), \RecursiveIteratorIterator::CHILD_FIRST );
+        foreach ( $it as $item ) {
+            $item->isDir() ? @rmdir( $item->getPathname() ) : @unlink( $item->getPathname() );
+        }
+        @rmdir( $dir );
+    }
+
+    /**
+     * The database, one batch per call: a group of tables up to
+     * $batch_bytes, or, for a table bigger than that, a part of it by
+     * primary key (a source that runs 3.0 or later). The dump is put
+     * together in staging and only takes its real name when whole. A
+     * source that can't export by parts gets the old single request.
+     */
+    public function fetch_database_paced( $budget, $batch_bytes ) {
+        $deadline   = Pace::deadline( $budget );
+        $batch_bytes = max( 256 * KB_IN_BYTES, (int) $batch_bytes );
+        $state_file = dirname( $this->state_file ) . '/database-state.php';
+        $parts_dir  = $this->staging_public . '/.disembark-db-parts';
+        $part_file  = $parts_dir . '/database-pull.sql.part';
+        $st         = json_decode( (string) Import::read_protected( $state_file ), true );
+        $state      = $this->state();
+        if ( ! is_array( $st ) ) {
+            if ( ! empty( $state['db_done'] ) && file_exists( $this->staging_public . '/database-pull.sql' ) ) {
+                return [ 'done' => true, 'ok' => true, 'tables' => 0, 'bytes' => filesize( $this->staging_public . '/database-pull.sql' ) ];
+            }
+            $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->source_session() ], 'POST', max( 10, (int) ceil( Pace::left( $deadline ) ) ) );
+            if ( is_wp_error( $pre ) ) {
+                return self::paced_error( $pre );
+            }
+            $tables = ( is_object( $pre ) && ! empty( $pre->tables ) ) ? array_values( (array) $pre->tables ) : [];
+            if ( empty( $tables ) ) {
+                return new \WP_Error( 'no_tables', 'Source returned no tables to export.', [ 'status' => 502 ] );
+            }
+            if ( empty( $pre->pacing ) ) {
+                // An older source: the whole database in one request.
+                $old = $this->fetch_database();
+                return is_wp_error( $old ) ? self::paced_error( $old ) : $old + [ 'done' => true, 'single' => true ];
+            }
+            $info = [];
+            foreach ( (array) ( $state['tables'] ?? [] ) as $t ) {
+                $info[ (string) $t['name'] ] = [ (int) ( $t['size'] ?? 0 ), (int) ( $t['rows'] ?? 0 ) ];
+            }
+            $st = [ 't' => 0, 'part' => null, 'bytes' => 0, 'tables' => [] ];
+            foreach ( $tables as $name ) {
+                $st['tables'][] = [ (string) $name, $info[ (string) $name ][0] ?? 0, $info[ (string) $name ][1] ?? 0 ];
+            }
+            wp_mkdir_p( $parts_dir );
+            @file_put_contents( $part_file, '' );
+            Import::write_protected( $state_file, (string) wp_json_encode( $st ) );
+        }
+        $schema_only = array_values( (array) ( $state['skip_rows'] ?? [] ) );
+        $skip        = array_flip( $schema_only );
+        $count       = count( $st['tables'] );
+        $timeout     = max( 10, (int) ceil( Pace::left( $deadline ) ) );
+        $t           = (int) $st['t'];
+        $batch       = [];
+
+        if ( $t < $count ) {
+            list( $name, $size, $rows ) = $st['tables'][ $t ];
+            $big = $size > $batch_bytes && $rows > 0 && ! isset( $skip[ $name ] );
+            if ( $st['part'] !== null || $big ) {
+                // Part of one large table, by primary key.
+                $per   = max( 200, (int) floor( $batch_bytes / max( 1, $size / max( 1, $rows ) ) ) );
+                $prev  = (array) ( $st['part'] ?? [] );
+                $resp  = $this->source_request( '/export-database-batch', [ 'tables' => [ $name ], 'schema_only' => $schema_only, 'shared_rows' => ! empty( $state['shared_rows'] ), 'part' => [ 'after' => $prev['key'] ?? null, 'offset' => (int) ( $prev['offset'] ?? 0 ), 'rows' => $per, 'head' => $st['part'] === null ] ], 'POST', $timeout );
+                if ( is_wp_error( $resp ) ) {
+                    return self::paced_error( $resp );
+                }
+                if ( ! is_object( $resp ) || empty( $resp->url ) || ! is_string( $resp->url ) ) {
+                    return new \WP_Error( 'export_failed', 'Source did not return a part of ' . $name . '.', [ 'status' => 502 ] );
+                }
+                $tail = '';
+                $part = [ 'key' => $resp->key ?? null, 'offset' => (int) ( $resp->offset ?? 0 ), 'rows' => (int) ( $prev['rows'] ?? 0 ) + (int) ( $resp->rows ?? 0 ) ];
+                if ( ! empty( $resp->done ) ) {
+                    $tail = '/*!40000 ALTER TABLE ' . Backup::ident( $name ) . " ENABLE KEYS */;\nSET @disembark_rows = '" . Backup::db_escape( $name ) . ':' . $part['rows'] . "';\n";
+                }
+                $added = $this->append_source_file( $resp->url, $part_file, (int) $st['bytes'], $tail, $timeout );
+                if ( is_wp_error( $added ) ) {
+                    return $added;
+                }
+                $st['bytes'] = $added;
+                $st['part']  = empty( $resp->done ) ? $part : null;
+                $st['t']     = empty( $resp->done ) ? $t : $t + 1;
+                $batch       = [ 'tables' => 1, 'part' => true, 'rows' => (int) ( $resp->rows ?? 0 ) ];
+            } else {
+                // A group of tables, up to the batch size.
+                $group = [];
+                $sum   = 0;
+                for ( $i = $t; $i < $count && count( $group ) < 100; $i++ ) {
+                    list( $n, $sz, $rw ) = $st['tables'][ $i ];
+                    $is_big = $sz > $batch_bytes && $rw > 0 && ! isset( $skip[ $n ] );
+                    if ( $group && ( $is_big || $sum + $sz > $batch_bytes ) ) {
+                        break;
+                    }
+                    $group[] = $n;
+                    $sum    += $sz;
+                }
+                $url = $this->source_request( '/export-database-batch', [ 'tables' => $group, 'schema_only' => $schema_only, 'shared_rows' => ! empty( $state['shared_rows'] ) ], 'POST', $timeout );
+                if ( is_wp_error( $url ) ) {
+                    return self::paced_error( $url );
+                }
+                if ( ! is_string( $url ) || ! preg_match( '#^https?://#', $url ) ) {
+                    return new \WP_Error( 'export_failed', 'Source did not return a database URL.', [ 'status' => 502 ] );
+                }
+                $added = $this->append_source_file( $url, $part_file, (int) $st['bytes'], '', $timeout );
+                if ( is_wp_error( $added ) ) {
+                    return $added;
+                }
+                $st['bytes'] = $added;
+                $st['t']     = $t + count( $group );
+                $batch       = [ 'tables' => count( $group ), 'part' => false, 'bytes' => $sum ];
+            }
+            Import::write_protected( $state_file, (string) wp_json_encode( $st ) );
+        }
+        if ( $st['t'] < $count ) {
+            return [ 'done' => false, 'tables_done' => (int) $st['t'], 'total_tables' => $count, 'bytes' => (int) $st['bytes'], 'batch' => $batch, 'table' => $st['tables'][ $st['t'] ][0] ];
+        }
+
+        // Whole: the dump takes its name, and the source's session and token go.
+        $dest = $this->staging_public . '/database-pull.sql';
+        if ( ! @rename( $part_file, $dest ) ) {
+            return new \WP_Error( 'write_failed', 'Could not save the database in staging (is the disk full?).', [ 'status' => 500 ] );
+        }
+        @rmdir( $parts_dir );
+        @unlink( $state_file );
+        $this->cleanup_source();
+        $state = $this->state();
+        unset( $state['source_token'] );
+        $state['db_done'] = true;
+        $this->save_state( $state );
+        return [ 'done' => true, 'ok' => true, 'tables' => $count, 'bytes' => filesize( $dest ), 'batch' => $batch ];
+    }
+
+    /**
+     * Downloads a file the source made, appends it (and $tail) to $file at
+     * byte $at (anything past it, from a killed call, goes first), and
+     * removes it from the source. Returns the new size or WP_Error.
+     */
+    private function append_source_file( $url, $file, $at, $tail, $timeout ) {
+        $tmp = $this->fetch_source_file( $url, $timeout );
+        $this->cleanup_source_file( $url );
+        if ( is_wp_error( $tmp ) ) {
+            return self::paced_error( $tmp );
+        }
+        $out = @fopen( $file, 'c+b' );
+        $in  = @fopen( $tmp, 'rb' );
+        $ok  = $out && $in && ftruncate( $out, $at ) && fseek( $out, $at ) === 0 && stream_copy_to_stream( $in, $out ) !== false && ( $tail === '' || fwrite( $out, $tail ) === strlen( $tail ) );
+        $size = $ok ? ftell( $out ) : 0;
+        if ( $in ) {
+            fclose( $in );
+        }
+        if ( $out ) {
+            $ok = fclose( $out ) && $ok;
+        }
+        @unlink( $tmp );
+        if ( ! $ok ) {
+            return new \WP_Error( 'write_failed', 'Could not save the database in staging (is the disk full?).', [ 'status' => 500 ] );
+        }
+        return $size;
     }
 
     /** The scanned file list, before any choices were applied. */
