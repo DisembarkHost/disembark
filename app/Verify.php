@@ -317,6 +317,11 @@ class Verify {
             if ( self::$target && strpos( $table, (string) self::$target['prefix'] ) !== 0 ) {
                 continue; // another site's table
             }
+            // A whole-site move into a WP Freighter main site leaves its
+            // tenants' tables alone, so their mentions aren't leftovers.
+            if ( ! self::$target && preg_match( '/^stacked_(\d+)_/', $table, $m ) && 'stacked_' . $m[1] . '_' !== $wpdb->prefix && Scope::freighter_primary() !== '' ) {
+                continue;
+            }
             $q       = '`' . str_replace( '`', '``', $table ) . '`';
             $columns = (array) $wpdb->get_results( "SHOW COLUMNS FROM {$q}", ARRAY_A );
             $keys    = [];
