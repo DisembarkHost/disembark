@@ -307,10 +307,10 @@ class Checks {
                 $v_here  = (string) ( $data['Version'] ?? '' );
                 $v_there = (string) ( $theirs[ $file ]['version'] ?? '' );
                 if ( $v_here !== '' && $v_there !== '' && version_compare( $v_there, $v_here, '<' ) ) {
-                    $older[] = ( $data['Name'] ?? $file ) . " {$v_here} → {$v_there}";
+                    $older[] = self::plain_name( $data['Name'] ?? $file ) . " {$v_here} → {$v_there}";
                 }
             } elseif ( in_array( $file, $active, true ) ) {
-                $idle[] = (string) ( $data['Name'] ?? $file );
+                $idle[] = self::plain_name( $data['Name'] ?? $file );
             }
         }
         if ( $older ) {
@@ -319,6 +319,11 @@ class Checks {
         if ( $idle ) {
             $add( 'info', 'plugins_inactive', 'Plugins active here that the source doesn\'t have', implode( ', ', array_slice( $idle, 0, 8 ) ) . ( count( $idle ) > 8 ? ', and ' . ( count( $idle ) - 8 ) . ' more' : '' ) . ' stay installed but won\'t be active afterwards: the source\'s database decides what\'s active.' );
         }
+    }
+
+    /** A plugin's name as plain text: some headers spell "&" as "&amp;", and the checks print as text. */
+    private static function plain_name( $name ) {
+        return html_entity_decode( (string) $name, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
     }
 
     /* ------------------------------------------------------ Environment */
