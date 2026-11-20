@@ -58,7 +58,7 @@
       if (!data) return;
       D.mount(box);
       onResume({ site: m.source, token: '', quiet: !!(m.move && m.move.quiet), label: (m.move && m.move.label) || 'Before pull from ' + D.host(m.source),
-        resume: { id: m.id, steps: data.steps || {}, started: m.started } });
+        resume: { id: m.id, steps: data.steps || {}, started: m.started, pace: data.pace || null } });
     }
 
     async function discard(m, btn) {

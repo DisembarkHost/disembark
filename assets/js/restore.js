@@ -450,11 +450,14 @@
             continue;
           }
           if (cancelled || TRANSIENT.indexOf(e.status) === -1) throw e;
+          // A pacing destination: a host answering busy again and again
+          // gets a pause, and a slow host never ends the move.
+          if (pacing) await noteFailure(e);
           if (!outage) {
             outage = Date.now();
             rlog(e.status === 0 ? 'Lost the connection. The server keeps working; waiting to reconnect\u2026' : 'The site answered ' + e.status + '. Trying again\u2026', 'dim');
           }
-          if (Date.now() - outage > GIVE_UP_MS) {
+          if (!pacing && Date.now() - outage > GIVE_UP_MS) {
             throw new Error('Couldn\u2019t reach ' + D.host(opts.targetHome) + ' for 15 minutes, so this stopped. The step it was on may still finish on the server. (' + D.errorText(e) + ')');
           }
           progress(e.status === 0 ? (navigator.onLine === false ? 'Offline. Waiting for a connection\u2026' : 'Connection lost. Retrying\u2026') : 'The site answered ' + e.status + '. Retrying\u2026');
@@ -480,6 +483,325 @@
         return retrying(function () { return opts.api.upload(endpoint, form); });
       }
     };
+
+    // Pace to the host (app/Pace.php). A destination that says "pacing" in
+    // its preflight runs each long step a piece at a time: every request
+    // stays within a time budget, answers { done: false }, and is asked
+    // again. The pull's batches are sized to the host as it goes: bigger
+    // after quick answers, halved after slow or failed ones, and up to three
+    // at once on a fast host. A failed request is sent again with the same
+    // request id after a short wait; a batch that fails twice is split. A
+    // host that keeps answering "busy" gets a longer pause, and the move
+    // never stops just because the host is slow. The pace learned is kept
+    // with the move, so a resume starts there. Anything older gets the old
+    // behavior: each step in one request.
+    var MB = 1024 * 1024;
+    var pacing = false, serverBudget = 20;
+    var pace = { files: 400, bytes: 48 * MB, db: 16 * MB, budget: 0, par: 1 };
+    var LIMIT = { files: [50, 5000], bytes: [4 * MB, 512 * MB], db: [1 * MB, 128 * MB] };
+    var START = { files: pace.files, bytes: pace.bytes, db: pace.db };
+    if (opts.resume && opts.resume.pace) Object.keys(pace).forEach(function (k) { var v = +opts.resume.pace[k]; if (v > 0) pace[k] = v; });
+    var lastTrouble = 0, fastStreak = 0, busyRun = 0, pauseLevel = 0, inFiles = false;
+    function h8(n) { return ('00000000' + n.toString(16)).slice(-8); }
+    // A step that takes several requests uses one number of the move's
+    // sequence and counts its own requests under it, so a resumed move
+    // lines up whatever pace it ran at.
+    function ridFor(s, k) { return importId.slice(0, 24) + h8(s) + h8(k); }
+    function clamp(v, lim) { return Math.max(lim[0], Math.min(lim[1], Math.round(v))); }
+    function paceNote(files) {
+      if (files && pace.par > 1) return 'Fast host: ' + pace.par + ' batches at once';
+      if (pace.budget && pace.budget < serverBudget) return 'Slow host: working in smaller pieces';
+      if (pace.files < START.files || pace.bytes < START.bytes || pace.db < START.db) return 'Slow host: working in smaller pieces';
+      return '';
+    }
+    function paced(text, files) { var n = paceNote(files); progress(text + (n ? ' · ' + n : '')); }
+    function paceBody(extra) { return Object.assign(t(), { paced: 1, pace: pace }, pace.budget ? { budget: pace.budget } : {}, extra || {}); }
+    function hasCode(e) { return !!(e && e.data && typeof e.data === 'object' && e.data.code); }
+    // Worth asking again: dropped, timed out, busy, or cut off by the host.
+    // A deliberate error from Disembark (a JSON error with a code) isn't,
+    // except the source failing or not answering in time.
+    function transientError(e) {
+      if (!e || e.cancelled) return false;
+      if (e.status === 0 || e.timeout) return true;
+      if ([408, 425, 429, 503, 504, 520, 521, 522, 523, 524].indexOf(e.status) !== -1) return true;
+      if (e.status === 500 || e.status === 502) return !hasCode(e) || ['source_error', 'source_unreachable', 'http_request_failed'].indexOf(e.data.code) !== -1;
+      return false;
+    }
+    // The host killed the request (no answer, or a gateway's): the next one asks for less.
+    function killedError(e) {
+      return e.status === 0 || e.timeout || ((e.status === 504 || e.status === 500 || e.status === 502 || e.status >= 520) && !hasCode(e));
+    }
+    // Too much asked at once: this host or the source cut the request off,
+    // or the source didn't answer in time (not a busy answer, which is luck).
+    function sizeError(e) {
+      if (killedError(e)) return true;
+      var c = e.data && e.data.code, st = e.data && e.data.data && e.data.data.source_status;
+      return c === 'source_unreachable' || (c === 'source_error' && (st === 500 || st === 502 || st === 504 || st >= 520));
+    }
+    // Halved when the host cuts a request off (never below 5s); after a run
+    // of answers it grows back, though never to within a quarter of a
+    // budget that was cut off.
+    var cutAt = 0, budgetRun = 0;
+    function shrinkBudget() {
+      var cur = pace.budget || serverBudget, next = Math.max(5, Math.floor(cur / 2));
+      cutAt = cutAt ? Math.min(cutAt, cur) : cur;
+      budgetRun = 0;
+      if (next >= cur) return;
+      pace.budget = next;
+      rlog('The host cut off a request. Asking for ' + next + 's of work per request from now on.', 'dim');
+    }
+    function growBudget() {
+      if (!pace.budget || ++budgetRun < 8) return;
+      budgetRun = 0;
+      var cap = Math.min(serverBudget, Math.floor((cutAt || serverBudget / 0.75) * 0.75)), next = Math.min(cap, Math.floor(pace.budget * 1.5));
+      if (next <= pace.budget) return;
+      pace.budget = next;
+      rlog('The host has kept up. Asking for ' + next + 's of work per request.', 'dim');
+    }
+    function backoffMs(n, e) {
+      var ms = Math.min(30000, 1000 * Math.pow(2, n - 1));
+      ms = ms * (0.7 + Math.random() * 0.6);
+      if (e && e.retryAfter) ms = Math.max(ms, Math.min(300, e.retryAfter) * 1000);
+      return Math.round(ms);
+    }
+    async function wait(ms) {
+      var end = Date.now() + ms;
+      while (Date.now() < end) {
+        if (cancelled) throw Cancelled();
+        await D.sleep(Math.min(500, end - Date.now()));
+      }
+    }
+    // Several "busy" answers in a row: the host is struggling. Pause
+    // (30s, then 60s, up to 5 minutes) and carry on.
+    async function hostPause() {
+      var secs = [30, 60, 120, 240, 300][Math.min(pauseLevel, 4)];
+      pauseLevel++;
+      rlog('The host answered busy ' + busyRun + ' times in a row. Pausing ' + secs + 's before going on.', 'dim');
+      var line = 'Slow host: waiting ' + secs + 's and trying again';
+      progress(line);
+      await wait(secs * 1000);
+      busyRun = 0;
+    }
+    async function noteFailure(e) {
+      lastTrouble = Date.now(); fastStreak = 0;
+      if (pace.par > 1) { pace.par = 1; if (inFiles) rlog('A request failed. One batch at a time from now on.', 'dim'); }
+      busyRun = (e.status === 503 || e.status === 429) ? busyRun + 1 : 0;
+      if (busyRun >= 5) await hostPause();
+    }
+    /**
+     * Sends one paced request with request id rid, again after each
+     * failure with the same id. body() makes the body afresh each time (the
+     * budget may have shrunk). onFail(e, n) answers 'retry' or 'split'
+     * (throws an error with .split set). Resolves { r, ms, failures }.
+     */
+    async function pacedPost(endpoint, body, rid, onFail) {
+      if (Object.prototype.hasOwnProperty.call(replay, rid)) return { r: replay[rid], ms: 0, failures: 0, replayed: true };
+      if (replaying) { replaying = false; rlog('Picked up where it stopped.', 'ok'); }
+      for (var n = 0; ;) {
+        if (cancelled) throw Cancelled();
+        var t0 = Date.now(), r;
+        try {
+          r = await opts.api.post(endpoint, Object.assign({ request_id: rid }, body()), { timeout: 300000 });
+        } catch (e) {
+          if (cancelled) throw Cancelled();
+          if (!transientError(e)) throw e;
+          n++;
+          await noteFailure(e);
+          var what = onFail ? onFail(e, n) : 'retry';
+          if (what === 'split') { var se = new Error('split'); se.split = true; se.cause = e; throw se; }
+          var ms = backoffMs(n, e);
+          rlog((e.status ? 'The site answered ' + e.status : (e.timeout ? 'No answer in time' : 'The connection dropped')) + '. Trying again in ' + Math.max(1, Math.round(ms / 1000)) + 's (attempt ' + (n + 1) + ').', 'dim');
+          await wait(ms);
+          continue;
+        }
+        if (r && r.code === 'disembark_step_running') { await wait(1500); continue; }
+        busyRun = 0; pauseLevel = 0;
+        if (cancelled) throw Cancelled();
+        return { r: r, ms: Date.now() - t0, failures: n };
+      }
+    }
+    /** A step that works until its budget and is asked again until done. Returns its last answer. */
+    async function budgeted(endpoint, body, onStep) {
+      var s = ++seq, k = 0, r;
+      do {
+        var res = await pacedPost(endpoint, function () { return paceBody(body); }, ridFor(s, ++k), function (e) {
+          if (killedError(e)) shrinkBudget();
+          return 'retry';
+        });
+        r = res.r;
+        if (!res.replayed && !res.failures) growBudget(); else if (res.failures) budgetRun = 0;
+        if (r && r.done === false && onStep) onStep(r);
+      } while (r && r.done === false);
+      return r;
+    }
+    /** Grows or shrinks a batch size after an answer that took ms (never after a retry). */
+    function adapt(key, ms, failures) {
+      if (failures) return;
+      var before = pace[key];
+      if (ms < 4000) pace[key] = clamp(pace[key] * 1.5, LIMIT[key]);
+      else if (ms < 8000) pace[key] = clamp(pace[key] * 1.25, LIMIT[key]);
+      else if (ms > 18000) pace[key] = clamp(pace[key] / 2, LIMIT[key]);
+      else if (ms > 12000) pace[key] = clamp(pace[key] * 0.8, LIMIT[key]);
+      if (pace[key] < before && ms > 18000) rlog('Slow answer (' + Math.round(ms / 1000) + 's). Smaller batches from now on.', 'dim');
+    }
+    function halve(key, why) {
+      var before = pace[key];
+      pace[key] = clamp(pace[key] / 2, LIMIT[key]);
+      if (pace[key] < before) rlog(why, 'dim');
+    }
+    function ranges(list) {
+      var n = 0;
+      (list || []).forEach(function (r) { n += r[1] - r[0]; });
+      return n;
+    }
+    function mergeRanges(a, b) {
+      var all = (a || []).concat(b || []).map(function (r) { return [r[0], r[1]]; }).sort(function (x, y) { return x[0] - y[0]; }), out = [];
+      all.forEach(function (r) {
+        if (r[1] <= r[0]) return;
+        var last = out[out.length - 1];
+        if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]); else out.push(r);
+      });
+      return out;
+    }
+    function firstGap(list, total) {
+      var at = 0;
+      for (var i = 0; i < list.length; i++) {
+        if (list[i][0] > at) return [at, Math.min(list[i][0], total)];
+        at = Math.max(at, list[i][1]);
+      }
+      return at < total ? [at, total] : null;
+    }
+    function covered(list, a, b) {
+      return list.some(function (r) { return r[0] <= a && r[1] >= b; });
+    }
+
+    /**
+     * The pull's files, in batches sized to the host, up to three at once.
+     * What is left always comes from the ranges the server says arrived.
+     */
+    async function pullFiles() {
+      var s = ++seq, k = 0, total = null, done = [], busy = [], forced = [], running = 0;
+      function show() {
+        if (total === null) return;
+        var n = Math.min(total, ranges(done));
+        paced('Pulling files… ' + D.fmt.num(n) + ' of ' + D.fmt.num(total), true);
+        stepEls.stage.meta.textContent = D.fmt.num(n) + ' / ' + D.fmt.num(total);
+      }
+      function take(r) {
+        if (!r || typeof r !== 'object') return;
+        if (typeof r.total === 'number') total = r.total;
+        if (r.ranges) done = mergeRanges(done, r.ranges);
+      }
+      function next() {
+        while (forced.length) {
+          var f = forced.shift();
+          if (!covered(done, f.offset, f.offset + f.count)) return f;
+        }
+        if (total === null) return running ? null : { offset: 0, count: pace.files };
+        var gap = firstGap(mergeRanges(done, busy), total);
+        return gap ? { offset: gap[0], count: Math.min(gap[1] - gap[0], pace.files) } : null;
+      }
+      async function byRanges(task) {
+        var chunk = 8 * MB;
+        for (;;) {
+          var res;
+          try {
+            res = await pacedPost('import/pull/fetch-files', function () { return paceBody({ offset: task.offset, count: 1, range: 1, chunk: chunk }); }, ridFor(s, ++k), function (e, n) {
+              if (killedError(e)) shrinkBudget();
+              if (n >= 2 && chunk > 256 * 1024) { chunk = Math.max(256 * 1024, Math.floor(chunk / 2)); rlog('Smaller pieces for that file (' + D.fmt.size(chunk) + ').', 'dim'); }
+              return 'retry';
+            });
+          } catch (e) {
+            if (e.data && e.data.code === 'no_ranges') { forced.unshift({ offset: task.offset, count: 1, whole: true }); return; }
+            throw e;
+          }
+          take(res.r);
+          if (covered(done, task.offset, task.offset + 1) || (res.r && res.r.file_done)) return;
+          if (res.r && res.r.size) paced('Pulling a large file in pieces… ' + D.fmt.size(res.r.got || 0) + ' of ' + D.fmt.size(res.r.size));
+        }
+      }
+      async function run(task) {
+        if (task.range) return byRanges(task);
+        var res;
+        try {
+          res = await pacedPost('import/pull/fetch-files', function () { return paceBody({ offset: task.offset, count: task.count, max_bytes: task.bytes || pace.bytes }); }, ridFor(s, ++k), function (e, n) {
+            if (sizeError(e)) task.killed = true;
+            return n >= 2 && !task.whole ? 'split' : 'retry';
+          });
+        } catch (e) {
+          if (!e.split) throw e;
+          if (task.count > 1) {
+            var half = Math.ceil(task.count / 2), bytes = Math.max(LIMIT.bytes[0], Math.round((task.bytes || pace.bytes) / 2));
+            rlog('A batch of ' + D.fmt.plural(task.count, 'file') + ' failed twice. Splitting it in two.', 'dim');
+            // Cut off by the host (not just a busy answer): too big for it.
+            if (task.killed) {
+              halve('files', 'Smaller file batches from now on (' + D.fmt.num(Math.round(pace.files / 2)) + ' files).');
+              pace.bytes = clamp(pace.bytes / 2, LIMIT.bytes);
+            }
+            forced.unshift({ offset: task.offset, count: half, bytes: bytes }, { offset: task.offset + half, count: task.count - half, bytes: bytes });
+          } else {
+            rlog('File ' + D.fmt.num(task.offset + 1) + ' failed twice in a batch. Fetching it in pieces.', 'dim');
+            forced.unshift({ offset: task.offset, count: 1, range: true });
+          }
+          return;
+        }
+        take(res.r);
+        if (res.replayed) return;
+        adapt('files', res.ms, res.failures);
+        adapt('bytes', res.ms, res.failures);
+        if (res.failures || res.ms >= 8000) {
+          fastStreak = 0;
+          if (res.ms > 12000 && pace.par > 1) { pace.par--; rlog('Answers are slowing down. ' + D.fmt.plural(pace.par, 'batch', 'batches') + ' at once.', 'dim'); }
+        } else if (Date.now() - lastTrouble > 60000 && total !== null && ++fastStreak >= 3 && pace.par < 3) {
+          fastStreak = 0;
+          pace.par++;
+          rlog('Fast host: ' + pace.par + ' batches at once.', 'dim');
+        }
+      }
+      inFiles = true;
+      await new Promise(function (resolve, reject) {
+        var failed = false;
+        function pump() {
+          if (failed) return;
+          for (;;) {
+            if (running >= (total === null ? 1 : pace.par)) break;
+            var task = next();
+            if (!task) break;
+            running++;
+            var held = [task.offset, task.offset + task.count];
+            busy.push(held);
+            run(task).then(function () {
+              running--; busy.splice(busy.indexOf(held), 1); show(); pump();
+            }, function (e) { failed = true; reject(e); });
+          }
+          if (!running && total !== null && ranges(done) >= total) resolve();
+          else if (!running && total !== null && !forced.length && !firstGap(done, total)) resolve();
+        }
+        pump();
+      }).finally(function () { inFiles = false; });
+      pace.par = 1;
+      return total || 0;
+    }
+
+    /** The pull's database: a batch of tables (or part of a big one) per request, sized to the host. */
+    async function pullDatabase() {
+      var s = ++seq, k = 0, r;
+      do {
+        var tries = 0;
+        var cut = false;
+        var res = await pacedPost('import/pull/fetch-database', function () { return paceBody({ batch_bytes: pace.db }); }, ridFor(s, ++k), function (e, n) {
+          tries = n;
+          cut = cut || sizeError(e);
+          // Twice, and cut off at least once (not just busy): a smaller batch.
+          if (n >= 2 && cut) halve('db', 'A database batch failed twice. Smaller ones from now on (' + D.fmt.size(Math.round(pace.db / 2)) + ').');
+          return 'retry';
+        });
+        r = res.r;
+        if (!res.replayed) adapt('db', res.ms, res.failures || tries);
+        if (r && r.done === false) paced('Pulling the database… ' + D.fmt.num(r.tables_done || 0) + ' of ' + D.fmt.plural(r.total_tables || 0, 'table') + ' (' + D.fmt.size(r.bytes || 0) + ')');
+      } while (r && r.done === false);
+      return r;
+    }
 
     async function stageFromSite() {
       rlog('Connecting to ' + opts.site + '…');
@@ -532,7 +854,8 @@
       await choose();
       await runChecks();
       var done = false, fetched = 0;
-      while (!done) {
+      if (pacing) fetched = await pullFiles();
+      while (!pacing && !done) {
         var r = await api.post('import/pull/fetch-files', t({ offset: fetched, count: 1000 }));
         fetched = r.fetched; done = r.done;
         progress('Pulling files… ' + D.fmt.num(fetched) + ' of ' + D.fmt.num(r.total));
@@ -540,7 +863,8 @@
       }
       rlog('Pulled ' + D.fmt.plural(fetched, 'file') + '.');
       progress('Pulling the database…');
-      var db = await api.post('import/pull/fetch-database', t());
+      var db = pacing ? await pullDatabase() : await api.post('import/pull/fetch-database', t());
+      if (db && db.single) rlog('The source runs an older Disembark, so its database came in one request.', 'dim');
       rlog('Database pulled (' + (db.tables || 0) + ' tables).');
       return String(c.source_home || '').replace(/\/$/, '');
     }
@@ -593,7 +917,8 @@
         stepEls.stage.meta.textContent = Math.round(((i + 1) / total) * 100) + '%';
       }
       progress('Unpacking the backup…');
-      await api.post('import/extract-zip', t({ file_path: 'restore.zip' }));
+      if (pacing) await budgeted('import/extract-zip', t({ file_path: 'restore.zip' }), function (r) { paced('Unpacking the backup\u2026 ' + D.fmt.num(r.entries_done || 0) + ' of ' + D.fmt.num(r.entries_total || 0)); });
+      else await api.post('import/extract-zip', t({ file_path: 'restore.zip' }));
     }
 
     // The arrival: every stop done, the boat moored on the far side, and two
@@ -638,6 +963,9 @@
         if (opts.resume) rlog('Resuming the move started ' + D.fmt.date(opts.resume.started) + ': replaying ' + D.fmt.plural(Object.keys(replay).length, 'finished step') + '\u2026', 'dim');
         var pre = await api.post('import/preflight', t());
         resumable = !!pre.resumable;
+        pacing = !!pre.pacing;
+        if (pre.budget > 0) serverBudget = +pre.budget;
+        if (pacing && opts.resume && opts.resume.pace) rlog('Carrying on at the pace learned before: ' + D.fmt.plural(pace.files, 'file') + ' a batch' + (pace.budget ? ', ' + pace.budget + 's a request' : '') + '.', 'dim');
         var destPrefix = pre.db_prefix || '', destHome = String(pre.home_url || opts.targetHome).replace(/\/$/, '');
         opts.targetHome = destHome;
         rlog('Destination: ' + destHome + ' (prefix ' + destPrefix + ').', 'dim');
@@ -671,7 +999,9 @@
         if (info.multisite && info.multisite.length) rlog('The source is a multisite network. This site keeps its own wp-config.php, so add: ' + info.multisite.join(' '), 'err');
 
         step('snap');
-        var snap = await api.post('import/snapshot', t({ label: opts.label || '' }));
+        var snap = pacing ? await budgeted('import/snapshot', t({ label: opts.label || '' }), function (r) { paced('Saving a rollback point\u2026 ' + D.fmt.num(r.tables_done || 0) + ' of ' + D.fmt.plural(r.tables_total || 0, 'table')); })
+          : await api.post('import/snapshot', t({ label: opts.label || '' }));
+        progress('');
         rollbackId = importId;
         rlog('Rollback point saved (id ' + importId + ').', 'ok');
         if (snap && snap.target) {
@@ -698,7 +1028,9 @@
         }
 
         step('files');
-        var dep = await api.post('import/deploy-files', t({ files: ['*'] }));
+        var dep = pacing ? await budgeted('import/deploy-files', t({ files: ['*'] }), function (r) { paced('Putting files in place\u2026 ' + D.fmt.num(r.placed || 0) + ' of ' + D.fmt.num(r.total || 0)); })
+          : await api.post('import/deploy-files', t({ files: ['*'] }));
+        progress('');
         rlog('Placed ' + D.fmt.plural(dep.deployed || 0, 'file') + '.');
         if (dep.removed) rlog('Removed ' + D.fmt.plural(dep.removed, 'file') + ' that are gone from the source (kept in the rollback point).');
         (dep.loaders_disabled || []).forEach(function (l) { rlog('Disabled a firewall loader that points at a file not on this server: ' + l, 'dim'); });
@@ -713,7 +1045,10 @@
         if (info.sql_file) {
           step('db');
           progress('This can take a while on large databases…');
-          var sq = await api.post('import/import-staged-sql', t({ sql_file: info.sql_file, old_prefix: srcPrefix, new_prefix: destPrefix }));
+          var sqBody = t({ sql_file: info.sql_file, old_prefix: srcPrefix, new_prefix: destPrefix });
+          var sq = pacing ? await budgeted('import/import-staged-sql', sqBody, function (r) { paced('Importing the database\u2026 ' + Math.floor(100 * (r.bytes_done || 0) / Math.max(1, r.bytes_total || 1)) + '%'); })
+            : await api.post('import/import-staged-sql', sqBody);
+          progress('');
           rlog(D.fmt.num(sq.statements_executed || 0) + ' statements executed.');
           stepEls.db.meta.textContent = D.fmt.num(sq.statements_executed || 0) + ' statements';
           Object.keys(sq.converted || {}).forEach(function (c) { rlog('This database server doesn\u2019t support ' + c.split(' \u2192 ')[0] + ', so ' + D.fmt.plural(sq.converted[c], 'table') + ' use ' + c.split(' \u2192 ')[1] + ' instead.', 'dim'); });
@@ -734,7 +1069,10 @@
           if ((srcHome && destHome && srcHome !== destHome) || Object.keys(paths).length || Object.keys(info.moved || {}).length) {
             if (srcHome && srcHome !== destHome) rlog('Rewriting ' + srcHome + ' → ' + destHome + ' (and its http, https and www spellings)…');
             Object.keys(paths).forEach(function (p) { rlog('Rewriting the old server\u2019s path ' + p + ' → ' + paths[p] + '…'); });
-            var sr = await api.post('import/search-replace', t({ from: srcHome || destHome, to: destHome }));
+            var srBody = t({ from: srcHome || destHome, to: destHome });
+            var sr = pacing ? await budgeted('import/search-replace', srBody, function (r) { paced('Rewriting addresses\u2026 table ' + D.fmt.num((r.tables_done || 0) + 1) + ' of ' + D.fmt.num(r.tables_total || 0)); })
+              : await api.post('import/search-replace', srBody);
+            progress('');
             rlog(D.fmt.num(sr.cells_changed || 0) + ' cells updated.');
             stepEls.urls.meta.textContent = D.fmt.num(sr.cells_changed || 0) + ' cells' + (sr.files_rewritten ? ' · ' + D.fmt.plural(sr.files_rewritten, 'file') : '');
             if (sr.files_rewritten) rlog('Rewrote the old address in ' + D.fmt.plural(sr.files_rewritten, 'file') + ' under uploads (' + (sr.files_rewritten_list || []).slice(0, 3).join(', ') + (sr.files_rewritten > 3 ? ', \u2026' : '') + ').');

@@ -278,12 +278,21 @@
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(opts.body || {});
     }
-    var res;
+    var res, timer = null;
+    // A paced step gives up on an answer that never comes (opts.timeout,
+    // ms) and asks again; the server finishes or replays it (see Steps).
+    if (opts.timeout && window.AbortController) {
+      var ctl = new AbortController();
+      init.signal = ctl.signal;
+      timer = setTimeout(function () { ctl.abort(); }, opts.timeout);
+    }
     try {
       res = await fetch(opts.url || apiUrl(path, query), init);
     } catch (e) {
-      throw new ApiError('Could not reach the site (' + e.message + ').', 0);
-    }
+      var err = new ApiError(init.signal && init.signal.aborted ? 'No answer from the site in time.' : 'Could not reach the site (' + e.message + ').', 0);
+      err.timeout = !!(init.signal && init.signal.aborted);
+      throw err;
+    } finally { if (timer) clearTimeout(timer); }
     if (!useToken && (res.status === 401 || res.status === 403)) {
       var code = '';
       try { code = (JSON.parse(await res.clone().text()) || {}).code || ''; } catch (e) { /* not JSON */ }
@@ -304,7 +313,9 @@
     try { data = text === '' ? null : JSON.parse(text); } catch (e) { /* plain text */ }
     if (!res.ok || (data && typeof data === 'object' && data.code && data.message && data.data && data.data.status >= 400)) {
       var msg = (data && data.message) ? data.message : (typeof data === 'string' && data ? data.slice(0, 200) : 'HTTP ' + res.status);
-      throw new ApiError(msg, res.status, data);
+      var fail = new ApiError(msg, res.status, data);
+      fail.retryAfter = parseInt(res.headers.get('Retry-After') || '', 10) || 0;
+      throw fail;
     }
     return data;
   }

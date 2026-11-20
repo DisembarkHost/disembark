@@ -16,27 +16,34 @@
     var base = String(siteUrl).replace(/\/+$/, '');
     var host = D.host(base);
     var usePlain = false;
-    async function call(root, endpoint, body) {
+    async function call(root, endpoint, body, o) {
       if (usePlain) root = base + '/?rest_route=/disembark/v1/';
-      var res;
+      var res, timer = null, ctl = (o && o.timeout && window.AbortController) ? new AbortController() : null;
+      if (ctl) timer = setTimeout(function () { ctl.abort(); }, o.timeout);
       try {
         res = await fetch(root + endpoint, {
           method: 'POST', mode: 'cors', credentials: 'omit',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(Object.assign({ token: token }, body || {}))
+          body: JSON.stringify(Object.assign({ token: token }, body || {})),
+          signal: ctl ? ctl.signal : undefined
         });
       } catch (e) {
+        if (ctl && ctl.signal.aborted) { var te = new D.api.Error('No answer from ' + host + ' in time.', 0); te.timeout = true; throw te; }
         throw new D.api.Error('Couldn’t reach ' + host + ' from this browser. Its server may block cross-site requests, or one site is http and the other https. You can pull from the destination instead: on ' + host + ', open Tools → Disembark → Pull, and paste this site’s connect line.', 0);
-      }
+      } finally { if (timer) clearTimeout(timer); }
       var text = await res.text(), data = text;
       try { data = text === '' ? null : JSON.parse(text); } catch (e) { /* not JSON */ }
       // The destination took a database with plain permalinks mid-push, so
       // /wp-json/ now answers with a page: carry on through ?rest_route=.
       if (res.ok && root.indexOf('/wp-json/') !== -1 && typeof data === 'string' && /<html|<!doctype/i.test(data.slice(0, 500))) {
         usePlain = true;
-        return call(root, endpoint, body);
+        return call(root, endpoint, body, o);
       }
-      if (!res.ok) throw new D.api.Error((data && data.message) || (host + ' responded ' + res.status + '.'), res.status, data);
+      if (!res.ok) {
+        var fail = new D.api.Error((data && data.message) || (host + ' responded ' + res.status + '.'), res.status, data);
+        fail.retryAfter = parseInt(res.headers.get('Retry-After') || '', 10) || 0;
+        throw fail;
+      }
       return data;
     }
     var roots = [base + '/wp-json/disembark/v1/', base + '/?rest_route=/disembark/v1/'], lastError = null;
@@ -47,7 +54,7 @@
           var root = roots[i];
           return {
             root: root, preflight: pre,
-            post: function (endpoint, body) { return call(root, endpoint, body); },
+            post: function (endpoint, body, o) { return call(root, endpoint, body, o); },
             upload: function () { throw new Error('Uploads are not used when pushing.'); }
           };
         }
