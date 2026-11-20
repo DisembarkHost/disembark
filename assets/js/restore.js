@@ -72,19 +72,20 @@
 
   /**
    * "Which site?" for a source that is a multisite network or a WP Freighter
-   * install. Resolves with a site ID, "all", or null when cancelled.
+   * install. Resolves with a site ID, or null when cancelled. Moving the
+   * whole install as one isn't offered: it isn't built yet (the server
+   * refuses it too, see Import::whole_install_refusal()).
    */
   D.chooseSite = function (box, install) {
     var kind = install.kind === 'multisite' ? 'network' : 'WP Freighter install';
     return new Promise(function (resolve) {
       var sel = h('select', { class: 'dsk-select' },
-        h('option', { value: 'all' }, 'The whole ' + kind + ' (' + D.fmt.plural(install.total || (install.sites || []).length, 'site') + ')'),
         (install.sites || []).map(function (s) {
           return h('option', { value: s.id }, D.host(s.url) + (s.name ? ' \u2014 ' + s.name : '') + ' (' + (s.id === 'main' ? 'main site' : (install.kind === 'multisite' ? 'site ' : 'tenant ') + s.id) + ')');
         }));
       function done(v) { D.mount(box); resolve(v); }
       D.mount(box, D.decideCard({ title: ['Which ', 'site?'],
-        text: D.host(install.home) + ' is a ' + kind + '. Bring one of its sites as a standalone site (its own tables, its users, its uploads, and the plugins and themes it uses), or the whole ' + kind + '.',
+        text: D.host(install.home) + ' is a ' + kind + '. Bring one of its sites as a standalone site: its own tables, its users, its uploads, and the plugins and themes it uses. Moving the whole ' + kind + ' as one is planned for a later version.',
         body: sel,
         go: h('button', { class: 'dsk-btn primary', type: 'button', onclick: function () { done(sel.value); } }, D.icon('ship'), 'Continue'),
         cancel: function () { done(null); } }));
@@ -337,6 +338,8 @@
       var r = await side('import/checks', {});
       progress('');
       if (!r) return;
+      // A move that can't land here at all (a whole network or install as one).
+      if (r.refused) throw new Error(r.refused);
       var marks = { block: '\u2717 ', warn: '! ', info: '\u00b7 ' };
       (r.checks || []).forEach(function (c) { rlog(marks[c.level] + c.title + (c.detail ? ': ' + c.detail : ''), c.level === 'block' ? 'err' : (c.level === 'info' ? 'dim' : '')); });
       if (!(r.checks || []).length) rlog('Checks before the move: nothing in the way.', 'dim');
@@ -1023,6 +1026,7 @@
 
         step('read'); progress('');
         var info = await api.post('import/staged-info', t());
+        if (info.refused) throw new Error(info.refused);
         var srcPrefix = (info.source && info.source.db_prefix) || '';
         var srcHome = String(opts.sourceUrl || siteHome || (info.source && info.source.home_url) || '').replace(/\/$/, '');
         rlog(D.fmt.plural(info.files || 0, 'file') + ' staged' + (info.sql_file ? ', database found.' : ', no database.'));

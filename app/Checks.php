@@ -66,8 +66,11 @@ class Checks {
             $c += [ 'id' => '', 'detail' => '' ];
         }
         unset( $c );
-        $levels = array_column( $checks, 'level' );
+        $levels  = array_column( $checks, 'level' );
+        // A move that can't land here at all (see Import::refused()).
+        $refused = $import->refused();
         return [
+            'refused' => $refused ? $refused->get_error_message() : null,
             'checks'  => $checks,
             'blocked' => in_array( 'block', $levels, true ),
             'space'   => $space,
@@ -282,9 +285,6 @@ class Checks {
         $here   = (string) get_bloginfo( 'version' );
         if ( $src_wp !== '' && version_compare( $src_wp, $here, '<' ) ) {
             $add( 'warn', 'wp_older', "WordPress goes back from {$here} to {$src_wp}", 'The move brings the source\'s WordPress files with it.' );
-        }
-        if ( ! empty( $profile['multisite'] ) && ! is_multisite() ) {
-            $add( 'warn', 'multisite', 'The source is a multisite network; this site isn\'t', 'This site keeps its own wp-config.php, so the network\'s constants have to be added there after the move (the run lists them).' );
         }
     }
 

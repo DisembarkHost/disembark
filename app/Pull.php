@@ -592,6 +592,11 @@ class Pull {
         if ( $site === null && $install && (string) $install['current'] !== (string) $install['main'] ) {
             $site = (string) $install['current'];
         }
+        // An install with one site so far (a network with only its main
+        // site, a WP Freighter install with no tenants yet): that site.
+        if ( $site === null && $install && count( (array) ( $install['sites'] ?? [] ) ) === 1 ) {
+            $site = (string) $install['main'];
+        }
         if ( $site !== null && $site !== '' && strtolower( $site ) !== 'all' ) {
             if ( ! $install ) {
                 return new \WP_Error( 'not_shared', 'The source is a single site, so there is no site to choose (--site).', [ 'status' => 400 ] );
@@ -644,12 +649,10 @@ class Pull {
         }
         $site = trim( (string) $site );
         if ( $site === '' || strtolower( $site ) === 'all' ) {
-            unset( $state['site'] );
-            $this->save_state( $state );
-            $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->source_session() ], 'POST' );
-        } else {
-            $pre = $this->use_site( $site );
+            // The whole install as one isn't built (see Import::whole_install_refusal()).
+            return $this->import->whole_install_refusal() ?: new \WP_Error( 'whole_install', 'Choose one site of the source.', [ 'status' => 409 ] );
         }
+        $pre = $this->use_site( $site );
         return is_wp_error( $pre ) ? $pre : $this->load_source( $pre );
     }
 
@@ -728,6 +731,12 @@ class Pull {
      * list is downloaded and cached locally.
      */
     public function scan_step( $step, $chunk = 0 ) {
+        // Nothing is copied for a move that can't land (a whole install as one).
+        // It can never go on, so it isn't left to resume either.
+        if ( $step === 'initiate' && ( $refused = $this->import->refused() ) ) {
+            $this->import->cancel( 'cleanup' );
+            return $refused;
+        }
         $payload = [ 'step' => $step ];
         if ( $step === 'process_chunk' ) {
             $payload['chunk'] = $chunk;

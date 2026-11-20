@@ -206,9 +206,59 @@ class Import {
         return [ 'ok' => true, 'target' => $t ? $t->info() : null ];
     }
 
-    /** Why this move can't go on here (see here_refusal()), or null. */
+    /** Why this move can't go on here (see here_refusal(), whole_install_refusal()), or null. */
     public function refused() {
-        return self::here_refusal( $this->target() );
+        return self::here_refusal( $this->target() ) ?: $this->whole_install_refusal();
+    }
+
+    /**
+     * A whole multisite network or WP Freighter install moved as one unit
+     * (a pull of its main address with every site, or a backup zip of all
+     * of it), into anything. Only half of that is built: a network's site
+     * addresses (wp_blogs, wp_site) and its wp-config.php constants, and a
+     * Freighter install's bootstrap and wp-config.php line, don't come
+     * across, and into an install it would take over the install's own
+     * registry. Refused, pointing at one site at a time. Null otherwise.
+     */
+    public function whole_install_refusal() {
+        $kind  = '';
+        $total = 0;
+        $zip   = false;
+        $state = is_file( $this->import_path . '/pull.json' ) ? json_decode( (string) file_get_contents( $this->import_path . '/pull.json' ), true ) : null;
+        if ( is_array( $state ) && ! empty( $state['source_url'] ) ) {
+            $install = (array) ( $state['install'] ?? [] );
+            if ( $install && empty( $state['site'] ) && empty( $state['scope'] ) ) {
+                $kind  = (string) ( $install['kind'] ?? '' );
+                $total = (int) ( $install['total'] ?? 0 );
+            }
+        } else {
+            $source  = json_decode( (string) wp_json_encode( $this->staged_source() ), true );
+            $profile = is_array( $source ) ? (array) ( $source['profile'] ?? [] ) : [];
+            if ( is_array( $source ) && empty( $source['scope'] ) ) {
+                $zip = true;
+                if ( ! empty( $profile['install']['kind'] ) ) {
+                    $kind  = (string) $profile['install']['kind'];
+                    $total = (int) ( $profile['install']['total'] ?? 0 );
+                } elseif ( ! empty( $profile['multisite'] ) || $this->staged_multisite_constants() ) {
+                    $kind = 'multisite';
+                } elseif ( ! array_key_exists( 'install', $profile ) && is_file( self::staged_file( $this->staging_path . '/public', 'wp-content/freighter.php' ) ) ) {
+                    // A backup from before the profile named the install.
+                    $kind = 'freighter';
+                }
+            }
+        }
+        if ( $kind !== 'multisite' && $kind !== 'freighter' ) {
+            return null;
+        }
+        $what  = $kind === 'multisite' ? 'multisite network' : 'WP Freighter install';
+        $count = $total > 1 ? ' (' . $total . ' sites)' : '';
+        $why   = $kind === 'multisite'
+            ? 'its sites\' addresses and the network\'s wp-config.php settings wouldn\'t come across'
+            : 'its tenants\' routing (WP Freighter\'s bootstrap and its wp-config.php line) wouldn\'t come across';
+        $how   = $zip
+            ? 'Back up one site of it instead (Backups → Download a backup zip, then pick the site), or pull the site you want from the ' . ( $kind === 'multisite' ? 'network' : 'install' ) . ' with --site=<id>.'
+            : 'Bring its sites one at a time: choose one site (in WP-CLI, --site=<id>).';
+        return new \WP_Error( 'whole_install', ( $zip ? 'This backup holds a whole ' : 'The source is a whole ' ) . $what . $count . '. Moving a whole ' . $what . ' as one isn\'t supported yet (it\'s planned): ' . $why . '. ' . $how . ' Nothing here was changed.', [ 'status' => 409 ] );
     }
 
     /**
@@ -316,6 +366,8 @@ class Import {
             'plugins'       => $plugins,
             'theme'         => [ 'stylesheet' => $theme->get_stylesheet(), 'name' => (string) $theme->get( 'Name' ), 'version' => (string) $theme->get( 'Version' ) ],
             'multisite'     => is_multisite(),
+            // A network or WP Freighter install exported whole (see whole_install_refusal()).
+            'install'       => ( $install = Scope::install() ) ? [ 'kind' => $install['kind'], 'total' => (int) $install['total'] ] : null,
         ];
     }
 
@@ -1643,8 +1695,10 @@ class Import {
                 break;
             }
         }
-        $source = $this->staged_source();
+        $source  = $this->staged_source();
+        $refused = $this->refused();
         return [
+            'refused'   => $refused ? $refused->get_error_message() : null,
             'files'     => $this->count_staged_files(),
             'sql_file'  => $sql_rel,
             'source'    => $source,

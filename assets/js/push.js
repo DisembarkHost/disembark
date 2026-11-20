@@ -148,7 +148,7 @@
     var inst = D.config.install;
     if (!inst) return '';
     var kind = inst.kind === 'multisite' ? 'network' : 'WP Freighter install';
-    if (inst.current === inst.main) return 'This is the main site of a ' + kind + '. The destination asks whether to bring the whole ' + kind + ' or one of its sites.';
+    if (inst.current === inst.main) return 'This is the main site of a ' + kind + '. The destination asks which of its sites to bring (one at a time: moving the whole ' + kind + ' as one is planned for a later version).';
     if (inst.kind === 'freighter' && D.address(D.config.homeUrl) === D.address(inst.home)) return 'This tenant has no domain of its own, so the destination can’t reach it directly. Push it from the main site’s Disembark instead and choose tenant ' + inst.current + '.';
     return 'This site goes as a standalone site: its own tables, its users, its uploads, and the plugins and themes it uses. The rest of the ' + kind + ' stays here.';
   };
