@@ -3920,7 +3920,7 @@ class Import {
 
         return [
             'success'          => empty( $errors ),
-            'tables_restored'  => count( $sql_files ),
+            'tables_restored'  => count( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? $sql_files ) ),
             'files_restored'   => count( $backed_up ),
             'files_removed'    => count( array_diff( $deployed, $backed_up ) ),
             'quiet_mode_lifted' => $quiet_lifted,
