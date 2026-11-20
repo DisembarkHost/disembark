@@ -12,6 +12,13 @@
    * A client for another site's Disembark API, authenticated with its token.
    * Probes pretty permalinks first, then ?rest_route= (plain permalinks).
    */
+  /** Whether a URL is on this computer or a private network (localhost, *.localhost, *.local, *.test, private IPs). */
+  function isLocal(url) {
+    var host = String(D.host(url) || '').toLowerCase().replace(/[:/].*$/, '').replace(/^\[|\]$/g, '');
+    return host === 'localhost' || /\.(localhost|local|test|internal|lan|home\.arpa)$/.test(host) || host === '::1' ||
+      /^(127|10)\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host) || /^169\.254\./.test(host) || /^f[cd][0-9a-f]{2}:/.test(host);
+  }
+
   D.remoteApi = async function (siteUrl, token) {
     var base = String(siteUrl).replace(/\/+$/, '');
     var host = D.host(base);
@@ -29,6 +36,11 @@
         });
       } catch (e) {
         if (ctl && ctl.signal.aborted) { var te = new D.api.Error('No answer from ' + host + ' in time.', 0); te.timeout = true; throw te; }
+        // A public site reaching one on this computer or network: Chrome
+        // (and other browsers) ask first, and refuse until it's allowed.
+        if (isLocal(base) && !isLocal(D.config.homeUrl)) {
+          throw new D.api.Error('Couldn’t reach ' + host + ' from this browser. It’s on your own computer or network and this site isn’t, so the browser asks before letting this page reach it: allow “local network access” when it asks (or from the icon at the left of the address bar, under site settings), then push again. Or pull from the destination instead: on ' + host + ', open Tools → Disembark → Pull, and paste this site’s connect line.', 0);
+        }
         throw new D.api.Error('Couldn’t reach ' + host + ' from this browser. Its server may block cross-site requests, or one site is http and the other https. You can pull from the destination instead: on ' + host + ', open Tools → Disembark → Pull, and paste this site’s connect line.', 0);
       } finally { if (timer) clearTimeout(timer); }
       var text = await res.text(), data = text;
