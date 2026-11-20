@@ -50,6 +50,15 @@
         });
       } catch (e) {
         if (ctl && ctl.signal.aborted) { var te = new D.api.Error('No answer from ' + host + ' in time.', 0); te.timeout = true; throw te; }
+        // The destination took a database with plain permalinks mid-push,
+        // and /wp-json/ now answers with its front page, which carries no
+        // CORS headers, so the browser can't read it: try ?rest_route=,
+        // which reaches the REST API with any permalinks.
+        if (!usePlain && root.indexOf('/wp-json/') !== -1) {
+          usePlain = true;
+          try { return await call(root, endpoint, body, o); } catch (e2) { usePlain = false; e = e2; }
+          if (e && e.status) throw e;
+        }
         // A public site reaching one on this computer or network: Chrome
         // (and other browsers) ask first, and refuse until it's allowed.
         if (isLocal(base) && !isLocal(D.config.homeUrl)) {
