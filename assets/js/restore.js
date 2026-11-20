@@ -444,8 +444,10 @@
           return r;
         } catch (e) {
           if (!resumable) {
-            if (cancelled || e.status !== 0 || attempt >= 3) throw e;
-            rlog('Connection dropped, retrying in ' + (attempt + 1) * 3 + 's\u2026', 'dim');
+            // Before the preflight (or on an older site): a dropped
+            // connection or a busy answer is tried again a few times.
+            if (cancelled || [0, 429, 502, 503, 504].indexOf(e.status) === -1 || attempt >= 3) throw e;
+            rlog((e.status ? 'The site answered ' + e.status : 'Connection dropped') + ', retrying in ' + (attempt + 1) * 3 + 's\u2026', 'dim');
             await D.sleep((attempt + 1) * 3000);
             continue;
           }
