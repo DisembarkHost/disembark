@@ -87,8 +87,9 @@ class User {
         if ( $token !== '' && self::token_valid( $token, isset( $request['import_id'] ) && is_string( $request['import_id'] ) ? $request['import_id'] : '' ) ) {
             return true;
         }
-        // Artificial delay on failure to slow down brute force scripts
-        sleep(1);
+        // No delay on failure: a sleep() here held a PHP worker for every
+        // refused request, so anyone could tie the site up, and a 42-character
+        // random token can't be guessed anyway.
         return false;
     }
 
