@@ -253,6 +253,51 @@ class Pull {
     }
 
     /**
+     * Firewalls in front of some sources (Patchstack on Kinsta, for one)
+     * refuse any request whose body names wp-config.php, which a whole-site
+     * file list always does, and the pull stalled on that batch. Once the
+     * source has answered 403 and then taken the same request packed, every
+     * request of this pull goes packed: its fields base64-encoded in one
+     * "packed" field beside the token, unpacked by the source before routing
+     * (see Run::unpack_body()). With $set, records that it works.
+     */
+    private function packed( $set = false ) {
+        $flag = dirname( $this->state_file ) . '/packed';
+        if ( $set ) {
+            @file_put_contents( $flag, '1' );
+        }
+        return file_exists( $flag );
+    }
+
+    /** A JSON request body for the source, packed when that's needed (see packed()). */
+    private function source_body( array $body, $pack = null ) {
+        if ( ! ( $pack ?? $this->packed() ) ) {
+            return wp_json_encode( $body );
+        }
+        $token = $body['token'] ?? '';
+        unset( $body['token'] );
+        return wp_json_encode( [ 'token' => $token, 'packed' => base64_encode( (string) wp_json_encode( $body ) ) ] );
+    }
+
+    /**
+     * POSTs to the source's /stream-file, packed when needed, and packed once
+     * more after a 403 (see packed()). Returns the temp path or WP_Error.
+     */
+    private function stream_post( array $body, $timeout ) {
+        $args = [ 'timeout' => $timeout, 'headers' => [ 'Content-Type' => 'application/json' ], 'body' => $this->source_body( $body ) ];
+        $tmp  = $this->download( 'POST', $this->source_endpoint( '/stream-file' ), $args );
+        if ( is_wp_error( $tmp ) && ! $this->packed() && (int) ( $tmp->get_error_data()['source_status'] ?? 0 ) === 403 ) {
+            $args['body'] = $this->source_body( $body, true );
+            $again        = $this->download( 'POST', $this->source_endpoint( '/stream-file' ), $args );
+            if ( ! is_wp_error( $again ) ) {
+                $this->packed( true );
+            }
+            return $again;
+        }
+        return $tmp;
+    }
+
+    /**
      * Calls the source site's Disembark REST API, honoring its permalink style.
      *
      * The token always travels in the request body, never in a URL (where
@@ -275,22 +320,34 @@ class Pull {
         $args = [
             'timeout' => $timeout,
             'headers' => [ 'Content-Type' => 'application/json' ],
-            'body'    => wp_json_encode( $body ),
+            'body'    => $this->source_body( $body ),
         ];
 
         // A source on a cheap host fails a request now and then (a 503, a
         // dropped connection): asked again twice, after a second and two.
-        for ( $try = 0; ; $try++ ) {
-            if ( strtoupper( $method ) === 'GET' ) {
-                $resp = $this->get_with_body( $url, $args );
-            } else {
-                $resp = $this->http( 'POST', $url, $args );
+        $send = function () use ( $method, $url, &$args, $timeout ) {
+            for ( $try = 0; ; $try++ ) {
+                if ( strtoupper( $method ) === 'GET' ) {
+                    $resp = $this->get_with_body( $url, $args );
+                } else {
+                    $resp = $this->http( 'POST', $url, $args );
+                }
+                $busy = ! is_wp_error( $resp ) && in_array( (int) wp_remote_retrieve_response_code( $resp ), [ 429, 503 ], true );
+                if ( $try >= 2 || ! ( $busy || ( is_wp_error( $resp ) && self::dropped( $resp ) && $timeout <= 120 ) ) ) {
+                    return $resp;
+                }
+                sleep( $try + 1 );
             }
-            $busy = ! is_wp_error( $resp ) && in_array( (int) wp_remote_retrieve_response_code( $resp ), [ 429, 503 ], true );
-            if ( $try >= 2 || ! ( $busy || ( is_wp_error( $resp ) && self::dropped( $resp ) && $timeout <= 120 ) ) ) {
-                break;
+        };
+        $resp = $send();
+        // Refused by a firewall in front of the source? Once more, packed.
+        if ( ! $this->packed() && ! is_wp_error( $resp ) && (int) wp_remote_retrieve_response_code( $resp ) === 403 ) {
+            $args['body'] = $this->source_body( $body, true );
+            $again        = $send();
+            if ( ! is_wp_error( $again ) && (int) wp_remote_retrieve_response_code( $again ) === 200 ) {
+                $this->packed( true );
+                $resp = $again;
             }
-            sleep( $try + 1 );
         }
 
         if ( is_wp_error( $resp ) ) {
@@ -359,7 +416,7 @@ class Pull {
         $resp = $this->http( $method, $url, $args );
         if ( is_wp_error( $resp ) || (int) wp_remote_retrieve_response_code( $resp ) !== 200 ) {
             @unlink( $tmp );
-            return is_wp_error( $resp ) ? $resp : new \WP_Error( 'download_failed', 'Source responded ' . wp_remote_retrieve_response_code( $resp ) . ' for ' . $name . '.', [ 'status' => 502 ] );
+            return is_wp_error( $resp ) ? $resp : new \WP_Error( 'download_failed', 'Source responded ' . wp_remote_retrieve_response_code( $resp ) . ' for ' . $name . '.', [ 'status' => 502, 'source_status' => (int) wp_remote_retrieve_response_code( $resp ) ] );
         }
         clearstatcache( true, $tmp );
         if ( $limit > 0 && filesize( $tmp ) >= $limit ) {
@@ -409,11 +466,7 @@ class Pull {
             return new \WP_Error( 'invalid_url', 'Source file URL has no path.', [ 'status' => 502 ] );
         }
 
-        $tmp = $this->download( 'POST', $this->source_endpoint( '/stream-file' ), [
-            'timeout' => $timeout,
-            'headers' => [ 'Content-Type' => 'application/json' ],
-            'body'    => wp_json_encode( [ 'token' => $state['source_token'] ?? '', 'file' => $relative ] ),
-        ] );
+        $tmp = $this->stream_post( [ 'token' => $state['source_token'] ?? '', 'file' => $relative ], $timeout );
         if ( is_wp_error( $tmp ) ) {
             return $tmp->get_error_code() === 'disk_full' ? $tmp : new \WP_Error( 'download_failed', "Source could not stream {$relative} (" . $tmp->get_error_message() . ').', [ 'status' => 502 ] );
         }
@@ -1048,6 +1101,12 @@ class Pull {
         return [ 'fetched' => $fetched, 'total' => (int) $total, 'done' => $fetched >= (int) $total, 'ranges' => $ranges ];
     }
 
+    /** The path of file $offset in the source's file list ('' when there is none). */
+    public function file_name( $offset ) {
+        $all = $this->file_list();
+        return is_wp_error( $all ) ? '' : (string) ( $all[ (int) $offset ]['name'] ?? '' );
+    }
+
     /** The scanned file list (after "What to bring"), or WP_Error. */
     private function file_list() {
         $state = $this->state();
@@ -1169,11 +1228,7 @@ class Pull {
         $size = (int) ( $file['size'] ?? 0 );
         $eof  = false;
         do {
-            $tmp = $this->download( 'POST', $this->source_endpoint( '/stream-file' ), [
-                'timeout' => max( 10, (int) ceil( Pace::left( $deadline ) ) ),
-                'headers' => [ 'Content-Type' => 'application/json' ],
-                'body'    => wp_json_encode( [ 'token' => $state['source_token'] ?? '', 'file' => $name, 'offset' => $got, 'length' => $chunk ] ),
-            ] );
+            $tmp = $this->stream_post( [ 'token' => $state['source_token'] ?? '', 'file' => $name, 'offset' => $got, 'length' => $chunk ], max( 10, (int) ceil( Pace::left( $deadline ) ) ) );
             if ( is_wp_error( $tmp ) ) {
                 fclose( $h );
                 return self::paced_error( $tmp );

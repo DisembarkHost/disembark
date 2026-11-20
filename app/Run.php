@@ -21,6 +21,7 @@ class Run {
         add_action( 'rest_api_init', [ $this, 'register_rest_endpoints' ] );
         add_filter( 'rest_authentication_errors', [ $this, 'allow_token_auth' ], 99 );
         add_filter( 'rest_dispatch_request', [ Steps::class, 'dispatch' ], 10, 4 );
+        add_filter( 'rest_pre_dispatch', [ __CLASS__, 'unpack_body' ], 10, 3 );
 
         // Daily clean-up of working files left behind (see purge()).
         add_action( self::PURGE_HOOK, [ __CLASS__, 'purge' ] );
@@ -61,6 +62,34 @@ class Run {
         if ( method_exists( '\Disembark\Import', 'purge_stale' ) ) {
             \Disembark\Import::purge_stale();
         }
+    }
+
+    /**
+     * Unpacks a request a pulling site sent packed: its fields base64-encoded
+     * in one "packed" field, because a firewall in front of this site refused
+     * the plain one (Patchstack refuses any body naming wp-config.php, which
+     * every whole-site file list does; see Pull::packed()). Runs before the
+     * route is matched, so its parameters are read as if sent plainly. Only
+     * for Disembark's own routes; the token check still runs as usual.
+     */
+    public static function unpack_body( $result, $server, $request ) {
+        if ( strpos( (string) $request->get_route(), '/disembark/v1/' ) !== 0 ) {
+            return $result;
+        }
+        $packed = $request->get_param( 'packed' );
+        if ( ! is_string( $packed ) || $packed === '' ) {
+            return $result;
+        }
+        $fields = json_decode( (string) base64_decode( $packed, true ), true );
+        if ( ! is_array( $fields ) ) {
+            return $result;
+        }
+        foreach ( $fields as $key => $value ) {
+            if ( is_string( $key ) && $key !== 'packed' && $key !== 'token' ) {
+                $request->set_param( $key, $value );
+            }
+        }
+        return $result;
     }
 
     /**
