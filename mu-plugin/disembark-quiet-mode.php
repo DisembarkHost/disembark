@@ -152,8 +152,22 @@ if ( ! class_exists( 'Disembark_Quiet_Mode' ) ) {
 
 		/* ------------------------------------------------------------ Jobs */
 
+		/**
+		 * Nothing scheduled runs, except Disembark's own daily clean-up of
+		 * old working files (it reaches no one outside the site).
+		 */
 		public static function no_cron_jobs() {
-			return [];
+			$ready = [];
+			$now   = microtime( true );
+			foreach ( (array) ( function_exists( '_get_cron_array' ) ? _get_cron_array() : [] ) as $time => $hooks ) {
+				if ( $time > $now ) {
+					break;
+				}
+				if ( isset( $hooks['disembark_purge'] ) ) {
+					$ready[ $time ] = [ 'disembark_purge' => $hooks['disembark_purge'] ];
+				}
+			}
+			return $ready;
 		}
 
 		/* ----------------------------------------------------- WooCommerce */

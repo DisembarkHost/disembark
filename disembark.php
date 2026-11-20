@@ -49,3 +49,8 @@ add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), 'disembark_add
 
 new Disembark\Run();
 new Disembark\Updater();
+
+// The daily clean-up (Disembark\Run::purge()) stops with the plugin.
+register_deactivation_hook( __FILE__, function () {
+	wp_clear_scheduled_hook( Disembark\Run::PURGE_HOOK );
+} );

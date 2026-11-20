@@ -4,6 +4,8 @@ namespace Disembark;
 
 class Run {
 
+    const PURGE_HOOK = 'disembark_purge';
+
     protected $plugin_url;
     protected $plugin_path;
 
@@ -21,6 +23,10 @@ class Run {
         add_filter( 'rest_authentication_errors', [ $this, 'allow_token_auth' ], 99 );
         add_filter( 'rest_dispatch_request', [ Steps::class, 'dispatch' ], 10, 4 );
 
+        // Daily clean-up of working files left behind (see purge()).
+        add_action( self::PURGE_HOOK, [ __CLASS__, 'purge' ] );
+        add_action( 'init', [ __CLASS__, 'schedule_purge' ] );
+
         if ( defined( 'WP_CLI' ) && \WP_CLI ) {
             \WP_CLI::add_command( 'disembark', new class {}, [
                 'shortdesc' => 'Disembark helper commands.',
@@ -37,6 +43,24 @@ class Run {
             \WP_CLI::add_command( 'disembark unfinished', [ 'Disembark\Command', 'unfinished' ] );
             \WP_CLI::add_command( 'disembark discard', [ 'Disembark\Command', 'discard' ] );
             \WP_CLI::add_command( 'disembark verify', [ 'Disembark\Command', 'verify' ] );
+        }
+    }
+
+    /** Schedules the daily clean-up once per site. */
+    public static function schedule_purge() {
+        if ( ! wp_next_scheduled( self::PURGE_HOOK ) ) {
+            wp_schedule_event( time() + HOUR_IN_SECONDS, 'daily', self::PURGE_HOOK );
+        }
+    }
+
+    /**
+     * Removes stale working files: backup sessions and restore folders that
+     * were left behind (an abandoned scan, a move that never finished).
+     * Restore points stay. The rules live with the import code.
+     */
+    public static function purge() {
+        if ( method_exists( '\Disembark\Import', 'purge_stale' ) ) {
+            \Disembark\Import::purge_stale();
         }
     }
 
