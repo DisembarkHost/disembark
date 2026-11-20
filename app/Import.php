@@ -2503,12 +2503,12 @@ class Import {
     /**
      * Options that belong to the host, not the site, by name prefix: Kinsta's
      * Patchstack firewall keeps its settings and the site's API token under
-     * patchstack_. Like the host's mu-plugins and tables, they stay with the
+     * patchstack_ (webarx_ on installs from before Patchstack's rename). Like the host's mu-plugins and tables, they stay with the
      * server: a move keeps the destination's own and leaves the source's
      * behind (see keep_install_rows()), so a secret never travels to every
      * copy.
      */
-    const HOST_OPTIONS = [ 'patchstack_' ];
+    const HOST_OPTIONS = [ 'patchstack_', 'webarx_' ];
 
     const HOST_MU_PLUGINS = [
         'wpengine', 'wpe-', 'mu-plugin.php', 'slt-force-strong-passwords', 'force-strong-passwords', 'stop-long-comments',
