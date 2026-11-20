@@ -95,9 +95,11 @@ if ( ! class_exists( 'Disembark_Quiet_Mode' ) ) {
 			}
 
 			// Emails: held and logged, never sent. pre_wp_mail catches anything
-			// that reaches core's wp_mail(); the pluggable wp_mail() below wins
-			// over SMTP plugins that replace wp_mail() (this loads first).
-			add_filter( 'pre_wp_mail', [ __CLASS__, 'hold_mail' ], PHP_INT_MAX, 2 );
+			// that reaches core's wp_mail(), first in line so a mailer plugin
+			// hooked there sees the email already handled; the pluggable
+			// wp_mail() below wins over SMTP plugins that replace wp_mail()
+			// (this loads first).
+			add_filter( 'pre_wp_mail', [ __CLASS__, 'hold_mail' ], PHP_INT_MIN, 2 );
 
 			// Scheduled jobs: WP-Cron runs nothing, even when a server cron
 			// requests wp-cron.php directly. Action Scheduler (WooCommerce,
@@ -106,6 +108,12 @@ if ( ! class_exists( 'Disembark_Quiet_Mode' ) ) {
 			// works by hand.
 			add_filter( 'pre_get_ready_cron_jobs', [ __CLASS__, 'no_cron_jobs' ], PHP_INT_MAX );
 			add_filter( 'action_scheduler_allow_async_request_runner', '__return_false', PHP_INT_MAX );
+			// `wp cron event run --due-now` (how many hosts run WP-Cron from a
+			// server cron) skips WP-Cron's own checks, so it's refused here.
+			// One event run by name still works by hand.
+			if ( defined( 'WP_CLI' ) && WP_CLI && class_exists( 'WP_CLI' ) ) {
+				WP_CLI::add_hook( 'before_invoke:cron event run', [ __CLASS__, 'refuse_cli_cron' ] );
+			}
 
 			// WooCommerce: no payment methods, no orders, no webhooks.
 			add_filter( 'woocommerce_available_payment_gateways', [ __CLASS__, 'no_gateways' ], PHP_INT_MAX );
@@ -117,6 +125,10 @@ if ( ! class_exists( 'Disembark_Quiet_Mode' ) ) {
 
 			// Outbound calls to payment, marketing, shipping-label and email
 			// APIs fail fast (refunds on copied orders would be real refunds).
+			// This covers requests made through WordPress's HTTP API. An SDK
+			// that calls curl or opens sockets itself (some payment and SMS
+			// libraries do) isn't covered: switch such plugins to test keys
+			// or turn them off on a copy.
 			add_filter( 'pre_http_request', [ __CLASS__, 'block_http' ], PHP_INT_MAX, 3 );
 
 			// Search engines: discouraged while quiet.
@@ -156,6 +168,17 @@ if ( ! class_exists( 'Disembark_Quiet_Mode' ) ) {
 		 * Nothing scheduled runs, except Disembark's own daily clean-up of
 		 * old working files (it reaches no one outside the site).
 		 */
+		/** WP-CLI hook: stops `wp cron event run --due-now` and `--all`. */
+		public static function refuse_cli_cron() {
+			$runner = WP_CLI::get_runner();
+			$assoc  = is_object( $runner ) ? (array) $runner->assoc_args : [];
+			if ( empty( $assoc['due-now'] ) && empty( $assoc['all'] ) ) {
+				return;
+			}
+			WP_CLI::warning( 'Disembark quiet mode: this site is a copy, so scheduled jobs are paused and nothing ran. Run one event by name to run it by hand, or turn quiet mode off with `wp disembark quiet-mode off`.' );
+			WP_CLI::halt( 0 );
+		}
+
 		public static function no_cron_jobs() {
 			$ready = [];
 			$now   = microtime( true );
@@ -215,6 +238,11 @@ if ( ! class_exists( 'Disembark_Quiet_Mode' ) ) {
 				'api.stripe.com'            => 'Stripe',
 				'api-m.paypal.com'          => 'PayPal',
 				'api.paypal.com'            => 'PayPal',
+				'api-3t.paypal.com'         => 'PayPal',
+				'api.mollie.com'            => 'Mollie',
+				'api.klarna.com'            => 'Klarna',
+				'api-na.klarna.com'         => 'Klarna',
+				'api-oc.klarna.com'         => 'Klarna',
 				'api.braintreegateway.com'  => 'Braintree',
 				'connect.squareup.com'      => 'Square',
 				'api.authorize.net'         => 'Authorize.net',
@@ -227,6 +255,10 @@ if ( ! class_exists( 'Disembark_Quiet_Mode' ) ) {
 				'googleads.googleapis.com'       => 'Google Ads',
 				'a.klaviyo.com'             => 'Klaviyo',
 				'api.hubapi.com'            => 'HubSpot',
+				// Text messages.
+				'api.twilio.com'            => 'Twilio',
+				'messaging.twilio.com'      => 'Twilio',
+				'verify.twilio.com'         => 'Twilio',
 				// Shipping labels.
 				'onlinetools.ups.com'       => 'UPS',
 				'apis.fedex.com'            => 'FedEx',
