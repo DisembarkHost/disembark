@@ -210,7 +210,7 @@
       if (!ok) return;
       await D.busy(btn, async function () {
         try {
-          await D.api.get('cleanup', all ? { include_restore_points: 1 } : {});
+          await D.api.post('cleanup', all ? { include_restore_points: 1 } : {});
           D.store.set({ scanned: false, files: [], index: null, excluded: new Set(), backupToken: '' });
           await D.loadStatus();
           loadPoints();

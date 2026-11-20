@@ -354,8 +354,9 @@ class Run {
             'callback' => [ $this, 'stream_file' ],
             'permission_callback' => '__return_true',
         ]);
+        // GET for the CLI and older destinations; POST keeps it out of URLs.
         register_rest_route('disembark/v1', '/cleanup', [
-            'methods'  => 'GET',
+            'methods'  => 'GET, POST',
             'callback' => [ $this, 'cleanup' ],
             'permission_callback' => '__return_true',
         ]);
