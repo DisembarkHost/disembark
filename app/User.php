@@ -50,7 +50,24 @@ class User {
         if ( hash_equals( (string) Token::get(), $token ) ) {
             return true;
         }
-        return $import_id !== '' && Import::token_guard_matches( (string) $import_id, $token );
+        if ( $import_id === '' || ! Import::token_guard_matches( (string) $import_id, $token ) ) {
+            return false;
+        }
+        // A restore's leftover key only carries that restore through its own
+        // steps (the import API), never the rest of Disembark: it can't read
+        // the database, regenerate the token or browse files.
+        return self::import_route();
+    }
+
+    /** True while serving one of Disembark's import routes (/import/...). */
+    private static function import_route() {
+        $route = '';
+        if ( isset( $GLOBALS['wp'] ) && is_object( $GLOBALS['wp'] ) && ! empty( $GLOBALS['wp']->query_vars['rest_route'] ) ) {
+            $route = $GLOBALS['wp']->query_vars['rest_route'];
+        } elseif ( isset( $_GET['rest_route'] ) && is_string( $_GET['rest_route'] ) ) {
+            $route = $_GET['rest_route'];
+        }
+        return (bool) preg_match( '#^/?disembark/v1/import/#i', (string) $route );
     }
 
     /** The header the dashboard sends the token in (kept out of URLs and logs). */
