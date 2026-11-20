@@ -242,29 +242,41 @@
   ApiError.prototype = Object.create(Error.prototype);
 
   /**
-   * Calls the Disembark REST API as the logged-in admin (cookie + nonce), with
-   * the site token as a fallback: a restore replaces the users table and ends
+   * Calls the Disembark REST API as the logged-in admin (cookie + nonce). The
+   * site token is the fallback: a restore replaces the users table and ends
    * the session mid-flow, and the token keeps the remaining steps authorized.
+   * It goes in a header, never in a URL (URLs land in access logs), and only
+   * once the login stops working: the first request refused for want of a
+   * login switches to it and is sent again.
    */
+  var useToken = false;
+  var LOGIN_ERRORS = ['rest_cookie_invalid_nonce', 'rest_forbidden', 'rest_not_logged_in'];
   async function request(method, path, opts) {
     opts = opts || {};
-    var token = D.store.state.token;
     var init = { method: method, headers: { 'X-WP-Nonce': cfg.nonce }, credentials: 'same-origin' };
+    if (useToken) init.headers['X-Disembark-Token'] = D.store.state.token;
     var query = Object.assign({}, opts.query || {});
     if (method === 'GET' || method === 'HEAD') {
-      query.token = token;
+      // nothing in the body
     } else if (opts.form) {
-      opts.form.append('token', token);
       init.body = opts.form;
     } else {
       init.headers['Content-Type'] = 'application/json';
-      init.body = JSON.stringify(Object.assign({ token: token }, opts.body || {}));
+      init.body = JSON.stringify(opts.body || {});
     }
     var res;
     try {
       res = await fetch(opts.url || apiUrl(path, query), init);
     } catch (e) {
       throw new ApiError('Could not reach the site (' + e.message + ').', 0);
+    }
+    if (!useToken && (res.status === 401 || res.status === 403)) {
+      var code = '';
+      try { code = (JSON.parse(await res.clone().text()) || {}).code || ''; } catch (e) { /* not JSON */ }
+      if (res.status === 401 || LOGIN_ERRORS.indexOf(code) !== -1) {
+        useToken = true;
+        return request(method, path, opts);
+      }
     }
     if (opts.blob) {
       if (!res.ok) throw new ApiError((await res.text()).slice(0, 200) || ('HTTP ' + res.status), res.status);
@@ -453,8 +465,11 @@
     var path = new URL(url, location.href).pathname;
     var home = new URL(cfg.homeUrl, location.href).pathname.replace(/\/$/, '');
     if (home && path.indexOf(home + '/') === 0) path = path.slice(home.length);
+    // A form post can't carry headers: the nonce, or the token once the
+    // login no longer works, goes in the (POST) body.
     var form = h('form', { method: 'POST', action: apiUrl('stream-file'), style: { display: 'none' } },
-      h('input', { type: 'hidden', name: 'token', value: D.store.state.token }),
+      h('input', { type: 'hidden', name: '_wpnonce', value: cfg.nonce }),
+      useToken ? h('input', { type: 'hidden', name: 'token', value: D.store.state.token }) : null,
       h('input', { type: 'hidden', name: 'file', value: decodeURIComponent(path.replace(/^\//, '')) }),
       name ? h('input', { type: 'hidden', name: 'download_name', value: name }) : null,
       o.deleteAfter ? h('input', { type: 'hidden', name: 'delete_after', value: '1' }) : null);

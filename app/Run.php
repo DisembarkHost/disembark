@@ -86,15 +86,18 @@ class Run {
 
         $token     = isset( $_REQUEST['token'] ) ? $_REQUEST['token'] : null;
         $import_id = isset( $_REQUEST['import_id'] ) ? $_REQUEST['import_id'] : '';
-        if ( ! $token && isset( $_SERVER['CONTENT_TYPE'] ) && stripos( $_SERVER['CONTENT_TYPE'], 'application/json' ) !== false ) {
+        if ( ! $token ) {
+            $token = User::request_token() ?: null; // the X-Disembark-Token header
+        }
+        if ( ( ! $token || $import_id === '' ) && isset( $_SERVER['CONTENT_TYPE'] ) && stripos( $_SERVER['CONTENT_TYPE'], 'application/json' ) !== false ) {
             $body = file_get_contents( 'php://input' );
-            if ( $body ) {
-                $json = json_decode( $body, true );
-                if ( is_array( $json ) && ! empty( $json['token'] ) ) {
+            $json = $body ? json_decode( $body, true ) : null;
+            if ( is_array( $json ) ) {
+                if ( ! $token && ! empty( $json['token'] ) && is_string( $json['token'] ) ) {
                     $token = $json['token'];
-                    if ( ! empty( $json['import_id'] ) && is_string( $json['import_id'] ) ) {
-                        $import_id = $json['import_id'];
-                    }
+                }
+                if ( $import_id === '' && ! empty( $json['import_id'] ) && is_string( $json['import_id'] ) ) {
+                    $import_id = $json['import_id'];
                 }
             }
         }
@@ -1412,7 +1415,7 @@ class Run {
         }
 
         $import = new Import( $import_id );
-        $import->set_request_token( (string) $request->get_param( 'token' ) );
+        $import->set_request_token( User::request_token( $request ) );
         return $import->execute_sql( $sql_content );
     }
 
@@ -1687,7 +1690,7 @@ class Run {
             return new \WP_Error( 'missing_params', 'import_id and sql_file are required.', [ 'status' => 400 ] );
         }
         return ( new Import( $import_id ) )
-            ->set_request_token( (string) $request->get_param( 'token' ) )
+            ->set_request_token( User::request_token( $request ) )
             ->import_staged_sql( $sql_file, $old_prefix, $new_prefix );
     }
 
@@ -1729,7 +1732,7 @@ class Run {
         }
 
         $import = new Import( $import_id );
-        $import->set_request_token( (string) $request->get_param( 'token' ) );
+        $import->set_request_token( User::request_token( $request ) );
         return $import->rollback();
     }
 

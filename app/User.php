@@ -53,6 +53,25 @@ class User {
         return $import_id !== '' && Import::token_guard_matches( (string) $import_id, $token );
     }
 
+    /** The header the dashboard sends the token in (kept out of URLs and logs). */
+    const TOKEN_HEADER = 'X-Disembark-Token';
+
+    /**
+     * The Disembark token a request carries: the token parameter (body or
+     * query, as the CLI and other sites send it) or the X-Disembark-Token
+     * header (the dashboard). '' when there is none.
+     */
+    public static function request_token( $request = null ) {
+        if ( $request !== null && isset( $request['token'] ) && is_string( $request['token'] ) && $request['token'] !== '' ) {
+            return $request['token'];
+        }
+        $header = $request instanceof \WP_REST_Request ? (string) $request->get_header( 'x_disembark_token' ) : '';
+        if ( $header === '' && isset( $_SERVER['HTTP_X_DISEMBARK_TOKEN'] ) && is_string( $_SERVER['HTTP_X_DISEMBARK_TOKEN'] ) ) {
+            $header = $_SERVER['HTTP_X_DISEMBARK_TOKEN'];
+        }
+        return trim( $header );
+    }
+
     public static function allowed( $request ) {
         // Preferred: a real WordPress user with the capability to manage the
         // site. This is true when the request authenticated as an administrator
@@ -64,7 +83,8 @@ class User {
         // Fallback: the per-site Disembark token. Kept for restrictive hosts
         // that strip the Authorization header, where application passwords can't
         // be used. See User::allowed() notes in the readme.
-        if ( isset( $request['token'] ) && self::token_valid( (string) $request['token'], isset( $request['import_id'] ) ? (string) $request['import_id'] : '' ) ) {
+        $token = self::request_token( $request );
+        if ( $token !== '' && self::token_valid( $token, isset( $request['import_id'] ) && is_string( $request['import_id'] ) ? $request['import_id'] : '' ) ) {
             return true;
         }
         // Artificial delay on failure to slow down brute force scripts
