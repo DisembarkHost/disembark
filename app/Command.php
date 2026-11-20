@@ -85,6 +85,11 @@ class Command {
      * `latest`. Finished steps are replayed; it carries on from where it
      * stopped with the options it started with.
      *
+     * [--full-database]
+     * : With --catch-up: copy every table. By default a catch-up leaves
+     * alone the tables that haven't changed on either side since the last
+     * pull (compared by fingerprint), and copies the rest.
+     *
      * [--site=<site>]
      * : Bring one site of a multisite network or a WP Freighter install: a
      * blog ID, a Freighter tenant ID or "main", or the site's address. The
@@ -244,7 +249,7 @@ class Command {
         }
 
         $this->say( '[2/9] Bringing the site over' );
-        $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'skip-quiet-mode', 'bring-host-files', 'catch-up', 'site', 'shared-tables', 'into', 'slug', 'domain' ] ) );
+        $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'skip-quiet-mode', 'bring-host-files', 'catch-up', 'full-database', 'site', 'shared-tables', 'into', 'slug', 'domain' ] ) );
         $c = $this->check( $this->step( function () use ( $pull, $source, $move_args ) {
             return $pull->connect( $source['url'], $source['token'], [ 'client' => 'cli', 'kind' => 'pull', 'args' => $move_args ], ! empty( $move_args['catch-up'] ), isset( $move_args['site'] ) ? (string) $move_args['site'] : null, ! empty( $move_args['shared-tables'] ) );
         } ), 'connect' );
@@ -278,7 +283,16 @@ class Command {
         // Batches sized to the source as it goes (see Pace).
         $this->pull_files_paced( $pull );
         $this->say( '      Copying the database' );
-        $db = $this->pull_database_paced( $pull );
+        $db = $this->pull_database_paced( $pull, ! empty( $assoc_args['catch-up'] ) && empty( $assoc_args['full-database'] ) );
+        $plan = (array) ( $db['plan'] ?? [] );
+        if ( ! empty( $plan['nofp'] ) ) {
+            $this->say( '      Every table comes across: ' . $plan['nofp'] . '.' );
+        } elseif ( $plan ) {
+            $this->say( '      Compared with the last pull: ' . self::plural( (int) $plan['copied'], 'table' ) . ' to copy, ' . number_format( count( (array) $plan['skipped'] ) ) . ' unchanged on both sides.' );
+            foreach ( (array) $plan['changed'] as $table => $why ) {
+                $this->say( "        {$table}: {$why}." );
+            }
+        }
         if ( ! empty( $db['single'] ) ) {
             $this->say( '      The source runs an older Disembark, so its database came in one request.' );
         }
@@ -408,6 +422,28 @@ class Command {
             }
         } else {
             $this->say( '[6/9] No database in the backup' );
+        }
+
+        // Tables a catch-up left alone are checked on the source once more
+        // (copied again if they changed meanwhile), and both sides'
+        // fingerprints are kept for the next catch-up.
+        if ( ! empty( $info['sql_file'] ) ) {
+            $from = $src_home !== '' ? $src_home : $dest_home;
+            $fp   = $this->budgeted( function ( $r ) { return (string) ( $r['what'] ?? '' ); }, function ( $budget ) use ( $pull, $from, $dest_home ) { return $pull->settle( $budget, $from, $dest_home ); } );
+            if ( ! is_wp_error( $fp ) && empty( $fp['none'] ) ) {
+                foreach ( (array) ( $fp['recopied'] ?? [] ) as $table ) {
+                    $this->say( "      {$table} changed during the catch-up, copied again." );
+                }
+                if ( ! empty( $fp['skip'] ) && empty( $fp['nofp'] ) ) {
+                    $summary['tables'] = [ 'copied' => (int) $fp['copied'], 'skipped' => (array) $fp['skipped'], 'recopied' => (array) $fp['recopied'], 'soft' => (array) $fp['soft'] ];
+                    $this->say( '      ' . self::plural( (int) $fp['copied'], 'table' ) . ' copied, ' . number_format( count( (array) $fp['skipped'] ) ) . ' unchanged and skipped' . ( $fp['skipped'] ? ': ' . implode( ', ', (array) $fp['skipped'] ) : '' ) . '.' );
+                    foreach ( (array) $fp['soft'] as $table => $why ) {
+                        $this->say( "      Copied {$table} rather than compare it: {$why}." );
+                    }
+                }
+            } elseif ( is_wp_error( $fp ) ) {
+                $this->fail( $fp->get_error_message(), 'database', $import_id );
+            }
         }
 
         $this->say( '[8/9] Finishing up' );
@@ -1234,13 +1270,13 @@ class Command {
     }
 
     /** The pull's database, a batch per request (see Pull::fetch_database_paced()). */
-    private function pull_database_paced( $pull ) {
+    private function pull_database_paced( $pull, $skip_unchanged = false ) {
         $s = ++$this->steps_seq;
         $k = 0;
         do {
             $cut = false;
-            list( $r, $secs, $failures ) = $this->paced_step( $s, ++$k, function () use ( $pull ) {
-                return $pull->fetch_database_paced( $this->pace['budget'] > 0 ? $this->pace['budget'] : Pace::default_budget(), $this->pace['db'] );
+            list( $r, $secs, $failures ) = $this->paced_step( $s, ++$k, function () use ( $pull, $skip_unchanged ) {
+                return $pull->fetch_database_paced( $this->pace['budget'] > 0 ? $this->pace['budget'] : Pace::default_budget(), $this->pace['db'], true, $skip_unchanged );
             }, function ( $e, $n ) use ( &$cut ) {
                 $cut = $cut || self::size_error( $e );
                 if ( $n >= 2 && $cut ) {
@@ -1252,7 +1288,9 @@ class Command {
             $r = $this->check( $r, 'database' );
             $this->adapt( 'db', $secs, $failures );
             Pace::remember( $this->steps_import, $this->pace );
-            if ( isset( $r['done'] ) && $r['done'] === false ) {
+            if ( isset( $r['done'] ) && $r['done'] === false && ( $r['phase'] ?? '' ) === 'compare' ) {
+                $this->say( '      Comparing tables with the last pull (' . $r['side'] . '): ' . (int) $r['compared'] . ' of ' . (int) $r['total'] );
+            } elseif ( isset( $r['done'] ) && $r['done'] === false ) {
                 $this->say( '      Copied ' . (int) $r['tables_done'] . ' of ' . (int) $r['total_tables'] . ' tables (' . size_format( (int) $r['bytes'] ) . ')' );
             }
         } while ( isset( $r['done'] ) && $r['done'] === false );

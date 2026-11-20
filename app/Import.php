@@ -228,6 +228,9 @@ class Import {
             // pull's batches are sized as the host allows, and a source
             // exports large tables in parts.
             'pacing'             => 1,
+            // Table fingerprints, so a catch-up skips tables unchanged on
+            // both sides (see Fingerprint).
+            'fingerprint'        => 1,
             'budget'             => Pace::default_budget(),
             'max_execution_time' => ini_get( 'max_execution_time' ),
             'tables'             => $tables,
@@ -342,12 +345,38 @@ class Import {
             if ( $meta !== null && ! empty( $meta['sql_files'] ) ) {
                 return [ 'done' => true, 'rollback_id' => $this->import_id, 'tables' => count( (array) $meta['tables'] ), 'target' => $target ? $target->info() : null ];
             }
-            $tables = $target ? $target->snapshot_tables() : $wpdb->get_col( 'SHOW TABLES' );
-            if ( empty( $tables ) ) {
+            $all = $target ? $target->snapshot_tables() : $wpdb->get_col( 'SHOW TABLES' );
+            if ( empty( $all ) ) {
                 return new \WP_Error( 'no_tables', 'No tables found to snapshot.', [ 'status' => 500 ] );
             }
-            $state = [ 'tables' => array_values( $tables ), 'name' => 'batch-' . md5( implode( ',', $tables ) ), 'cur' => [], 'size' => 0 ];
+            // A catch-up that leaves unchanged tables alone saves only the
+            // others, and the full list (see Pull::plan_decide()).
+            $plan   = json_decode( (string) self::read_protected( $this->import_path . '/db-plan.php' ), true );
+            $skip   = array_flip( (array) ( $plan['skipped_dst'] ?? [] ) );
+            $tables = array_values( array_filter( $all, function ( $t ) use ( $skip ) { return ! isset( $skip[ $t ] ); } ) );
+            $state  = [ 'tables' => $tables, 'all' => array_values( $all ), 'name' => 'batch-' . md5( implode( ',', $tables ) ), 'cur' => [], 'size' => 0 ];
         }
+        $done = $this->write_restore_dump( $state, $state_file, $deadline );
+        if ( is_wp_error( $done ) ) {
+            return $done;
+        }
+        if ( ! $done ) {
+            return [ 'done' => false, 'tables_done' => (int) ( $state['cur']['t'] ?? 0 ), 'tables_total' => count( $state['tables'] ) ];
+        }
+        $result = $this->snapshot_saved( $label, $state['all'] ?? $state['tables'], $target, $state['tables'] );
+        if ( is_array( $result ) ) {
+            $result['done'] = true;
+        }
+        return $result;
+    }
+
+    /**
+     * Writes the restore-point dump of $state['tables'] (as $state['name'],
+     * behind the exit line, under a name rollback() doesn't read until it's
+     * whole), carrying on from $state and saving it to $state_file as it
+     * goes. True when done, false when out of time, or WP_Error.
+     */
+    private function write_restore_dump( array &$state, $state_file, $deadline ) {
         $part = $this->rollback_path . '/' . $state['name'] . '.db.php.part';
         $fail = function ( $why ) use ( $part, $state_file ) {
             @unlink( $part );
@@ -385,7 +414,7 @@ class Import {
         if ( ! $done ) {
             $save( $cur );
             fclose( $handle );
-            return [ 'done' => false, 'tables_done' => (int) ( $cur['t'] ?? 0 ), 'tables_total' => count( $state['tables'] ) ];
+            return false;
         }
         $ok = fwrite( $handle, "SET FOREIGN_KEY_CHECKS = 1;\nSET UNIQUE_CHECKS = 1;\n" . Backup::EXPORT_COMPLETE_MARKER . "\n" ) !== false;
         $ok = fclose( $handle ) && $ok;
@@ -393,15 +422,44 @@ class Import {
             return $fail( 'Could not finish the restore point (is the disk full?).' );
         }
         @unlink( $state_file );
-        $result = $this->snapshot_saved( $label, $state['tables'], $target );
-        if ( is_array( $result ) ) {
-            $result['done'] = true;
+        return true;
+    }
+
+    /**
+     * Adds $tables (as they are now) to this move's restore point, before
+     * a catch-up copies again tables it had left alone. Paced like the
+     * snapshot.
+     */
+    public function snapshot_add( $tables, $budget ) {
+        $deadline   = Pace::deadline( $budget );
+        $state_file = $this->rollback_path . '/snapshot-add-state.php';
+        $meta       = self::rollback_meta( $this->rollback_path );
+        if ( $meta === null ) {
+            return new \WP_Error( 'no_rollback', 'This move has no restore point to add to.', [ 'status' => 409 ] );
         }
-        return $result;
+        $state = json_decode( (string) self::read_protected( $state_file ), true );
+        if ( ! is_array( $state ) ) {
+            $tables = array_values( array_diff( array_map( 'strval', (array) $tables ), (array) ( $meta['saved_tables'] ?? $meta['tables'] ) ) );
+            if ( ! $tables ) {
+                return [ 'done' => true ];
+            }
+            $state = [ 'tables' => $tables, 'name' => 'recheck-' . md5( implode( ',', $tables ) . microtime() ), 'cur' => [], 'size' => 0 ];
+        }
+        $done = $this->write_restore_dump( $state, $state_file, $deadline );
+        if ( is_wp_error( $done ) || ! $done ) {
+            return is_wp_error( $done ) ? $done : [ 'done' => false ];
+        }
+        $file = $this->rollback_path . '/' . $state['name'] . '.db.php';
+        $meta['sql_files'][ basename( $file ) ] = filesize( $file );
+        $meta['saved_tables'] = array_values( array_unique( array_merge( (array) ( $meta['saved_tables'] ?? $meta['tables'] ), $state['tables'] ) ) );
+        if ( ! $this->save_rollback_meta( $meta ) ) {
+            return new \WP_Error( 'snapshot_failed', 'Failed to save the rollback point.', [ 'status' => 500 ] );
+        }
+        return [ 'done' => true ];
     }
 
     /** Records a restore point whose dumps are in place, and makes a new subsite or tenant. */
-    private function snapshot_saved( $label, $all_tables, $target ) {
+    private function snapshot_saved( $label, $all_tables, $target, $saved_tables = null ) {
         $sql_sizes = [];
         foreach ( self::rollback_sql_files( $this->rollback_path ) as $sql_file ) {
             $sql_sizes[ basename( $sql_file ) ] = filesize( $sql_file );
@@ -417,6 +475,9 @@ class Import {
             'label'       => substr( sanitize_text_field( (string) $label ), 0, 200 ),
             'tables'      => $all_tables,
             'sql_files'   => $sql_sizes,
+            // The tables the dump holds, when that isn't all of them (a
+            // catch-up leaves unchanged ones alone, and so does rollback).
+            'saved_tables' => $saved_tables === null ? $all_tables : array_values( $saved_tables ),
             'deployed_files' => [],
             'backed_up_files' => [],
         ];
@@ -831,7 +892,7 @@ class Import {
      * still built as copies and swapped in once, by the call that reaches
      * the end of the dump. Without one, the whole dump runs in this request.
      */
-    public function import_staged_sql( $sql_file, $old_prefix = '', $new_prefix = '', $budget = null ) {
+    public function import_staged_sql( $sql_file, $old_prefix = '', $new_prefix = '', $budget = null, $merge = false ) {
         if ( ! self::is_safe_relative_path( $sql_file ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid SQL file path.', [ 'status' => 400 ] );
         }
@@ -1085,10 +1146,16 @@ class Import {
         }
         // The address rewrite after the move covers these and this site's own.
         $this->prepare_import_dir();
-        file_put_contents( $this->import_path . '/imported-tables.json', wp_json_encode( array_keys( $imported ) ) );
+        // $merge: a second import in the same move (a catch-up copying again
+        // tables that changed meanwhile) adds to the first one's lists.
+        $names = array_keys( $imported );
+        if ( $merge && is_file( $this->import_path . '/imported-tables.json' ) ) {
+            $names = array_values( array_unique( array_merge( (array) json_decode( (string) file_get_contents( $this->import_path . '/imported-tables.json' ), true ), $names ) ) );
+        }
+        file_put_contents( $this->import_path . '/imported-tables.json', wp_json_encode( $names ) );
         // Rows are counted right after the swap, before this site's own
         // token is written back into the options table.
-        $rows   = empty( $run['errors'] ) ? $this->check_rows( $expected ) : null;
+        $rows   = empty( $run['errors'] ) ? $this->check_rows( $expected, $merge ) : null;
         $result = $this->end_statements( $run );
         if ( $paced ) {
             $result['done'] = true;
@@ -1122,9 +1189,10 @@ class Import {
      * writes to them). Saved for the checks after the move. A source that
      * predates row counts sends none, and nothing is checked.
      */
-    private function check_rows( $expected ) {
+    private function check_rows( $expected, $merge = false ) {
         global $wpdb;
         $missing = [];
+        $earlier = $merge && is_file( $this->import_path . '/rows-check.json' ) ? json_decode( (string) file_get_contents( $this->import_path . '/rows-check.json' ), true ) : null;
         foreach ( $expected as $table => $rows ) {
             $actual = $wpdb->get_var( 'SELECT COUNT(*) FROM `' . str_replace( '`', '``', $table ) . '`' );
             if ( $actual === null ) {
@@ -1133,7 +1201,12 @@ class Import {
                 $missing[] = [ 'table' => $table, 'expected' => $rows, 'actual' => (int) $actual ];
             }
         }
-        $check = [ 'checked' => count( $expected ), 'rows' => array_sum( $expected ), 'mismatched' => $missing ];
+        if ( is_array( $earlier ) ) {
+            // Tables checked again replace their earlier result.
+            $missing  = array_merge( array_values( array_filter( (array) ( $earlier['mismatched'] ?? [] ), function ( $m ) use ( $expected ) { return ! isset( $expected[ $m['table'] ] ); } ) ), $missing );
+            $expected = array_merge( (array) ( $earlier['expected'] ?? [] ), $expected );
+        }
+        $check = [ 'checked' => count( $expected ), 'rows' => array_sum( $expected ), 'mismatched' => $missing, 'expected' => $expected ];
         $this->prepare_import_dir();
         file_put_contents( $this->import_path . '/rows-check.json', wp_json_encode( $check ) );
         return $check;
@@ -1495,6 +1568,20 @@ class Import {
     }
 
     /**
+     * The address rewrite of a move (see move_search_replace()) on $tables
+     * only, without the files: a catch-up's tables copied a second time.
+     */
+    public function rewrite_tables( $from, $to, $tables, $budget = null ) {
+        $source  = $this->staged_source();
+        $moved   = self::scope_pairs( $source, $to, null );
+        $options = [ 'variants' => true, 'extra' => self::path_pairs( $source ) + $moved ];
+        if ( $budget !== null ) {
+            $options['budget'] = $budget;
+        }
+        return $tables ? $this->search_replace( $from, $to, array_values( $tables ), false, $options ) : [ 'done' => true, 'cells_changed' => 0 ];
+    }
+
+    /**
      * The tables a whole-site move rewrites: this site's (its prefix) and the
      * ones the import created. Never every table in the database: one shared
      * with another site (staging beside production, two prefixes) keeps the
@@ -1509,6 +1596,11 @@ class Import {
             $extra  = array_filter( (array) json_decode( (string) file_get_contents( $file ), true ), function ( $t ) use ( $all ) { return is_string( $t ) && isset( $all[ $t ] ); } );
             $tables = array_merge( $tables, $extra );
         }
+        // A catch-up leaves unchanged tables alone: they were rewritten on
+        // the last pull, and this site's fingerprint says they still are.
+        $plan = json_decode( (string) self::read_protected( $this->import_path . '/db-plan.php' ), true );
+        $skip = array_flip( (array) ( $plan['skipped_dst'] ?? [] ) );
+        $tables = array_filter( $tables, function ( $t ) use ( $skip ) { return ! isset( $skip[ $t ] ); } );
         return array_values( array_unique( array_map( 'strval', $tables ) ) );
     }
 
@@ -3817,7 +3909,7 @@ class Import {
     /** The working files of paced steps (see Pace), once a move is done or cancelled. */
     private function remove_pace_files() {
         $this->merge_deploy_journal();
-        foreach ( [ 'sql-state.php', 'sql-journal.php', 'deploy-list.php', 'deploy-journal.php', 'replace-state.php', 'replace-journal.php', 'extract-state.php', 'fetched.php', 'fetched.lock', 'database-state.php', 'pace.php', 'rollback/snapshot-state.php' ] as $name ) {
+        foreach ( [ 'sql-state.php', 'sql-journal.php', 'deploy-list.php', 'deploy-journal.php', 'replace-state.php', 'replace-journal.php', 'extract-state.php', 'fetched.php', 'fetched.lock', 'database-state.php', 'pace.php', 'db-plan.php', 'settle-state.php', 'fingerprints.php', 'rollback/snapshot-state.php', 'rollback/snapshot-add-state.php' ] as $name ) {
             @unlink( $this->import_path . '/' . $name );
         }
         foreach ( (array) glob( $this->rollback_path . '/*.db.php.part' ) as $part ) {
@@ -4455,7 +4547,7 @@ class Import {
             return $fail( 'the snapshot holds no tables' );
         }
         if ( $format >= 2 ) {
-            foreach ( (array) ( $meta['tables'] ?? [] ) as $table ) {
+            foreach ( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? [] ) as $table ) {
                 if ( ! isset( $creates[ $table ] ) ) {
                     return $fail( "table {$table} is missing from it" );
                 }

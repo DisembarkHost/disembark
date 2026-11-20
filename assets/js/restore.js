@@ -120,7 +120,7 @@
     // the same move asks for the same ids. Resuming replays the steps the
     // server already finished (opts.resume.steps) and carries on from the
     // first one it didn't.
-    var catchUpInfo = null, target = null, seq = 0, replay = (opts.resume && opts.resume.steps) || {}, replaying = Object.keys(replay).length > 0;
+    var tablePlan = null, catchUpInfo = null, target = null, seq = 0, replay = (opts.resume && opts.resume.steps) || {}, replaying = Object.keys(replay).length > 0;
     function ridAt(n) { return importId.slice(0, 24) + ('00000000' + n.toString(16)).slice(-8); }
     var log = h('div', { class: 'dsk-log' });
     var kind = opts.kind || (!opts.local ? 'push' : (opts.mode === 'site' ? 'pull' : 'restore'));
@@ -792,7 +792,9 @@
       do {
         var tries = 0;
         var cut = false;
-        var res = await pacedPost('import/pull/fetch-database', function () { return paceBody({ batch_bytes: pace.db }); }, ridFor(s, ++k), function (e, n) {
+        // Fingerprints are taken for the next catch-up; on a catch-up,
+        // tables unchanged on both sides since the last pull stay as they are.
+        var res = await pacedPost('import/pull/fetch-database', function () { return paceBody({ batch_bytes: pace.db, fingerprints: 1, skip_unchanged: opts.catchUp && !opts.fullDatabase ? 1 : 0 }); }, ridFor(s, ++k), function (e, n) {
           tries = n;
           cut = cut || sizeError(e);
           // Twice, and cut off at least once (not just busy): a smaller batch.
@@ -800,6 +802,7 @@
           return 'retry';
         });
         r = res.r;
+        if (r && r.phase === 'compare') { paced('Comparing tables with the last pull (' + r.side + ')\u2026 ' + D.fmt.num(r.compared || 0) + ' of ' + D.fmt.num(r.total || 0)); continue; }
         if (!res.replayed) adapt('db', res.ms, res.failures || tries);
         if (r && r.done === false) paced('Pulling the database… ' + D.fmt.num(r.tables_done || 0) + ' of ' + D.fmt.plural(r.total_tables || 0, 'table') + ' (' + D.fmt.size(r.bytes || 0) + ')');
       } while (r && r.done === false);
@@ -868,6 +871,12 @@
       progress('Pulling the database…');
       var db = pacing ? await pullDatabase() : await api.post('import/pull/fetch-database', t());
       if (db && db.single) rlog('The source runs an older Disembark, so its database came in one request.', 'dim');
+      if (db && db.plan) tablePlan = db.plan;
+      if (tablePlan && tablePlan.nofp) rlog('Every table comes across: ' + tablePlan.nofp + '.', 'dim');
+      else if (tablePlan) {
+        rlog('Comparing with the last pull: ' + D.fmt.plural(tablePlan.copied, 'table') + ' to copy, ' + D.fmt.num(tablePlan.skipped.length) + ' unchanged on both sides.', 'dim');
+        Object.keys(tablePlan.changed || {}).forEach(function (tb) { rlog('  ' + tb + ': ' + tablePlan.changed[tb] + '.', 'dim'); });
+      }
       rlog('Database pulled (' + (db.tables || 0) + ' tables).');
       return String(c.source_home || '').replace(/\/$/, '');
     }
@@ -1086,6 +1095,21 @@
             }
           } else skip('urls', 'same address');
         } else { skip('db', 'none in backup'); skip('urls', 'not needed'); }
+
+        // A pull: tables a catch-up left alone are checked on the source once
+        // more (and copied again if they changed meanwhile), and both sides'
+        // fingerprints are kept for the next catch-up.
+        if (pacing && pre.fingerprint && opts.mode === 'site' && info.sql_file) {
+          var fp = await budgeted('import/pull/fingerprints', t({ from: srcHome || destHome, to: destHome }), function (r) { if (r.what) paced(r.what + '\u2026'); });
+          progress('');
+          (fp.recopied || []).forEach(function (tb) { rlog(tb + ' changed during the catch-up, copied again.', 'ok'); });
+          if (fp.skip && !fp.nofp) {
+            stepEls.db.meta.textContent = D.fmt.num(fp.copied || 0) + ' copied \u00b7 ' + D.fmt.num((fp.skipped || []).length) + ' unchanged';
+            stepEls.db.meta.title = D.fmt.plural(fp.copied || 0, 'table') + ' copied \u00b7 ' + D.fmt.num((fp.skipped || []).length) + ' unchanged, skipped';
+            if ((fp.skipped || []).length) rlog('Unchanged on both sides since the last pull, left as they were: ' + fp.skipped.join(', ') + '.', 'dim');
+            Object.keys(fp.soft || {}).forEach(function (tb) { rlog('Copied ' + tb + ' rather than compare it: ' + fp.soft[tb] + '.', 'dim'); });
+          }
+        }
 
         step('fin');
         var fin = await api.post('import/finalize', t());

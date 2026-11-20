@@ -839,7 +839,14 @@ class Pull {
             $previous = is_file( self::pull_file( $source ) ) ? (string) file_get_contents( self::pull_file( $source ) ) : null;
             Import::write_protected( $rollback . '/pull-memory.php', (string) wp_json_encode( [ 'file' => self::pull_file( $source ), 'previous' => $previous ] ) );
         }
-        $body = wp_json_encode( [ 'source' => untrailingslashit( $source ), 'at' => time(), 'files' => $files ] );
+        $memory = [ 'source' => untrailingslashit( $source ), 'at' => time(), 'files' => $files ];
+        // Both sides' table fingerprints, for skipping unchanged tables next time.
+        $fps = json_decode( (string) Import::read_protected( dirname( $this->state_file ) . '/fingerprints.php' ), true );
+        if ( is_array( $fps ) && ! empty( $fps['tables'] ) ) {
+            $memory['tables']     = $fps['tables'];
+            $memory['all_tables'] = (array) ( $fps['all'] ?? [] );
+        }
+        $body = wp_json_encode( $memory );
         $tmp  = self::pull_file( $source ) . '.tmp';
         if ( ! is_string( $body ) || @file_put_contents( $tmp, "<?php exit; ?>\n" . $body ) === false ) {
             return false;
@@ -1266,7 +1273,7 @@ class Pull {
      * together in staging and only takes its real name when whole. A
      * source that can't export by parts gets the old single request.
      */
-    public function fetch_database_paced( $budget, $batch_bytes ) {
+    public function fetch_database_paced( $budget, $batch_bytes, $fingerprints = false, $skip_unchanged = false ) {
         $deadline   = Pace::deadline( $budget );
         $batch_bytes = max( 256 * KB_IN_BYTES, (int) $batch_bytes );
         $state_file = dirname( $this->state_file ) . '/database-state.php';
@@ -1274,9 +1281,10 @@ class Pull {
         $part_file  = $parts_dir . '/database-pull.sql.part';
         $st         = json_decode( (string) Import::read_protected( $state_file ), true );
         $state      = $this->state();
+        $schema_only = array_values( (array) ( $state['skip_rows'] ?? [] ) );
         if ( ! is_array( $st ) ) {
             if ( ! empty( $state['db_done'] ) && file_exists( $this->staging_public . '/database-pull.sql' ) ) {
-                return [ 'done' => true, 'ok' => true, 'tables' => 0, 'bytes' => filesize( $this->staging_public . '/database-pull.sql' ) ];
+                return [ 'done' => true, 'ok' => true, 'tables' => 0, 'bytes' => filesize( $this->staging_public . '/database-pull.sql' ), 'plan' => self::plan_summary( $this->plan() ) ];
             }
             $pre = $this->source_request( '/import/preflight', [ 'import_id' => $this->source_session() ], 'POST', max( 10, (int) ceil( Pace::left( $deadline ) ) ) );
             if ( is_wp_error( $pre ) ) {
@@ -1289,7 +1297,11 @@ class Pull {
             if ( empty( $pre->pacing ) ) {
                 // An older source: the whole database in one request.
                 $old = $this->fetch_database();
-                return is_wp_error( $old ) ? self::paced_error( $old ) : $old + [ 'done' => true, 'single' => true ];
+                $out = is_wp_error( $old ) ? self::paced_error( $old ) : $old + [ 'done' => true, 'single' => true ];
+                if ( ! is_wp_error( $out ) && $fingerprints && $skip_unchanged && ! empty( $state['catch_up'] ) ) {
+                    $out['plan'] = [ 'copied' => count( $tables ), 'skipped' => [], 'soft' => [], 'changed' => [], 'nofp' => 'the source runs an older Disembark without table fingerprints, so every table was copied' ];
+                }
+                return $out;
             }
             $info = [];
             foreach ( (array) ( $state['tables'] ?? [] ) as $t ) {
@@ -1299,91 +1311,537 @@ class Pull {
             foreach ( $tables as $name ) {
                 $st['tables'][] = [ (string) $name, $info[ (string) $name ][0] ?? 0, $info[ (string) $name ][1] ?? 0 ];
             }
+            // Fingerprints first (see Fingerprint): always taken before the
+            // export, so a table that changes in between is copied again
+            // next time rather than skipped by mistake.
+            $st['fp'] = $fingerprints && ! $this->import->target() ? $this->plan_init( $pre, $st['tables'], $schema_only, $skip_unchanged ) : null;
             wp_mkdir_p( $parts_dir );
             @file_put_contents( $part_file, '' );
             Import::write_protected( $state_file, (string) wp_json_encode( $st ) );
         }
-        $schema_only = array_values( (array) ( $state['skip_rows'] ?? [] ) );
-        $skip        = array_flip( $schema_only );
-        $count       = count( $st['tables'] );
-        $timeout     = max( 10, (int) ceil( Pace::left( $deadline ) ) );
-        $t           = (int) $st['t'];
-        $batch       = [];
-
-        if ( $t < $count ) {
-            list( $name, $size, $rows ) = $st['tables'][ $t ];
-            $big = $size > $batch_bytes && $rows > 0 && ! isset( $skip[ $name ] );
-            if ( $st['part'] !== null || $big ) {
-                // Part of one large table, by primary key.
-                $per   = max( 200, (int) floor( $batch_bytes / max( 1, $size / max( 1, $rows ) ) ) );
-                $prev  = (array) ( $st['part'] ?? [] );
-                $resp  = $this->source_request( '/export-database-batch', [ 'tables' => [ $name ], 'schema_only' => $schema_only, 'shared_rows' => ! empty( $state['shared_rows'] ), 'part' => [ 'after' => $prev['key'] ?? null, 'offset' => (int) ( $prev['offset'] ?? 0 ), 'rows' => $per, 'head' => $st['part'] === null ] ], 'POST', $timeout );
-                if ( is_wp_error( $resp ) ) {
-                    return self::paced_error( $resp );
-                }
-                if ( ! is_object( $resp ) || empty( $resp->url ) || ! is_string( $resp->url ) ) {
-                    return new \WP_Error( 'export_failed', 'Source did not return a part of ' . $name . '.', [ 'status' => 502 ] );
-                }
-                $tail = '';
-                $part = [ 'key' => $resp->key ?? null, 'offset' => (int) ( $resp->offset ?? 0 ), 'rows' => (int) ( $prev['rows'] ?? 0 ) + (int) ( $resp->rows ?? 0 ) ];
-                if ( ! empty( $resp->done ) ) {
-                    $tail = '/*!40000 ALTER TABLE ' . Backup::ident( $name ) . " ENABLE KEYS */;\nSET @disembark_rows = '" . Backup::db_escape( $name ) . ':' . $part['rows'] . "';\n";
-                }
-                $added = $this->append_source_file( $resp->url, $part_file, (int) $st['bytes'], $tail, $timeout );
-                if ( is_wp_error( $added ) ) {
-                    return $added;
-                }
-                $st['bytes'] = $added;
-                $st['part']  = empty( $resp->done ) ? $part : null;
-                $st['t']     = empty( $resp->done ) ? $t : $t + 1;
-                $batch       = [ 'tables' => 1, 'part' => true, 'rows' => (int) ( $resp->rows ?? 0 ) ];
-            } else {
-                // A group of tables, up to the batch size.
-                $group = [];
-                $sum   = 0;
-                for ( $i = $t; $i < $count && count( $group ) < 100; $i++ ) {
-                    list( $n, $sz, $rw ) = $st['tables'][ $i ];
-                    $is_big = $sz > $batch_bytes && $rw > 0 && ! isset( $skip[ $n ] );
-                    if ( $group && ( $is_big || $sum + $sz > $batch_bytes ) ) {
-                        break;
-                    }
-                    $group[] = $n;
-                    $sum    += $sz;
-                }
-                $url = $this->source_request( '/export-database-batch', [ 'tables' => $group, 'schema_only' => $schema_only, 'shared_rows' => ! empty( $state['shared_rows'] ) ], 'POST', $timeout );
-                if ( is_wp_error( $url ) ) {
-                    return self::paced_error( $url );
-                }
-                if ( ! is_string( $url ) || ! preg_match( '#^https?://#', $url ) ) {
-                    return new \WP_Error( 'export_failed', 'Source did not return a database URL.', [ 'status' => 502 ] );
-                }
-                $added = $this->append_source_file( $url, $part_file, (int) $st['bytes'], '', $timeout );
-                if ( is_wp_error( $added ) ) {
-                    return $added;
-                }
-                $st['bytes'] = $added;
-                $st['t']     = $t + count( $group );
-                $batch       = [ 'tables' => count( $group ), 'part' => false, 'bytes' => $sum ];
-            }
+        $save = function () use ( &$st, $state_file ) {
             Import::write_protected( $state_file, (string) wp_json_encode( $st ) );
+        };
+        if ( ! empty( $st['fp'] ) && $st['fp']['phase'] !== 'done' ) {
+            $step = $this->plan_step( $st, $deadline, $save );
+            if ( is_wp_error( $step ) ) {
+                return $step;
+            }
+            $save();
+            if ( $st['fp']['phase'] !== 'done' ) {
+                return [ 'done' => false, 'phase' => 'compare', 'side' => $st['fp']['phase'] === 'dst' ? 'destination' : 'source', 'compared' => count( $st['fp']['src'] ) + count( $st['fp']['why'] ) + count( $st['fp']['dst'] ), 'total' => count( $st['fp']['large'] ) ];
+            }
+        }
+        $count   = count( $st['tables'] );
+        $timeout = max( 10, (int) ceil( Pace::left( $deadline ) ) );
+        $batch   = [];
+        if ( (int) $st['t'] < $count ) {
+            $batch = $this->export_batch( $st, $part_file, $batch_bytes, $schema_only, $state, $timeout );
+            if ( is_wp_error( $batch ) ) {
+                return $batch;
+            }
+            $save();
         }
         if ( $st['t'] < $count ) {
             return [ 'done' => false, 'tables_done' => (int) $st['t'], 'total_tables' => $count, 'bytes' => (int) $st['bytes'], 'batch' => $batch, 'table' => $st['tables'][ $st['t'] ][0] ];
         }
 
-        // Whole: the dump takes its name, and the source's session and token go.
+        // Whole: the dump takes its name, and the source's session and token
+        // go, unless skipped tables still have to be checked once more at
+        // the end (see settle()).
         $dest = $this->staging_public . '/database-pull.sql';
         if ( ! @rename( $part_file, $dest ) ) {
             return new \WP_Error( 'write_failed', 'Could not save the database in staging (is the disk full?).', [ 'status' => 500 ] );
         }
         @rmdir( $parts_dir );
         @unlink( $state_file );
-        $this->cleanup_source();
+        $plan = $this->plan();
+        if ( empty( $plan['skipped'] ) ) {
+            $this->cleanup_source();
+        }
         $state = $this->state();
-        unset( $state['source_token'] );
+        if ( empty( $plan['skipped'] ) ) {
+            unset( $state['source_token'] );
+        }
         $state['db_done'] = true;
         $this->save_state( $state );
-        return [ 'done' => true, 'ok' => true, 'tables' => $count, 'bytes' => filesize( $dest ), 'batch' => $batch ];
+        return [ 'done' => true, 'ok' => true, 'tables' => $count, 'bytes' => filesize( $dest ), 'batch' => $batch, 'plan' => self::plan_summary( $plan ) ];
+    }
+
+    /**
+     * Exports one batch from the source into $part_file: a group of the
+     * tables in $st (from $st['t'], up to $batch_bytes), or a part of a
+     * table bigger than that, by primary key. Moves $st on. Returns what
+     * the batch held, or WP_Error.
+     */
+    private function export_batch( array &$st, $part_file, $batch_bytes, $schema_only, $state, $timeout ) {
+        $skip  = array_flip( $schema_only );
+        $count = count( $st['tables'] );
+        $t     = (int) $st['t'];
+        list( $name, $size, $rows ) = $st['tables'][ $t ];
+        $big = $size > $batch_bytes && $rows > 0 && ! isset( $skip[ $name ] );
+        if ( $st['part'] !== null || $big ) {
+            // Part of one large table, by primary key.
+            $per   = max( 200, (int) floor( $batch_bytes / max( 1, $size / max( 1, $rows ) ) ) );
+            $prev  = (array) ( $st['part'] ?? [] );
+            $resp  = $this->source_request( '/export-database-batch', [ 'tables' => [ $name ], 'schema_only' => $schema_only, 'shared_rows' => ! empty( $state['shared_rows'] ), 'part' => [ 'after' => $prev['key'] ?? null, 'offset' => (int) ( $prev['offset'] ?? 0 ), 'rows' => $per, 'head' => $st['part'] === null ] ], 'POST', $timeout );
+            if ( is_wp_error( $resp ) ) {
+                return self::paced_error( $resp );
+            }
+            if ( ! is_object( $resp ) || empty( $resp->url ) || ! is_string( $resp->url ) ) {
+                return new \WP_Error( 'export_failed', 'Source did not return a part of ' . $name . '.', [ 'status' => 502 ] );
+            }
+            $tail = '';
+            $part = [ 'key' => $resp->key ?? null, 'offset' => (int) ( $resp->offset ?? 0 ), 'rows' => (int) ( $prev['rows'] ?? 0 ) + (int) ( $resp->rows ?? 0 ) ];
+            if ( ! empty( $resp->done ) ) {
+                $tail = '/*!40000 ALTER TABLE ' . Backup::ident( $name ) . " ENABLE KEYS */;\nSET @disembark_rows = '" . Backup::db_escape( $name ) . ':' . $part['rows'] . "';\n";
+            }
+            $added = $this->append_source_file( $resp->url, $part_file, (int) $st['bytes'], $tail, $timeout );
+            if ( is_wp_error( $added ) ) {
+                return $added;
+            }
+            $st['bytes'] = $added;
+            $st['part']  = empty( $resp->done ) ? $part : null;
+            $st['t']     = empty( $resp->done ) ? $t : $t + 1;
+            return [ 'tables' => 1, 'part' => true, 'rows' => (int) ( $resp->rows ?? 0 ) ];
+        }
+        // A group of tables, up to the batch size.
+        $group = [];
+        $sum   = 0;
+        for ( $i = $t; $i < $count && count( $group ) < 100; $i++ ) {
+            list( $n, $sz, $rw ) = $st['tables'][ $i ];
+            $is_big = $sz > $batch_bytes && $rw > 0 && ! isset( $skip[ $n ] );
+            if ( $group && ( $is_big || $sum + $sz > $batch_bytes ) ) {
+                break;
+            }
+            $group[] = $n;
+            $sum    += $sz;
+        }
+        $url = $this->source_request( '/export-database-batch', [ 'tables' => $group, 'schema_only' => $schema_only, 'shared_rows' => ! empty( $state['shared_rows'] ) ], 'POST', $timeout );
+        if ( is_wp_error( $url ) ) {
+            return self::paced_error( $url );
+        }
+        if ( ! is_string( $url ) || ! preg_match( '#^https?://#', $url ) ) {
+            return new \WP_Error( 'export_failed', 'Source did not return a database URL.', [ 'status' => 502 ] );
+        }
+        $added = $this->append_source_file( $url, $part_file, (int) $st['bytes'], '', $timeout );
+        if ( is_wp_error( $added ) ) {
+            return $added;
+        }
+        $st['bytes'] = $added;
+        $st['t']     = $t + count( $group );
+        return [ 'tables' => count( $group ), 'part' => false, 'bytes' => $sum ];
+    }
+
+    /* ------------------------------------------------------------------
+     * Skipping unchanged tables on a catch-up (see Fingerprint)
+     *
+     * A table is left as it is only when the source's fingerprint matches
+     * the one it had at the end of the last pull AND this site's matches
+     * the one it had then: each side is only ever compared with itself.
+     * Anything in doubt (small, a view, no primary key, an older source,
+     * nothing recorded last time, a fingerprint that failed) is copied.
+     * Skipped tables are fingerprinted on the source once more after the
+     * import, and copied again if they changed meanwhile.
+     * ---------------------------------------------------------------- */
+
+    private function plan_file() {
+        return dirname( $this->state_file ) . '/db-plan.php';
+    }
+
+    /** This pull's table plan (see plan_step()), or null. */
+    public function plan() {
+        $plan = json_decode( (string) Import::read_protected( $this->plan_file() ), true );
+        return is_array( $plan ) ? $plan : null;
+    }
+
+    private function save_plan( $plan ) {
+        Import::write_protected( $this->plan_file(), (string) wp_json_encode( $plan ) );
+    }
+
+    /** What the client is told about the plan. */
+    private static function plan_summary( $plan ) {
+        if ( ! is_array( $plan ) || empty( $plan['skip'] ) ) {
+            return null;
+        }
+        return [ 'copied' => count( (array) $plan['copied'] ), 'skipped' => array_values( (array) $plan['skipped'] ), 'soft' => (object) ( $plan['soft'] ?? [] ), 'changed' => (object) ( $plan['changed'] ?? [] ), 'nofp' => (string) ( $plan['nofp'] ?? '' ) ];
+    }
+
+    /** The name a source table gets here (the import swaps the prefix). */
+    private function dest_name( $table ) {
+        global $wpdb;
+        $old = (string) ( $this->state()['source_prefix'] ?? '' );
+        $new = (string) $wpdb->prefix;
+        return $old !== '' && $new !== '' && $old !== $new && strpos( $table, $old ) === 0 ? $new . substr( $table, strlen( $old ) ) : $table;
+    }
+
+    private function plan_init( $pre, $tables, $schema_only, $skip_unchanged ) {
+        $state  = $this->state();
+        $skip   = array_flip( (array) $schema_only );
+        $large  = [];
+        $map    = [];
+        foreach ( $tables as list( $name, $size ) ) {
+            $map[ $name ] = $this->dest_name( $name );
+            if ( $size >= Fingerprint::MIN_BYTES && ! isset( $skip[ $name ] ) ) {
+                $large[] = $name;
+            }
+        }
+        $nofp = '';
+        if ( ! empty( $pre->scope ) ) {
+            $nofp = 'the source is one site of a network, so every table was copied';
+        } elseif ( empty( $pre->fingerprint ) ) {
+            $nofp = 'the source runs an older Disembark without table fingerprints, so every table was copied';
+        }
+        $then = [];
+        $last = ! empty( $state['catch_up'] ) ? self::last_pull( self::memory_source( $state ) ) : null;
+        if ( $last && ! empty( $last['tables'] ) ) {
+            $then = [ 'tables' => (array) $last['tables'], 'all' => (array) ( $last['all_tables'] ?? [] ) ];
+        }
+        return [
+            'phase' => $nofp === '' && $large ? 'src' : 'decide',
+            'skip'  => (bool) $skip_unchanged && ! empty( $state['catch_up'] ),
+            'large' => $large,
+            'map'   => $map,
+            'all'   => array_keys( $map ),
+            'then'  => $then,
+            'nofp'  => $nofp,
+            'src'   => [],
+            'dst'   => [],
+            'why'   => [],
+            'cur'   => [],
+            'dcur'  => [],
+        ];
+    }
+
+    /**
+     * Fingerprints $tables on the source until $deadline, from $cur (moved
+     * on). A request that fails is counted in the cursor before it's sent,
+     * so a slice that keeps failing gets smaller and then gives up on its
+     * table (see Fingerprint::run()). Results go into $src / $why. Returns
+     * true when done, false when out of time, or WP_Error to try again.
+     */
+    private function source_fingerprints( $tables, array &$cur, array &$src, array &$why, $deadline, $save ) {
+        do {
+            $tries        = (int) ( $cur['tries'] ?? 0 );
+            // The source's own host may stop it sooner than this one stops
+            // us: after a failed request it gets half the time ('b' stays here).
+            $budget       = (int) min( max( 2, floor( Pace::left( $deadline ) ) - 1 ), (int) ( $cur['b'] ?? Pace::MAX_BUDGET ) );
+            if ( $tries > 0 ) {
+                $budget = max( 2, (int) floor( $budget / 2 ) );
+            }
+            $sent         = array_diff_key( $cur, [ 'b' => 1 ] );
+            $cur['tries'] = $tries + 1;
+            $cur['b']     = $budget;
+            $save();
+            $resp = $this->source_request( '/fingerprint', [ 'tables' => array_values( $tables ), 'cur' => $sent ?: (object) [], 'budget' => $budget ], 'POST', max( 10, (int) ceil( Pace::left( $deadline ) ) + 5 ) );
+            if ( is_wp_error( $resp ) ) {
+                $status = (int) ( $resp->get_error_data()['status'] ?? 0 );
+                if ( in_array( $status, [ 429, 502, 503, 504 ], true ) || self::dropped( $resp ) ) {
+                    return self::paced_error( $resp );
+                }
+                // Never fails the move: whatever is left is copied.
+                foreach ( array_slice( array_values( $tables ), (int) ( $cur['t'] ?? 0 ) ) as $table ) {
+                    $why[ $table ] = 'the source couldn\'t fingerprint it (' . substr( $resp->get_error_message(), 0, 100 ) . ')';
+                }
+                return true;
+            }
+            $resp = json_decode( (string) wp_json_encode( $resp ), true );
+            foreach ( (array) ( $resp['results'] ?? [] ) as $table => $r ) {
+                if ( isset( $r['fp'] ) ) {
+                    $src[ $table ] = (string) $r['fp'];
+                } else {
+                    $why[ $table ] = (string) ( $r['unknown'] ?? 'unknown' );
+                }
+            }
+            $cur      = (array) ( $resp['cur'] ?? [] ) + [ 'b' => $budget ];
+            $save();
+            if ( ! empty( $resp['done'] ) ) {
+                return true;
+            }
+        } while ( Pace::left( $deadline ) > 3 );
+        return false;
+    }
+
+    /** Fingerprints $tables here until $deadline (see source_fingerprints()). */
+    private static function local_fingerprints( $tables, array &$cur, array &$out, array &$why, $deadline, $save ) {
+        $r = Fingerprint::run( $tables, $cur, $deadline, function ( $c ) use ( &$cur, $save ) {
+            $cur = $c;
+            $save();
+        } );
+        foreach ( $r['results'] as $table => $one ) {
+            if ( isset( $one['fp'] ) ) {
+                $out[ $table ] = $one['fp'];
+            } else {
+                $why[ $table ] = $one['unknown'];
+            }
+        }
+        $cur = $r['cur'];
+        return $r['done'];
+    }
+
+    /** One call's worth of the plan: source fingerprints, this site's, then the decision. */
+    private function plan_step( array &$st, $deadline, $save ) {
+        $fp = &$st['fp'];
+        if ( $fp['phase'] === 'src' ) {
+            $done = $this->source_fingerprints( $fp['large'], $fp['cur'], $fp['src'], $fp['why'], $deadline, $save );
+            if ( is_wp_error( $done ) ) {
+                return $done;
+            }
+            if ( ! $done ) {
+                return true;
+            }
+            $fp['phase'] = $fp['skip'] && ! empty( $fp['then']['tables'] ) ? 'dst' : 'decide';
+            $save();
+        }
+        if ( $fp['phase'] === 'dst' ) {
+            // Only tables that could be skipped: unchanged on the source.
+            $here = Fingerprint::sizes();
+            $todo = [];
+            foreach ( $fp['large'] as $t ) {
+                $then = $fp['then']['tables'][ $t ] ?? null;
+                $d    = $fp['map'][ $t ];
+                if ( isset( $fp['src'][ $t ], $then['src'], $then['dst'], $here[ $d ] ) && $then['src'] === $fp['src'][ $t ] && ( $then['as'] ?? $d ) === $d ) {
+                    $todo[] = $d;
+                }
+            }
+            $dwhy = [];
+            if ( ! self::local_fingerprints( $todo, $fp['dcur'], $fp['dst'], $dwhy, $deadline, $save ) ) {
+                foreach ( $dwhy as $d => $reason ) {
+                    $fp['dst'][ $d ] = 'unknown: ' . $reason;
+                }
+                return true;
+            }
+            foreach ( $dwhy as $d => $reason ) {
+                $fp['dst'][ $d ] = 'unknown: ' . $reason;
+            }
+            $fp['phase'] = 'decide';
+        }
+        if ( $fp['phase'] === 'decide' ) {
+            $this->plan_decide( $st );
+            $fp['phase'] = 'done';
+        }
+        return true;
+    }
+
+    /** Decides table by table, saves the plan, and keeps only the tables to copy in the export. */
+    private function plan_decide( array &$st ) {
+        $fp      = $st['fp'];
+        $state   = $this->state();
+        $schema  = array_flip( (array) ( $state['skip_rows'] ?? [] ) );
+        $large   = array_flip( $fp['large'] );
+        $then    = (array) ( $fp['then']['tables'] ?? [] );
+        $before  = array_flip( (array) ( $fp['then']['all'] ?? [] ) );
+        $copy    = [];
+        $skipped = [];
+        $soft    = [];
+        $changed = [];
+        foreach ( $st['tables'] as $row ) {
+            $t = $row[0];
+            $d = $fp['map'][ $t ];
+            if ( ! $fp['skip'] || isset( $schema[ $t ] ) || ! isset( $large[ $t ] ) || $fp['nofp'] !== '' ) {
+                $copy[] = $row;
+                continue;
+            }
+            $was = $then[ $t ] ?? null;
+            $dst = $fp['dst'][ $d ] ?? null;
+            if ( isset( $fp['why'][ $t ] ) ) {
+                $soft[ $t ] = $fp['why'][ $t ];
+            } elseif ( ! $was ) {
+                if ( $before && ! isset( $before[ $t ] ) ) {
+                    $changed[ $t ] = 'new on the source';
+                } else {
+                    $soft[ $t ] = 'no fingerprint from the last pull';
+                }
+            } elseif ( empty( $was['src'] ) || empty( $was['dst'] ) ) {
+                $soft[ $t ] = 'no fingerprint from the last pull';
+            } elseif ( $was['src'] !== ( $fp['src'][ $t ] ?? '' ) ) {
+                $changed[ $t ] = 'changed on the source';
+            } elseif ( $dst === null ) {
+                $soft[ $t ] = 'not on this site any more';
+            } elseif ( strpos( (string) $dst, 'unknown: ' ) === 0 ) {
+                $soft[ $t ] = substr( $dst, 9 ) . ' (here)';
+            } elseif ( $dst !== $was['dst'] ) {
+                $changed[ $t ] = 'changed on this site';
+            } else {
+                $skipped[] = $t;
+                continue;
+            }
+            $copy[] = $row;
+        }
+        $st['tables'] = $copy;
+        $st['t']      = 0;
+        $this->save_plan( [
+            'skip'        => $fp['skip'],
+            'skipped'     => $skipped,
+            'skipped_dst' => array_values( array_map( function ( $t ) use ( $fp ) { return $fp['map'][ $t ]; }, $skipped ) ),
+            'copied'      => array_column( $copy, 0 ),
+            'soft'        => $soft,
+            'changed'     => $changed,
+            'nofp'        => $fp['nofp'],
+            'large'       => $fp['large'],
+            'map'         => $fp['map'],
+            'all'         => $fp['all'],
+            'src'         => $fp['src'],
+            'src_why'     => $fp['why'],
+        ] );
+    }
+
+    /**
+     * After the address rewrite: fingerprints the skipped tables on the
+     * source once more and copies again any that changed during the move
+     * (into the restore point first, then exported, imported and rewritten
+     * like the rest), then fingerprints this site's tables and keeps both
+     * sides' fingerprints for the next catch-up (see remember_files()).
+     * $from / $to: the address rewrite's. Paced like the other steps.
+     */
+    public function settle( $budget, $from, $to ) {
+        $deadline = Pace::deadline( $budget );
+        $plan     = $this->plan();
+        if ( ! $plan ) {
+            return [ 'done' => true, 'none' => true ];
+        }
+        $dir        = dirname( $this->state_file );
+        $state_file = $dir . '/settle-state.php';
+        $st         = json_decode( (string) Import::read_protected( $state_file ), true );
+        $state      = $this->state();
+        if ( ! is_array( $st ) ) {
+            $st = [ 'phase' => ! empty( $plan['skipped'] ) && ! empty( $state['source_token'] ) ? 'recheck' : 'cleanup', 'cur' => [], 'src' => [], 'why' => [], 'changed' => [], 'dcur' => [], 'dst' => [], 'dwhy' => [], 'x' => null ];
+        }
+        $save = function () use ( &$st, $state_file ) {
+            Import::write_protected( $state_file, (string) wp_json_encode( $st ) );
+        };
+        $more = function ( $what, $extra = [] ) use ( &$st, $save ) {
+            $save();
+            return [ 'done' => false, 'phase' => $st['phase'], 'what' => $what ] + $extra;
+        };
+        $import = $this->import;
+        $parts  = $this->staging_public . '/.disembark-db-parts';
+
+        if ( $st['phase'] === 'recheck' ) {
+            if ( empty( $st['cur'] ) ) {
+                /** Fires once before the skipped tables are fingerprinted on the source again. */
+                do_action( 'disembark_catch_up_recheck', $plan['skipped'], $this->import_id );
+            }
+            $done = $this->source_fingerprints( $plan['skipped'], $st['cur'], $st['src'], $st['why'], $deadline, $save );
+            if ( is_wp_error( $done ) ) {
+                return $done;
+            }
+            if ( ! $done ) {
+                return $more( 'Checking the skipped tables on the source once more' );
+            }
+            foreach ( $plan['skipped'] as $t ) {
+                if ( ( $st['src'][ $t ] ?? null ) !== ( $plan['src'][ $t ] ?? '' ) ) {
+                    $st['changed'][] = $t;
+                }
+            }
+            $st['phase'] = $st['changed'] ? 'save' : 'cleanup';
+            $save();
+        }
+        if ( $st['phase'] === 'save' ) {
+            $saved = $import->snapshot_add( array_map( function ( $t ) use ( $plan ) { return $plan['map'][ $t ]; }, $st['changed'] ), Pace::left( $deadline ) );
+            if ( is_wp_error( $saved ) ) {
+                return $saved;
+            }
+            if ( empty( $saved['done'] ) ) {
+                return $more( 'Adding the tables that changed to the restore point' );
+            }
+            $info = [];
+            foreach ( (array) ( $state['tables'] ?? [] ) as $t ) {
+                $info[ (string) $t['name'] ] = [ (int) ( $t['size'] ?? 0 ), (int) ( $t['rows'] ?? 0 ) ];
+            }
+            $st['x'] = [ 't' => 0, 'part' => null, 'bytes' => 0, 'tables' => array_map( function ( $t ) use ( $info ) { return [ $t, $info[ $t ][0] ?? 0, $info[ $t ][1] ?? 0 ]; }, $st['changed'] ) ];
+            wp_mkdir_p( $parts );
+            @file_put_contents( $parts . '/recheck.sql', '' );
+            $st['phase'] = 'fetch';
+            $save();
+        }
+        if ( $st['phase'] === 'fetch' ) {
+            while ( $st['x']['t'] < count( $st['x']['tables'] ) ) {
+                $b = $this->export_batch( $st['x'], $parts . '/recheck.sql', 16 * MB_IN_BYTES, (array) ( $state['skip_rows'] ?? [] ), $state, max( 10, (int) ceil( Pace::left( $deadline ) ) ) );
+                if ( is_wp_error( $b ) ) {
+                    return $b;
+                }
+                $save();
+                if ( Pace::left( $deadline ) < 3 ) {
+                    return $more( 'Copying the tables that changed again' );
+                }
+            }
+            $st['phase'] = 'import';
+            $save();
+        }
+        if ( $st['phase'] === 'import' ) {
+            global $wpdb;
+            $sq = $import->import_staged_sql( 'public/.disembark-db-parts/recheck.sql', (string) ( $state['source_prefix'] ?? '' ), (string) $wpdb->prefix, Pace::left( $deadline ), true );
+            if ( is_wp_error( $sq ) ) {
+                return $sq;
+            }
+            if ( ! empty( $sq['errors'] ) ) {
+                return new \WP_Error( 'recheck_failed', 'Copying the tables that changed during the catch-up again failed: ' . $sq['errors'][0], [ 'status' => 500 ] );
+            }
+            if ( isset( $sq['done'] ) && ! $sq['done'] ) {
+                return $more( 'Importing the tables that changed again' );
+            }
+            $st['phase'] = 'rewrite';
+            $save();
+        }
+        if ( $st['phase'] === 'rewrite' ) {
+            $sr = $import->rewrite_tables( $from, $to, array_map( function ( $t ) use ( $plan ) { return $plan['map'][ $t ]; }, $st['changed'] ), Pace::left( $deadline ) );
+            if ( is_wp_error( $sr ) ) {
+                return $sr;
+            }
+            if ( isset( $sr['done'] ) && ! $sr['done'] ) {
+                return $more( 'Rewriting addresses in the tables that changed' );
+            }
+            @unlink( $parts . '/recheck.sql' );
+            $st['phase'] = 'cleanup';
+            $save();
+        }
+        if ( $st['phase'] === 'cleanup' ) {
+            // Done with the source: its session and its token go.
+            if ( ! empty( $state['source_token'] ) ) {
+                $this->cleanup_source();
+                $state = $this->state();
+                unset( $state['source_token'] );
+                $this->save_state( $state );
+            }
+            $st['phase'] = 'dst';
+            $save();
+        }
+        if ( $st['phase'] === 'dst' ) {
+            $here = Fingerprint::sizes();
+            $todo = [];
+            foreach ( $plan['large'] as $t ) {
+                if ( isset( $here[ $plan['map'][ $t ] ] ) ) {
+                    $todo[] = $plan['map'][ $t ];
+                }
+            }
+            if ( ! self::local_fingerprints( $todo, $st['dcur'], $st['dst'], $st['dwhy'], $deadline, $save ) ) {
+                return $more( 'Fingerprinting this site\'s tables for next time', [ 'done_tables' => count( $st['dst'] ) + count( $st['dwhy'] ), 'total' => count( $todo ) ] );
+            }
+            // Kept for next time: each source table's fingerprint (the new
+            // one for a table copied again) beside this site's.
+            $src = (array) $plan['src'];
+            foreach ( $st['changed'] as $t ) {
+                $src[ $t ] = $st['src'][ $t ] ?? null; // fingerprinted before its second copy (or unknown)
+            }
+            $tables = [];
+            foreach ( $plan['large'] as $t ) {
+                $tables[ $t ] = [ 'src' => $src[ $t ] ?? null, 'dst' => $st['dst'][ $plan['map'][ $t ] ] ?? null, 'as' => $plan['map'][ $t ] ];
+            }
+            Import::write_protected( $dir . '/fingerprints.php', (string) wp_json_encode( [ 'tables' => $tables, 'all' => $plan['all'], 'at' => time() ] ) );
+            @unlink( $state_file );
+            $skipped = array_values( array_diff( (array) $plan['skipped'], $st['changed'] ) );
+            return [
+                'done'      => true,
+                'skip'      => ! empty( $plan['skip'] ),
+                'skipped'   => $skipped,
+                'copied'    => count( (array) $plan['copied'] ) + count( $st['changed'] ),
+                'recopied'  => $st['changed'],
+                'soft'      => (object) ( (array) $plan['soft'] + array_map( function ( $r ) { return $r . ' (here, for next time)'; }, array_diff_key( $st['dwhy'], array_flip( array_map( function ( $t ) use ( $plan ) { return $plan['map'][ $t ]; }, array_keys( (array) $plan['soft'] ) ) ) ) ) ),
+                'nofp'      => (string) $plan['nofp'],
+            ];
+        }
+        return $more( '' );
     }
 
     /**

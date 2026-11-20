@@ -349,6 +349,16 @@ class Run {
             'callback' => [ $this, 'export_database_batch' ],
             'permission_callback' => '__return_true',
         ]);
+        register_rest_route('disembark/v1', '/fingerprint', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'fingerprint' ],
+            'permission_callback' => '__return_true',
+        ]);
+        register_rest_route('disembark/v1', '/import/pull/fingerprints', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'import_pull_fingerprints' ],
+            'permission_callback' => '__return_true',
+        ]);
         register_rest_route('disembark/v1', '/stream-file', [
             'methods'  => 'POST',
             'callback' => [ $this, 'stream_file' ],
@@ -1068,6 +1078,31 @@ class Run {
         return ( new Backup( $backup_token ) )->database_export_batch( $tables, $schema_only, ! empty( $request['shared_rows'] ) );
     }
 
+    /**
+     * The source side of skipping unchanged tables: fingerprints of the
+     * tables asked for, a piece at a time (see Fingerprint). One site of a
+     * network isn't fingerprinted (its rows are filtered and rewritten on
+     * the way out), so its tables are always copied.
+     */
+    function fingerprint( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $scope = Scope::from_request( $request );
+        if ( is_wp_error( $scope ) ) {
+            return $scope;
+        }
+        $tables = is_array( $request['tables'] ) ? array_values( array_filter( $request['tables'], 'is_string' ) ) : [];
+        if ( $scope ) {
+            return [ 'done' => true, 'results' => (object) array_fill_keys( $tables, [ 'unknown' => 'one site of a network' ] ), 'cur' => (object) [] ];
+        }
+        $cur = is_array( $request['cur'] ) ? $request['cur'] : [];
+        $cur = array_intersect_key( $cur, array_flip( [ 't', 'key', 'rows', 's1', 's2', 'struct', 'slice', 'tries' ] ) );
+        $run = Fingerprint::run( $tables, $cur, Pace::deadline( Pace::budget( $request['budget'] ?? null ) ) );
+        $run['results'] = (object) $run['results'];
+        return $run;
+    }
+
     function get_manifest( $request ) {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
@@ -1610,9 +1645,27 @@ class Run {
         }
         $budget = self::paced( $params );
         if ( $budget !== null ) {
-            return ( new Pull( $import_id ) )->fetch_database_paced( $budget, (int) ( $params['batch_bytes'] ?? 8 * MB_IN_BYTES ) );
+            return ( new Pull( $import_id ) )->fetch_database_paced( $budget, (int) ( $params['batch_bytes'] ?? 8 * MB_IN_BYTES ), ! empty( $params['fingerprints'] ), ! empty( $params['skip_unchanged'] ) );
         }
         return ( new Pull( $import_id ) )->fetch_database();
+    }
+
+    /**
+     * After the address rewrite of a pull: the final re-check of tables a
+     * catch-up left alone, and both sides' fingerprints kept for next time
+     * (see Pull::settle()). Paced.
+     */
+    function import_pull_fingerprints( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $params    = $request->get_json_params();
+        $import_id = $params['import_id'] ?? '';
+        if ( empty( $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        $budget = self::paced( $params );
+        return ( new Pull( $import_id ) )->settle( $budget === null ? Pace::default_budget() : $budget, (string) ( $params['from'] ?? '' ), (string) ( $params['to'] ?? '' ) );
     }
 
     /** Moves that stopped before finishing (see Pull::unfinished()). */
