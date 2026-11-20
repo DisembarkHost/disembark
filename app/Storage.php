@@ -17,6 +17,33 @@ class Storage {
     }
 
     /**
+     * The base folder's URL. Usually uploads' baseurl, but WordPress builds
+     * that from WP_CONTENT_URL when upload_path is an absolute path, so a
+     * site whose uploads were moved to another folder under the web root
+     * (with no upload_url_path) gets a baseurl that doesn't serve basedir,
+     * and every file a pull fetched from it answered 404. When basedir sits
+     * under the web root and baseurl doesn't end in that same path, the URL
+     * is built from the site address instead.
+     */
+    public static function base_url() {
+        $uploads = wp_upload_dir();
+        $url     = untrailingslashit( (string) $uploads['baseurl'] );
+        if ( get_option( 'upload_url_path' ) ) {
+            return $url . '/disembark';
+        }
+        $root = rtrim( str_replace( '\\', '/', ABSPATH ), '/' );
+        $dir  = rtrim( str_replace( '\\', '/', (string) $uploads['basedir'] ), '/' );
+        if ( strpos( $dir, $root . '/' ) === 0 ) {
+            $rel  = '/' . substr( $dir, strlen( $root ) + 1 );
+            $path = rtrim( (string) wp_parse_url( $url, PHP_URL_PATH ), '/' );
+            if ( substr( $path, -strlen( $rel ) ) !== $rel ) {
+                $url = untrailingslashit( site_url( $rel ) );
+            }
+        }
+        return $url . '/disembark';
+    }
+
+    /**
      * Creates $dir if needed and guards it plus every folder between it and
      * the Disembark base folder.
      */

@@ -16,7 +16,7 @@ class Backup {
         $token             = Storage::sanitize_session( $token );
         $this->token       = empty( $token ) ? Storage::new_session() : $token;
         $this->backup_path = wp_upload_dir()["basedir"] . "/disembark/{$this->token}";
-        $backup_url        = wp_upload_dir()["baseurl"] . "/disembark/{$this->token}";
+        $backup_url        = Storage::base_url() . "/{$this->token}";
         // Ensure URL scheme matches the current request to prevent mixed content issues
         // Check multiple indicators for HTTPS (handles reverse proxy scenarios)
         $is_https = is_ssl()
