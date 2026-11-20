@@ -831,6 +831,9 @@
         progress('');
       }
       rlog('Connected. Source: ' + c.source_home + ' (' + c.table_count + ' tables).');
+      // One site of an install comes through the install's address: name
+      // the move after the site that comes over.
+      if (c.scope && c.source_home && kind === 'pull') { srcLabel = D.host(c.source_home); setTitle(opts.title || 'Restoring', srcLabel); }
       if (c.scope) {
         rlog('Bringing one site: ' + c.scope.label + '. It arrives as a standalone site.', 'ok');
         if (c.scope.users !== null && c.scope.users !== undefined) rlog(D.fmt.plural(c.scope.users, 'user') + (c.scope.users === 1 ? ' comes' : ' come') + ' across: its members, the authors of its posts, and the network\u2019s super admins (as administrators).', 'dim');
@@ -1146,7 +1149,7 @@
           checks.appendChild(h('div', { class: 'dsk-chk warn' }, D.icon('alert'), h('div', null,
             h('strong', null, D.fmt.plural(codeMentions.total, 'theme or plugin file') + (codeMentions.total === 1 ? ' still mentions ' : ' still mention ') + D.host(codeMentions.from) + '. '),
             'Disembark doesn\u2019t edit code, so check these by hand:',
-            h('ul', { style: { fontFamily: 'var(--mono)', fontSize: '12px' } }, codeMentions.list.map(function (f) { return h('li', null, f); }),
+            h('ul', { style: { fontFamily: 'var(--mono)', fontSize: '12px', overflowWrap: 'anywhere' } }, codeMentions.list.map(function (f) { return h('li', null, f); }),
               codeMentions.total > codeMentions.list.length ? h('li', null, '\u2026 and ' + (codeMentions.total - codeMentions.list.length) + ' more') : null))));
         }
       } catch (e) {
