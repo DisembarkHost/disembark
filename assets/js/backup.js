@@ -57,17 +57,25 @@
     renderScans();
 
     // A network or WP Freighter install: back up all of it or one site, as
-    // a standalone site (restores into any single site).
+    // a standalone site (restores into any single site). A zip of the whole
+    // install is for keeping or a full server restore by hand: Move refuses
+    // it (Import::whole_install_refusal()), so the label says so.
+    function wholeNote() {
+      var inst = D.config.install;
+      if (!inst || S.site) return '';
+      var kind = inst.kind === 'multisite' ? 'network' : 'WP Freighter install';
+      return 'A zip of the whole ' + kind + ' is for keeping, or for restoring this whole server by hand (unzip it, import its database). Move brings one site at a time, so it won’t restore this zip: pick one site under Back up for a zip it restores into any WordPress site.';
+    }
     function sitePicker() {
       var inst = D.config.install;
       if (!inst || !(inst.sites || []).length) return null;
       var kind = inst.kind === 'multisite' ? 'network' : 'WP Freighter install';
       var sel = h('select', { class: 'dsk-select', 'aria-label': 'What to back up', onchange: function () { D.setSite(sel.value); } },
-        h('option', { value: '' }, 'The whole ' + kind + ' (' + D.fmt.plural(inst.total || inst.sites.length, 'site') + ')'),
+        h('option', { value: '' }, 'The whole ' + kind + ' (' + D.fmt.plural(inst.total || inst.sites.length, 'site') + '), for a full server restore'),
         inst.sites.map(function (s) { return h('option', { value: s.id, selected: s.id === S.site }, D.siteName(s.id)); }));
       return h('div', { class: 'dsk-card dsk-bk-scope' },
         h('span', { class: 'caps' }, 'Back up'), sel,
-        h('span', { class: 'muted' }, S.site ? 'This site alone, as a standalone site: its tables, its users, its uploads, and the plugins and themes it uses. Restore it into any single WordPress site.' : 'Every site of the ' + kind + ', exactly as it is here.'));
+        h('span', { class: 'muted' }, S.site ? 'This site alone, as a standalone site: its tables, its users, its uploads, and the plugins and themes it uses. Restore it into any single WordPress site.' : 'Every site of the ' + kind + ', exactly as it is here. ' + wholeNote()));
     }
 
     /* ---------------------------------------------------- The two cards */
@@ -322,6 +330,7 @@
           title: 'Backup ready',
           body: h('div', { class: 'dsk-stack', style: { gap: '10px' } },
             h('p', null, h('strong', null, fin.file_name), ' (' + D.fmt.size(fin.size) + ') is downloading.'),
+            wholeNote() ? h('p', { class: 'muted' }, wholeNote()) : null,
             h('p', { class: 'muted' }, 'Delete it from the server once the download finishes? It’s a full copy of the site in a public folder (with an unguessable name).')),
           actions: [{ label: 'Keep it for now', value: 'keep' }, { label: 'Delete from server', kind: 'primary', value: 'delete' }]
         });
