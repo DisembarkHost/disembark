@@ -2292,6 +2292,9 @@ class Import {
         'kinsta-mu-plugins', 'gd-system-plugin', 'pantheon', 'wpcomsh', 'endurance-', 'flywheel', 'pressable',
         'sg-security', 'sg-cachepress', 'wp-cloudflare-page-cache', 'liquidweb', 'nexcess', 'cloudways', 'bluehost',
         'dreamhost', 'hostinger', 'ionos',
+        // CaptainCore (Anchor Hosting): its login helper and the site's
+        // Fathom analytics, which would count a copy's visits as the real site's.
+        'captaincore-',
     ];
 
     /**
