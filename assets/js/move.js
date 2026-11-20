@@ -238,10 +238,10 @@
           D.config.refused || ('Run the move from the main site’s Disembark and pick “Replace” there.')))));
     }
     if (k === 'pull' || k === 'push') { body.push(connectField()); ready = !!S.connect; why = 'Paste a connect line first'; }
+    else { body.push(zipField()); ready = !!S.file; why = 'Choose a backup zip first'; }
     // A local site can't push to a live one (the live one can't reach it): the zip route instead.
     var localToLive = k === 'push' && S.connect ? D.localToLive(S.connect.url) : '';
     if (localToLive) { ready = false; why = 'Use a backup zip instead'; }
-    else { body.push(zipField()); ready = !!S.file; why = 'Choose a backup zip first'; }
     if (S.to === 'new') body.push(intoField());
     var last = k === 'pull' && S.connect && S.to === 'this' ? D.pull.lastPullFor(S.connect.url) : null;
     if (last) {
