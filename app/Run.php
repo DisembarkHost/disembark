@@ -563,10 +563,10 @@ class Run {
             }
         }
         global $wpdb;
-        $sql = "SELECT table_name AS \"table\", data_length + index_length AS \"size\" FROM information_schema.TABLES WHERE table_schema = '" . DB_NAME . "' ORDER BY (data_length + index_length) DESC;";
+        $sql = $wpdb->prepare( "SELECT table_name AS \"table\", data_length + index_length AS \"size\" FROM information_schema.TABLES WHERE table_schema = %s ORDER BY (data_length + index_length) DESC;", DB_NAME );
         $response = $wpdb->get_results( $sql );
         foreach( $response as $row ) {
-            $row->row_count = $wpdb->get_var( "SELECT COUNT(*) FROM " . $row->table );
+            $row->row_count = $wpdb->get_var( "SELECT COUNT(*) FROM " . Backup::ident( $row->table ) );
         }
         return $response;
     }
@@ -585,7 +585,7 @@ class Run {
 
         // Validate Table Name
         $valid_tables = $wpdb->get_col( "SHOW TABLES" );
-        if ( ! in_array( $table, $valid_tables ) ) {
+        if ( ! in_array( $table, $valid_tables, true ) ) {
             return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
         }
 
@@ -616,7 +616,7 @@ class Run {
 
         // Validate Table Name
         $valid_tables = $wpdb->get_col( "SHOW TABLES" );
-        if ( ! in_array( $table, $valid_tables ) ) {
+        if ( ! in_array( $table, $valid_tables, true ) ) {
             return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
         }
 
@@ -625,7 +625,7 @@ class Run {
         }
 
         $auto_inc_col = null;
-        $columns = $wpdb->get_results( "SHOW COLUMNS FROM `$table`" );
+        $columns = $wpdb->get_results( "SHOW COLUMNS FROM " . Backup::ident( $table ) );
         foreach ( $columns as $col ) {
             if ( stripos( $col->Extra, 'auto_increment' ) !== false ) {
                 $auto_inc_col = $col->Field;
@@ -668,7 +668,7 @@ class Run {
 
         // Validate Table Name
         $valid_tables = $wpdb->get_col( "SHOW TABLES" );
-        if ( ! in_array( $table, $valid_tables ) ) {
+        if ( ! in_array( $table, $valid_tables, true ) ) {
             return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
         }
 
@@ -703,19 +703,19 @@ class Run {
 
         // 1. Validate Table Name
         $valid_tables = $wpdb->get_col( "SHOW TABLES" );
-        if ( ! in_array( $table, $valid_tables ) ) {
+        if ( ! in_array( $table, $valid_tables, true ) ) {
             return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
         }
 
         // 2. Build Query
-        $sql = "SELECT * FROM `{$table}`";
+        $sql = "SELECT * FROM " . Backup::ident( $table );
 
         // 3. Handle Sorting securely
         if ( $orderby ) {
             // Get valid columns for this table to ensure the 'orderby' param is safe
-            $valid_columns = $wpdb->get_col( "DESCRIBE `{$table}`" );
-            if ( in_array( $orderby, $valid_columns ) ) {
-                $sql .= " ORDER BY `{$orderby}` {$order}";
+            $valid_columns = $wpdb->get_col( "DESCRIBE " . Backup::ident( $table ) );
+            if ( in_array( $orderby, $valid_columns, true ) ) {
+                $sql .= " ORDER BY " . Backup::ident( $orderby ) . " {$order}";
             }
         }
 
@@ -726,7 +726,7 @@ class Run {
         $rows = $wpdb->get_results( $sql, ARRAY_A );
         
         // Get total rows for pagination
-        $total = $wpdb->get_var( "SELECT COUNT(*) FROM `{$table}`" );
+        $total = $wpdb->get_var( "SELECT COUNT(*) FROM " . Backup::ident( $table ) );
 
         return [
             'rows' => $rows,
@@ -744,15 +744,15 @@ class Run {
 
         // Security: Validate table existence
         $valid_tables = $wpdb->get_col( "SHOW TABLES" );
-        if ( ! in_array( $table, $valid_tables ) ) {
+        if ( ! in_array( $table, $valid_tables, true ) ) {
             return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
         }
 
         // Get Table Structure
-        $structure = $wpdb->get_results( "DESCRIBE `{$table}`" );
+        $structure = $wpdb->get_results( "DESCRIBE " . Backup::ident( $table ) );
         
         // Get Table Status (for engine, collation, etc.)
-        $status = $wpdb->get_row( "SHOW TABLE STATUS LIKE '{$table}'" );
+        $status = $wpdb->get_row( $wpdb->prepare( 'SHOW TABLE STATUS LIKE %s', $wpdb->esc_like( (string) $table ) ) );
 
         return [
             'structure' => $structure,

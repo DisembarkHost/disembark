@@ -410,20 +410,20 @@ class Backup {
         $empty = $scope && in_array( $table, $scope->shared_tables(), true );
 
         if ( 0 == $rows_start ) {
-            $create_table = $wpdb->get_results( "SHOW CREATE TABLE `{$real}`", ARRAY_N );
+            $create_table = $wpdb->get_results( "SHOW CREATE TABLE " . self::ident( $real ), ARRAY_N );
             if ( false === $create_table || ! isset( $create_table[0] ) ) {
                 return false;
             }
             $create_table_array = $create_table[0];
             unset( $create_table );
             if ( self::is_view_definition( $create_table_array[1] ) ) {
-                fwrite( $file_handle, 'DROP VIEW IF EXISTS `' . $table . "`;\n" . str_replace( "\n", ' ', $create_table_array[1] ) . ";\n" );
+                fwrite( $file_handle, 'DROP VIEW IF EXISTS ' . self::ident( $table ) . ";\n" . str_replace( "\n", ' ', $create_table_array[1] ) . ";\n" );
                 fclose( $file_handle );
                 return $backup_url;
             }
             $insert_sql .= str_replace( "\n", '', $scope ? $scope->create( $create_table_array[1], $table, $real ) : $create_table_array[1] ) . ";\n";
             unset( $create_table_array );
-            $insert_sql .= "/*!40000 ALTER TABLE `{$table}` DISABLE KEYS */;\n";
+            $insert_sql .= "/*!40000 ALTER TABLE " . self::ident( $table ) . " DISABLE KEYS */;\n";
             $insert_sql .= "SET FOREIGN_KEY_CHECKS = 0;\n";
             $insert_sql .= "SET UNIQUE_CHECKS = 0;\n";
         }
@@ -438,7 +438,7 @@ class Backup {
             }
             // ORDER BY the primary key: without it MySQL may return pages in
             // any order, so separate LIMIT/OFFSET requests can skip or repeat rows.
-            $query       = "SELECT * FROM `$real`" . ( $where !== '' ? " WHERE {$where}" : '' ) . self::order_by_primary_key( $real ) . " LIMIT " . (int) $rows_start . ',' . (int) $select_row_limit;
+            $query       = "SELECT * FROM " . self::ident( $real ) . ( $where !== '' ? " WHERE {$where}" : '' ) . self::order_by_primary_key( $real ) . " LIMIT " . (int) $rows_start . ',' . (int) $select_row_limit;
             $table_query = $wpdb->get_results( $query, ARRAY_N );
             $rows_start += $select_row_limit;
             if ( $wpdb->last_error ) {
@@ -461,7 +461,7 @@ class Backup {
                         continue;
                     }
                 }
-                $insert_sql .= "INSERT INTO `$table` VALUES(";
+                $insert_sql .= "INSERT INTO " . self::ident( $table ) . " VALUES(";
                 for ( $n = 1; $n <= $num_fields; $n++ ) {
                     $m = $n - 1;
                     if ( null === $fetch_row[ $m ] ) {
@@ -486,7 +486,7 @@ class Backup {
                 $insert_sql .= self::insert_line( $table, $row );
             }
         }
-        $insert_sql  .= "/*!40000 ALTER TABLE `{$table}` ENABLE KEYS */;\n";
+        $insert_sql  .= "/*!40000 ALTER TABLE " . self::ident( $table ) . " ENABLE KEYS */;\n";
         $insert_sql  .= "SET FOREIGN_KEY_CHECKS = 1;\n";
         $insert_sql  .= "SET UNIQUE_CHECKS = 1;\n";
         $write_return = fwrite( $file_handle, $insert_sql );
@@ -575,17 +575,17 @@ class Backup {
             // A view has a definition, not rows of its own: its rows belong
             // to the tables it reads, and inserting them would write there.
             if ( self::is_view_definition( $create_table[0][1] ) ) {
-                if ( ! $write( 'DROP VIEW IF EXISTS `' . str_replace( '`', '``', $table ) . "`;\n" . str_replace( "\n", ' ', $create_table[0][1] ) . ";\n" ) ) {
+                if ( ! $write( 'DROP VIEW IF EXISTS ' . self::ident( $table ) . ";\n" . str_replace( "\n", ' ', $create_table[0][1] ) . ";\n" ) ) {
                     return $fail( 'Could not write the database export (disk full?).' );
                 }
                 continue;
             }
-            if ( ! $write( str_replace( "\n", '', $create_table[0][1] ) . ";\n/*!40000 ALTER TABLE `{$table}` DISABLE KEYS */;\n" ) ) {
+            if ( ! $write( str_replace( "\n", '', $create_table[0][1] ) . ";\n/*!40000 ALTER TABLE " . self::ident( $table ) . " DISABLE KEYS */;\n" ) ) {
                 return $fail( 'Could not write the database export (disk full?).' );
             }
 
             if ( isset( $schema_only[ $table ] ) ) {
-                if ( ! $write( "/*!40000 ALTER TABLE `{$table}` ENABLE KEYS */;\n" ) ) {
+                if ( ! $write( "/*!40000 ALTER TABLE " . self::ident( $table ) . " ENABLE KEYS */;\n" ) ) {
                     return $fail( 'Could not write the database export (disk full?).' );
                 }
                 continue;
@@ -603,9 +603,9 @@ class Backup {
 
             while ( true ) {
                 if ( $keyset && $last_key !== null ) {
-                    $query = $wpdb->prepare( "SELECT * FROM `{$real}` WHERE `{$keys[0]}` > %s" . ( $where !== '' ? " AND ({$where})" : '' ) . "{$order_by} LIMIT %d", $last_key, $select_row_limit );
+                    $query = $wpdb->prepare( "SELECT * FROM " . self::ident( $real ) . " WHERE " . self::ident( $keys[0] ) . " > %s" . ( $where !== '' ? " AND ({$where})" : '' ) . "{$order_by} LIMIT %d", $last_key, $select_row_limit );
                 } else {
-                    $query = "SELECT * FROM `{$real}`" . ( $where !== '' ? " WHERE {$where}" : '' ) . "{$order_by} LIMIT " . (int) $offset . ',' . (int) $select_row_limit;
+                    $query = "SELECT * FROM " . self::ident( $real ) . ( $where !== '' ? " WHERE {$where}" : '' ) . "{$order_by} LIMIT " . (int) $offset . ',' . (int) $select_row_limit;
                 }
                 $rows = $wpdb->get_results( $query, ARRAY_N );
                 if ( $wpdb->last_error ) {
@@ -667,7 +667,7 @@ class Backup {
             // How many rows the table had, so the import can check they all
             // arrived. A harmless statement (a user variable) rather than a
             // comment: older importers simply run it.
-            if ( ! $write( "/*!40000 ALTER TABLE `{$table}` ENABLE KEYS */;\nSET @disembark_rows = '" . self::db_escape( $table ) . ':' . $exported . "';\n" ) ) {
+            if ( ! $write( "/*!40000 ALTER TABLE " . self::ident( $table ) . " ENABLE KEYS */;\nSET @disembark_rows = '" . self::db_escape( $table ) . ':' . $exported . "';\n" ) ) {
                 return $fail( 'Could not write the database export (disk full?).' );
             }
         }
@@ -1104,7 +1104,7 @@ class Backup {
         foreach ( $row as $value ) {
             $values[] = ( null === $value ) ? 'NULL' : "'" . self::db_escape( $value ) . "'";
         }
-        return "INSERT INTO `{$table}` VALUES(" . implode( ', ', $values ) . ");\n";
+        return "INSERT INTO " . self::ident( $table ) . " VALUES(" . implode( ', ', $values ) . ");\n";
     }
 
     /**
@@ -1184,6 +1184,11 @@ class Backup {
         }
         // Return success even if file not found, as the goal is for it to be gone
         return [ 'success' => true, 'message' => "File {$safe_file_name} not found or already deleted." ];
+    }
+
+    /** A table or column name as a quoted SQL identifier. */
+    public static function ident( $name ) {
+        return '`' . str_replace( '`', '``', (string) $name ) . '`';
     }
 
     /** True when SHOW CREATE TABLE answered with a view's definition. */
