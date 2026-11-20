@@ -74,12 +74,11 @@ class Run {
      * per-endpoint User::allowed() check still runs.
      */
     public function allow_token_auth( $errors ) {
-        // Scope strictly to Disembark's own REST namespace (pretty and
-        // ?rest_route= forms) — matching "disembark" anywhere in the URI would
-        // relax the cookie/nonce check for unrelated routes too.
-        $uri    = rawurldecode( isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '' );
-        $prefix = '/' . rest_get_url_prefix() . '/disembark/v1';
-        if ( strpos( $uri, $prefix ) === false && strpos( $uri, 'rest_route=/disembark/v1' ) === false ) {
+        // Scope strictly to Disembark's own REST routes: the route WordPress
+        // is about to serve (pretty or ?rest_route= form) must start with
+        // /disembark/v1. Looking for the namespace anywhere in the URI would
+        // relax the cookie/nonce check for any route with it in a query string.
+        if ( ! preg_match( '#^/disembark/v1(/|$)#i', self::current_rest_route() ) ) {
             return $errors;
         }
 
@@ -105,6 +104,17 @@ class Run {
             return true; // valid token → skip the cookie/nonce requirement
         }
         return $errors;
+    }
+
+    /** The REST route this request is serving, as rest_api_loaded() reads it. */
+    private static function current_rest_route() {
+        $route = '';
+        if ( isset( $GLOBALS['wp'] ) && is_object( $GLOBALS['wp'] ) && ! empty( $GLOBALS['wp']->query_vars['rest_route'] ) ) {
+            $route = $GLOBALS['wp']->query_vars['rest_route'];
+        } elseif ( isset( $_GET['rest_route'] ) ) {
+            $route = $_GET['rest_route'];
+        }
+        return is_string( $route ) ? '/' . ltrim( $route, '/' ) : '';
     }
 
     /**
