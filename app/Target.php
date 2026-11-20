@@ -437,12 +437,10 @@ class Target {
      */
     public function merge_users( $old_prefix, $incoming = null, $journal_file = '' ) {
         global $wpdb;
-        $report = [ 'created' => 0, 'matched' => 0, 'renumbered' => 0 ];
-        // What the merge adds to the network's users and takes from them,
-        // one line per row as it goes, so a rollback takes exactly that
-        // out again (see undo_merge()): "u" a user it created, "m" a
-        // usermeta row it added, "d" a usermeta row it removed.
-        $journal = $journal_file !== '' ? Pace::journal_open( $journal_file ) : null;
+        // renamed: users whose login was taken here and who log in under a
+        // new one; unattributed: users who couldn't be added, whose content
+        // now has no author rather than someone else's.
+        $report = [ 'created' => 0, 'matched' => 0, 'renumbered' => 0, 'renamed' => [], 'unattributed' => [], 'orphaned' => 0 ];
         if ( $this->kind !== 'multisite' ) {
             return $report;
         }
@@ -453,6 +451,11 @@ class Target {
         if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $in_users ) ) ) !== $in_users ) {
             return $report;
         }
+        // What the merge adds to the network's users and takes from them,
+        // one line per row as it goes, so a rollback takes exactly that
+        // out again (see undo_merge()): "u" a user it created, "m" a
+        // usermeta row it added, "d" a usermeta row it removed.
+        $journal = $journal_file !== '' ? Pace::journal_open( $journal_file ) : null;
         // Replacing a site: its old roles go, the incoming ones replace them.
         if ( $this->into !== 'new' ) {
             $where = $this->own_meta_where();
@@ -480,17 +483,43 @@ class Target {
             // Only WordPress's own columns, by name: the incoming table's
             // column names are the source's to choose.
             $u = array_intersect_key( $u, array_flip( [ 'user_login', 'user_pass', 'user_nicename', 'user_email', 'user_url', 'user_registered', 'user_activation_key', 'user_status', 'display_name' ] ) );
-            if ( ! isset( $u['user_login'], $u['user_nicename'] ) ) {
-                continue;
+            $asked = (string) ( $u['user_login'] ?? '' );
+            // A user without a login (or one WordPress wouldn't take) still
+            // gets an account, under a login made from their old ID.
+            $login = sanitize_user( $asked );
+            $why   = 'was taken';
+            if ( $login === '' || $login !== $asked ) {
+                $login = 'user-' . $old;
+                $why   = $asked === '' ? 'was empty' : 'isn\'t a valid login';
             }
+            $u['user_login']    = $login;
+            $u['user_nicename'] = sanitize_title( (string) ( $u['user_nicename'] ?? '' ) ) ?: sanitize_title( $login );
             foreach ( [ 'user_login' => 60, 'user_nicename' => 50 ] as $col => $max ) {
                 $base = (string) $u[ $col ];
                 for ( $n = 2; $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM `{$users}` WHERE `{$col}` = %s", $u[ $col ] ) ); $n++ ) {
                     $u[ $col ] = substr( $base, 0, $max - 4 ) . '-' . $n;
                 }
             }
-            if ( $wpdb->insert( $users, $u ) === false ) {
+            $error = '';
+            $ok    = $wpdb->insert( $users, $u ) !== false;
+            if ( ! $ok ) {
+                // Once more with a login of its own and only what an
+                // account needs (a value this database won't take, a
+                // plugin's trigger refusing the name).
+                $error           = (string) $wpdb->last_error;
+                $why             = 'was refused';
+                $u['user_login'] = $u['user_nicename'] = 'user-' . $old . '-' . strtolower( wp_generate_password( 6, false ) );
+                $ok              = $wpdb->insert( $users, array_intersect_key( $u, array_flip( [ 'user_login', 'user_pass', 'user_nicename', 'user_email', 'display_name' ] ) ) ) !== false;
+            }
+            if ( ! $ok ) {
+                // Their content keeps no author rather than pointing at
+                // whoever has their old ID here.
+                $map[ $old ] = 0;
+                $report['unattributed'][] = [ 'login' => $asked, 'email' => $email, 'error' => substr( $error !== '' ? $error : (string) $wpdb->last_error, 0, 160 ) ];
                 continue;
+            }
+            if ( $u['user_login'] !== $asked ) {
+                $report['renamed'][] = [ 'from' => $asked, 'to' => (string) $u['user_login'], 'email' => $email, 'why' => $why ];
             }
             $map[ $old ]       = (int) $wpdb->insert_id;
             $created[ $old ]   = true;
@@ -506,7 +535,7 @@ class Target {
             foreach ( $rows as $r ) {
                 $last = (int) $r['umeta_id'];
                 $old  = (int) $r['user_id'];
-                if ( ! isset( $map[ $old ] ) ) {
+                if ( empty( $map[ $old ] ) ) {
                     continue;
                 }
                 $key      = (string) $r['meta_key'];
@@ -538,30 +567,49 @@ class Target {
             update_user_meta( $map[ $old ], 'primary_blog', (int) $this->id );
         }
 
-        // The site's own tables point at users by ID.
-        $changes = array_filter( $map, function ( $new, $old ) { return (int) $new !== (int) $old; }, ARRAY_FILTER_USE_BOTH );
-        if ( $changes ) {
-            $p = $this->prefix;
-            $columns = [ [ "{$p}posts", 'post_author', '' ], [ "{$p}comments", 'user_id', '' ], [ "{$p}links", 'link_owner', '' ],
-                [ "{$p}postmeta", 'meta_value', "meta_key IN ('_edit_last','_customer_user')" ],
-                [ "{$p}wc_orders", 'customer_id', '' ], [ "{$p}wc_customer_lookup", 'user_id', '' ] ];
-            $offset = 1000000000000;
-            foreach ( $columns as list( $table, $col, $where ) ) {
-                if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) !== $table ) {
-                    continue;
-                }
-                $extra = $where !== '' ? " AND {$where}" : '';
-                // Two passes through a high offset, so 2→5 and 5→9 can't chain.
-                foreach ( array_chunk( $changes, 500, true ) as $chunk ) {
+        // The site's own tables point at users by ID. Every incoming ID is
+        // renumbered (to the user's ID here, or 0 for one who couldn't be
+        // added), and an ID that names no incoming user (an author deleted
+        // on the source) becomes 0: left as it was, it would name whoever
+        // has that ID on this network.
+        $p       = $this->prefix;
+        $columns = [ [ "{$p}posts", 'post_author', '' ], [ "{$p}comments", 'user_id', '' ], [ "{$p}links", 'link_owner', '' ],
+            [ "{$p}postmeta", 'meta_value', "meta_key IN ('_edit_last','_customer_user')" ],
+            [ "{$p}wc_orders", 'customer_id', '' ], [ "{$p}wc_customer_lookup", 'user_id', '' ] ];
+        /**
+         * Filters the columns that hold a user ID in a site whose users are
+         * merged into a network's: [ table, column, extra WHERE ] each, the
+         * table under the site's prefix (passed as the second argument).
+         */
+        $columns = (array) apply_filters( 'disembark_user_id_columns', $columns, $p );
+        $offset  = 1000000000000;
+        $moved   = array_filter( $map, function ( $new, $old ) { return (int) $new !== (int) $old; }, ARRAY_FILTER_USE_BOTH );
+        $same    = array_diff_key( $map, $moved );
+        foreach ( $columns as $c ) {
+            list( $table, $col, $where ) = array_values( (array) $c ) + [ '', '', '' ];
+            $table = (string) $table;
+            $col   = (string) $col;
+            if ( strpos( $table, $p ) !== 0 || ! preg_match( '/^[A-Za-z0-9_]+$/', $col ) || $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) !== $table ) {
+                continue;
+            }
+            $extra = (string) $where !== '' ? " AND ({$where})" : '';
+            // Through a high offset, so 2→5 and 5→9 can't chain; the ones
+            // that keep their ID too, so they aren't taken for orphans.
+            foreach ( [ $moved, $same ] as $i => $set ) {
+                foreach ( array_chunk( $set, 500, true ) as $chunk ) {
                     $case = '';
                     foreach ( $chunk as $old => $new ) {
                         $case .= ' WHEN ' . (int) $old . ' THEN ' . ( (int) $new + $offset );
                     }
-                    $in = implode( ',', array_map( 'intval', array_keys( $chunk ) ) );
-                    $report['renumbered'] += (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = CASE `{$col}`{$case} END WHERE `{$col}` IN ({$in}){$extra}" );
+                    $in      = implode( ',', array_map( 'intval', array_keys( $chunk ) ) );
+                    $changed = (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = CASE `{$col}`{$case} END WHERE `{$col}` IN ({$in}){$extra}" );
+                    if ( $i === 0 ) {
+                        $report['renumbered'] += $changed;
+                    }
                 }
-                $wpdb->query( "UPDATE `{$table}` SET `{$col}` = `{$col}` - {$offset} WHERE `{$col}` >= {$offset}{$extra}" );
             }
+            $report['orphaned'] += (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = 0 WHERE `{$col}` > 0 AND `{$col}` < {$offset}{$extra}" );
+            $wpdb->query( "UPDATE `{$table}` SET `{$col}` = `{$col}` - {$offset} WHERE `{$col}` >= {$offset}{$extra}" );
         }
         // The roles the site defines, under its prefix.
         if ( $old_prefix !== '' && $old_prefix !== $this->prefix ) {

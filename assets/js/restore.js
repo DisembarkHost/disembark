@@ -1100,6 +1100,11 @@
           if (superBrought.length) rlog('Brought ' + D.fmt.plural(superBrought.length, 'super admin') + ' as administrators: ' + superBrought.join(', ') + '.', 'ok');
           // Into the network's main site: the network kept its users, and the incoming ones joined them.
           if (sq.users && !target) ctx.keptUsers = true;
+          if (sq.users) {
+            (sq.users.renamed || []).forEach(function (r) { rlog('The login ' + r.from + ' (' + r.email + ') ' + (r.why || 'was taken') + ' on this network, so that user logs in as ' + r.to + '.', 'ok'); });
+            (sq.users.unattributed || []).forEach(function (r) { rlog(r.login + ' (' + r.email + ') couldn\u2019t be added (' + r.error + '): their posts, comments and orders here have no author now.', 'err'); });
+            if (sq.users.orphaned) rlog(D.fmt.plural(sq.users.orphaned, 'row') + ' named a user the source no longer has, so they have no author now (not someone else here).', 'dim');
+          }
           if (sq.users && (sq.users.created || sq.users.matched)) rlog((target ? '' : 'The network keeps its users. ') + 'Users joined the network: ' + D.fmt.plural(sq.users.created, 'new account') + ', ' + D.fmt.plural(sq.users.matched, 'existing account') + ' matched by email' + (sq.users.renumbered ? ' (' + D.fmt.plural(sq.users.renumbered, 'row') + ' of posts, comments and orders renumbered)' : '') + '.');
           if (srcPrefix && destPrefix && srcPrefix !== destPrefix) {
             var rp = await api.post('import/remap-prefix', t({ old_prefix: srcPrefix, new_prefix: destPrefix }));

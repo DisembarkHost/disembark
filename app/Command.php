@@ -444,6 +444,15 @@ class Command {
             }
             if ( isset( $sq['users'] ) && ( $sq['users']['created'] || $sq['users']['matched'] ) ) {
                 $summary['users'] = $sq['users'];
+                foreach ( (array) ( $sq['users']['renamed'] ?? [] ) as $r ) {
+                    $this->say( "      The login {$r['from']} ({$r['email']}) " . ( $r['why'] ?? 'was taken' ) . " on this network, so that user logs in as {$r['to']}." );
+                }
+                foreach ( (array) ( $sq['users']['unattributed'] ?? [] ) as $r ) {
+                    $this->say( "      ! {$r['login']} ({$r['email']}) couldn't be added ({$r['error']}): their posts, comments and orders here have no author now." );
+                }
+                if ( ! empty( $sq['users']['orphaned'] ) ) {
+                    $this->say( '      ' . self::plural( (int) $sq['users']['orphaned'], 'row' ) . ' named a user the source no longer has, so they have no author now (not someone else here).' );
+                }
                 $this->say( '      ' . ( empty( $sq['target'] ) ? 'The network keeps its users. ' : '' ) . 'Users joined the network: ' . self::plural( (int) $sq['users']['created'], 'new account' ) . ', ' . self::plural( (int) $sq['users']['matched'], 'existing account' ) . ' matched by email' . ( $sq['users']['renumbered'] ? ' (' . self::plural( (int) $sq['users']['renumbered'], 'row' ) . ' of posts, comments and orders renumbered to match)' : '' ) . '.' );
             }
             if ( $src_prefix !== '' && $dest_prefix !== '' && $src_prefix !== $dest_prefix ) {
