@@ -650,6 +650,13 @@ class Import {
         return (bool) preg_match( '#(?:^|/)uploads/(?:sites/\d+/)?disembark(?:/|$)#', $rel );
     }
 
+    /** Whether $rel is inside the Disembark running this import. */
+    private static function own_plugin_path( $rel ) {
+        $own = strtolower( self::own_plugin_dir() );
+        $low = strtolower( self::normalize_rel( $rel ) );
+        return $own !== '' && ( $low === rtrim( $own, '/' ) || strpos( $low, $own ) === 0 );
+    }
+
     /** This plugin's folder relative to the site root ("wp-content/plugins/disembark/"), or ''. */
     private static function own_plugin_dir() {
         static $dir = null;
@@ -1481,6 +1488,7 @@ class Import {
         $errors    = [];
         $backed_up = [];
         $kept      = [];
+        $own_kept  = 0; // files this site keeps its own copy of (see below)
 
         // The dashboard (thin client) can't list staged files, so it passes
         // ["*"] to deploy everything. A whole-snapshot zip nests the site under
@@ -1552,6 +1560,9 @@ class Import {
             // Never put a database dump (or Disembark's own working files) in
             // the web root, even when a client lists it explicitly.
             if ( self::never_deploy( $relative_path ) ) {
+                if ( self::own_plugin_path( $relative_path ) ) {
+                    $own_kept++;
+                }
                 continue;
             }
             // Leave the destination's host setup alone: its mu-plugins and
@@ -1560,6 +1571,7 @@ class Import {
                 $host = self::host_file( $relative_path, $web_root );
                 if ( $host !== '' ) {
                     $kept[ $host ] = true;
+                    $own_kept++;
                     continue;
                 }
             }
@@ -1634,7 +1646,12 @@ class Import {
         }
 
         return [
-            'deployed'        => count( $deployed ),
+            // Files this site deliberately keeps its own copy of (the
+            // Disembark running this move, the host's mu-plugins and
+            // drop-ins) count as in place: the CLI checks that every file
+            // it sent is, and stops the restore otherwise.
+            'deployed'        => count( $deployed ) + $own_kept,
+            'kept_own'        => $own_kept,
             'errors'          => $errors,
             'host_files_kept' => array_keys( $kept ),
             'loaders_disabled' => self::disable_missing_prepends( $web_root, $deployed ),
