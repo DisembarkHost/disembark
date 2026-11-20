@@ -441,6 +441,7 @@
             continue;
           }
           back();
+          busyRun = 0; pauseLevel = 0;
           return r;
         } catch (e) {
           if (!resumable) {
@@ -649,7 +650,7 @@
     function halve(key, why) {
       var before = pace[key];
       pace[key] = clamp(pace[key] / 2, LIMIT[key]);
-      if (pace[key] < before) rlog(why, 'dim');
+      if (pace[key] < before) rlog(typeof why === 'function' ? why() : why, 'dim');
     }
     function ranges(list) {
       var n = 0;
@@ -737,8 +738,8 @@
             rlog('A batch of ' + D.fmt.plural(task.count, 'file') + ' failed twice. Splitting it in two.', 'dim');
             // Cut off by the host (not just a busy answer): too big for it.
             if (task.killed) {
-              halve('files', 'Smaller file batches from now on (' + D.fmt.num(Math.round(pace.files / 2)) + ' files).');
               pace.bytes = clamp(pace.bytes / 2, LIMIT.bytes);
+              halve('files', function () { return 'Smaller file batches from now on (' + D.fmt.num(pace.files) + ' files).'; });
             }
             forced.unshift({ offset: task.offset, count: half, bytes: bytes }, { offset: task.offset + half, count: task.count - half, bytes: bytes });
           } else {
@@ -795,7 +796,7 @@
           tries = n;
           cut = cut || sizeError(e);
           // Twice, and cut off at least once (not just busy): a smaller batch.
-          if (n >= 2 && cut) halve('db', 'A database batch failed twice. Smaller ones from now on (' + D.fmt.size(Math.round(pace.db / 2)) + ').');
+          if (n >= 2 && cut) halve('db', function () { return 'A database batch failed twice. Smaller ones from now on (' + D.fmt.size(pace.db) + ').'; });
           return 'retry';
         });
         r = res.r;
