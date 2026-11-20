@@ -202,6 +202,11 @@ class Backup {
                         $state['total_dirs']++;
                     }
                 } elseif ( is_file( $full_path ) ) {
+                    // Opcode-cache helpers (__opcache_*.php) belong to the
+                    // server they were dropped on, never to a copy.
+                    if ( strpos( basename( $full_path ), '__opcache_' ) === 0 ) {
+                        continue;
+                    }
                     $file_info = [
                         'name'  => $name,
                         'size'  => filesize( $full_path ),

@@ -771,6 +771,7 @@ class Pull {
         }
         $this->source_request( '/cleanup-file', [ 'file_name' => 'manifest.json' ], 'POST', 30 );
         $state  = $this->state();
+        $files  = $this->movable( $files );
         $result = [ 'status' => 'ready', 'source_files' => count( $files ) ];
 
         // Catch-up: keep only files that are new or changed since the last
@@ -1938,7 +1939,33 @@ class Pull {
             copy( $state['file_list'], $all );
         }
         $files = json_decode( (string) file_get_contents( $all ), true );
-        return is_array( $files ) ? $files : [];
+        return is_array( $files ) ? $this->movable( $files ) : [];
+    }
+
+    /**
+     * The files this move can use, whatever the source sent (an older one
+     * sends more): never an opcode-cache helper (__opcache_*), never the
+     * install's wp-config.php with one of its sites, and into a subsite or
+     * tenant only wp-content (it never places core or root files, so they
+     * aren't fetched).
+     */
+    private function movable( $files ) {
+        $state  = $this->state();
+        $scoped = ! empty( $state['scope'] );
+        $into   = Target::load( dirname( $this->state_file ) ) !== null;
+        return array_values( array_filter( $files, function ( $f ) use ( $scoped, $into ) {
+            $name = (string) ( $f['name'] ?? '' );
+            if ( strpos( basename( $name ), '__opcache_' ) === 0 || ( $scoped && $name === 'wp-config.php' ) ) {
+                return false;
+            }
+            return ! $into || strpos( $name, 'wp-content/' ) === 0;
+        } ) );
+    }
+
+    /** Whether the source is one site of an install other than its main site (its web root isn't the site's). */
+    private static function scoped_tenant( $state ) {
+        $scope = (array) ( $state['scope'] ?? [] );
+        return $scope && empty( $scope['main'] ) && (string) ( $scope['site'] ?? '' ) !== 'main';
     }
 
     /**
@@ -1951,7 +1978,7 @@ class Pull {
             return $files;
         }
         $state = $this->state();
-        return Skips::analyze( $files, (array) ( $state['tables'] ?? [] ), (string) ( $state['source_prefix'] ?? '' ) );
+        return Skips::analyze( $files, (array) ( $state['tables'] ?? [] ), (string) ( $state['source_prefix'] ?? '' ), [ 'install_root' => self::scoped_tenant( $state ) ] );
     }
 
     /**

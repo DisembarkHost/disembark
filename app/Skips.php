@@ -110,7 +110,38 @@ class Skips {
      * $files: [ ['name' => 'wp-content/x.php', 'size' => 123], ... ]
      * $tables: [ ['name' => 'wp_posts', 'size' => 123, 'rows' => 4], ... ]
      */
-    public static function analyze( $files, $tables, $prefix ) {
+    /** WordPress's own files in the web root (wp-config.php never travels with one site of an install). */
+    const CORE_ROOT = [ 'index.php', 'license.txt', 'readme.html', 'wp-activate.php', 'wp-blog-header.php', 'wp-comments-post.php',
+        'wp-config-sample.php', 'wp-config.php', 'wp-cron.php', 'wp-links-opml.php', 'wp-load.php', 'wp-login.php', 'wp-mail.php',
+        'wp-settings.php', 'wp-signup.php', 'wp-trackback.php', 'xmlrpc.php' ];
+
+    /**
+     * The install's own things in the web root, when the source is one site
+     * of a network or WP Freighter install (not its main site): everything
+     * at the top level that isn't WordPress core or the site's content
+     * (scripts, other apps, notes, .htaccess). Top-level names.
+     */
+    public static function install_root( $paths ) {
+        $core = array_flip( self::CORE_ROOT );
+        $out  = [];
+        foreach ( array_keys( $paths ) as $p ) {
+            $top = (string) strtok( (string) $p, '/' );
+            if ( $top === '' || in_array( $top, [ 'wp-admin', 'wp-includes', 'wp-content' ], true ) || ( strpos( (string) $p, '/' ) === false && isset( $core[ $top ] ) ) ) {
+                continue;
+            }
+            $out[ $top ] = true;
+        }
+        $out = array_keys( $out );
+        sort( $out );
+        return $out;
+    }
+
+    /**
+     * $opts['install_root']: the source is one site of an install, so its
+     * web root holds the install's things, not the site's: offered as a
+     * suggestion that leaves them behind by default.
+     */
+    public static function analyze( $files, $tables, $prefix, $opts = [] ) {
         $folders = [];  // path => [bytes, files]
         $paths   = [];  // file path => size
         $bytes   = 0;
@@ -183,6 +214,22 @@ class Skips {
                 continue;
             }
             $suggestions[] = array_merge( [ 'id' => $s['id'], 'group' => $s['group'], 'label' => $s['label'], 'why' => $s['why'], 'default' => $s['default'] ], $hit );
+        }
+
+        if ( ! empty( $opts['install_root'] ) && ( $extra = self::install_root( $paths ) ) ) {
+            $hit = [ 'paths' => $extra, 'names' => [], 'tables' => [], 'files' => 0, 'bytes' => 0, 'name_files' => 0, 'name_bytes' => 0, 'table_bytes' => 0, 'rows' => 0 ];
+            foreach ( $extra as $p ) {
+                if ( isset( $folders[ $p ] ) ) {
+                    $hit['bytes'] += $folders[ $p ][0];
+                    $hit['files'] += $folders[ $p ][1];
+                } elseif ( isset( $paths[ $p ] ) ) {
+                    $hit['bytes'] += $paths[ $p ];
+                    $hit['files']++;
+                }
+            }
+            array_unshift( $suggestions, array_merge( [ 'id' => 'install-root', 'group' => 'The install', 'label' => 'The install\'s own files in the web root',
+                'why' => 'This site is one of several sharing that install, and these sit next to WordPress for all of them (scripts, other apps, notes, server settings), not for this site. Tick any you want in the file list.',
+                'default' => true ], $hit ) );
         }
 
         $folder_rows = [];

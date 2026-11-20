@@ -141,6 +141,15 @@ class Command {
      * firewall files and traffic data. Logs and data tables come across
      * empty rather than missing.
      *
+     * [--bring-root[=<names>]]
+     * : With --site (one site of a network or WP Freighter install, not its
+     * main site): also bring the install's own files in its web root (scripts,
+     * other apps, notes, .htaccess: anything at the top level that isn't
+     * WordPress core or the site's content). They stay behind by default.
+     * Without a value, all of them; or top-level names, comma-separated
+     * (for example --bring-root=.htaccess,invites). The install's
+     * wp-config.php never comes.
+     *
      * [--skip-checks]
      * : Go ahead even when the checks before the move find a problem that
      * would stop it (not enough disk space, a database user that can't create
@@ -250,7 +259,7 @@ class Command {
         }
 
         $this->say( '[2/9] Bringing the site over' );
-        $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'skip-quiet-mode', 'bring-host-files', 'catch-up', 'full-database', 'site', 'shared-tables', 'into', 'slug', 'domain' ] ) );
+        $move_args = array_intersect_key( $assoc_args, array_flip( [ 'skip', 'skip-rows', 'template', 'bring-everything', 'bring-root', 'skip-quiet-mode', 'bring-host-files', 'catch-up', 'full-database', 'site', 'shared-tables', 'into', 'slug', 'domain' ] ) );
         $c = $this->check( $this->step( function () use ( $pull, $source, $move_args ) {
             return $pull->connect( $source['url'], $source['token'], [ 'client' => 'cli', 'kind' => 'pull', 'args' => $move_args ], ! empty( $move_args['catch-up'] ), isset( $move_args['site'] ) ? (string) $move_args['site'] : null, ! empty( $move_args['shared-tables'] ) );
         } ), 'connect' );
@@ -829,6 +838,22 @@ class Command {
             $ids = [];
         }
         $choice = Skips::resolve( $contents, $ids, $paths, $rows );
+        // The install's own root files (see Skips::install_root()) stay
+        // behind unless --bring-root asks for them, all or by name.
+        $root = [];
+        foreach ( $contents['suggestions'] as $s ) {
+            if ( $s['id'] === 'install-root' ) {
+                $root = $s['paths'];
+            }
+        }
+        $brought = [];
+        if ( isset( $assoc_args['bring-root'] ) && $root ) {
+            $brought = in_array( $assoc_args['bring-root'], [ true, '' ], true ) ? $root : array_values( array_intersect( $root, $split( 'bring-root' ) ) );
+            $choice['skip_paths'] = array_values( array_diff( $choice['skip_paths'], $brought ) );
+            foreach ( array_diff( $split( 'bring-root' ), $root ) as $unknown ) {
+                $this->say( "      --bring-root: {$unknown} isn't one of the install's root files here (" . implode( ', ', $root ) . ').' );
+            }
+        }
         $sel    = $this->check( $this->step( function () use ( $pull, $choice ) { return $pull->select( $choice['skip_paths'], $choice['skip_names'], $choice['skip_rows'] ); } ), 'scan' );
 
         $this->say( '      ' . self::plural( (int) $sel['files'], 'file' ) . ' to copy (' . size_format( (int) $sel['bytes'] ) . ').' );
@@ -837,8 +862,18 @@ class Command {
             $this->say( '      Leaving behind ' . self::plural( (int) $left['files'], 'file' ) . ' (' . size_format( (int) $left['bytes'] ) . ')' . ( $left['rows'] ? ' and the rows of ' . self::plural( count( $left['rows'] ), 'table' ) : '' ) . ':' );
             foreach ( $contents['suggestions'] as $s ) {
                 if ( $ids === null ? $s['default'] : in_array( $s['id'], (array) $ids, true ) ) {
+                    if ( $s['id'] === 'install-root' ) {
+                        $kept = array_values( array_diff( $s['paths'], $brought ) );
+                        if ( $kept ) {
+                            $this->say( '        ' . $s['label'] . ': ' . implode( ', ', array_slice( $kept, 0, 12 ) ) . ( count( $kept ) > 12 ? ', …' : '' ) . ' (--bring-root brings them, or --bring-root=<names> some)' );
+                        }
+                        continue;
+                    }
                     $this->say( '        ' . $s['label'] . ' (' . size_format( $s['bytes'] + $s['table_bytes'] ) . ')' );
                 }
+            }
+            if ( $brought ) {
+                $this->say( '      Bringing the install\'s root files you asked for: ' . implode( ', ', $brought ) . '.' );
             }
             foreach ( $paths as $p ) {
                 $this->say( '        ' . $p );

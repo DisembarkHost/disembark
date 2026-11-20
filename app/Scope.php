@@ -213,6 +213,8 @@ class Scope {
         } else {
             $this->setup_freighter();
         }
+        // The install's own wp-config.php never leaves with one of its sites.
+        $this->drop_files[] = 'wp-config.php';
         $this->pools_from_usage();
     }
 
@@ -767,6 +769,8 @@ class Scope {
             'home'          => $this->home,
             'prefix'        => $this->prefix,
             'label'         => ( $this->name !== '' ? $this->name . ', ' : '' ) . $what . ' of the ' . $install . ' at ' . wp_parse_url( $this->main_home, PHP_URL_HOST ),
+            // The main site shares the install's web root; other sites don't own it.
+            'main'          => $this->kind === 'multisite' ? $this->prefix === $this->base : $this->id === 'main',
             'install_home'  => $this->main_home,
             'files'         => $this->freighter['files'] ?? null,
             'bases'         => array_values( array_filter( $this->bases ) ),

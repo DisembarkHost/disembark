@@ -162,6 +162,12 @@
           paths.add(n.path);
         } else if (cov.path === n.path && !cov.by) {
           paths.delete(n.path);
+        } else if (cov.path === n.path && cov.by && cov.by.paths.length > 1 && !(cov.by.names || []).length && !(cov.by.tables || []).length) {
+          // A list of files and folders (the install's root files, archives
+          // in the root): this one comes, the rest still stay behind.
+          on.delete(cov.by.id);
+          cov.by.paths.forEach(function (p) { if (p !== n.path) paths.add(p); });
+          D.toast('Bringing ' + n.path + '. The rest of “' + cov.by.label + '” stays behind.');
         } else if (cov.path === n.path && cov.by) {
           on.delete(cov.by.id);
           D.toast('Unticked “' + cov.by.label + '”.');
