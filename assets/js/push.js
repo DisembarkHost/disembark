@@ -19,6 +19,20 @@
       /^(127|10)\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host) || /^169\.254\./.test(host) || /^f[cd][0-9a-f]{2}:/.test(host);
   }
 
+  D.isLocal = isLocal;
+
+  /**
+   * Why this site can't push to siteUrl, or '': a site on this computer or
+   * a private network pushing to a public one. A push makes the destination
+   * download from here, and a live host can't reach a local site. The zip
+   * route works today; a push that uploads from here is planned.
+   */
+  D.localToLive = function (siteUrl) {
+    if (!isLocal(D.config.homeUrl) || isLocal(siteUrl)) return '';
+    var dest = D.host(siteUrl), here = D.host(D.config.homeUrl);
+    return dest + ' is on the internet and ' + here + ' is on your computer or network, so ' + dest + ' can’t download from it (a push has the destination download). Send it as a backup zip instead: Backups → Download a backup zip here, then on ' + dest + ' open Move → A backup zip. A push that uploads from here is planned.';
+  };
+
   D.remoteApi = async function (siteUrl, token) {
     var base = String(siteUrl).replace(/\/+$/, '');
     var host = D.host(base);
@@ -87,7 +101,8 @@
    * reached (the form stays). back() goes back to the Move form.
    */
   D.pushRun = async function (view, st, btn, back) {
-    var api;
+    var api, local = D.localToLive(st.site);
+    if (local) { D.toast(local, 'error'); return false; }
     try { api = await D.busy(btn, function () { return D.remoteApi(st.site, st.token); }); }
     catch (err) { D.toast(D.errorText(err), 'error'); return false; }
     if (!api) return false;

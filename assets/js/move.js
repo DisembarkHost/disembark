@@ -238,6 +238,9 @@
           D.config.refused || ('Run the move from the main site’s Disembark and pick “Replace” there.')))));
     }
     if (k === 'pull' || k === 'push') { body.push(connectField()); ready = !!S.connect; why = 'Paste a connect line first'; }
+    // A local site can't push to a live one (the live one can't reach it): the zip route instead.
+    var localToLive = k === 'push' && S.connect ? D.localToLive(S.connect.url) : '';
+    if (localToLive) { ready = false; why = 'Use a backup zip instead'; }
     else { body.push(zipField()); ready = !!S.file; why = 'Choose a backup zip first'; }
     if (S.to === 'new') body.push(intoField());
     var last = k === 'pull' && S.connect && S.to === 'this' ? D.pull.lastPullFor(S.connect.url) : null;
@@ -250,6 +253,7 @@
     // The one warning that matters.
     if (S.to === 'new' && S.into === 'new') warn = h('div', { class: 'dsk-warn1 calm' }, D.icon('check'), h('div', null, h('strong', null, 'Nothing here is replaced.'), 'It arrives as a new ' + one + ' with its own tables, uploads and settings' + (net ? ', and its users join the network’s' : '') + '. Rolling back removes the ' + one + '.'));
     else if (S.to === 'new') warn = h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null, h('strong', null, 'This replaces ' + intoLabel() + '.'), 'Its tables, uploads and settings are overwritten. The main site and the other ' + one + 's aren’t touched.'));
+    else if (localToLive) warn = h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null, h('strong', null, 'A live site can’t reach this one.'), localToLive, ' ', h('a', { href: '#backups' }, 'Go to Backups')));
     else if (k === 'push') warn = h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null, h('strong', null, 'This replaces ' + (r || 'the destination') + '.'), 'Its files and database are overwritten with this site, including its user accounts: afterwards you log in there with this site’s credentials.'));
     else warn = h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null, h('strong', null, isMain ? 'This replaces the main site of the ' + (net ? 'network' : 'install') + '.' : 'This replaces this site.'), 'Its files and database are overwritten with ' + (k === 'pull' ? (r || 'the source') + '’s' : 'the backup’s') + '. ' + (isMain && net ? 'The network keeps its users, super admins and subsite members; the incoming site’s users join them (matched by email, never as super admins).' : 'User accounts come over too, so afterwards you log in with the source site’s credentials.') + (isMain ? ' To keep what’s here, choose “A new ' + one + '” instead.' : '')));
 

@@ -228,6 +228,18 @@ class Pull {
         return $ips[0];
     }
 
+    /** Whether $url's host is on this computer or a private network by its name or address (localhost, *.local, *.test, a private IP). */
+    public static function local_address( $url ) {
+        $host = trim( strtolower( (string) wp_parse_url( (string) $url, PHP_URL_HOST ) ), '[]' );
+        if ( $host === '' ) {
+            return false;
+        }
+        if ( filter_var( $host, FILTER_VALIDATE_IP ) ) {
+            return self::internal_ip( $host );
+        }
+        return $host === 'localhost' || (bool) preg_match( '/\.(?:localhost|local|test|internal|lan|home\.arpa)$/', $host );
+    }
+
     /** Whether $ip is private, loopback, link-local, shared (CGNAT), reserved or multicast. */
     private static function internal_ip( $ip ) {
         $ip = strtolower( (string) $ip );
@@ -559,6 +571,13 @@ class Pull {
             }
         }
         if ( $style === null ) {
+            // A site on someone's computer or private network can't be
+            // reached from a live host (a push from it has this site
+            // download from it).
+            if ( self::local_address( $source_url ) && ! self::local_address( home_url() ) ) {
+                $src = (string) wp_parse_url( $source_url, PHP_URL_HOST );
+                return new \WP_Error( 'source_local', $src . ' is on a computer or private network that this site can\'t reach, so it can\'t be pulled from here (and can\'t push here). Send it as a backup zip instead: download one in Disembark on ' . $src . ' (Backups → Download a backup zip) and restore it here (Move → A backup zip). A push that uploads from a local site is planned.', [ 'status' => 400 ] );
+            }
             return new \WP_Error( 'connect_failed', 'Could not reach the source or the token was rejected. Check the URL, token, and that Disembark is active on the source.', [ 'status' => 400 ] );
         }
 
