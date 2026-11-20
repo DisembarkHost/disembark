@@ -3737,15 +3737,41 @@ class Import {
             // (DROP-before-CREATE), never all up front, so a rollback that
             // stops midway leaves every table present and can be run again.
             $run = $this->begin_statements();
+            // Rows go back many at a time, as the import sends them (one
+            // statement per row made a large table take minutes).
+            $packet  = (int) $wpdb->get_var( 'SELECT @@max_allowed_packet' );
+            $max     = (int) max( 65536, min( 1048576, $packet > 0 ? $packet / 2 : 1048576 ) );
+            $pending = null;
+            $flush   = function () use ( &$pending, &$run ) {
+                if ( ! $pending ) {
+                    return true;
+                }
+                $sql     = $pending['head'] . implode( ',', $pending['rows'] );
+                $pending = null;
+                return $this->run_statement( $sql, $run );
+            };
             foreach ( $sql_files as $sql_file ) {
-                $read = self::each_sql_statement_in_file( $sql_file, function ( $statement ) use ( &$run ) {
+                $read = self::each_sql_statement_in_file( $sql_file, function ( $statement ) use ( &$run, &$pending, $flush, $max ) {
                     foreach ( self::transform_statements( [ $statement ] ) as $transformed ) {
-                        if ( ! $this->run_statement( $transformed, $run ) ) {
+                        $transformed = trim( $transformed );
+                        if ( strlen( $transformed ) < $max && preg_match( '/^(INSERT\s+INTO\s+`(?:[^`]|``)+`\s+VALUES\s*)(\(.*\))$/s', $transformed, $im ) ) {
+                            if ( $pending && ( $pending['head'] !== $im[1] || $pending['bytes'] + strlen( $im[2] ) >= $max || count( $pending['rows'] ) >= 2000 ) && ! $flush() ) {
+                                return false;
+                            }
+                            if ( ! $pending ) {
+                                $pending = [ 'head' => $im[1], 'rows' => [], 'bytes' => strlen( $im[1] ) ];
+                            }
+                            $pending['rows'][] = $im[2];
+                            $pending['bytes'] += strlen( $im[2] ) + 1;
+                            continue;
+                        }
+                        if ( ! $flush() || ! $this->run_statement( $transformed, $run ) ) {
                             return false;
                         }
                     }
                     return true;
                 } );
+                $flush();
                 if ( is_wp_error( $read ) ) {
                     $run['errors'][] = $read->get_error_message();
                     break;
