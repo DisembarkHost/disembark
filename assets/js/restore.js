@@ -1385,12 +1385,12 @@
     var showAll = false;
     var card = h('section', { class: 'dsk-card dsk-sec' },
       h('div', { class: 'dsk-sec-h' }, h('div', { class: 'spotmini', html: D.H.spot('points') }),
-        h('div', null, h('h3', null, 'Restore points'), h('p', null, 'One is saved before every pull, restore and search and replace. Roll back puts this site back exactly as it was then, files and database both.')),
+        h('div', null, h('h3', null, 'Restore points'), h('p', null, 'One is saved before every pull, restore and search and replace. Roll back puts this site back as it was then: the database, and the files the moves since changed.')),
         h('span', { class: 'r' }, count)),
       body);
+    var points = [];
     async function load() {
       D.mount(body, h('div', { class: 'dsk-tl-empty' }, h('span', { class: 'dsk-spin' }), ' Loading…'));
-      var points;
       try { points = await D.api.get('restore-points'); }
       catch (e) { D.mount(body, h('div', { class: 'dsk-tl-empty' }, D.note('error', 'Could not list restore points: ' + D.errorText(e)))); return; }
       var bytes = points.reduce(function (n, p) { return n + (p.size || 0); }, 0);
@@ -1405,28 +1405,69 @@
           h('div', null,
             h('b', null, p.label || 'Restore point'),
             i === 0 ? h('span', { class: 'dsk-tag ok', style: { marginLeft: '8px' } }, 'latest') : null,
-            p.rolled_back_at ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' } }, 'rolled back ' + D.fmt.ago(p.rolled_back_at)) : null,
-            h('div', { class: 'when' }, D.fmt.date(p.created_at) + ' · ' + D.fmt.size(p.size) + ' · ' + (p.files ? 'files and database' : 'database only')),
+            p.rolled_back_at ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' } }, (hasFiles(p) && !p.files_spent ? 'database rolled back ' : 'rolled back ') + D.fmt.ago(p.rolled_back_at)) : null,
+            hasFiles(p) && p.files_spent ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' }, title: 'A rollback moved this point\u2019s saved files back into place, so it can put back the database only.' }, 'files put back') : null,
+            h('div', { class: 'when' }, D.fmt.date(p.created_at) + ' · ' + D.fmt.size(p.size) + ' · ' + (!hasFiles(p) ? 'database only' : p.files_spent ? 'database (its files were put back)' : 'files and database')),
             p.left_alone ? h('div', { class: 'when' }, D.OLD_POINT_NOTE) : null),
           h('div', { class: 'acts' },
             h('button', { class: 'dsk-btn sm', type: 'button', onclick: function (e) { rollback(p, e.currentTarget); } }, D.icon('restore'), 'Roll back'),
             h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function (e) { remove(p, e.currentTarget); } }, 'Delete')));
       })), points.length > limit ? h('div', { class: 'dsk-tl-more' }, h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function () { showAll = true; load(); } }, 'Show all ' + points.length)) : null);
     }
+    function hasFiles(p) { return !!(p.files || p.deployed); }
+    /** The restore points made after p that rolling back to it undoes first, newest first (matches Import::later_points()). */
+    function laterThan(p, files) {
+      return points.filter(function (q) {
+        return q.id !== p.id && q.created_at > p.created_at && (!q.rolled_back_at || (files && hasFiles(q) && !q.files_spent));
+      }).sort(function (a, b) { return b.created_at - a.created_at; });
+    }
     async function rollback(p, btn) {
+      var choice = hasFiles(p) && !p.files_spent && !p.creates_site, files = true;
+      var laterBox = h('div');
+      function showLater() {
+        var later = laterThan(p, files);
+        D.mount(laterBox, later.length ? h('div', { class: 'dsk-stack', style: { gap: '4px' } },
+          h('p', null, 'First it undoes ', h('strong', null, D.fmt.plural(later.length, 'later move')), ', newest first:'),
+          h('ul', { style: { margin: '0 0 0 18px', padding: 0 } }, later.slice(0, 8).map(function (q) {
+            return h('li', null, (q.label || 'Restore point') + ' ', h('span', { class: 'muted' }, '(' + D.fmt.date(q.created_at) + ')'));
+          }), later.length > 8 ? h('li', { class: 'muted' }, 'and ' + D.fmt.plural(later.length - 8, 'more')) : null)) : null);
+      }
+      var opt = function (value, title, text) {
+        var input = h('input', { type: 'radio', name: 'dsk-rb-files', value: value, style: { marginTop: '3px' } });
+        input.checked = (value === 'all') === files;
+        input.addEventListener('change', function () { files = value === 'all'; showLater(); });
+        return h('label', { style: { display: 'flex', gap: '10px', alignItems: 'flex-start', padding: '9px 0', borderTop: '1px solid var(--line)', cursor: 'pointer' } }, input,
+          h('span', null, h('strong', null, title), h('small', { class: 'muted', style: { display: 'block', marginTop: '2px' } }, text)));
+      };
+      showLater();
       var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
         h('p', null, 'Put this site back to how it was on ', h('strong', null, D.fmt.date(p.created_at)), '?'),
-        h('p', { class: 'muted' }, 'The database is replaced with the snapshot' + (p.files ? ' and the files a restore changed are put back' : '') + '. Anything changed since is lost.')),
+        choice ? h('div', null,
+          opt('all', 'Database and files', 'The database goes back to the snapshot, the files the move replaced come back and the ones it added go.'),
+          opt('db', 'Database only', 'The files stay as they are now, and the restore point keeps its saved files for a later rollback. An older database with newer plugin files usually works, though a plugin may ask to update its database.'))
+          : h('p', { class: 'muted' }, p.creates_site ? 'The subsite or tenant this move created goes completely: its tables, folders and files.'
+            : hasFiles(p) && p.files_spent ? 'Only the database goes back: an earlier rollback already put this point’s files back (a rollback moves them into place, so it can only happen once).'
+            : 'The database is replaced with the snapshot.'),
+        laterBox,
+        h('p', { class: 'muted' }, 'Anything changed since is lost.')),
         { title: 'Roll back?', confirmLabel: 'Roll back', danger: true });
       if (!ok) return;
+      var label = btn.lastChild, was = label && label.nodeType === 3 ? label.textContent : null;
       await D.busy(btn, async function () {
         try {
-          var r = await D.paced(D.api, 'import/rollback', { import_id: p.id });
+          var r = await D.paced(D.api, 'import/rollback', { import_id: p.id, files: files, later: true }, function (x) {
+            if (was === null) return;
+            label.textContent = x.steps ? 'Undoing ' + x.step + ' of ' + x.steps + '…' : (x.phase === 'files' ? 'Files ' + D.fmt.num(x.files_done || 0) + ' of ' + D.fmt.num(x.files_total || 0) : 'Database…');
+          });
           if (r.errors && r.errors.length) throw new Error(D.fmt.plural(r.errors.length, 'error') + ': ' + r.errors.slice(0, 2).join(' · '));
-          D.toast('Rolled back to ' + D.fmt.date(p.created_at) + '.' + (r.warnings && r.warnings.length ? ' ' + r.warnings.join(' ') : ''));
+          D.toast('Rolled back to ' + D.fmt.date(p.created_at) + (r.files === false ? ' (database only)' : '') + '.' + (r.warnings && r.warnings.length ? ' ' + r.warnings.join(' ') : ''));
+          // User accounts went back with a whole-site move's database: log in again.
+          var moves = [p].concat(r.undone || []).some(function (q) { return /^Before (restore|pull|push|catch-up)/i.test(q.label || ''); });
+          if (moves && !r.logins_kept) { setTimeout(function () { location.href = D.config.loginUrl; }, 2500); return; }
           if (D.store.state.database.length) D.loadDatabase(true).catch(function () {});
           load();
-        } catch (e) { D.toast('Rollback failed: ' + D.errorText(e), 'error'); }
+        } catch (e) { D.toast('Rollback failed: ' + D.errorText(e), 'error'); load(); }
+        finally { if (was !== null) label.textContent = was; }
       });
     }
     async function remove(p, btn) {
