@@ -1056,6 +1056,9 @@ class Pull {
                 'files_fetched'  => is_file( $dir . '/fetched.php' ) ? Pace::ranges_count( json_decode( (string) Import::read_protected( $dir . '/fetched.php' ), true ) ) : (int) ( $state['fetched'] ?? 0 ),
                 'database'       => ! empty( $state['db_done'] ),
                 'rollback_point' => $has_point,
+                // Tables of other sites its restore point holds (one from
+                // before 3.0's scope fix), which a rollback leaves alone.
+                'left_alone'     => $has_point ? ( new Import( $id ) )->rollback_leaves() : 0,
                 // Past its restore point, it's kept until it's resumed,
                 // discarded or rolled back, however long that takes.
                 'idle_days'      => (int) floor( max( 0, time() - $touched ) / DAY_IN_SECONDS ),

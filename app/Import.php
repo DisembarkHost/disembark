@@ -4393,6 +4393,9 @@ class Import {
                 'files'          => count( (array) ( $meta['backed_up_files'] ?? [] ) ),
                 'deployed'       => count( (array) ( $meta['deployed_files'] ?? [] ) ),
                 'size'           => $size,
+                // A restore point from before 3.0's scope fix that holds
+                // other sites' tables: a rollback leaves those alone.
+                'left_alone'     => ( new self( substr( basename( $dir ), strlen( '_import_' ) ) ) )->rollback_leaves( $meta ),
             ];
         }
         usort( $points, function ( $a, $b ) { return $b['created_at'] - $a['created_at']; } );
@@ -5072,31 +5075,227 @@ class Import {
         return [ 'keys_changed' => $changed ];
     }
 
+    /**
+     * Whose tables and folders a rollback of this restore point may touch,
+     * by the install's rules as they are now, whatever the point holds.
+     * Restore points from before 3.0's scope fix (and every 2.9 one) hold
+     * every table in the database, and one made for a move into a subsite
+     * or tenant also holds the network's users or the main site's options.
+     * Worked out once, before anything changes: after the snapshot's
+     * options table is back, an install whose old options didn't list its
+     * tenants no longer looks like one.
+     *
+     * - kind "target": a move into a subsite or tenant, its prefix only;
+     * - kind "install": this site of a network or WP Freighter install
+     *   (main site, subsite or tenant), its own prefix and never another
+     *   site's (prefix_N_, stacked_N_) or the network's tables. The
+     *   network's users come back only when this point's move replaced
+     *   them and left no journal to take its rows out again ("users");
+     * - kind "plain": every table the point holds;
+     * - kind "partial": a point of only the tables a change touched
+     *   (Browse's search and replace), all of them.
+     * Any of the first three leaves alone the tables of another WordPress in the same
+     * database ("others": wp_staging_ beside wp_). "folders": the folder
+     * whose numbered children belong to the install's sites (content/ on
+     * WP Freighter, uploads/sites/ on a network), and "site" the one of
+     * them that is this site's own.
+     */
+    private function rollback_owner( $meta ) {
+        global $wpdb;
+        $now    = array_map( 'strval', (array) $wpdb->get_col( 'SHOW TABLES' ) );
+        $held   = array_map( 'strval', array_merge( (array) ( $meta['tables'] ?? [] ), (array) ( $meta['saved_tables'] ?? [] ) ) );
+        $prefix = strtolower( (string) $wpdb->prefix );
+        $owner  = [ 'kind' => 'plain', 'prefix' => $prefix, 'network' => false, 'base' => '', 'shared' => [], 'freighter' => false, 'users' => false, 'others' => [], 'folders' => '', 'site' => '' ];
+        $multi  = is_multisite();
+        if ( ! empty( $meta['partial'] ) ) {
+            // Only the tables a change touched (Browse's search and replace,
+            // maybe across every table in the database): all of them go back.
+            $owner['kind'] = 'partial';
+            return $owner;
+        }
+        if ( ! empty( $meta['target'] ) ) {
+            $owner['kind']      = 'target';
+            $owner['prefix']    = strtolower( (string) ( $meta['target']['prefix'] ?? '' ) );
+            $owner['network']   = ( $meta['target']['kind'] ?? '' ) === 'multisite';
+            $owner['freighter'] = ! $owner['network'];
+            $owner['site']      = (string) ( $meta['target']['id'] ?? '' );
+        } elseif ( $multi || Scope::freighter_primary() !== '' ) {
+            $owner['kind']      = 'install';
+            $owner['network']   = $multi;
+            $owner['freighter'] = ! $multi;
+            $owner['site']      = $multi ? (string) get_current_blog_id() : ( preg_match( '/^stacked_(\d+)_$/', $prefix, $m ) && $prefix !== strtolower( Scope::freighter_primary() ) ? $m[1] : '' );
+        }
+        if ( $owner['network'] || ( $multi && $owner['kind'] === 'install' ) ) {
+            $owner['base']   = strtolower( (string) $wpdb->base_prefix );
+            // The network's own tables (Target::tables() leaves the same out).
+            $owner['shared'] = array_values( array_unique( array_merge( (array) $wpdb->global_tables, (array) $wpdb->ms_global_tables, [ 'blogs', 'blogmeta', 'site', 'sitemeta', 'signups', 'registration_log', 'blog_versions', 'sitecategories', 'domain_mapping', 'domain_mapping_logins' ] ) ) );
+            $owner['folders'] = wp_normalize_path( ( defined( 'UPLOADS' ) ? ABSPATH . UPLOADS : WP_CONTENT_DIR . '/uploads' ) ) . '/sites';
+        } elseif ( $owner['freighter'] ) {
+            $owner['folders'] = wp_normalize_path( ABSPATH ) . 'content';
+        }
+        if ( $owner['kind'] === 'install' && $owner['network'] && $owner['prefix'] === $owner['base'] ) {
+            $owner['users'] = $this->move_replaced_users( $held, $owner['base'] );
+        }
+        // Another WordPress in the same database: a prefix with its own
+        // options and posts tables, now or in the point.
+        $names = array_flip( array_map( 'strtolower', array_merge( $now, $held ) ) );
+        foreach ( array_keys( $names ) as $n ) {
+            if ( substr( $n, -7 ) === 'options' && ( $p = substr( $n, 0, -7 ) ) !== '' && $p !== $owner['prefix'] && isset( $names[ $p . 'posts' ] ) ) {
+                $owner['others'][] = $p;
+            }
+        }
+        return $owner;
+    }
+
+    /**
+     * Whether the move behind this restore point replaced a network's users
+     * wholesale, so its rollback puts them back: a 2.9 build's move (which
+     * replaced every table and recorded none), one whose import replaced
+     * them, or one that merged them without a journal. A merge 3.0 journaled
+     * is taken out row by row instead (Target::undo_merge()).
+     */
+    private function move_replaced_users( $held, $base ) {
+        if ( ! in_array( strtolower( $base . 'users' ), array_map( 'strtolower', $held ), true ) ) {
+            return false;
+        }
+        if ( is_file( $this->rollback_path . '/users-merge.php' ) ) {
+            return false;
+        }
+        if ( ! is_file( $this->import_path . '/imported-tables.json' ) && ! is_file( $this->import_path . '/sql-state.php' ) ) {
+            return true;
+        }
+        $imported = array_map( 'strtolower', $this->imported_tables() );
+        return in_array( strtolower( $base . 'users' ), $imported, true ) || in_array( strtolower( $base . self::INCOMING_USERS . 'users' ), $imported, true );
+    }
+
+    /** Whether a rollback by $owner (see rollback_owner()) may restore or drop $table. */
+    private static function rollback_owns( $owner, $table ) {
+        if ( $owner['kind'] === 'partial' ) {
+            return true;
+        }
+        $t      = strtolower( (string) $table );
+        $prefix = (string) $owner['prefix'];
+        // The longest prefix it starts with decides whose it is.
+        $best = null;
+        foreach ( array_merge( (array) $owner['others'], [ $prefix ] ) as $p ) {
+            if ( $p !== '' && strpos( $t, $p ) === 0 && ( $best === null || strlen( $p ) > strlen( $best ) ) ) {
+                $best = $p;
+            }
+        }
+        if ( $best !== null && $best !== $prefix ) {
+            return false;
+        }
+        if ( $owner['kind'] === 'plain' ) {
+            return true;
+        }
+        if ( $prefix === '' || strpos( $t, $prefix ) !== 0 ) {
+            return false;
+        }
+        $rest = substr( $t, strlen( $prefix ) );
+        if ( $owner['kind'] === 'target' ) {
+            // On a network, wp_1_ doesn't exist and wp_10_ starts with wp_1.
+            return ! ( $owner['network'] && preg_match( '/^\d+_/', $rest ) );
+        }
+        if ( $owner['network'] ) {
+            if ( $prefix !== $owner['base'] ) {
+                return true; // a subsite: its own prefix is its own
+            }
+            if ( preg_match( '/^\d+_/', $rest ) ) {
+                return false;
+            }
+            if ( in_array( $rest, (array) $owner['shared'], true ) || strpos( $rest, 'wu_' ) === 0 ) {
+                return $owner['users'] && in_array( $rest, [ 'users', 'usermeta' ], true );
+            }
+            return true;
+        }
+        return ! ( preg_match( '/^stacked_(\d+)_/', $t, $m ) && 'stacked_' . $m[1] . '_' !== $prefix );
+    }
+
+    /** Whether the file at $path (absolute) is in another site's folder of the install (see rollback_owner()). */
+    private static function rollback_other_site_path( $owner, $path ) {
+        $root = (string) ( $owner['folders'] ?? '' );
+        if ( $root === '' ) {
+            return false;
+        }
+        $path = wp_normalize_path( (string) $path );
+        if ( strpos( $path, $root . '/' ) !== 0 ) {
+            return false;
+        }
+        $id = strtok( substr( $path, strlen( $root ) + 1 ), '/' );
+        return preg_match( '/^\d+$/', (string) $id ) && (string) (int) $id !== (string) $owner['site'];
+    }
+
+    /** What a rollback by $owner leaves alone of the restore point's tables. */
+    private static function rollback_left_tables( $owner, $meta ) {
+        $held = array_values( array_unique( array_map( 'strval', array_merge( (array) ( $meta['tables'] ?? [] ), (array) ( $meta['saved_tables'] ?? [] ) ) ) ) );
+        return array_values( array_filter( $held, function ( $t ) use ( $owner ) { return ! self::rollback_owns( $owner, $t ); } ) );
+    }
+
+    /**
+     * How many of this restore point's tables a rollback would leave alone
+     * as other sites' (see rollback_owner()): 0 for a point that holds only
+     * this site's, as every point 3.0 saves does.
+     */
+    public function rollback_leaves( $meta = null ) {
+        $meta = $meta === null ? self::rollback_meta( $this->rollback_path ) : $meta;
+        if ( ! is_array( $meta ) ) {
+            return 0;
+        }
+        return count( self::rollback_left_tables( $this->rollback_owner( $meta ), $meta ) );
+    }
+
+    /** What a rollback left alone, in words: [] when nothing. */
+    private static function rollback_left_words( $owner, $tables, $files ) {
+        $whose = ( $owner['kind'] ?? 'plain' ) === 'plain' ? 'another WordPress in this database' : 'other sites on this install';
+        $out   = [];
+        if ( $tables ) {
+            $out[] = 'Left alone: ' . $tables . ' ' . ( $tables === 1 ? 'table that belongs' : 'tables that belong' ) . ' to ' . $whose . '.';
+        }
+        if ( $files ) {
+            $out[] = 'Left alone: ' . $files . ' ' . ( $files === 1 ? 'file' : 'files' ) . ' in other sites\' folders on this install.';
+        }
+        return $out;
+    }
+
+    /** The table or view a restore point's statement creates, fills or drops, or null. */
+    private static function dump_statement_table( $statement ) {
+        $statement = self::strip_leading_comments( (string) $statement );
+        if ( preg_match( '/^(?:DROP\s+VIEW(?:\s+IF\s+EXISTS)?|CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW)\s+`((?:[^`]|``)+)`/i', $statement, $m ) ) {
+            return str_replace( '``', '`', $m[1] );
+        }
+        return self::statement_table( $statement );
+    }
+
     /** After a rollback's tables are back: drops the tables the move added (see rollback()). */
-    private function drop_added_tables( $meta ) {
+    private function drop_added_tables( $meta, $owner ) {
         global $wpdb;
         $kept = array_flip( array_map( 'strval', (array) ( $meta['tables'] ?? [] ) ) );
-        if ( ! empty( $meta['target'] ) ) {
-            $only = (string) ( $meta['target']['prefix'] ?? '' );
-            if ( $only === '' ) {
+        $owned = [];
+        if ( $owner['kind'] === 'target' ) {
+            if ( $owner['prefix'] === '' ) {
                 return;
             }
-            $owned = [];
-            foreach ( (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $only ) . '%' ) ) as $t ) {
-                // On a network, wp_1_ doesn't exist and wp_10_ starts with wp_1.
-                if ( ( $meta['target']['kind'] ?? '' ) === 'multisite' && preg_match( '/^' . preg_quote( $only, '/' ) . '\d+_/', (string) $t ) ) {
-                    continue;
+            foreach ( (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $owner['prefix'] ) . '%' ) ) as $t ) {
+                if ( self::rollback_owns( $owner, $t ) ) {
+                    $owned[ (string) $t ] = true;
                 }
-                $owned[ (string) $t ] = true;
             }
         } else {
-            // A restore point that doesn't list its tables can't tell added ones apart.
-            if ( empty( $meta['tables'] ) ) {
+            // A restore point that doesn't list its tables can't tell added
+            // ones apart, and one without this site's options table isn't
+            // this site's (another site of the install saved it).
+            $held = array_map( 'strtolower', (array) ( $meta['tables'] ?? [] ) );
+            if ( ! $held || ! in_array( $owner['prefix'] . 'options', $held, true ) ) {
                 return;
             }
-            $owned = array_flip( self::own_tables() );
-            foreach ( $this->imported_tables() as $t ) {
-                if ( ! self::other_sites_table( $t ) ) {
+            // This site's own tables, and the ones this move imported:
+            // never another site's of the install or another WordPress's,
+            // one made after the restore point included. On an install,
+            // only tables under this site's own prefix.
+            $imported = array_flip( $this->imported_tables() );
+            foreach ( (array) $wpdb->get_col( 'SHOW TABLES' ) as $t ) {
+                $t = (string) $t;
+                if ( ( strpos( strtolower( $t ), $owner['prefix'] ) === 0 || isset( $imported[ $t ] ) ) && self::rollback_owns( $owner, $t ) ) {
                     $owned[ $t ] = true;
                 }
             }
@@ -5180,6 +5379,11 @@ class Import {
             if ( is_wp_error( $check ) ) {
                 return $check;
             }
+            // Only this site's tables come back, by the install's rules as
+            // they are now, whatever the restore point holds (see
+            // rollback_owner()).
+            $owner = $this->rollback_owner( $meta );
+            $left  = self::rollback_left_tables( $owner, $meta );
             $st = [
                 'phase'    => 'database',
                 'files'    => array_map( 'basename', $sql_files ),
@@ -5191,7 +5395,13 @@ class Import {
                 // as it is now (tenants made since the restore point
                 // included), not as its options table had it then.
                 'registry' => ! empty( $meta['target'] ) ? [] : $this->registry_rows(),
+                'owner'    => $owner,
+                'left'     => $left,
+                'left_files' => 0,
             ];
+            if ( $left ) {
+                error_log( "Disembark: rollback {$this->import_id} leaves alone " . count( $left ) . ' tables of its restore point that belong to other sites: ' . implode( ', ', array_slice( $left, 0, 20 ) ) . ( count( $left ) > 20 ? ', …' : '' ) );
+            }
             @unlink( $this->import_path . '/rollback-journal.php' );
             @unlink( $done_file );
             if ( $paced ) {
@@ -5200,7 +5410,13 @@ class Import {
             }
         }
         $meta = (array) self::rollback_meta( $this->rollback_path );
-        $save = function () use ( &$st, $state_file, $paced ) {
+        if ( empty( $st['owner'] ) ) {
+            // A rollback an earlier build started.
+            $st['owner'] = $this->rollback_owner( $meta );
+            $st['left']  = self::rollback_left_tables( $st['owner'], $meta );
+        }
+        $owner = (array) $st['owner'];
+        $save  = function () use ( &$st, $state_file, $paced ) {
             if ( $paced ) {
                 self::write_protected( $state_file, (string) wp_json_encode( $st ) );
             }
@@ -5218,7 +5434,7 @@ class Import {
             // tables and the ones this move imported. Never another site's
             // of the install, one made after the restore point included.
             if ( $st['files'] && empty( $errors ) && empty( $meta['partial'] ) ) {
-                $this->drop_added_tables( $meta );
+                $this->drop_added_tables( $meta, $owner );
             }
             $this->put_registry_rows( (array) $st['registry'] );
             wp_cache_flush();
@@ -5249,8 +5465,15 @@ class Import {
                 }
                 return [ 'done' => false, 'phase' => 'files', 'files_done' => (int) $st['i'], 'files_total' => $total ];
             }
+            // Another site's folder of the install (a tenant's content/<id>,
+            // a subsite's uploads/sites/<id>) is that site's now: a move
+            // from an earlier build that reached into it isn't undone there.
+            $relative_path = $st['i'] < count( $backed_up ) ? $backed_up[ $st['i'] ] : $deployed[ $st['i'] - count( $backed_up ) ];
+            if ( ( $st['i'] < count( $backed_up ) || ! isset( $was_saved[ $relative_path ] ) ) && self::rollback_other_site_path( $owner, $web_root . '/' . $relative_path ) ) {
+                $st['left_files'] = (int) ( $st['left_files'] ?? 0 ) + 1;
+                continue;
+            }
             if ( $st['i'] < count( $backed_up ) ) {
-                $relative_path = $backed_up[ $st['i'] ];
                 $backup_src    = $this->rollback_file( $relative_path );
                 $dest          = $web_root . '/' . $relative_path;
                 if ( file_exists( $backup_src ) ) {
@@ -5285,8 +5508,8 @@ class Import {
             // The deploy recorded the folders it added: those go (deepest
             // first, once empty), and folders that were here before stay,
             // empty or not.
-            $dirs = array_filter( (array) $meta['created_dirs'], function ( $dir ) {
-                return self::is_safe_relative_path( (string) $dir ) && ! in_array( (string) $dir, [ 'wp-admin', 'wp-includes', 'wp-content' ], true );
+            $dirs = array_filter( (array) $meta['created_dirs'], function ( $dir ) use ( $owner, $web_root ) {
+                return self::is_safe_relative_path( (string) $dir ) && ! in_array( (string) $dir, [ 'wp-admin', 'wp-includes', 'wp-content' ], true ) && ! self::rollback_other_site_path( $owner, $web_root . '/' . $dir . '/' );
             } );
             usort( $dirs, function ( $a, $b ) { return substr_count( $b, '/' ) - substr_count( $a, '/' ) ?: strcmp( $b, $a ); } );
             foreach ( $dirs as $dir ) {
@@ -5297,7 +5520,7 @@ class Import {
             // empty go, walking up, short of the ones above.
             $emptied = [];
             foreach ( $deployed as $relative_path ) {
-                if ( ! isset( $was_saved[ $relative_path ] ) ) {
+                if ( ! isset( $was_saved[ $relative_path ] ) && ! self::rollback_other_site_path( $owner, $web_root . '/' . $relative_path ) ) {
                     $emptied[ dirname( $relative_path ) ] = true;
                 }
             }
@@ -5335,15 +5558,22 @@ class Import {
             }
         }
 
+        $left_tables = (array) ( $st['left'] ?? [] );
+        $left_files  = (int) ( $st['left_files'] ?? 0 );
         $result = [
             'success'          => empty( $errors ),
-            'tables_restored'  => count( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? $st['files'] ) ),
+            'tables_restored'  => max( 0, count( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? $st['files'] ) ) - count( $left_tables ) ),
             'files_restored'   => count( $backed_up ),
             'files_removed'    => count( array_diff( $deployed, $backed_up ) ),
             'quiet_mode_lifted' => $quiet_lifted,
             // A move into a subsite or tenant, or into a network (whose
-            // users stay), leaves this site's logins as they were.
-            'logins_kept'      => ! empty( $meta['target'] ) || is_multisite(),
+            // users stay unless the move replaced them), leaves this site's
+            // logins as they were.
+            'logins_kept'      => ! empty( $meta['target'] ) || ( is_multisite() && empty( $owner['users'] ) ),
+            // What a restore point from an earlier build holds of other
+            // sites (see rollback_owner()), which stays as it is now.
+            'left_alone'       => [ 'tables' => count( $left_tables ), 'files' => $left_files, 'names' => array_slice( $left_tables, 0, 50 ) ],
+            'warnings'         => self::rollback_left_words( $owner, count( $left_tables ), $left_files ),
             'errors'           => $errors,
         ];
         @unlink( $state_file );
@@ -5375,6 +5605,7 @@ class Import {
      */
     private function rollback_tables( array &$st, $deadline, $save ) {
         global $wpdb;
+        $owner        = ! empty( $st['owner'] ) ? (array) $st['owner'] : null;
         $journal_file = $this->import_path . '/rollback-journal.php';
         $paced        = $deadline > 0;
         // A call that was killed got past its last checkpoint: the journal
@@ -5416,8 +5647,12 @@ class Import {
         $stop_at = 0;
         for ( ; $fi < count( $st['files'] ); $fi++ ) {
             $path = $this->rollback_path . '/' . $st['files'][ $fi ];
-            $read = self::each_sql_statement_in_file( $path, function ( $statement, $end ) use ( &$pending, &$stop_at, $exec, $flush, $max, $journal, &$fi, $paced, $deadline ) {
-                foreach ( self::transform_statements( [ $statement ] ) as $transformed ) {
+            $read = self::each_sql_statement_in_file( $path, function ( $statement, $end ) use ( &$pending, &$stop_at, $exec, $flush, $max, $journal, &$fi, $paced, $deadline, $owner ) {
+                // Another site's table in a restore point from an earlier
+                // build: it stays as it is now (see rollback_owner()).
+                $table = $owner ? self::dump_statement_table( $statement ) : null;
+                $own   = $table === null || self::rollback_owns( $owner, $table );
+                foreach ( $own ? self::transform_statements( [ $statement ] ) : [] as $transformed ) {
                     $transformed = trim( $transformed );
                     if ( strlen( $transformed ) < $max && preg_match( '/^(INSERT\s+INTO\s+`(?:[^`]|``)+`\s+VALUES\s*)(\(.*\))$/s', $transformed, $im ) ) {
                         if ( $pending && ( $pending['head'] !== $im[1] || $pending['bytes'] + strlen( $im[2] ) >= $max || count( $pending['rows'] ) >= 2000 ) && ! $flush() ) {
