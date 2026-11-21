@@ -240,9 +240,9 @@
       others.forEach(function (s) { opts.push({ value: String(s.id), label: 'Replace ' + (s.name || D.host(s.url)) }); });
       control = D.seg(opts, String(S.into), function (v) { S.into = v; render(); });
     } else {
-      control = h('select', { class: 'dsk-select', onchange: function () { S.into = control.value; render(); } },
-        opts.concat(others.map(function (s) { return { value: String(s.id), label: 'Replace ' + one + ' ' + s.id + ': ' + D.host(s.url) + (s.name ? ' (' + s.name + ')' : '') }; }))
-          .map(function (o) { return h('option', { value: o.value, selected: String(S.into) === o.value }, o.label); }));
+      control = D.combo([{ value: 'new', label: 'A new ' + one, sub: 'Nothing here is replaced' }].concat(others.map(function (s) {
+        return { value: String(s.id), label: 'Replace ' + (s.name || D.host(s.url)), sub: D.host(s.url) + ' · ' + one + ' ' + s.id };
+      })), String(S.into), function (v) { S.into = v; render(); }, { label: 'Where it lands', placeholder: 'Search ' + one + 's by name or address' });
     }
     return h('div', { class: 'dsk-into' }, h('div', { class: 'dsk-field-h' }, h('span', { class: 'dsk-label' }, 'Where it lands on ' + here)), control);
   }

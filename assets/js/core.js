@@ -486,6 +486,61 @@
     return el;
   };
 
+  /**
+   * An autocomplete picker (ARIA combobox). options: [{ value, label, sub }];
+   * typing filters on label and sub, arrows move, Enter picks, Escape
+   * closes and puts the chosen label back. onChange(value) after a pick.
+   */
+  var comboN = 0;
+  D.combo = function (options, value, onChange, o) {
+    o = o || {};
+    var id = 'dsk-combo-' + (++comboN), active = -1, shown = [];
+    var input = h('input', { class: 'dsk-input', type: 'text', role: 'combobox', 'aria-expanded': 'false', 'aria-autocomplete': 'list', 'aria-controls': id,
+      'aria-label': o.label || '', placeholder: o.placeholder || 'Type to search…', spellcheck: 'false', autocomplete: 'off', autocapitalize: 'none' });
+    var list = h('ul', { class: 'dsk-combo-list', id: id, role: 'listbox', hidden: true });
+    var el = h('div', { class: 'dsk-combo' }, D.icon('search'), input, h('span', { class: 'dsk-combo-caret', 'aria-hidden': 'true' }), list);
+    function current() { return options.find(function (x) { return x.value === value; }); }
+    function reset() { var c = current(); input.value = c ? c.label : ''; }
+    function open(q) {
+      q = (q || '').trim().toLowerCase();
+      shown = options.filter(function (x) { return !q || (x.label + ' ' + (x.sub || '')).toLowerCase().indexOf(q) !== -1; });
+      active = shown.findIndex(function (x) { return x.value === value; });
+      if (active < 0 && shown.length) active = 0;
+      mount(list, shown.length ? shown.map(function (x, i) {
+        return h('li', { id: id + '-' + i, role: 'option', class: 'dsk-combo-opt', 'aria-selected': String(x.value === value),
+          onmousedown: function (e) { e.preventDefault(); pick(x); }, onmousemove: function () { if (active !== i) { active = i; mark(); } } },
+          h('span', { class: 'l' }, x.label), x.sub ? h('span', { class: 'sub' }, x.sub) : null);
+      }) : h('li', { class: 'dsk-combo-none' }, 'No site matches “' + q + '”'));
+      list.hidden = false; input.setAttribute('aria-expanded', 'true'); mark();
+    }
+    function close() { list.hidden = true; input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); }
+    function mark() {
+      Array.prototype.forEach.call(list.querySelectorAll('.dsk-combo-opt'), function (li, i) { li.classList.toggle('on', i === active); });
+      var li = active >= 0 && list.querySelector('#' + id + '-' + active);
+      if (li) { input.setAttribute('aria-activedescendant', li.id); li.scrollIntoView({ block: 'nearest' }); }
+    }
+    function pick(x) { close(); var changed = x.value !== value; value = x.value; reset(); if (changed) onChange(value); }
+    input.addEventListener('focus', function () { input.select(); open(''); });
+    input.addEventListener('click', function () { if (list.hidden) open(''); });
+    input.addEventListener('input', function () { open(input.value); });
+    input.addEventListener('blur', function () { close(); reset(); });
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (list.hidden) { open(''); return; }
+        if (shown.length) { active = (active + (e.key === 'ArrowDown' ? 1 : -1) + shown.length) % shown.length; mark(); }
+      } else if (e.key === 'Enter') {
+        if (!list.hidden && shown[active]) { e.preventDefault(); pick(shown[active]); }
+      } else if (e.key === 'Escape') {
+        if (!list.hidden) { e.preventDefault(); e.stopPropagation(); close(); reset(); }
+      } else if (e.key === 'Tab') { close(); reset(); }
+    });
+    el.addEventListener('click', function (e) { if (e.target !== input) input.focus(); });
+    reset();
+    el.input = input;
+    return el;
+  };
+
   D.search = function (placeholder, onInput) {
     var input = h('input', { class: 'dsk-input', type: 'search', placeholder: placeholder, spellcheck: 'false', oninput: function () { onInput(input.value.trim().toLowerCase()); } });
     var el = h('div', { class: 'dsk-search' }, D.icon('search'), input);

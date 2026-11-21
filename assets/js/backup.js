@@ -70,9 +70,10 @@
       var inst = D.config.install;
       if (!inst || !(inst.sites || []).length) return null;
       var kind = inst.kind === 'multisite' ? 'network' : 'WP Freighter install';
-      var sel = h('select', { class: 'dsk-select', 'aria-label': 'What to back up', onchange: function () { D.setSite(sel.value); } },
-        h('option', { value: '' }, 'The whole ' + kind + ' (' + D.fmt.plural(inst.total || inst.sites.length, 'site') + '), for a full server restore'),
-        inst.sites.map(function (s) { return h('option', { value: s.id, selected: s.id === S.site }, D.siteName(s.id)); }));
+      var opts = [{ value: '', label: 'The whole ' + kind, sub: D.fmt.plural(inst.total || inst.sites.length, 'site') + ' · for a full server restore' }].concat(inst.sites.map(function (s) {
+        return { value: s.id, label: s.name || D.host(s.url), sub: D.host(s.url) + ' · ' + (s.id === 'main' ? 'main site' : (inst.kind === 'multisite' ? 'site ' : 'tenant ') + s.id) };
+      }));
+      var sel = D.combo(opts, S.site || '', function (v) { D.setSite(v); }, { label: 'What to back up', placeholder: 'Search sites by name or address' });
       return h('div', { class: 'dsk-card dsk-bk-scope' },
         h('span', { class: 'caps' }, 'Back up'), sel,
         h('span', { class: 'muted' }, S.site ? 'This site alone, as a standalone site: its tables, its users, its uploads, and the plugins and themes it uses. Restore it into any single WordPress site.' : 'Every site of the ' + kind + ', exactly as it is here. ' + wholeNote()));
