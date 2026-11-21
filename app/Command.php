@@ -458,7 +458,7 @@ class Command {
             if ( $src_prefix !== '' && $dest_prefix !== '' && $src_prefix !== $dest_prefix ) {
                 $rp = $this->check( $this->step( function () use ( $import, $src_prefix, $dest_prefix ) { return $import->remap_table_prefix( $src_prefix, $dest_prefix ); } ), 'prefix', $import_id );
                 $summary['prefix'] = [ 'from' => $src_prefix, 'to' => $dest_prefix ];
-                $this->say( "      Table prefix remapped {$src_prefix} → {$dest_prefix} (" . (int) ( $rp['keys_changed'] ?? 0 ) . ' keys).' );
+                $this->say( "      Table prefix remapped {$src_prefix} → {$dest_prefix}" . ( ! empty( $rp['keys_changed'] ) ? ' (' . self::plural( (int) $rp['keys_changed'], 'user and role key' ) . ').' : '.' ) );
             }
 
             $this->say( '[7/9] Rewriting URLs' );
@@ -900,7 +900,7 @@ class Command {
             if ( $src_prefix !== '' && $dest_prefix !== '' && $src_prefix !== $dest_prefix ) {
                 $rp = $this->check( $import->remap_table_prefix( $src_prefix, $dest_prefix ), 'prefix', $import_id );
                 $summary['prefix'] = [ 'from' => $src_prefix, 'to' => $dest_prefix ];
-                $this->say( "      Table prefix remapped {$src_prefix} → {$dest_prefix} (" . (int) ( $rp['keys_changed'] ?? 0 ) . ' keys).' );
+                $this->say( "      Table prefix remapped {$src_prefix} → {$dest_prefix}" . ( ! empty( $rp['keys_changed'] ) ? ' (' . self::plural( (int) $rp['keys_changed'], 'user and role key' ) . ').' : '.' ) );
             }
 
             $this->say( '[7/9] Rewriting URLs' );

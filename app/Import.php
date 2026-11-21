@@ -2832,7 +2832,7 @@ class Import {
         $dest   = $web_root . '/' . $relative_path;
         if ( $target ) {
             if ( self::never_deploy( $relative_path ) ) {
-                return [ 'k' => 1 ];
+                return [];
             }
             // A dedicated WP Freighter tenant has its own mu-plugins and
             // drop-ins folder, but the source host's (its Kinsta mu-plugin,
@@ -2878,12 +2878,12 @@ class Import {
 
         // Skip wp-config.php (in any case: one disk is case-insensitive)
         if ( strtolower( basename( $relative_path ) ) === 'wp-config.php' ) {
-            return [ 'k' => 1 ];
+            return [];
         }
         // Never put a database dump (or Disembark's own working files) in
         // the web root, even when a client lists it explicitly.
         if ( self::never_deploy( $relative_path ) ) {
-            return [ 'k' => 1 ];
+            return self::own_plugin_path( $relative_path ) ? [ 'k' => 1 ] : [];
         }
         // Leave the destination's host setup alone: its mu-plugins and
         // cache drop-ins belong to the server, not the site being moved.

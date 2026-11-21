@@ -1228,7 +1228,7 @@
           if (sq.users && (sq.users.created || sq.users.matched)) rlog((target ? '' : 'The network keeps its users. ') + 'Users joined the network: ' + D.fmt.plural(sq.users.created, 'new account') + ', ' + D.fmt.plural(sq.users.matched, 'existing account') + ' matched by email' + (sq.users.renumbered ? ' (' + D.fmt.plural(sq.users.renumbered, 'row') + ' of posts, comments and orders renumbered)' : '') + '.');
           if (srcPrefix && destPrefix && srcPrefix !== destPrefix) {
             var rp = await api.post('import/remap-prefix', t({ old_prefix: srcPrefix, new_prefix: destPrefix }));
-            rlog('Table prefix remapped ' + srcPrefix + ' → ' + destPrefix + ' (' + (rp.keys_changed || 0) + ' keys).');
+            rlog('Table prefix remapped ' + srcPrefix + ' → ' + destPrefix + (rp.keys_changed ? ' (' + D.fmt.plural(rp.keys_changed, 'user and role key') + ').' : '.'));
           }
           step('urls'); progress('');
           var paths = info.paths || {};
@@ -1464,8 +1464,8 @@
         h('p', null, D.host(D.config.homeUrl) + ' now holds the copied site, and you’re still logged in. The network’s users, super admins and every subsite’s members are as they were.'),
         h('p', { style: { marginTop: '8px' } }, 'The incoming site’s users joined the network: they log in with their own passwords, and an account that was already here keeps its own.'),
         h('div', { class: 'row' },
-          again,
-          h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
+          h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel),
+          again),
         ctx.undoDetails());
       return;
     }
@@ -1474,8 +1474,7 @@
       h('p', null, 'User accounts came over with the copy, so your current login no longer applies here. ', h('strong', { style: { color: 'var(--ink)' } }, 'Log in with the source site’s credentials.')),
       h('div', { class: 'row' },
         h('a', { class: 'dsk-btn primary', href: ctx.loginUrl || D.config.loginUrl }, 'Log in again'),
-        h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel),
-        again),
+        h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
       ctx.undoDetails());
   };
 })();
