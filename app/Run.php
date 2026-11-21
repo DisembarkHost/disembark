@@ -36,6 +36,7 @@ class Run {
             \WP_CLI::add_command( 'disembark connect-line', [ 'Disembark\Command', 'cli_info' ] );
             \WP_CLI::add_command( 'disembark cli-info', [ 'Disembark\Command', 'cli_info' ] );
             \WP_CLI::add_command( 'disembark pull', [ 'Disembark\Command', 'pull' ] );
+            \WP_CLI::add_command( 'disembark restore', [ 'Disembark\Command', 'restore' ] );
             \WP_CLI::add_command( 'disembark restore-points', [ 'Disembark\Command', 'restore_points' ] );
             \WP_CLI::add_command( 'disembark rollback', [ 'Disembark\Command', 'rollback' ] );
             \WP_CLI::add_command( 'disembark delete-restore-point', [ 'Disembark\Command', 'delete_restore_point' ] );

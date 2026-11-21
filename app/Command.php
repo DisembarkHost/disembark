@@ -568,6 +568,303 @@ class Command {
     }
 
     /**
+     * Restores a backup zip that is on this server into this site.
+     *
+     * Runs the same steps as Tools → Disembark → Move with a backup zip:
+     * saves a rollback point, puts the files in place, imports the database,
+     * remaps the table prefix and rewrites the old address. Takes Disembark's
+     * own backup zips and other hosts' downloadable backups (Kinsta's, WP
+     * Engine's and others with the site's files and a .sql dump). This site's
+     * wp-config.php, its own Disembark and its host setup are kept.
+     *
+     * The database is found on its own when it's clear which dump is the
+     * site's (Disembark's own, the only .sql at the zip's root or at the root
+     * of its public/ folder, or the one named for DB_NAME or holding the
+     * site's options table). Otherwise the restore stops before changing
+     * anything and lists the dumps it found: name one with --database. A zip
+     * with no database is restored only with --files-only.
+     *
+     * ## OPTIONS
+     *
+     * <zip>
+     * : Path to the backup zip on this server.
+     *
+     * [--database=<path>]
+     * : The database dump to restore, as its path in the zip (for example
+     * mysql/shop.sql). Needed when the zip holds several and it isn't clear
+     * which is the site's, or when the only ones are deep in its folders.
+     *
+     * [--files-only]
+     * : Restore the files and leave this site's database as it is. Needed
+     * when the zip has no database, so a restore never ends as files only by
+     * accident.
+     *
+     * [--yes]
+     * : Don't ask for confirmation.
+     *
+     * [--source-url=<url>]
+     * : The address the backup came from, when neither the zip nor its
+     * database says (the address rewrite runs from it).
+     *
+     * [--bring-host-files]
+     * : Also put the backup's host files in place (mu-plugins and cache
+     * drop-ins).
+     *
+     * [--skip-checks]
+     * : Go ahead even when the checks before the move find a problem that
+     * would stop it.
+     *
+     * [--skip-verify]
+     * : Don't run the checks after the move.
+     *
+     * [--skip-quiet-mode]
+     * : Don't turn on quiet mode. By default a restore from another address
+     * turns it on (see `wp disembark quiet-mode`).
+     *
+     * [--format=<format>]
+     * : Output format.
+     * ---
+     * default: text
+     * options:
+     *   - text
+     *   - json
+     * ---
+     *
+     * ## EXAMPLES
+     *
+     *     $ wp disembark restore ~/backups/example-com.zip --yes
+     *     $ wp disembark restore ~/kinsta-backup.zip --yes --format=json
+     *     $ wp disembark restore ~/cpanel-backup.zip --database=mysql/example_wp.sql --yes
+     *     $ wp disembark restore ~/files.zip --files-only --yes
+     */
+    public function restore( $args, $assoc_args ) {
+        $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
+        @set_time_limit( 0 );
+        $zip = (string) ( $args[0] ?? '' );
+        if ( $zip === '' || ! is_file( $zip ) ) {
+            $this->fail( "No zip at {$zip}." );
+        }
+        $zip = (string) realpath( $zip );
+        if ( ! empty( $assoc_args['files-only'] ) && isset( $assoc_args['database'] ) ) {
+            $this->fail( '--database and --files-only don\'t go together: pick one.' );
+        }
+        if ( $refused = Import::here_refusal() ) {
+            $this->fail( $refused->get_error_message(), 'preflight' );
+        }
+        $import_id = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
+        $import    = new Import( $import_id );
+        $summary   = [ 'ok' => false, 'source' => $zip, 'import_id' => $import_id ];
+        $started   = time();
+        // Before anything is saved, a stop leaves nothing behind.
+        $stop = function ( $message, $step ) use ( $import ) {
+            $import->cancel( 'cleanup' );
+            $this->fail( $message . ' Nothing on this site was changed.', $step );
+        };
+
+        $this->say( '[1/9] Checking this site' );
+        $pre         = $this->check( $import->preflight(), 'preflight' );
+        $dest_prefix = (string) ( $pre['db_prefix'] ?? '' );
+        $dest_home   = untrailingslashit( (string) ( $pre['home_url'] ?? home_url() ) );
+        $summary['destination'] = $dest_home;
+        $this->confirm( $assoc_args, 'Replace ' . $dest_home . ' with the backup in ' . basename( $zip ) . '? A rollback point is saved first, and afterwards you log in with the backup\'s credentials.' );
+
+        $this->say( '[2/9] Unpacking ' . basename( $zip ) . ' (' . size_format( (int) filesize( $zip ) ) . ')' );
+        $t0 = microtime( true );
+        $st = $import->stage_zip_file( $zip );
+        if ( is_wp_error( $st ) ) {
+            $stop( $st->get_error_message(), 'stage' );
+        }
+        $this->say( '      ' . number_format( (int) $st['files_staged'] ) . ' files unpacked in ' . round( microtime( true ) - $t0 ) . 's.' );
+        $checks = Checks::before_move( $import_id );
+        if ( ! empty( $checks['refused'] ) ) {
+            $stop( (string) $checks['refused'], 'checks' );
+        }
+        if ( ! empty( $checks['blocked'] ) && empty( $assoc_args['skip-checks'] ) ) {
+            $import->cancel( 'cleanup' );
+        }
+        $this->report_checks( $checks, $summary, ! empty( $assoc_args['skip-checks'] ) );
+
+        $this->say( '[3/9] Reading the backup' );
+        $choice = ! empty( $assoc_args['files-only'] ) ? 'none' : ( isset( $assoc_args['database'] ) ? trim( (string) $assoc_args['database'] ) : null );
+        if ( $choice !== null && $choice !== 'none' ) {
+            $chosen = $import->choose_database( $choice, 'named with --database' );
+            if ( is_wp_error( $chosen ) ) {
+                $info  = $import->staged_info();
+                $found = array_merge( array_column( (array) ( $info['database']['candidates'] ?? [] ), 'file' ), (string) ( $info['sql_file'] ?? '' ) !== '' ? [ $info['sql_file'] ] : [] );
+                $stop( $chosen->get_error_message() . ( $found ? ' It has: ' . implode( ', ', $found ) . '.' : ' It has none.' ), 'read' );
+            }
+            $choice = null;
+        }
+        $info = $import->staged_info( $choice );
+        if ( is_wp_error( $info ) ) {
+            $stop( $info->get_error_message(), 'read' );
+        }
+        $info = json_decode( (string) wp_json_encode( $info ), true );
+        if ( ! empty( $info['refused'] ) ) {
+            $stop( (string) $info['refused'], 'read' );
+        }
+        $db = (array) $info['database'];
+        if ( ( $db['ask'] ?? '' ) === 'none' ) {
+            $stop( 'This zip has no database Disembark can use (no .sql or .sql.gz file in it). To restore its files only, run this again with --files-only.', 'read' );
+        }
+        if ( ( $db['ask'] ?? '' ) === 'pick' ) {
+            $lines = [];
+            foreach ( (array) $db['candidates'] as $c ) {
+                $lines[] = self::describe_dump( $c );
+            }
+            $stop( 'This zip holds ' . self::plural( count( $lines ), 'database dump' ) . ( count( $lines ) === 1 ? ' inside the site\'s files' : ' and it isn\'t clear which is the site\'s' ) . '. Name one with --database=<path>, or restore the files only with --files-only. Found: ' . implode( '; ', $lines ) . '.', 'read' );
+        }
+        $summary['database'] = $info['sql_file'] ? [ 'file' => $info['sql_file'], 'why' => $db['why'] ] : null;
+        $this->say( '      ' . number_format( (int) $info['files'] ) . ' files staged. ' . ( $info['sql_file'] ? 'Database: ' . $info['sql_file'] . ' (' . $db['why'] . ').' : 'No database: files only (--files-only).' ) );
+        $src_prefix = (string) ( $info['source']['db_prefix'] ?? '' );
+        $src_home   = untrailingslashit( (string) ( $assoc_args['source-url'] ?? ( $info['source']['home_url'] ?? '' ) ) );
+        if ( $info['sql_file'] ) {
+            $this->say( '      From ' . ( $src_home !== '' ? $src_home : 'an address its database will tell' ) . ( $src_prefix !== '' ? ", tables {$src_prefix}*" : '' ) . '.' );
+        }
+        if ( ! empty( $info['multisite'] ) ) {
+            $summary['multisite_constants'] = $info['multisite'];
+            $this->say( '      The source is a multisite network. This site keeps its own wp-config.php, so add these constants to it:' );
+            foreach ( $info['multisite'] as $line ) {
+                $this->say( '        ' . $line );
+            }
+        }
+
+        $this->say( '[4/9] Saving a rollback point' );
+        $this->check( $this->budgeted( function ( $r ) { return 'Saved ' . (int) $r['tables_done'] . ' of ' . (int) $r['tables_total'] . ' tables'; }, function ( $budget ) use ( $import, $zip ) { return $import->snapshot( 'Before restore of ' . basename( $zip ), $budget ); } ), 'snapshot' );
+        $summary['rollback_id'] = $import_id;
+        $summary['undo']        = "wp disembark rollback {$import_id}";
+        $this->say( "      Saved. Undo any time with: wp disembark rollback {$import_id}" );
+
+        // Quiet mode goes on before the files and database arrive (or, when
+        // only the imported database tells the old address, right after it).
+        $quiet    = false;
+        $go_quiet = function ( $from ) use ( &$quiet, &$summary, $assoc_args, $dest_home, $import_id ) {
+            if ( $quiet || ! empty( $assoc_args['skip-quiet-mode'] ) || $from === '' || Quiet::address( $from ) === Quiet::address( $dest_home ) ) {
+                return;
+            }
+            $this->check( Quiet::enable( $from, $import_id ), 'quiet-mode', $import_id );
+            $quiet = true;
+            $summary['quiet_mode'] = [ 'on' => true, 'off' => 'wp disembark quiet-mode off' ];
+            $this->say( '      Quiet mode on: emails held, scheduled jobs paused, checkout closed, payment and marketing APIs blocked.' );
+        };
+        $go_quiet( $src_home );
+
+        $this->say( '[5/9] Putting files in place' );
+        $keep = empty( $assoc_args['bring-host-files'] );
+        $dep  = $this->check( $this->budgeted( function ( $r ) { return 'Placed ' . number_format( (int) $r['placed'] ) . ' of ' . number_format( (int) $r['total'] ) . ' files'; }, function ( $budget ) use ( $import, $keep ) { return $import->deploy_files( [ '*' ], $keep, $budget ); } ), 'files', $import_id );
+        $summary['files_deployed']  = (int) $dep['deployed'];
+        $summary['host_files_kept'] = $dep['host_files_kept'] ?? [];
+        $this->say( '      Placed ' . number_format( (int) $dep['deployed'] ) . ' files.' );
+        if ( ! empty( $dep['removed'] ) ) {
+            $this->say( '      Removed ' . self::plural( (int) $dep['removed'], 'file' ) . ' that ' . ( (int) $dep['removed'] === 1 ? 'is' : 'are' ) . ' gone from the backup (kept in the rollback point).' );
+        }
+        if ( ! empty( $dep['loaders_disabled'] ) ) {
+            $this->say( '      Disabled firewall loaders that point at files not on this server: ' . implode( ', ', $dep['loaders_disabled'] ) );
+        }
+        if ( ! empty( $dep['host_files_kept'] ) ) {
+            $this->say( '      Left out (host files; this site keeps its own): ' . implode( ', ', $dep['host_files_kept'] ) );
+        }
+        if ( ! empty( $dep['errors'] ) ) {
+            $this->fail( count( $dep['errors'] ) . ' files could not be put in place (first: ' . $dep['errors'][0] . '). Stopped before the database import.', 'files', $import_id );
+        }
+
+        if ( $info['sql_file'] ) {
+            $this->say( '[6/9] Importing the database' );
+            $sql_file = (string) $info['sql_file'];
+            $t0 = microtime( true );
+            $sq = $this->check( $this->budgeted( function ( $r ) { return 'Imported ' . (int) floor( 100 * $r['bytes_done'] / max( 1, $r['bytes_total'] ) ) . '%'; }, function ( $budget ) use ( $import, $sql_file, $src_prefix, $dest_prefix ) { return $import->import_staged_sql( $sql_file, $src_prefix, $dest_prefix, $budget ); } ), 'database', $import_id );
+            $summary['statements'] = (int) $sq['statements_executed'];
+            $summary['database_seconds'] = (int) round( microtime( true ) - $t0 );
+            foreach ( (array) ( $sq['converted'] ?? [] ) as $conversion => $tables ) {
+                $this->say( "      This database server doesn't support all of the source's table settings, so {$conversion} in " . self::plural( (int) $tables, 'table' ) . '.' );
+            }
+            if ( ! empty( $sq['definers_removed'] ) ) {
+                $this->say( '      Removed the source server\'s DEFINER account from ' . (int) $sq['definers_removed'] . ' views, triggers or routines.' );
+            }
+            if ( ! empty( $sq['errors'] ) ) {
+                $this->fail( 'The database import reported ' . count( $sq['errors'] ) . ' errors (first: ' . $sq['errors'][0] . '). ' . ( ! empty( $sq['database_unchanged'] ) ? 'This site\'s database was not changed: the import works on copies of the tables and only swaps them in when every statement succeeds.' : 'Stopped before rewriting URLs.' ), 'database', $import_id );
+            }
+            $this->say( '      ' . number_format( (int) $sq['statements_executed'] ) . ' statements executed, ' . self::plural( (int) ( $sq['tables_swapped'] ?? 0 ), 'table' ) . ' swapped in (' . $summary['database_seconds'] . 's).' );
+            if ( $src_home === '' && ! empty( $sq['source_home'] ) ) {
+                $src_home = untrailingslashit( (string) $sq['source_home'] );
+                $this->say( "      The database is {$src_home}'s." );
+                $go_quiet( $src_home );
+            }
+            if ( $src_prefix !== '' && $dest_prefix !== '' && $src_prefix !== $dest_prefix ) {
+                $rp = $this->check( $import->remap_table_prefix( $src_prefix, $dest_prefix ), 'prefix', $import_id );
+                $summary['prefix'] = [ 'from' => $src_prefix, 'to' => $dest_prefix ];
+                $this->say( "      Table prefix remapped {$src_prefix} → {$dest_prefix} (" . (int) ( $rp['keys_changed'] ?? 0 ) . ' keys).' );
+            }
+
+            $this->say( '[7/9] Rewriting URLs' );
+            $paths = Import::path_pairs( $info['source'] ?? null ) + Import::scope_pairs( $info['source'] ?? null );
+            if ( ( $src_home !== '' && $src_home !== $dest_home ) || $paths ) {
+                $from = $src_home !== '' ? $src_home : $dest_home;
+                $sr   = $this->check( $this->budgeted( function ( $r ) { return 'Rewriting table ' . ( (int) $r['tables_done'] + 1 ) . ' of ' . (int) $r['tables_total']; }, function ( $budget ) use ( $import, $from, $dest_home ) {
+                    return $import->move_search_replace( $from, $dest_home, $budget );
+                } ), 'urls', $import_id );
+                $summary['urls'] = [ 'from' => $src_home, 'to' => $dest_home, 'cells_changed' => (int) ( $sr['cells_changed'] ?? 0 ), 'files_rewritten' => (int) ( $sr['files_rewritten'] ?? 0 ) ];
+                $this->say( '      ' . ( $from !== $dest_home ? "{$src_home} → {$dest_home} (every http, https and www spelling): " : 'Same address: ' ) . number_format( (int) ( $sr['cells_changed'] ?? 0 ) ) . ' cells, ' . (int) ( $sr['files_rewritten'] ?? 0 ) . ' files under uploads.' );
+            } else {
+                $this->say( '      ' . ( $src_home === '' ? 'The backup doesn\'t say its address (pass --source-url to rewrite it).' : 'Same address, nothing to rewrite.' ) );
+            }
+        } else {
+            $this->say( '[6/9] No database: this site keeps its own (--files-only)' );
+        }
+
+        $this->say( '[8/9] Finishing up' );
+        $fin  = $this->check( $import->finalize(), 'finalize', $import_id );
+        $tidy = (array) ( $fin['tidy'] ?? [] );
+        if ( ! empty( $tidy['caches_cleared'] ) ) {
+            $summary['caches_cleared'] = array_keys( (array) $tidy['caches_cleared'] );
+            $this->say( '      Cleared page caches so nothing serves the old site: ' . implode( ', ', $summary['caches_cleared'] ) . '.' );
+        }
+        foreach ( (array) ( $tidy['plugins_turned_off'] ?? [] ) as $plugin ) {
+            $summary['plugins_turned_off'][] = $plugin['plugin'];
+            $this->say( "      Turned off {$plugin['name']}: {$plugin['why']}." );
+        }
+        if ( ! empty( $tidy['login_url']['url'] ) ) {
+            $summary['login_url'] = $tidy['login_url']['url'];
+            $this->say( "      The login page is moved by {$tidy['login_url']['plugin']}: {$tidy['login_url']['url']}" );
+        }
+        if ( empty( $assoc_args['skip-verify'] ) ) {
+            $this->say( '[9/9] Checking the result' );
+            $verify = Verify::run( $import_id );
+            if ( ! is_wp_error( $verify ) ) {
+                $summary['verify'] = $this->report_verify( $verify );
+            }
+        }
+        $summary['ok']      = true;
+        $summary['seconds'] = time() - $started;
+        if ( $this->json ) {
+            \WP_CLI::line( wp_json_encode( $summary, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
+            return;
+        }
+        \WP_CLI::success( 'Restored ' . basename( $zip ) . " into {$dest_home}" . ( $info['sql_file'] ? '. Log in with the backup\'s credentials.' : ' (files only; the database is this site\'s own).' ) );
+        \WP_CLI::log( "Undo: wp disembark rollback {$import_id}" );
+        if ( $quiet ) {
+            \WP_CLI::log( 'Quiet mode is on (this is a copy). Lift it with: wp disembark quiet-mode off' );
+        }
+    }
+
+    /** One line about a database dump found in a zip (see Import::database_info()). */
+    private static function describe_dump( $c ) {
+        $bits = [ size_format( (int) $c['size'] ) ];
+        if ( empty( $c['usable'] ) ) {
+            $bits[] = 'not usable: ' . ( $c['note'] !== '' ? $c['note'] : 'not a database dump' );
+        } else {
+            if ( $c['prefix'] !== '' ) {
+                $bits[] = "tables {$c['prefix']}*";
+            }
+            $bits[] = $c['options'] !== '' ? "options table {$c['options']}" : ( ! empty( $c['whole'] ) ? 'no options table' : 'no options table in the first ' . size_format( (int) $c['looked'] ) );
+            if ( $c['home'] !== '' ) {
+                $bits[] = $c['home'];
+            }
+        }
+        return $c['file'] . ' (' . implode( ', ', $bits ) . ( ! empty( $c['guess'] ) ? '; the best guess' : '' ) . ')';
+    }
+
+    /**
      * Shows, turns on or turns off quiet mode.
      *
      * Quiet mode keeps a copy of a site from reaching the real world: emails
@@ -1095,7 +1392,7 @@ class Command {
                 $this->say( "      ✗ {$m['table']} has " . ( $m['actual'] === null ? 'gone missing' : number_format( (int) $m['actual'] ) . ' rows' ) . '; the source exported ' . number_format( (int) $m['expected'] ) . '.' );
             }
         } else {
-            $this->say( '      · The source doesn\'t report row counts (an older Disembark), so rows weren\'t compared.' );
+            $this->say( '      · The source doesn\'t report row counts (an older Disembark, or another host\'s dump), so rows weren\'t compared.' );
         }
         $pages = (array) ( $v['pages'] ?? [] );
         if ( ! empty( $pages['note'] ) ) {

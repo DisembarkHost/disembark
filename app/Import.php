@@ -736,6 +736,28 @@ class Import {
     }
 
     /**
+     * Unpacks a zip already on this server (wp disembark restore) into
+     * staging, as an uploaded one is. The zip itself stays where it is.
+     */
+    public function stage_zip_file( $zip_path ) {
+        if ( $refused = $this->refused() ) {
+            return $refused;
+        }
+        if ( ! is_file( $zip_path ) || ! is_readable( $zip_path ) ) {
+            return new \WP_Error( 'not_found', "Can't read {$zip_path}.", [ 'status' => 404 ] );
+        }
+        $this->prepare_import_dir();
+        if ( ! is_dir( $this->staging_path ) && ! wp_mkdir_p( $this->staging_path ) ) {
+            return new \WP_Error( 'write_failed', 'Could not make the staging folder (is the disk full?).', [ 'status' => 500 ] );
+        }
+        $result = self::extract_zip_into( $zip_path, $this->staging_path, [ 'strict' => true ] );
+        if ( is_wp_error( $result ) ) {
+            return $result;
+        }
+        return [ 'success' => true, 'files_staged' => $this->count_staged_files() ];
+    }
+
+    /**
      * Extracts a ZIP into the staging directory (see extract_zip_into()).
      */
     private function extract_zip_file( $zip_path ) {
