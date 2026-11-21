@@ -3146,6 +3146,13 @@ class Import {
                 return $rel;
             }
         }
+        // The firewall loader this server's PHP settings run first
+        // (auto_prepend_file): the source's names the old server's paths
+        // and loaders, and replacing it would quietly turn this site's
+        // firewall off. Kept when this site has one.
+        if ( strtolower( $rel ) === 'wordfence-waf.php' && is_file( $web_root . '/wordfence-waf.php' ) ) {
+            return $rel;
+        }
         $mu = 'wp-content/mu-plugins/';
         if ( strpos( $rel, $mu ) !== 0 ) {
             return '';

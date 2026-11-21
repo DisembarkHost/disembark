@@ -50,6 +50,14 @@ class Skips {
               'paths' => [ 'wp-content/cache', 'wp-content/et-cache', 'wp-content/litespeed', 'wp-content/uploads/siteground-optimizer-assets' ],
               'tables' => [ 'wpr_rucss_used_css' ] ],
 
+            // Leftovers
+            [ 'id' => 'file-manager-leftovers', 'group' => 'Caches', 'default' => true, 'label' => 'File manager thumbnails and quarantine',
+              'why' => 'The .tmb and .quarantine folders that File Manager plugins (elFinder) leave in the web root: thumbnails and unpacked uploads nothing on the site uses.',
+              'paths' => [ '.tmb', '.quarantine', 'wp-content/.tmb', 'wp-content/.quarantine' ] ],
+            [ 'id' => 'server-config-leftovers', 'group' => 'Caches', 'default' => true, 'label' => 'Old server config files in the web root',
+              'why' => 'nginx.conf and the conf folder hold rules plugins wrote for the old server (W3 Total Cache, Imagify, Solid Security). The new server never reads them from the web root.',
+              'paths' => [ 'nginx.conf', 'conf' ] ],
+
             // Logs
             [ 'id' => 'error-logs', 'group' => 'Logs', 'default' => true, 'label' => 'PHP error logs',
               'why' => 'The old server\'s error logs.', 'names' => [ 'error_log', 'debug.log', 'php_errorlog' ] ],
