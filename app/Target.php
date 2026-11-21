@@ -417,7 +417,9 @@ class Target {
                 }
                 return [ $this->content . '/' . $sub, true ];
             }
-            return null;
+            // A dedicated tenant has a whole wp-content of its own, so its
+            // other folders come too (a gallery's, a font or cache plugin's).
+            return [ $this->content . '/' . $sub, true ];
         }
         $shared = self::rel( WP_CONTENT_DIR );
         if ( in_array( $top, [ 'plugins', 'themes', 'languages' ], true ) ) {
