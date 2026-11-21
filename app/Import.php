@@ -4237,6 +4237,14 @@ class Import {
         }
 
         $result = $wpdb->query( $statement );
+        // The site stays live while this runs: between the DROP just before a
+        // CREATE and the CREATE itself, a request that loads a plugin can make
+        // the plugin's missing table again (Search & Filter does). Drop it and
+        // create it once more.
+        if ( $result === false && preg_match( '/^CREATE\s+TABLE\s+`((?:[^`]|``)+)`/i', $statement, $cm ) && preg_match( '/already exists/i', (string) $wpdb->last_error ) ) {
+            $wpdb->query( 'DROP TABLE IF EXISTS `' . $cm[1] . '`' );
+            $result = $wpdb->query( $statement );
+        }
         if ( $result === false ) {
             // Don't fail on DROP TABLE errors
             if ( stripos( $statement, 'DROP TABLE' ) === 0 ) {
@@ -4414,6 +4422,20 @@ class Import {
      * old and isn't dated in the future, else null. Guards written by older
      * builds (token-guard.json, unsigned) are never honoured.
      */
+    /** Writes this import's token guard (see begin_statements()), signed with $token. */
+    private function write_token_guard( $token ) {
+        $key = self::guard_key();
+        if ( $token === '' || $key === '' ) {
+            return false;
+        }
+        $this->prepare_import_dir();
+        $created = time();
+        return self::write_protected( $this->import_path . '/token-guard.php', (string) wp_json_encode( [
+            'created_at' => $created,
+            'mac'        => self::guard_mac( $key, $this->import_id, $created, $token ),
+        ] ) );
+    }
+
     private static function read_token_guard( $import_id ) {
         $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) );
         if ( $import_id === '' ) {
@@ -5899,7 +5921,7 @@ class Import {
             // Asked again right after it finished (a lost answer): the same
             // answer, not a second rollback.
             $done = json_decode( (string) self::read_protected( $done_file ), true );
-            if ( $paced && is_array( $done ) && (int) ( $done['at'] ?? 0 ) > time() - 600 && (bool) ( $done['files_asked'] ?? true ) === $asked_files ) {
+            if ( $paced && is_array( $done ) && (int) ( $done['at'] ?? 0 ) > time() - 600 && (bool) ( $done['files_asked'] ?? true ) === $asked_files && empty( $done['result']['errors'] ) ) {
                 return (array) $done['result'];
             }
             // A paced deploy that stopped partway journaled what it placed.
@@ -6103,20 +6125,21 @@ class Import {
         // Quiet mode turned on by this restore goes with it.
         $quiet_lifted = empty( $errors ) && Quiet::lift_for_rollback( (string) $this->import_id );
 
-        // Remember the rollback so the restore points list can show it.
-        if ( empty( $errors ) ) {
-            $saved = self::rollback_meta( $this->rollback_path );
-            if ( $saved !== null ) {
+        // Remember the rollback so the restore points list can show it, and
+        // whether its saved files went back into place: a rollback moves
+        // them, so they go back once, and that's so even when the database
+        // part reported errors.
+        $saved = self::rollback_meta( $this->rollback_path );
+        if ( $saved !== null ) {
+            if ( empty( $errors ) ) {
                 $saved['rolled_back_at'] = time();
-                // Whether its saved files went back into place (a rollback
-                // moves them, so they can be put back only once).
-                if ( $with_files ) {
-                    $saved['files_put_back_at'] = time();
-                } elseif ( ! isset( $saved['files_put_back_at'] ) ) {
-                    $saved['files_put_back_at'] = 0;
-                }
-                $this->save_rollback_meta( $saved );
             }
+            if ( $with_files ) {
+                $saved['files_put_back_at'] = time();
+            } elseif ( ! isset( $saved['files_put_back_at'] ) ) {
+                $saved['files_put_back_at'] = 0;
+            }
+            $this->save_rollback_meta( $saved );
         }
 
         $left_tables = (array) ( $st['left'] ?? [] );
@@ -6202,6 +6225,12 @@ class Import {
             if ( $paced ) {
                 $this->prepare_import_dir();
                 self::write_protected( $chain_file, (string) wp_json_encode( $ch ) );
+                // Every request of the chain names this point, while each
+                // step's rollback guards its own: once the first step puts
+                // back older user accounts (and token), the dashboard's next
+                // request is let in by a guard here, signed with the token it
+                // authenticated with now.
+                $this->write_token_guard( $this->request_token !== '' ? $this->request_token : (string) Token::read() );
             }
         }
         $save = function () use ( &$ch, $chain_file, $paced ) {
