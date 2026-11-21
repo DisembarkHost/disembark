@@ -363,7 +363,14 @@ class Target {
      * the whole install.
      */
     public function dest( $rel ) {
-        $to = $this->map( $rel );
+        if ( ! Import::is_safe_relative_path( $rel ) ) {
+            return null;
+        }
+        $norm = preg_replace( '#/+#', '/', str_replace( '\\', '/', $rel ) );
+        if ( Import::in_storage( $norm ) ) {
+            return null;
+        }
+        $to = $this->map( $norm );
         // Never into a Disembark folder (its restore points, token guards)
         // and never a database export.
         if ( $to === null || Import::in_storage( $to[0] ) || preg_match( '#\.(?:db|sql)\.txt$#i', $to[0] ) ) {
@@ -378,15 +385,42 @@ class Target {
             return null;
         }
         $sub = substr( $rel, strlen( 'wp-content/' ) );
+        if ( strpos( $sub, '/' ) === false ) {
+            // Never map drop-ins or loose files at wp-content/ root
+            // (freighter.php, sunrise.php, db.php, advanced-cache.php,
+            // object-cache.php, maintenance.php, db-error.php, etc.).
+            return null;
+        }
         $top = (string) strtok( $sub, '/' );
         if ( $top === 'uploads' ) {
+            if ( preg_match( '#^uploads/disembark(?:/|$)#i', $sub ) ) {
+                return null;
+            }
+            if ( preg_match( '/\.(?:php[34578s]?|phtml|phar|pht)$/i', $sub ) ) {
+                return null;
+            }
             return [ $this->uploads . substr( $sub, strlen( 'uploads' ) ), ! ( $this->kind === 'freighter' && $this->files === 'shared' ) ];
         }
         if ( $this->content !== '' ) {
-            return [ $this->content . '/' . $sub, true ];
+            if ( in_array( $top, [ 'plugins', 'themes', 'languages' ], true ) ) {
+                return [ $this->content . '/' . $sub, true ];
+            }
+            if ( $top === 'mu-plugins' ) {
+                $entry = (string) strtok( substr( $sub, strlen( 'mu-plugins/' ) ), '/' );
+                if ( $entry === '' || strtolower( $entry ) === 'disembark-quiet-mode.php' || stripos( $entry, 'freighter' ) === 0 ) {
+                    return null;
+                }
+                foreach ( Import::HOST_MU_PLUGINS as $name ) {
+                    if ( stripos( $entry, $name ) === 0 ) {
+                        return null;
+                    }
+                }
+                return [ $this->content . '/' . $sub, true ];
+            }
+            return null;
         }
         $shared = self::rel( WP_CONTENT_DIR );
-        if ( in_array( $top, [ 'plugins', 'themes', 'languages' ], true ) && strpos( $sub, '/' ) !== false ) {
+        if ( in_array( $top, [ 'plugins', 'themes', 'languages' ], true ) ) {
             return [ $shared . '/' . $sub, false ];
         }
         return null;
@@ -582,9 +616,21 @@ class Target {
          * table under the site's prefix (passed as the second argument).
          */
         $columns = (array) apply_filters( 'disembark_user_id_columns', $columns, $p );
-        $offset  = 1000000000000;
-        $moved   = array_filter( $map, function ( $new, $old ) { return (int) $new !== (int) $old; }, ARRAY_FILTER_USE_BOTH );
-        $same    = array_diff_key( $map, $moved );
+        $offset       = 1000000000000;
+        $unattributed = [];
+        $moved        = [];
+        $same         = [];
+        foreach ( $map as $old => $new ) {
+            $old = (int) $old;
+            $new = (int) $new;
+            if ( $new === 0 ) {
+                $unattributed[ $old ] = 0;
+            } elseif ( $new !== $old ) {
+                $moved[ $old ] = $new;
+            } else {
+                $same[ $old ] = $new;
+            }
+        }
         foreach ( $columns as $c ) {
             list( $table, $col, $where ) = array_values( (array) $c ) + [ '', '', '' ];
             $table = (string) $table;
@@ -592,7 +638,20 @@ class Target {
             if ( strpos( $table, $p ) !== 0 || ! preg_match( '/^[A-Za-z0-9_]+$/', $col ) || $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) !== $table ) {
                 continue;
             }
-            $extra = (string) $where !== '' ? " AND ({$where})" : '';
+            $col_info = $wpdb->get_row( $wpdb->prepare( "SHOW COLUMNS FROM `{$table}` LIKE %s", $wpdb->esc_like( $col ) ), ARRAY_A );
+            if ( ! is_array( $col_info ) ) {
+                continue;
+            }
+            $nullable  = isset( $col_info['Null'] ) && strtoupper( (string) $col_info['Null'] ) === 'YES';
+            $empty_val = $nullable ? 'NULL' : '0';
+            $extra     = (string) $where !== '' ? " AND ({$where})" : '';
+            // Unattributed users ($new === 0) go straight to NULL (for nullable
+            // columns such as wc_customer_lookup.user_id, avoiding UNIQUE index
+            // collisions) or 0 without passing through $offset.
+            foreach ( array_chunk( array_keys( $unattributed ), 500 ) as $chunk ) {
+                $in = implode( ',', array_map( 'intval', $chunk ) );
+                $report['renumbered'] += (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` IN ({$in}){$extra}" );
+            }
             // Through a high offset, so 2→5 and 5→9 can't chain; the ones
             // that keep their ID too, so they aren't taken for orphans.
             foreach ( [ $moved, $same ] as $i => $set ) {
@@ -608,7 +667,7 @@ class Target {
                     }
                 }
             }
-            $report['orphaned'] += (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = 0 WHERE `{$col}` > 0 AND `{$col}` < {$offset}{$extra}" );
+            $report['orphaned'] += (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` > 0 AND `{$col}` < {$offset}{$extra}" );
             $wpdb->query( "UPDATE `{$table}` SET `{$col}` = `{$col}` - {$offset} WHERE `{$col}` >= {$offset}{$extra}" );
         }
         // The roles the site defines, under its prefix.
@@ -760,22 +819,53 @@ class Target {
 
     /** After a rollback: a site this move created goes completely. */
     public function undo() {
-        $root = rtrim( wp_normalize_path( dirname( WP_CONTENT_DIR ) ), '/' );
-        foreach ( (array) $this->created_dirs as $rel ) {
-            $rel = trim( (string) $rel, '/' );
-            if ( $rel === '' || ! Import::is_safe_relative_path( $rel ) || in_array( $rel, [ 'wp-content', 'wp-content/uploads', 'wp-content/plugins', 'wp-content/themes', 'content', 'wp-admin', 'wp-includes' ], true ) ) {
+        $root         = rtrim( wp_normalize_path( dirname( WP_CONTENT_DIR ) ), '/' );
+        $created_dirs = array_map( function ( $d ) {
+            return trim( (string) $d, '/' );
+        }, (array) $this->created_dirs );
+        $protected = [
+            'wp-content',
+            'wp-content/uploads',
+            'wp-content/uploads/sites',
+            'wp-content/blogs.dir',
+            'wp-content/plugins',
+            'wp-content/themes',
+            'content',
+            'wp-admin',
+            'wp-includes',
+        ];
+        foreach ( $created_dirs as $rel ) {
+            if ( $rel === '' || ! Import::is_safe_relative_path( $rel ) || in_array( $rel, $protected, true ) ) {
                 continue;
             }
             self::remove_dir( $root . '/' . $rel );
         }
-        // A tenant this move created owns its content/<id> outright (the
-        // list above can hold only its subfolders, when the move also had
-        // to create content/ for the install's first tenant), and that
-        // content/ goes too if nothing else is in it.
-        if ( $this->created && $this->content !== '' && preg_match( '#^content/\d+$#', (string) $this->content ) ) {
-            self::remove_dir( $root . '/' . $this->content );
-            if ( in_array( 'content', (array) $this->created_dirs, true ) ) {
-                @rmdir( $root . '/content' );
+        // A site this move created owns only its own folder (not the shared
+        // uploads/sites, blogs.dir or content/ container, which may now hold
+        // other sites). Remove the shared container non-recursively only if
+        // this move created it and nothing else is inside.
+        if ( $this->created && $this->kind === 'multisite' ) {
+            $uploads = trim( (string) $this->uploads, '/' );
+            if ( preg_match( '#^(wp-content/(?:uploads/sites|blogs\.dir)/\d+)(?:/files)?$#', $uploads, $m ) ) {
+                $site_dir = $m[1];
+                self::remove_dir( $root . '/' . $site_dir );
+                $parent = dirname( $site_dir );
+                if ( in_array( $parent, $created_dirs, true ) ) {
+                    @rmdir( $root . '/' . $parent );
+                }
+            }
+        } elseif ( $this->created && $this->kind === 'freighter' ) {
+            $tenant_dir = '';
+            if ( $this->content !== '' && preg_match( '#^content/\d+$#', (string) $this->content ) ) {
+                $tenant_dir = (string) $this->content;
+            } elseif ( $this->files === 'hybrid' && $this->id !== '' && preg_match( '/^\d+$/', (string) $this->id ) ) {
+                $tenant_dir = 'content/' . (string) $this->id;
+            }
+            if ( $tenant_dir !== '' ) {
+                self::remove_dir( $root . '/' . $tenant_dir );
+                if ( in_array( 'content', $created_dirs, true ) ) {
+                    @rmdir( $root . '/content' );
+                }
             }
         }
         // Its row in the install's registry goes, and nothing else there:

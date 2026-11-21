@@ -13,7 +13,17 @@ namespace Disembark;
 class Storage {
 
     public static function base_dir() {
-        return wp_upload_dir()['basedir'] . '/disembark';
+        $switched = is_multisite() && get_current_blog_id() !== get_main_site_id();
+        if ( $switched ) {
+            switch_to_blog( get_main_site_id() );
+        }
+        try {
+            return wp_upload_dir()['basedir'] . '/disembark';
+        } finally {
+            if ( $switched ) {
+                restore_current_blog();
+            }
+        }
     }
 
     /**
@@ -26,21 +36,31 @@ class Storage {
      * is built from the site address instead.
      */
     public static function base_url() {
-        $uploads = wp_upload_dir();
-        $url     = untrailingslashit( (string) $uploads['baseurl'] );
-        if ( get_option( 'upload_url_path' ) ) {
-            return $url . '/disembark';
+        $switched = is_multisite() && get_current_blog_id() !== get_main_site_id();
+        if ( $switched ) {
+            switch_to_blog( get_main_site_id() );
         }
-        $root = rtrim( str_replace( '\\', '/', ABSPATH ), '/' );
-        $dir  = rtrim( str_replace( '\\', '/', (string) $uploads['basedir'] ), '/' );
-        if ( strpos( $dir, $root . '/' ) === 0 ) {
-            $rel  = '/' . substr( $dir, strlen( $root ) + 1 );
-            $path = rtrim( (string) wp_parse_url( $url, PHP_URL_PATH ), '/' );
-            if ( substr( $path, -strlen( $rel ) ) !== $rel ) {
-                $url = untrailingslashit( site_url( $rel ) );
+        try {
+            $uploads = wp_upload_dir();
+            $url     = untrailingslashit( (string) $uploads['baseurl'] );
+            if ( get_option( 'upload_url_path' ) ) {
+                return $url . '/disembark';
+            }
+            $root = rtrim( str_replace( '\\', '/', ABSPATH ), '/' );
+            $dir  = rtrim( str_replace( '\\', '/', (string) $uploads['basedir'] ), '/' );
+            if ( strpos( $dir, $root . '/' ) === 0 ) {
+                $rel  = '/' . substr( $dir, strlen( $root ) + 1 );
+                $path = rtrim( (string) wp_parse_url( $url, PHP_URL_PATH ), '/' );
+                if ( substr( $path, -strlen( $rel ) ) !== $rel ) {
+                    $url = untrailingslashit( site_url( $rel ) );
+                }
+            }
+            return $url . '/disembark';
+        } finally {
+            if ( $switched ) {
+                restore_current_blog();
             }
         }
-        return $url . '/disembark';
     }
 
     /**
@@ -51,9 +71,9 @@ class Storage {
         if ( ! is_dir( $dir ) ) {
             wp_mkdir_p( $dir );
         }
-        $base = self::base_dir();
+        $base = rtrim( wp_normalize_path( self::base_dir() ), '/' );
         self::protect( $base );
-        $dir = rtrim( $dir, '/' );
+        $dir = rtrim( wp_normalize_path( (string) $dir ), '/' );
         while ( strlen( $dir ) > strlen( $base ) && strpos( $dir, $base . '/' ) === 0 ) {
             self::protect( $dir );
             $dir = dirname( $dir );

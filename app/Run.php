@@ -60,7 +60,7 @@ class Run {
      * import replaces the options table, so it may).
      */
     public static function upgrade_storage() {
-        if ( (int) get_option( 'disembark_storage_version', 0 ) >= self::STORAGE_VERSION ) {
+        if ( (int) get_site_option( 'disembark_storage_version', 0 ) >= self::STORAGE_VERSION ) {
             return;
         }
         $base = Storage::base_dir();
@@ -80,7 +80,7 @@ class Run {
             }
             @unlink( $base . '/upgrade.lock' );
         }
-        update_option( 'disembark_storage_version', self::STORAGE_VERSION, true );
+        update_site_option( 'disembark_storage_version', self::STORAGE_VERSION );
     }
 
     /** Schedules the daily clean-up once per site. */
@@ -121,8 +121,9 @@ class Run {
         if ( ! is_array( $fields ) ) {
             return $result;
         }
+        $url_params = (array) $request->get_url_params();
         foreach ( $fields as $key => $value ) {
-            if ( is_string( $key ) && $key !== 'packed' && $key !== 'token' ) {
+            if ( is_string( $key ) && $key !== 'packed' && $key !== 'token' && ! array_key_exists( $key, $url_params ) ) {
                 $request->set_param( $key, $value );
             }
         }
@@ -631,7 +632,7 @@ class Run {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
 
-        $directory = wp_upload_dir()["basedir"] . "/disembark/";
+        $directory = Storage::base_dir() . '/';
         $size = 0;
         $sessions = [];
 
@@ -1119,7 +1120,11 @@ class Run {
             return $scope;
         }
         $backup_token = $request['backup_token'];
-        $table = empty( $request['table'] ) ? "" : $request['table'];
+        $url_params   = (array) $request->get_url_params();
+        $table        = isset( $url_params['table'] ) ? (string) $url_params['table'] : '';
+        if ( $table === '' || ! preg_match( '/^[a-zA-Z0-9_-]+$/', $table ) ) {
+            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        }
         if ( ! empty( $request['parts'] ) ) {
             return ( new Backup( $backup_token ) )->database_export( $table, $request['parts'], $request['rows_per_part'] );
         }

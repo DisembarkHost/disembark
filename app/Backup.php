@@ -15,7 +15,7 @@ class Backup {
         // that could climb out of it (e.g. "../.." via /cleanup-file).
         $token             = Storage::sanitize_session( $token );
         $this->token       = empty( $token ) ? Storage::new_session() : $token;
-        $this->backup_path = wp_upload_dir()["basedir"] . "/disembark/{$this->token}";
+        $this->backup_path = Storage::base_dir() . "/{$this->token}";
         $backup_url        = Storage::base_url() . "/{$this->token}";
         // Ensure URL scheme matches the current request to prevent mixed content issues
         // Check multiple indicators for HTTPS (handles reverse proxy scenarios)
@@ -232,7 +232,7 @@ class Backup {
         file_put_contents( $state_file, json_encode( $state ) );
         
         // Check if we're all done
-        if ( empty( $state['directories_to_scan'] ) ) {
+        if ( empty( $state['directories_to_scan'] ) && empty( $state['current_directory_items'] ) ) {
             $state['status'] = 'scan_complete';
             file_put_contents( $state_file, json_encode( $state ) );
         }
@@ -386,29 +386,35 @@ class Backup {
 
     public function database_export( $table, $parts = 0, $rows_per_part = 0 ) {
         global $wpdb;
+        $table = (string) $table;
+        if ( $table === '' || ! preg_match( '/^[a-zA-Z0-9_$-]+$/', $table ) ) {
+            return false;
+        }
+        $scope = Scope::active();
+        $real  = $scope ? $scope->real( $table ) : $table;
+        if ( $real === null || $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $real ) ) ) !== $real ) {
+            return false;
+        }
+
         self::prepare_escaping();
         $select_row_limit = 1000;
         $rows_start       = 0;
         $insert_sql       = "";
+        $parts            = (int) $parts;
+        $rows_per_part    = (int) $rows_per_part;
         
         // Hosts commonly block downloads of *.sql and *.sql.* (and some block
         // *.sql.txt), so exports carry no "sql" in their name at all.
         $file_ext         = self::EXPORT_EXT;
         $backup_file      = "{$this->backup_path}/{$table}{$file_ext}";
         $backup_url       = "{$this->backup_url}/{$table}{$file_ext}";
-        if ( ! empty( $parts ) ) {
+        if ( $parts > 0 ) {
             $backup_file  = "{$this->backup_path}/{$table}-{$parts}{$file_ext}";
             $backup_url   = "{$this->backup_url}/{$table}-{$parts}{$file_ext}";
             $rows_start   = ( $parts - 1 ) * $rows_per_part;
         }
 
-        if ( false === ( $file_handle = fopen( $backup_file, 'a' ) ) ) {
-            return false;
-        }
-        $scope = Scope::active();
-        $real  = $scope ? $scope->real( $table ) : $table;
-        if ( $real === null ) {
-            @fclose( $file_handle );
+        if ( false === ( $file_handle = fopen( $backup_file, 'w' ) ) ) {
             return false;
         }
         $where = $scope ? $scope->where( $table ) : '';
@@ -417,6 +423,8 @@ class Backup {
         if ( 0 == $rows_start ) {
             $create_table = $wpdb->get_results( "SHOW CREATE TABLE " . self::ident( $real ), ARRAY_N );
             if ( false === $create_table || ! isset( $create_table[0] ) ) {
+                @fclose( $file_handle );
+                @unlink( $backup_file );
                 return false;
             }
             $create_table_array = $create_table[0];
@@ -1136,6 +1144,9 @@ class Backup {
      * SQL to the archive's database dump.
      */
     public function archive_add_database( $archive_name, $tables = [], $table = '', $part = 0, $rows_per_part = 0 ) {
+        if ( $this->archiver_type !== 'ZipArchive' ) {
+            return new \WP_Error( 'no_zip', 'This server has no ZipArchive, so backups have to run through the CLI.', [ 'status' => 501 ] );
+        }
         $paths = $this->archive_paths( $archive_name );
         if ( is_wp_error( $paths ) ) {
             return $paths;
@@ -1170,6 +1181,9 @@ class Backup {
     /** Adds the database dump and the source record, and returns the zip's URL. */
     public function archive_finish( $archive_name ) {
         global $wpdb;
+        if ( $this->archiver_type !== 'ZipArchive' ) {
+            return new \WP_Error( 'no_zip', 'This server has no ZipArchive, so backups have to run through the CLI.', [ 'status' => 501 ] );
+        }
         $paths = $this->archive_paths( $archive_name );
         if ( is_wp_error( $paths ) ) {
             return $paths;
