@@ -19,7 +19,7 @@ class Import {
             $import_id = substr( bin2hex( random_bytes( 16 ) ), 0, 24 );
         }
         $this->import_id     = $import_id;
-        $base                = wp_upload_dir()['basedir'] . '/disembark';
+        $base                = Storage::base_dir();
         $this->import_path   = "{$base}/_import_{$import_id}";
         $this->staging_path  = "{$this->import_path}/staging";
         $this->rollback_path = "{$this->import_path}/rollback";
@@ -78,7 +78,7 @@ class Import {
 
     /** Writes $data behind the exit line, atomically. */
     public static function write_protected( $file, $data ) {
-        $tmp = $file . '.tmp';
+        $tmp = $file . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp.php';
         if ( @file_put_contents( $tmp, self::PHP_EXIT . $data ) === false ) {
             @unlink( $tmp );
             return false;
@@ -138,7 +138,7 @@ class Import {
         // half written. The exit line goes first, so even the temp file
         // shows nothing.
         $in  = @fopen( $from, 'rb' );
-        $tmp = $to . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
+        $tmp = $to . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp.php';
         $out = $in ? @fopen( $tmp, 'wb' ) : false;
         if ( ! $in || ! $out ) {
             if ( $in ) {
@@ -520,7 +520,7 @@ class Import {
      * goes. True when done, false when out of time, or WP_Error.
      */
     private function write_restore_dump( array &$state, $state_file, $deadline ) {
-        $part = $this->rollback_path . '/' . $state['name'] . '.db.php.part';
+        $part = $this->rollback_path . '/' . $state['name'] . '.db.part.php';
         $fail = function ( $why ) use ( $part, $state_file ) {
             @unlink( $part );
             @unlink( $state_file );
@@ -817,7 +817,7 @@ class Import {
             }
             // Written under a temp name of its own and renamed when whole
             // (see copy_protected()).
-            $tmp = $dest . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
+            $tmp = $dest . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp.php';
             $in  = $zip->getStream( $name );
             $out = $in ? @fopen( $tmp, 'wb' ) : false;
             $ok  = $in && $out && fwrite( $out, self::PHP_EXIT ) !== false && stream_copy_to_stream( $in, $out ) !== false;
@@ -1414,13 +1414,32 @@ class Import {
                 return false;
             }
             $transformed_statements = self::transform_statements( [ $statement ], $old_prefix, $new_prefix );
+            if ( $target && $new_prefix !== '' ) {
+                $safe = [];
+                foreach ( $transformed_statements as $t ) {
+                    $tname = self::statement_table( $t );
+                    if ( $tname !== null && strpos( $tname, $new_prefix ) !== 0 ) {
+                        $refused++;
+                        continue;
+                    }
+                    $safe[] = $t;
+                }
+                $transformed_statements = $safe;
+            }
             if ( $shared_main ) {
                 $kept = [];
                 foreach ( $transformed_statements as $t ) {
-                    $t    = self::rename_statement_table( $t, $in_users );
-                    $name = self::statement_table( $t );
-                    if ( $name !== null && self::other_sites_table( $name ) ) {
-                        if ( preg_match( '/^(?:\/\*!\d+\s+)?CREATE\s/i', $t ) ) {
+                    $t     = self::rename_statement_table( $t, $in_users );
+                    $names = self::statement_tables( $t );
+                    $other = false;
+                    foreach ( $names as $name ) {
+                        if ( self::other_sites_table( $name ) ) {
+                            $other = true;
+                            break;
+                        }
+                    }
+                    if ( $other ) {
+                        if ( preg_match( '/^(?:\/\*M?!\d*\s*)?CREATE\s/i', self::strip_leading_comments( $t ) ) ) {
                             $foreign++;
                         }
                         continue;
@@ -1641,7 +1660,7 @@ class Import {
     /** A fresh swap, with copies left by an earlier attempt dropped first. */
     private static function swap_start() {
         global $wpdb;
-        foreach ( (array) $wpdb->get_results( $wpdb->prepare( 'SHOW FULL TABLES WHERE `Tables_in_' . DB_NAME . '` LIKE %s', $wpdb->esc_like( self::SHADOW_PREFIX ) . '%' ), ARRAY_N ) as $row ) {
+        foreach ( (array) $wpdb->get_results( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( self::SHADOW_PREFIX ) . '%' ), ARRAY_N ) as $row ) {
             $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
             $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $row[0] ) . '`' );
         }
@@ -1687,13 +1706,14 @@ class Import {
         $ident = '(?:`((?:[^`]|``)+)`|([A-Za-z0-9_$]+))';
         $out   = [];
         foreach ( $statements as $statement ) {
-            if ( preg_match( '/^(?:DROP\s+TABLE\b|LOCK\s+TABLES\b|UNLOCK\s+TABLES\b)/i', $statement ) ) {
-                continue;
-            }
             // The statement's start with executable-comment markers taken
             // out: mysqldump splits a view's or trigger's CREATE across
-            // several (CREATE ALGORITHM=… then DEFINER=… then VIEW …).
+            // several (CREATE ALGORITHM=… then DEFINER=… then VIEW …),
+            // and wraps DROP TABLE before a view in /*!50001 ... */.
             $flat = trim( (string) preg_replace( '/\s+/', ' ', (string) preg_replace( '/\/\*M?!\d*|\*\//', ' ', substr( $statement, 0, 600 ) ) ) );
+            if ( preg_match( '/^(?:DROP\s+TABLE\b|LOCK\s+TABLES?\b|UNLOCK\s+TABLES?\b)/i', $flat ) ) {
+                continue;
+            }
             // Triggers, routines and events wait for the swap too: a trigger
             // on a table's copy would go with the table it replaces, and
             // none of them may change the site before the import succeeds.
@@ -1706,9 +1726,17 @@ class Import {
             // has succeeded. Rows an older exporter wrote for a view would
             // land in the table behind it, so they're dropped.
             if ( preg_match( '/^(?:DROP\s+VIEW\b|CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW\s+' . $ident . ')/i', $flat, $m ) ) {
-                if ( stripos( $flat, 'DROP' ) !== 0 && isset( $m[1] ) ) {
+                if ( stripos( $flat, 'DROP' ) !== 0 && ( ( isset( $m[1] ) && $m[1] !== '' ) || ( isset( $m[2] ) && $m[2] !== '' ) ) ) {
                     $view = str_replace( '``', '`', $m[1] !== '' ? $m[1] : ( $m[2] ?? '' ) );
+                    // mysqldump creates a placeholder table for each view earlier in
+                    // the dump; drop its shadow copy and take it out of the swap map
+                    // so swap_finish() doesn't rename a table in the view's way.
+                    if ( isset( $swap['map'][ $view ] ) ) {
+                        $out[] = 'DROP TABLE IF EXISTS `' . $swap['map'][ $view ] . '`';
+                        unset( $swap['map'][ $view ], $swap['keys'][ $view ] );
+                    }
                     $swap['views'][ $view ] = true;
+                    $swap['deferred'][]     = 'DROP TABLE IF EXISTS `' . str_replace( '`', '``', $view ) . '`';
                     $swap['deferred'][]     = 'DROP VIEW IF EXISTS `' . str_replace( '`', '``', $view ) . '`';
                     $swap['deferred'][]     = $statement;
                 }
@@ -1756,6 +1784,14 @@ class Import {
             if ( $swap['map'] && preg_match( '/^((?:INSERT(?:\s+(?:IGNORE|DELAYED|LOW_PRIORITY|HIGH_PRIORITY))*\s+INTO|REPLACE(?:\s+(?:DELAYED|LOW_PRIORITY))*\s+INTO|ALTER\s+TABLE|TRUNCATE(?:\s+TABLE)?)\s+)' . $ident . '/i', $statement, $m ) ) {
                 $table = str_replace( '``', '`', $m[2] !== '' ? $m[2] : $m[3] );
                 if ( isset( $swap['map'][ $table ] ) ) {
+                    // phpMyAdmin/Adminer add foreign keys in ALTER TABLE statements
+                    // at the end of the dump. Running them against the shadow table
+                    // collides with the live table's constraint names (ERROR 1826),
+                    // so defer them until swap_finish() has dropped the live tables.
+                    if ( stripos( $m[1], 'ALTER' ) === 0 && preg_match( '/\bFOREIGN\s+KEY\b|\bCONSTRAINT\s+(?:`(?:[^`]|``)+`|[A-Za-z0-9_$]+)\s+CHECK\b/i', $statement ) ) {
+                        $swap['deferred'][] = $statement;
+                        continue;
+                    }
                     $statement = $m[1] . '`' . $swap['map'][ $table ] . '`' . substr( $statement, strlen( $m[0] ) );
                 }
             }
@@ -1978,7 +2014,13 @@ class Import {
      * candidates (for 'pick': each dump found, with what a look at it shows) ].
      */
     public function database_info() {
-        $out = [ 'file' => null, 'why' => '', 'ask' => '', 'files_only' => false, 'prefix' => '', 'home' => '', 'candidates' => [] ];
+        $out    = [ 'file' => null, 'why' => '', 'ask' => '', 'files_only' => false, 'prefix' => '', 'home' => '', 'candidates' => [] ];
+        $choice = json_decode( (string) self::read_protected( $this->import_path . '/db-choice.php' ), true );
+        if ( is_array( $choice ) && ! empty( $choice['none'] ) ) {
+            $out['files_only'] = true;
+            $out['why']        = 'files only, as asked';
+            return $out;
+        }
         // Disembark's own export, as before: no need to look any further.
         foreach ( [ '/public', '' ] as $sub ) {
             // Staged as database-x.sql.php; an older build left database-x.sql.
@@ -1991,12 +2033,6 @@ class Import {
         }
         $found  = $this->find_dumps();
         $config = $this->staged_config();
-        $choice = json_decode( (string) self::read_protected( $this->import_path . '/db-choice.php' ), true );
-        if ( is_array( $choice ) && ! empty( $choice['none'] ) ) {
-            $out['files_only'] = true;
-            $out['why']        = 'files only, as asked';
-            return $out;
-        }
         $pick = function ( $rel, $why ) use ( &$out, $found, $config ) {
             $peek          = $this->peek_cached( $rel, $config['prefix'], 20 );
             $out['file']   = $rel;
@@ -2507,44 +2543,44 @@ class Import {
         // This site's folders, as URLs under its address ($to): content_url()
         // can't be trusted mid-import (WP-CLI reports http, and the options
         // table is the source's until the rewrite).
-        $uploads  = wp_upload_dir( null, false );
-        $web_root = wp_normalize_path( dirname( WP_CONTENT_DIR ) );
-        $to       = untrailingslashit( $to !== '' ? (string) $to : home_url() );
-        $dirs     = [ 'wp-content' => wp_normalize_path( WP_CONTENT_DIR ), 'wp-content/uploads' => wp_normalize_path( (string) $uploads['basedir'] ) ];
-        $urls     = [];
+        $uploads   = wp_upload_dir( null, false );
+        $web_root  = wp_normalize_path( dirname( WP_CONTENT_DIR ) );
+        $dest_home = untrailingslashit( $to !== '' ? (string) $to : home_url() );
+        $dirs      = [ 'wp-content' => wp_normalize_path( WP_CONTENT_DIR ), 'wp-content/uploads' => wp_normalize_path( (string) $uploads['basedir'] ) ];
+        $urls      = [];
         foreach ( $dirs as $key => $dir ) {
-            $urls[ $key ] = $to . '/' . ltrim( strpos( $dir, $web_root . '/' ) === 0 ? substr( $dir, strlen( $web_root ) + 1 ) : $key, '/' );
+            $urls[ $key ] = $dest_home . '/' . ltrim( strpos( $dir, $web_root . '/' ) === 0 ? substr( $dir, strlen( $web_root ) + 1 ) : $key, '/' );
         }
         if ( $target ) {
-            $to   = untrailingslashit( $target->home );
-            $urls = [ 'wp-content' => $to . '/' . ( $target->content !== '' ? $target->content : ltrim( substr( wp_normalize_path( WP_CONTENT_DIR ), strlen( $web_root ) ), '/' ) ), 'wp-content/uploads' => $to . '/' . $target->uploads ];
-            $dirs = [ 'wp-content' => $target->content !== '' ? $web_root . '/' . $target->content : wp_normalize_path( WP_CONTENT_DIR ), 'wp-content/uploads' => $web_root . '/' . $target->uploads ];
+            $dest_home = untrailingslashit( $target->home );
+            $urls      = [ 'wp-content' => $dest_home . '/' . ( $target->content !== '' ? $target->content : ltrim( substr( wp_normalize_path( WP_CONTENT_DIR ), strlen( $web_root ) ), '/' ) ), 'wp-content/uploads' => $dest_home . '/' . $target->uploads ];
+            $dirs      = [ 'wp-content' => $target->content !== '' ? $web_root . '/' . $target->content : wp_normalize_path( WP_CONTENT_DIR ), 'wp-content/uploads' => $web_root . '/' . $target->uploads ];
         }
         $pairs   = [];
-        foreach ( (array) ( $scope['url_pairs'] ?? [] ) as $from_url => $to ) {
-            if ( isset( $urls[ $to ] ) && self::safe_source_url( $from_url ) ) {
-                $pairs += self::url_variants( trailingslashit( (string) $from_url ), trailingslashit( $urls[ $to ] ) );
+        foreach ( (array) ( $scope['url_pairs'] ?? [] ) as $from_url => $dest_key ) {
+            if ( isset( $urls[ $dest_key ] ) && self::safe_source_url( $from_url ) ) {
+                $pairs += self::url_variants( trailingslashit( (string) $from_url ), trailingslashit( $urls[ $dest_key ] ) );
             }
         }
         foreach ( (array) ( $scope['moves'] ?? [] ) as $move ) {
-            list( $from, $to ) = array_values( (array) $move ) + [ '', '' ];
+            list( $from, $dest_key ) = array_values( (array) $move ) + [ '', '' ];
             $from = trim( (string) $from, '/' );
-            if ( ! self::safe_source_folder( $from ) || ! isset( $urls[ $to ] ) ) {
+            if ( ! self::safe_source_folder( $from ) || ! isset( $urls[ $dest_key ] ) ) {
                 continue;
             }
             foreach ( (array) ( $scope['bases'] ?? [] ) as $base ) {
                 if ( self::safe_source_url( $base ) ) {
-                    $pairs += self::url_variants( untrailingslashit( (string) $base ) . '/' . $from . '/', trailingslashit( $urls[ $to ] ) );
+                    $pairs += self::url_variants( untrailingslashit( (string) $base ) . '/' . $from . '/', trailingslashit( $urls[ $dest_key ] ) );
                 }
             }
-            $pairs += [ '/' . $from . '/' => trailingslashit( (string) ( wp_parse_url( $urls[ $to ], PHP_URL_PATH ) ?: '/' . $to ) ) ];
+            $pairs += [ '/' . $from . '/' => trailingslashit( (string) ( wp_parse_url( $urls[ $dest_key ], PHP_URL_PATH ) ?: '/' . $dest_key ) ) ];
             if ( ! empty( $scope['abspath'] ) && self::safe_source_path( $scope['abspath'] ) ) {
-                $pairs += [ trailingslashit( (string) $scope['abspath'] ) . $from . '/' => trailingslashit( wp_normalize_path( $dirs[ $to ] ) ) ];
+                $pairs += [ trailingslashit( (string) $scope['abspath'] ) . $from . '/' => trailingslashit( wp_normalize_path( $dirs[ $dest_key ] ) ) ];
             }
         }
         foreach ( (array) ( $scope['aliases'] ?? [] ) as $alias ) {
             if ( self::safe_source_url( $alias ) ) {
-                $pairs += self::url_variants( untrailingslashit( (string) $alias ), untrailingslashit( $target ? $target->home : home_url() ) );
+                $pairs += self::url_variants( untrailingslashit( (string) $alias ), $dest_home );
             }
         }
         foreach ( $pairs as $f => $t ) {
@@ -2791,7 +2827,7 @@ class Import {
         $dest   = $web_root . '/' . $relative_path;
         if ( $target ) {
             if ( self::never_deploy( $relative_path ) ) {
-                return [];
+                return [ 'k' => 1 ];
             }
             // A dedicated WP Freighter tenant has its own mu-plugins and
             // drop-ins folder, but the source host's (its Kinsta mu-plugin,
@@ -2837,12 +2873,12 @@ class Import {
 
         // Skip wp-config.php (in any case: one disk is case-insensitive)
         if ( strtolower( basename( $relative_path ) ) === 'wp-config.php' ) {
-            return [];
+            return [ 'k' => 1 ];
         }
         // Never put a database dump (or Disembark's own working files) in
         // the web root, even when a client lists it explicitly.
         if ( self::never_deploy( $relative_path ) ) {
-            return self::own_plugin_path( $relative_path ) ? [ 'k' => 1 ] : [];
+            return [ 'k' => 1 ];
         }
         // Leave the destination's host setup alone: its mu-plugins and
         // cache drop-ins belong to the server, not the site being moved.
@@ -3185,12 +3221,60 @@ class Import {
     /** The incoming users of a whole-site move into a network's main site wait under {base}{this}users (see import_staged_sql()). */
     const INCOMING_USERS = 'dskin_';
 
-    /** The table a CREATE, INSERT, ALTER, DROP, TRUNCATE or LOCK statement names, or null. */
+    /** The table or view a DML/DDL statement names, or null. */
     private static function statement_table( $statement ) {
-        if ( preg_match( '/^(?:\/\*!\d+\s+)?(?:CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT(?:\s+(?:IGNORE|DELAYED|LOW_PRIORITY|HIGH_PRIORITY))*\s+INTO|REPLACE(?:\s+(?:DELAYED|LOW_PRIORITY))*\s+INTO|ALTER\s+TABLE|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|TRUNCATE(?:\s+TABLE)?|LOCK\s+TABLES)\s+`((?:[^`]|``)+)`/i', ltrim( (string) $statement ), $m ) ) {
-            return str_replace( '``', '`', $m[1] );
+        $clean = self::strip_leading_comments( (string) $statement );
+        $flat  = trim( (string) preg_replace( '/\s+/', ' ', (string) preg_replace( '/\/\*M?!\d*|\*\//', ' ', substr( $clean, 0, 600 ) ) ) );
+        $ident = '(?:`((?:[^`]|``)+)`|([A-Za-z0-9_$]+))';
+        $head  = '(?:'
+            . 'CREATE\s+(?:(?:OR\s+REPLACE|TEMPORARY)\s+)*TABLE(?:\s+IF\s+NOT\s+EXISTS)?'
+            . '|CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW'
+            . '|INSERT(?:\s+(?:IGNORE|DELAYED|LOW_PRIORITY|HIGH_PRIORITY))*(?:\s+INTO)?'
+            . '|REPLACE(?:\s+(?:DELAYED|LOW_PRIORITY))*(?:\s+INTO)?'
+            . '|UPDATE(?:\s+(?:LOW_PRIORITY|IGNORE))*'
+            . '|DELETE(?:\s+(?:LOW_PRIORITY|QUICK|IGNORE))*\s+FROM'
+            . '|ALTER(?:\s+(?:ONLINE|IGNORE))*\s+TABLE'
+            . '|DROP(?:\s+TEMPORARY)?\s+(?:TABLE|VIEW)(?:\s+IF\s+EXISTS)?'
+            . '|TRUNCATE(?:\s+TABLE)?'
+            . '|LOCK\s+TABLES?'
+            . '|RENAME\s+TABLE'
+            . ')';
+        if ( preg_match( '/^' . $head . '\s+(?:(?:`(?:[^`]|``)+`|[A-Za-z0-9_$]+)\s*\.\s*)?' . $ident . '/i', $flat, $m ) ) {
+            return str_replace( '``', '`', $m[1] !== '' ? $m[1] : $m[2] );
         }
         return null;
+    }
+
+    /** Every table or view name targeted by $statement (handles multi-table DROP/RENAME/LOCK). */
+    private static function statement_tables( $statement ) {
+        $tables = [];
+        $first  = self::statement_table( $statement );
+        if ( $first !== null ) {
+            $tables[] = $first;
+        }
+        $clean = self::strip_leading_comments( (string) $statement );
+        $flat  = trim( (string) preg_replace( '/\s+/', ' ', (string) preg_replace( '/\/\*M?!\d*|\*\//', ' ', $clean ) ) );
+        $ident = '(?:`((?:[^`]|``)+)`|([A-Za-z0-9_$]+))';
+        if ( preg_match( '/^RENAME\s+TABLE\s+(.+)$/is', $flat, $m ) ) {
+            foreach ( preg_split( '/\s*(?:,|\bTO\b)\s*/i', trim( $m[1] ) ) as $part ) {
+                if ( preg_match( '/^(?:(?:`(?:[^`]|``)+`|[A-Za-z0-9_$]+)\s*\.\s*)?' . $ident . '/i', trim( $part ), $tm ) ) {
+                    $tables[] = str_replace( '``', '`', $tm[1] !== '' ? $tm[1] : $tm[2] );
+                }
+            }
+        } elseif ( preg_match( '/^DROP(?:\s+TEMPORARY)?\s+(?:TABLE|VIEW)(?:\s+IF\s+EXISTS)?\s+(.+)$/is', $flat, $m ) ) {
+            foreach ( preg_split( '/\s*,\s*/', trim( $m[1] ) ) as $part ) {
+                if ( preg_match( '/^(?:(?:`(?:[^`]|``)+`|[A-Za-z0-9_$]+)\s*\.\s*)?' . $ident . '/i', trim( $part ), $tm ) ) {
+                    $tables[] = str_replace( '``', '`', $tm[1] !== '' ? $tm[1] : $tm[2] );
+                }
+            }
+        } elseif ( preg_match( '/^LOCK\s+TABLES?\s+(.+)$/is', $flat, $m ) ) {
+            foreach ( preg_split( '/\s*,\s*/', trim( $m[1] ) ) as $part ) {
+                if ( preg_match( '/^(?:(?:`(?:[^`]|``)+`|[A-Za-z0-9_$]+)\s*\.\s*)?' . $ident . '/i', trim( $part ), $tm ) ) {
+                    $tables[] = str_replace( '``', '`', $tm[1] !== '' ? $tm[1] : $tm[2] );
+                }
+            }
+        }
+        return array_values( array_unique( $tables ) );
     }
 
     /** $statement with the table it names renamed per $map (old name => new name). */
@@ -3198,10 +3282,37 @@ class Import {
         if ( ! $map ) {
             return $statement;
         }
-        return preg_replace_callback( '/^(\s*(?:\/\*!\d+\s+)?(?:CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT(?:\s+(?:IGNORE|DELAYED|LOW_PRIORITY|HIGH_PRIORITY))*\s+INTO|REPLACE(?:\s+(?:DELAYED|LOW_PRIORITY))*\s+INTO|ALTER\s+TABLE|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|TRUNCATE(?:\s+TABLE)?|LOCK\s+TABLES)\s+`)((?:[^`]|``)+)`/i', function ( $m ) use ( $map ) {
-            $name = str_replace( '``', '`', $m[2] );
-            return $m[1] . str_replace( '`', '``', $map[ $name ] ?? $name ) . '`';
-        }, (string) $statement, 1 );
+        $statement = self::strip_leading_comments( (string) $statement );
+        $lower_map = array_change_key_case( $map, CASE_LOWER );
+        $head      = '(?:\/\*M?!\d*\s*)?(?:'
+            . 'CREATE\s+(?:(?:OR\s+REPLACE|TEMPORARY)\s+)*TABLE(?:\s+IF\s+NOT\s+EXISTS)?'
+            . '|CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW'
+            . '|INSERT(?:\s+(?:IGNORE|DELAYED|LOW_PRIORITY|HIGH_PRIORITY))*(?:\s+INTO)?'
+            . '|REPLACE(?:\s+(?:DELAYED|LOW_PRIORITY))*(?:\s+INTO)?'
+            . '|UPDATE(?:\s+(?:LOW_PRIORITY|IGNORE))*'
+            . '|DELETE(?:\s+(?:LOW_PRIORITY|QUICK|IGNORE))*\s+FROM'
+            . '|ALTER(?:\s+(?:ONLINE|IGNORE))*\s+TABLE'
+            . '|DROP(?:\s+TEMPORARY)?\s+(?:TABLE|VIEW)(?:\s+IF\s+EXISTS)?'
+            . '|TRUNCATE(?:\s+TABLE)?'
+            . '|LOCK\s+TABLES?'
+            . '|RENAME\s+TABLE'
+            . ')';
+        return preg_replace_callback(
+            '/^(\s*' . $head . '\s+)(?:`((?:[^`]|``)+)`|([A-Za-z0-9_$]+))/i',
+            function ( $m ) use ( $map, $lower_map ) {
+                $name = $m[2] !== '' ? str_replace( '``', '`', $m[2] ) : $m[3];
+                if ( isset( $map[ $name ] ) ) {
+                    $new = $map[ $name ];
+                } elseif ( isset( $lower_map[ strtolower( $name ) ] ) ) {
+                    $new = $lower_map[ strtolower( $name ) ];
+                } else {
+                    return $m[0];
+                }
+                return $m[1] . '`' . str_replace( '`', '``', $new ) . '`';
+            },
+            $statement,
+            1
+        );
     }
 
     /**
@@ -3248,15 +3359,19 @@ class Import {
             $statement = self::strip_leading_comments( $statement );
             if ( $remap ) {
                 $statement = preg_replace_callback(
-                    '/^((?:\/\*!\d+\s+)?(?:CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT\s+INTO|REPLACE\s+INTO|ALTER\s+TABLE|LOCK\s+TABLES|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|TRUNCATE\s+TABLE)\s+`)' . preg_quote( $old_prefix, '/' ) . '/i',
+                    '/^((?:\/\*M?!\d*\s*)?(?:CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT(?:\s+(?:IGNORE|DELAYED|LOW_PRIORITY|HIGH_PRIORITY))*\s+INTO|REPLACE(?:\s+(?:DELAYED|LOW_PRIORITY))*\s+INTO|ALTER\s+TABLE|LOCK\s+TABLES|DROP\s+(?:TABLE|VIEW)(?:\s+IF\s+EXISTS)?|TRUNCATE(?:\s+TABLE)?)\s+`?)' . preg_quote( $old_prefix, '/' ) . '/i',
                     function ( $m ) use ( $new_prefix ) {
                         return $m[1] . $new_prefix;
                     },
                     $statement
                 );
-                // Foreign keys name their parent table too.
-                if ( preg_match( '/^(?:\/\*!\d+\s+)?(?:CREATE|ALTER)\s+TABLE/i', $statement ) ) {
-                    $statement = preg_replace( '/(\bREFERENCES\s+`)' . preg_quote( $old_prefix, '/' ) . '/i', '${1}' . str_replace( [ '\\', '$' ], [ '\\\\', '\\$' ], $new_prefix ), $statement );
+                // Foreign keys name their parent table too (backticked or unbackticked).
+                if ( preg_match( '/^(?:\/\*M?!\d*\s*)?(?:CREATE|ALTER)\s+TABLE/i', $statement ) ) {
+                    $statement = preg_replace(
+                        '/(\bREFERENCES(?:\s|\/\*(?!M?!).*?\*\/)+`?)' . preg_quote( $old_prefix, '/' ) . '/is',
+                        '${1}' . str_replace( [ '\\', '$' ], [ '\\\\', '\\$' ], $new_prefix ),
+                        $statement
+                    );
                 }
             }
             if ( preg_match( '/^CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`([^`]+)`/i', $statement, $m ) ) {
@@ -3285,7 +3400,7 @@ class Import {
                     return '';
                 }
                 $i = $nl + 1;
-            } elseif ( $c === '/' && substr( $statement, $i, 2 ) === '/*' && substr( $statement, $i, 3 ) !== '/*!' ) {
+            } elseif ( $c === '/' && substr( $statement, $i, 2 ) === '/*' && substr( $statement, $i, 3 ) !== '/*!' && substr( $statement, $i, 4 ) !== '/*M!' ) {
                 $end = strpos( $statement, '*/', $i + 2 );
                 if ( $end === false ) {
                     return '';
@@ -3321,8 +3436,26 @@ class Import {
         if ( $sql === '' ) {
             return 'ok';
         }
+        $wrapped = false;
         if ( preg_match( '/^\/\*M?!\d*\s?(.*)\*\/$/s', $sql, $m ) && strpos( $m[1], '*/' ) === false ) {
-            $sql = trim( $m[1] );
+            $wrapped = true;
+            $sql     = trim( $m[1] );
+        }
+        if ( $wrapped ) {
+            // In Target mode, only allow executable-comment wrapping on SET
+            // statements (mysqldump session lines) and quietly skip mysqldump's
+            // DISABLE/ENABLE KEYS lines (never executed). Refuse any DML/DDL
+            // wrapped in /*! ... */ or /*M! ... */.
+            if ( preg_match( '/^SET\s/i', $sql ) ) {
+                if ( self::target_set_allowed( $sql ) ) {
+                    return 'ok';
+                }
+                return self::dump_session_restore( $sql ) ? 'skip' : 'refused';
+            }
+            if ( preg_match( '/^ALTER\s+TABLE\s+`((?:[^`]|``)+)`\s+(?:DISABLE|ENABLE)\s+KEYS\s*$/i', $sql ) ) {
+                return 'skip';
+            }
+            return 'refused';
         }
         $ident = '`((?:[^`]|``)+)`';
         $heads = [
@@ -3344,6 +3477,10 @@ class Import {
                 // Nothing that reads, renames or swaps another table, runs a
                 // routine, or reaches outside the database or onto the disk.
                 if ( preg_match( '/\b(SELECT|UNION|RENAME|LIKE|EXCHANGE|TABLE|TABLESPACE|DISCARD|OUTFILE|DUMPFILE|LOAD_FILE|DIRECTORY|CONNECTION|TABLE_TYPE|TABNAME|FILE_NAME|TRIGGER|PROCEDURE|FUNCTION|EVENT|GRANT|HANDLER|CALL|EXECUTE|PREPARE|DATABASE|SCHEMA|INTO)\b|;|`i`\s*\.|\.\s*`i`/i', $rest ) ) {
+                    return 'refused';
+                }
+                // Foreign keys in Target mode must backtick the referenced table.
+                if ( preg_match( '/\bREFERENCES\b(?!\s+`i`)/i', $rest ) ) {
                     return 'refused';
                 }
             }
@@ -3434,36 +3571,110 @@ class Import {
      * unwrapped, so case, spacing and comment wrapping don't hide anything.
      * The reason, or null.
      */
-    private static function server_problem( $sql, $lock_prefix = null ) {
+    private static function server_problem( $sql, $lock_prefix = null, $raw = '' ) {
         $names = $sql;
         $sql   = preg_replace( '/`(?:[^`]|``)*`/', '`i`', $sql );
         $at    = '(?:^|;|\b(?:BEGIN|DO|THEN|ELSE|LOOP|REPEAT)\b)\s*';
         $rules = [
-            'installs or removes a plugin or library in the database server (INSTALL PLUGIN, SONAME)' => '/' . $at . '(?:UN)?INSTALL\s+(?:PLUGIN|SONAME)\b|\bSONAME\b/i',
-            'defines a link to another database server (CREATE SERVER)'                      => '/' . $at . '(?:CREATE|ALTER|DROP)\s+(?:OR\s+REPLACE\s+)?SERVER\b/i',
-            'reads a file on the database server (LOAD DATA, LOAD XML, LOAD_FILE)'            => '/' . $at . 'LOAD\s+(?:DATA|XML)\b|\bLOAD_FILE\s*\(/i',
-            'writes a file on the database server (INTO OUTFILE, INTO DUMPFILE)'             => '/\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i',
-            'changes database accounts or privileges (GRANT, REVOKE, USER, ROLE, PASSWORD)'  => '/' . $at . '(?:GRANT|REVOKE)\b|' . $at . '(?:CREATE|ALTER|DROP|RENAME)\s+(?:USER|ROLE)\b|' . $at . 'SET\s+(?:PASSWORD|(?:DEFAULT\s+)?ROLE)\b/i',
-            'changes a setting for the whole database server (SET GLOBAL)'                   => '/@@(?:GLOBAL|PERSIST(?:_ONLY)?)\b|\b(?:GLOBAL|PERSIST|PERSIST_ONLY)\s+[A-Za-z_][\w.]*\s*:?=/i',
-            'runs a database server command (FLUSH, RESET, SHUTDOWN, KILL, BINLOG, PURGE LOGS)' => '/' . $at . '(?:FLUSH|RESET|SHUTDOWN|KILL|BINLOG)\b|' . $at . 'PURGE\s+(?:BINARY|MASTER)\s+LOGS\b/i',
-            'changes replication (CHANGE MASTER, START or STOP SLAVE)'                       => '/' . $at . 'CHANGE\s+(?:MASTER|REPLICATION)\b|' . $at . '(?:START|STOP)\s+(?:ALL\s+)?(?:SLAVES?|REPLICAS?)\b/i',
-            'creates, changes or drops a whole database (CREATE DATABASE, DROP DATABASE)'    => '/' . $at . '(?:CREATE|ALTER|DROP)\s+(?:DATABASE|SCHEMA)\b/i',
+            'installs or removes a plugin, component or library in the database server (INSTALL PLUGIN, COMPONENT, SONAME)' => '/\b(?:UN)?INSTALL\s+(?:PLUGIN|COMPONENT|SONAME)\b|\bSONAME\b/i',
+            'defines a link to another database server (CREATE SERVER)'                                                     => '/' . $at . '(?:CREATE|ALTER|DROP)\s+(?:OR\s+REPLACE\s+)?SERVER\b/i',
+            'reads a file on the database server (LOAD DATA, LOAD XML, LOAD_FILE)'                                          => '/' . $at . 'LOAD\s+(?:DATA|XML)\b|\bLOAD_FILE\s*\(/i',
+            'writes a file on the database server (INTO OUTFILE, INTO DUMPFILE)'                                            => '/\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i',
+            'changes database accounts or privileges (GRANT, REVOKE, USER, ROLE, PASSWORD)'                                 => '/' . $at . '(?:GRANT|REVOKE)\b|' . $at . '(?:CREATE|ALTER|DROP|RENAME)\s+(?:USER|ROLE)\b|' . $at . 'SET\s+(?:PASSWORD|(?:DEFAULT\s+)?ROLE)\b/i',
+            'changes a setting for the whole database server (SET GLOBAL)'                                                  => '/@@(?:GLOBAL|PERSIST(?:_ONLY)?)\b|\b(?:GLOBAL|PERSIST|PERSIST_ONLY)\s+(?:`i`|[A-Za-z_][\w.]*)(?:\.(?:`i`|[A-Za-z_][\w.]*))*\s*:?=/i',
+            'runs a database server command (FLUSH, RESET, SHUTDOWN, KILL, BINLOG, PURGE LOGS)'                             => '/' . $at . '(?:FLUSH|RESET|SHUTDOWN|KILL|BINLOG)\b|' . $at . 'PURGE\s+(?:BINARY|MASTER)\s+LOGS\b/i',
+            'uses prepared SQL statements (PREPARE, EXECUTE, DEALLOCATE)'                                                   => '/' . $at . '(?:PREPARE|EXECUTE|DEALLOCATE|DROP\s+PREPARE)\b/i',
+            'changes replication (CHANGE MASTER, START or STOP SLAVE)'                                                      => '/' . $at . 'CHANGE\s+(?:MASTER|REPLICATION)\b|' . $at . '(?:START|STOP)\s+(?:ALL\s+)?(?:SLAVES?|REPLICAS?)\b/i',
+            'creates, changes or drops a whole database (CREATE DATABASE, DROP DATABASE)'                                   => '/' . $at . '(?:CREATE|ALTER|DROP)\s+(?:DATABASE|SCHEMA)\b/i',
         ];
+        // For CREATE TRIGGER/PROCEDURE/FUNCTION/EVENT, also extract the body
+        // past the header/characteristics so single-statement routines without
+        // BEGIN are checked against every rule above.
+        $targets = [ $sql ];
+        $routine_body = self::extract_routine_body( $sql );
+        if ( $routine_body !== null && $routine_body !== '' ) {
+            $targets[] = $routine_body;
+        }
         foreach ( $rules as $what => $rule ) {
-            if ( preg_match( $rule, $sql ) ) {
-                $more = strpos( $what, 'whole database' ) !== false ? ' (A dump made with mysqldump --databases or --all-databases does this: export just this site\'s database instead.)' : '';
-                return "The incoming database has a statement that {$what}, which no WordPress database needs, so a move doesn't accept it.{$more} Nothing was imported from it.";
+            foreach ( $targets as $target_sql ) {
+                if ( preg_match( $rule, $target_sql ) ) {
+                    $more = strpos( $what, 'whole database' ) !== false ? ' (A dump made with mysqldump --databases or --all-databases does this: export just this site\'s database instead.)' : '';
+                    return "The incoming database has a statement that {$what}, which no WordPress database needs, so a move doesn't accept it.{$more} Nothing was imported from it.";
+                }
             }
         }
-        if ( preg_match( '/^\s*USE\s+(`(?:[^`]|``)+`|[A-Za-z0-9_$]+)\s*$/i', $names, $m ) ) {
+        // Reject session settings that change how MySQL lexes later statements
+        // (NO_BACKSLASH_ESCAPES / ANSI_QUOTES in sql_mode, or non-UTF8/latin1
+        // character_set_client / NAMES). Safe mysqldump lines pass cleanly.
+        $has_set = false;
+        foreach ( $targets as $target_sql ) {
+            if ( preg_match( '/' . $at . 'SET\b/i', $target_sql ) ) {
+                $has_set = true;
+                break;
+            }
+        }
+        if ( $has_set && preg_match( '/\b(?:sql_mode|character_set_client|NAMES|CHARACTER\s+SET|CHARSET)\b/i', $names ) ) {
+            $raw_clean    = $raw !== '' ? self::sql_uncomment( $raw ) : $names;
+            $safe_charset = '(?:utf8mb4|utf8mb3|utf8|latin1|ascii|binary|default)';
+            if ( preg_match( '/(?:^|[,;\s])(?:(?:SESSION|LOCAL)\s+|@@(?:(?:SESSION|LOCAL)\.)?)?(?:`sql_mode`|sql_mode)\s*:?=/i', $names ) ) {
+                if ( preg_match_all( '/(?:^|[,;\s])(?:(?:SESSION|LOCAL)\s+|@@(?:(?:SESSION|LOCAL)\.)?)?(?:`sql_mode`|sql_mode)\s*:?=\s*((?:\'(?:[^\'\\\\]|\\\\.|\'\')*\'|"(?:[^"\\\\]|\\\\.|"")*")(?=\s*(?:[,;]|$))|[^,;]+)/i', $raw_clean, $sm ) ) {
+                    $bad_modes = [ 'NO_BACKSLASH_ESCAPES', 'ANSI_QUOTES', 'ANSI', 'POSTGRESQL', 'ORACLE', 'MSSQL', 'DB2', 'MAXDB' ];
+                    foreach ( $sm[1] as $val ) {
+                        $val = trim( $val );
+                        if ( preg_match( '/^(?:@(?:OLD|saved)_[A-Za-z_]+|DEFAULT)$/i', $val ) ) {
+                            continue;
+                        }
+                        if ( preg_match( '/^([\'"])([A-Za-z0-9_, ]*)\1$/', $val, $qm ) ) {
+                            $modes = array_filter( array_map( 'trim', explode( ',', strtoupper( $qm[2] ) ) ) );
+                            foreach ( $modes as $mode ) {
+                                if ( in_array( $mode, $bad_modes, true ) ) {
+                                    return "The incoming database changes sql_mode to {$mode}, which alters how SQL quotes and escapes are parsed, so a move doesn't accept it. Nothing was imported from it.";
+                                }
+                            }
+                            continue;
+                        }
+                        if ( preg_match( '/^[A-Za-z][A-Za-z0-9_]*$/', $val ) && ! in_array( strtoupper( $val ), $bad_modes, true ) ) {
+                            continue;
+                        }
+                        return "The incoming database changes sql_mode in a way this can't verify safely, so a move doesn't accept it. Nothing was imported from it.";
+                    }
+                }
+            }
+            if ( preg_match( '/(?:^|[,;\s])(?:(?:SESSION|LOCAL)\s+|@@(?:(?:SESSION|LOCAL)\.)?)?(?:`character_set_client`|character_set_client)\s*:?=/i', $names ) ) {
+                if ( preg_match_all( '/(?:^|[,;\s])(?:(?:SESSION|LOCAL)\s+|@@(?:(?:SESSION|LOCAL)\.)?)?(?:`character_set_client`|character_set_client)\s*:?=\s*((?:\'(?:[^\'\\\\]|\\\\.|\'\')*\'|"(?:[^"\\\\]|\\\\.|"")*")(?=\s*(?:[,;]|$))|[^,;]+)/i', $raw_clean, $cm ) ) {
+                    foreach ( $cm[1] as $val ) {
+                        $val = trim( $val );
+                        if ( preg_match( '/^@(?:OLD|saved)_[A-Za-z_]+$/i', $val ) ) {
+                            continue;
+                        }
+                        if ( preg_match( '/^([\'"]?)' . $safe_charset . '\1$/i', $val ) ) {
+                            continue;
+                        }
+                        return "The incoming database changes character_set_client to an unsupported encoding, so a move doesn't accept it. Nothing was imported from it.";
+                    }
+                }
+            }
+            if ( preg_match( '/' . $at . 'SET\s+(?:NAMES|CHARACTER\s+SET|CHARSET)\b/i', $sql ) || ( $routine_body !== null && preg_match( '/' . $at . 'SET\s+(?:NAMES|CHARACTER\s+SET|CHARSET)\b/i', $routine_body ) ) ) {
+                if ( preg_match_all( '/\bSET\s+(?:NAMES|CHARACTER\s+SET|CHARSET)\s+([^;]+)/i', $raw_clean, $nm ) ) {
+                    foreach ( $nm[1] as $val ) {
+                        $val = trim( $val );
+                        if ( ! preg_match( '/^([\'"]?)' . $safe_charset . '\1(?:\s+COLLATE\s+([\'"]?)[A-Za-z0-9_]+\2)?$/i', $val ) ) {
+                            return "The incoming database changes the connection character set to an unsupported encoding, so a move doesn't accept it. Nothing was imported from it.";
+                        }
+                    }
+                }
+            }
+        }
+        $trimmed_names = trim( $names, " \t\r\n;" );
+        if ( preg_match( '/^USE\s+(`(?:[^`]|``)+`|[A-Za-z0-9_$]+)$/i', $trimmed_names, $m ) ) {
             $db = str_replace( '``', '`', trim( $m[1], '`' ) );
             if ( $db !== DB_NAME ) {
                 return "The incoming database switches to another database ({$db}), so a move doesn't accept it. A dump made with mysqldump --databases or --all-databases does this: export just this site's database instead. Nothing was imported from it.";
             }
-        } elseif ( preg_match( '/^\s*USE\b/i', $sql ) ) {
+        } elseif ( preg_match( '/(?:^|;)\s*USE\b/i', $sql ) ) {
             return "The incoming database switches to another database, so a move doesn't accept it. Nothing was imported from it.";
         }
-        if ( $lock_prefix !== null && $lock_prefix !== '' && preg_match( '/^\s*LOCK\s+TABLES?\s+(.+)$/is', $names, $m ) ) {
+        if ( $lock_prefix !== null && $lock_prefix !== '' && preg_match( '/(?:^|;)\s*LOCK\s+TABLES?\s+([^;]+)$/is', rtrim( $names, " \t\r\n;" ), $m ) ) {
             foreach ( preg_split( '/\s*,\s*/', trim( $m[1] ) ) as $part ) {
                 if ( preg_match( '/^(`(?:[^`]|``)+`|[A-Za-z0-9_$]+)/', $part, $t ) && stripos( str_replace( '``', '`', trim( $t[1], '`' ) ), $lock_prefix ) !== 0 ) {
                     return "The incoming database locks {$t[1]}, a table outside this site's own ({$lock_prefix}*), so a move doesn't accept it. Nothing was imported from it.";
@@ -3471,6 +3682,55 @@ class Import {
             }
         }
         return null;
+    }
+
+    /**
+     * Extracts the executable body of a CREATE TRIGGER/PROCEDURE/FUNCTION/EVENT
+     * skeleton past its header and routine characteristics so single-statement
+     * bodies without BEGIN can be validated with the same leading-statement rules.
+     */
+    private static function extract_routine_body( $sql ) {
+        $head = '/(?:^|;)\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*(?:(?:`i`|\'\'|[A-Za-z0-9_$.-]+)(?:\s*@\s*(?:`i`|\'\'|[A-Za-z0-9_$.%-]+))?|CURRENT_USER(?:\s*\(\s*\))?)\s+)?(?:AGGREGATE\s+)?(TRIGGER|PROCEDURE|FUNCTION|EVENT)\b/i';
+        if ( ! preg_match( $head, $sql, $m, PREG_OFFSET_CAPTURE ) ) {
+            return null;
+        }
+        $kind = strtoupper( $m[1][0] );
+        $rest = substr( $sql, $m[0][1] + strlen( $m[0][0] ) );
+        $body = '';
+        if ( $kind === 'TRIGGER' ) {
+            if ( preg_match( '/\bFOR\s+EACH\s+ROW(?:\s+(?:FOLLOWS|PRECEDES)\s+(?:`i`|[A-Za-z0-9_$]+))?\s*/i', $rest, $tm, PREG_OFFSET_CAPTURE ) ) {
+                $body = substr( $rest, $tm[0][1] + strlen( $tm[0][0] ) );
+            }
+        } elseif ( $kind === 'EVENT' ) {
+            if ( preg_match( '/\bDO\b\s*/i', $rest, $em, PREG_OFFSET_CAPTURE ) ) {
+                $body = substr( $rest, $em[0][1] + strlen( $em[0][0] ) );
+            }
+        } else {
+            // PROCEDURE or FUNCTION: skip past parameter list (...)
+            $open = strpos( $rest, '(' );
+            if ( $open !== false ) {
+                $depth = 0;
+                for ( $i = $open, $n = strlen( $rest ); $i < $n; $i++ ) {
+                    if ( $rest[ $i ] === '(' ) {
+                        $depth++;
+                    } elseif ( $rest[ $i ] === ')' && --$depth === 0 ) {
+                        $body = substr( $rest, $i + 1 );
+                        break;
+                    }
+                }
+            }
+        }
+        $body = ltrim( $body );
+        if ( $body === '' ) {
+            return null;
+        }
+        if ( $kind === 'FUNCTION' && preg_match( '/^RETURNS\s+[A-Za-z_]+(?:\s*\([^)]*\))?(?:\s+(?:UNSIGNED|ZEROFILL|SIGNED|BINARY|ASCII|UNICODE|(?:CHARACTER\s+SET|CHARSET)\s+\S+|COLLATE\s+\S+))*\s*/i', $body, $rm ) ) {
+            $body = ltrim( (string) substr( $body, strlen( $rm[0] ) ) );
+        }
+        while ( preg_match( '/^(?:COMMENT\s+\'\'|LANGUAGE\s+SQL|(?:NOT\s+)?DETERMINISTIC|(?:CONTAINS|NO)\s+SQL|(?:READS|MODIFIES)\s+SQL\s+DATA|SQL\s+SECURITY\s+(?:DEFINER|INVOKER)|(?:`i`|[A-Za-z0-9_$]+)\s*:)\s*/i', $body, $cm ) ) {
+            $body = ltrim( (string) substr( $body, strlen( $cm[0] ) ) );
+        }
+        return $body;
     }
 
     /** Storage engines a dump may create tables with: none that reaches outside the database (FEDERATED, CONNECT, SPIDER, S3), reads other tables (MRG_MyISAM) or files on the server (CSV, CONNECT). */
@@ -3497,20 +3757,19 @@ class Import {
      */
     private static function reach_problem( $statement, $prefix, $shared = false, $old = '', $new = '', $locks = false ) {
         $raw = trim( (string) $statement );
-        // Rows, most of any dump, are read through only when one could
-        // name a file (INSERT … SELECT LOAD_FILE(), … INTO OUTFILE).
-        $word = self::statement_word( $raw );
-        if ( ( $word === 'INSERT' || $word === 'REPLACE' ) && stripos( $raw, 'FILE' ) === false ) {
+        // Rows, most of any dump, skip full lexing only when they are a plain
+        // INSERT/REPLACE ... INTO `table` VALUES (...) with no comments or FILE.
+        if ( strpos( $raw, '/*' ) === false && stripos( $raw, 'FILE' ) === false && preg_match( '/^\s*(?:INSERT|REPLACE)\s+(?:IGNORE\s+)?INTO\s+`(?:[^`]|``)+`\s+VALUES\s*\(/i', $raw ) ) {
             return null;
         }
-        $sql = self::sql_skeleton( $raw, true );
+        $sql = self::sql_skeleton( $raw, true, true );
         if ( $sql === null ) {
             return "The incoming database has a statement this can't read safely (an executable comment inside another, or one that doesn't end), so a move doesn't accept it. Nothing was imported from it.";
         }
-        if ( $why = self::server_problem( $sql, $locks ? (string) $prefix : null ) ) {
+        if ( $why = self::server_problem( $sql, $locks ? (string) $prefix : null, $raw ) ) {
             return $why;
         }
-        if ( ! preg_match( '/^\s*(CREATE\s+(?:TEMPORARY\s+)?TABLE|ALTER\s+(?:ONLINE\s+|IGNORE\s+)*TABLE)\b/i', $sql, $head ) ) {
+        if ( ! preg_match( '/^\s*(?:;\s*)*(CREATE\s+(?:(?:OR\s+REPLACE|TEMPORARY)\s+)*TABLE|ALTER\s+(?:ONLINE\s+|IGNORE\s+)*TABLE)\b/i', $sql, $head ) ) {
             return null;
         }
         $name  = self::statement_table( $statement );
@@ -3523,17 +3782,31 @@ class Import {
         }
         $own = $prefix === '' || $name === null || stripos( $name, $prefix ) === 0;
         $ident = '(?:`(?:[^`]|``)+`|[A-Za-z0-9_$]+)';
-        // Table options follow the column list; columns may be called "engine".
+        // Table options can appear after the column list (...) OR before the
+        // first "(" (e.g. CREATE TABLE t ENGINE=FEDERATED AS SELECT (1)).
+        // Columns inside (...) may be called "engine", so skip only the first
+        // balanced parenthesized group while checking both sides of it.
         $opts = $sql;
-        if ( stripos( $head[1], 'CREATE' ) === 0 && ( $open = strpos( $sql, '(' ) ) !== false ) {
-            $depth = 0;
-            for ( $i = $open, $n = strlen( $sql ); $i < $n; $i++ ) {
-                if ( $sql[ $i ] === '(' ) {
-                    $depth++;
-                } elseif ( $sql[ $i ] === ')' && --$depth === 0 ) {
-                    $opts = substr( $sql, $i + 1 );
-                    break;
+        if ( stripos( $head[1], 'CREATE' ) === 0 ) {
+            $after_head = (string) preg_replace( '/^\s*(?:;\s*)*CREATE\s+(?:(?:OR\s+REPLACE|TEMPORARY)\s+)*TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+(?:' . $ident . '\s*\.\s*)?' . $ident . '/i', '', $sql, 1 );
+            if ( ( $open = strpos( $after_head, '(' ) ) !== false ) {
+                $before = substr( $after_head, 0, $open );
+                $after  = '';
+                $depth  = 0;
+                for ( $i = $open, $n = strlen( $after_head ); $i < $n; $i++ ) {
+                    if ( $after_head[ $i ] === '(' ) {
+                        $depth++;
+                    } elseif ( $after_head[ $i ] === ')' && --$depth === 0 ) {
+                        $after = substr( $after_head, $i + 1 );
+                        break;
+                    }
                 }
+                if ( $depth !== 0 ) {
+                    $after = substr( $after_head, $open + 1 );
+                }
+                $opts = $before . ' ' . $after;
+            } else {
+                $opts = $after_head;
             }
         }
         if ( preg_match_all( '/\bENGINE\b\s*(?:=\s*)?(' . $ident . '|\'\'|\S+)/i', $opts, $engines ) ) {
@@ -3611,7 +3884,7 @@ class Import {
      * as this reads it is hidden from MySQL too. Null when it ends inside a
      * string or comment. $keep_names: backticked names stay as they are.
      */
-    private static function sql_skeleton( $sql, $keep_names = false ) {
+    private static function sql_skeleton( $sql, $keep_names = false, $mark_exec_end = false ) {
         $out  = '';
         $len  = strlen( $sql );
         $i    = 0;
@@ -3650,7 +3923,7 @@ class Import {
                 $i    = $end + 2;
             } elseif ( $c === '*' && $n === '/' && $exec ) {
                 $exec = false;
-                $out .= ' ';
+                $out .= $mark_exec_end ? ' ; ' : ' ';
                 $i   += 2;
             } elseif ( $c === "'" || $c === '"' ) {
                 $j = $i + 1;
@@ -3692,6 +3965,92 @@ class Import {
             }
         }
         return $exec ? null : $out;
+    }
+
+    /**
+     * Strips plain SQL comments and unwraps executable-comment markers while
+     * keeping string literals and backticked identifiers intact (used to
+     * inspect literal values in SET sql_mode / character_set_client / NAMES).
+     */
+    private static function sql_uncomment( $sql ) {
+        $out  = '';
+        $len  = strlen( $sql );
+        $i    = 0;
+        $exec = false;
+        while ( $i < $len ) {
+            $run = strcspn( $sql, "-#/*'\"`", $i );
+            if ( $run > 0 ) {
+                $out .= substr( $sql, $i, $run );
+                $i   += $run;
+                continue;
+            }
+            $c = $sql[ $i ];
+            $n = $i + 1 < $len ? $sql[ $i + 1 ] : '';
+            if ( ( $c === '-' && $n === '-' && ( $i + 2 >= $len || ord( $sql[ $i + 2 ] ) <= 32 ) ) || $c === '#' ) {
+                $nl = strpos( $sql, "\n", $i );
+                if ( $nl === false ) {
+                    return $out;
+                }
+                $out .= ' ';
+                $i    = $nl + 1;
+            } elseif ( $c === '/' && $n === '*' ) {
+                if ( preg_match( '/\G\/\*M?!\d*/', $sql, $mm, 0, $i ) ) {
+                    $exec = true;
+                    $out .= ' ';
+                    $i   += strlen( $mm[0] );
+                    continue;
+                }
+                $end = strpos( $sql, '*/', $i + 2 );
+                if ( $end === false ) {
+                    return $out;
+                }
+                $out .= ' ';
+                $i    = $end + 2;
+            } elseif ( $c === '*' && $n === '/' && $exec ) {
+                $exec = false;
+                $out .= ' ';
+                $i   += 2;
+            } elseif ( $c === "'" || $c === '"' ) {
+                $j = $i + 1;
+                while ( $j < $len ) {
+                    $j += strcspn( $sql, '\\' . $c, $j );
+                    if ( $j >= $len ) {
+                        break;
+                    }
+                    if ( $sql[ $j ] === '\\' ) {
+                        $j += 2;
+                        continue;
+                    }
+                    if ( $j + 1 < $len && $sql[ $j + 1 ] === $c ) {
+                        $j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                $out .= substr( $sql, $i, min( $len, $j + 1 ) - $i );
+                $i    = $j + 1;
+            } elseif ( $c === '`' ) {
+                $j = $i + 1;
+                while ( $j < $len ) {
+                    $j = strpos( $sql, '`', $j );
+                    if ( $j === false ) {
+                        $j = $len;
+                        break;
+                    }
+                    if ( $j + 1 < $len && $sql[ $j + 1 ] === '`' ) {
+                        $j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                $out .= substr( $sql, $i, min( $len, $j + 1 ) - $i );
+                $i    = $j + 1;
+            } else {
+                $out .= $c;
+                $i++;
+            }
+        }
+        return $out;
     }
 
     /**
@@ -3797,11 +4156,11 @@ class Import {
             return true;
         }
         // Skip SET statements we handle ourselves
-        if ( preg_match( '/^SET\s+(FOREIGN_KEY_CHECKS|UNIQUE_CHECKS|sql_mode|NAMES)/i', $statement ) ) {
+        if ( preg_match( '/^SET\s+(?:(?:SESSION|LOCAL)\s+)?(?:@@(?:(?:SESSION|LOCAL)\.)?)?(FOREIGN_KEY_CHECKS|UNIQUE_CHECKS|sql_mode|NAMES)\b/i', $statement ) ) {
             return true;
         }
         // Skip the DISABLE/ENABLE KEYS comments
-        if ( preg_match( '/^\/\*!\d+\s+ALTER TABLE/', $statement ) ) {
+        if ( preg_match( '/^\/\*M?!\d*\s*ALTER\s+TABLE\s+(?:`(?:[^`]|``)+`|[A-Za-z0-9_$]+)\s+(?:DISABLE|ENABLE)\s+KEYS\s*\*\/$/i', $statement ) ) {
             return true;
         }
 
@@ -4338,7 +4697,7 @@ class Import {
                 }
             }
         }
-        $report['elementor_css_cleared'] = self::clear_elementor_css();
+        $report['elementor_css_cleared'] = self::clear_elementor_css( $target );
         return $report;
     }
 
@@ -4347,21 +4706,37 @@ class Import {
      * uploads/elementor/css and records it in _elementor_css. Clearing both,
      * as its own "Regenerate CSS" does, makes it rebuild on the next view.
      */
-    private static function clear_elementor_css() {
+    private static function clear_elementor_css( $target = null ) {
         global $wpdb;
-        $dir = wp_upload_dir()['basedir'] . '/elementor/css';
+        if ( $target ) {
+            if ( $target->uploads === '' || $target->prefix === '' || ! preg_match( '/^[A-Za-z0-9_]+$/', $target->prefix ) ) {
+                return false;
+            }
+            $web_root = wp_normalize_path( dirname( WP_CONTENT_DIR ) );
+            $dir      = $web_root . '/' . trim( (string) $target->uploads, '/' ) . '/elementor/css';
+            $postmeta = $target->prefix . 'postmeta';
+            $options  = $target->prefix . 'options';
+        } else {
+            $dir      = wp_upload_dir()['basedir'] . '/elementor/css';
+            $postmeta = $wpdb->postmeta;
+            $options  = $wpdb->options;
+        }
         if ( ! is_dir( $dir ) ) {
             return false;
         }
         foreach ( (array) glob( $dir . '/*.css' ) as $file ) {
             @unlink( $file );
         }
-        $wpdb->query( $wpdb->prepare( "DELETE FROM {$wpdb->postmeta} WHERE meta_key = %s", '_elementor_css' ) );
+        $wpdb->query( $wpdb->prepare( "DELETE FROM `{$postmeta}` WHERE meta_key = %s", '_elementor_css' ) );
         foreach ( [ '_elementor_global_css', 'elementor-custom-breakpoints-files' ] as $option ) {
-            $wpdb->delete( $wpdb->options, [ 'option_name' => $option ] );
-            wp_cache_delete( $option, 'options' );
+            $wpdb->delete( $options, [ 'option_name' => $option ] );
+            if ( ! $target ) {
+                wp_cache_delete( $option, 'options' );
+            }
         }
-        wp_cache_delete( 'alloptions', 'options' );
+        if ( ! $target ) {
+            wp_cache_delete( 'alloptions', 'options' );
+        }
         return true;
     }
 
@@ -4574,7 +4949,7 @@ class Import {
             }
             $rel = ltrim( str_replace( '\\', '/', substr( $path, strlen( $root ) ) ), '/' );
             // What a copy that stopped left behind.
-            if ( preg_match( '/\.dsk\.php\.(?:[0-9a-f]{12}\.)?tmp$/', $rel ) ) {
+            if ( preg_match( '/\.dsk\.php\.(?:[0-9a-f]{12}\.)?tmp(?:\.php)?$/', $rel ) ) {
                 if ( (int) @filemtime( $path ) < time() - HOUR_IN_SECONDS ) {
                     @unlink( $path );
                 }
@@ -5768,7 +6143,7 @@ class Import {
         foreach ( [ 'sql-state.php', 'sql-journal.php', 'deploy-list.php', 'deploy-journal.php', 'replace-state.php', 'replace-journal.php', 'extract-state.php', 'fetched.php', 'fetched.lock', 'database-state.php', 'pace.php', 'db-plan.php', 'db-peek.php', 'settle-state.php', 'fingerprints.php', 'rollback/snapshot-state.php', 'rollback/snapshot-add-state.php' ] as $name ) {
             @unlink( $this->import_path . '/' . $name );
         }
-        foreach ( (array) glob( $this->rollback_path . '/*.db.php.part' ) as $part ) {
+        foreach ( array_merge( glob( $this->rollback_path . '/*.db.part.php' ) ?: [], glob( $this->rollback_path . '/*.db.php.part' ) ?: [] ) as $part ) {
             @unlink( $part );
         }
     }
@@ -6303,7 +6678,7 @@ class Import {
     }
 
     private static function sql_scanner( $delim = ';' ) {
-        return [ 'buf' => '', 'cur' => '', 'state' => 'normal', 'stopped' => false, 'ended_cleanly' => false, 'fed' => 0, 'pos' => 0, 'delim' => (string) $delim !== '' ? (string) $delim : ';' ];
+        return [ 'buf' => '', 'cur' => '', 'state' => 'normal', 'exec' => false, 'stopped' => false, 'ended_cleanly' => false, 'fed' => 0, 'pos' => 0, 'delim' => (string) $delim !== '' ? (string) $delim : ';' ];
     }
 
     /**
@@ -6319,6 +6694,7 @@ class Import {
         $len   = strlen( $s );
         $i     = 0;
         $state = $scan['state'];
+        $exec  = ! empty( $scan['exec'] );
         $cur   = $scan['cur'];
         // The file offset of $s[0], so each statement's end can be reported.
         $base         = ( $scan['fed'] ?? 0 ) - strlen( $scan['buf'] );
@@ -6345,25 +6721,33 @@ class Import {
                     // A client DELIMITER line at the start of a statement
                     // (mysqldump writes one around each trigger and routine,
                     // whose bodies hold ";"): from here on that ends one.
-                    if ( ( $ch === 'D' || $ch === 'd' ) && strlen( $cur ) < 4096 && strncasecmp( substr( $s, $i, 9 ), 'DELIMITER', min( 9, $len - $i ) ) === 0 && trim( self::strip_leading_comments( $cur ) ) === '' ) {
-                        if ( $len - $i < 10 && ! $final ) {
-                            break 2; // too little left to tell
-                        }
-                        $nl = strpos( $s, "\n", $i );
-                        if ( $nl === false && ! $final ) {
-                            break 2; // the rest of the line is in the next piece
-                        }
-                        $line = $nl === false ? substr( $s, $i ) : substr( $s, $i, $nl - $i );
-                        if ( preg_match( '/^DELIMITER[ \t]+(\S+)[ \t]*\r?$/i', $line, $dm ) ) {
-                            $scan['delim'] = $dm[1];
-                            $i             = $nl === false ? $len : $nl + 1;
-                            $cur           = '';
-                            $scan['pos']   = $base + $i;
-                            break;
+                    // Leading spaces/tabs before DELIMITER are allowed.
+                    if ( ! $exec && ( $ch === 'D' || $ch === 'd' || $ch === ' ' || $ch === "\t" ) && strlen( $cur ) < 4096 && trim( self::strip_leading_comments( $cur ) ) === '' ) {
+                        $ws = ( $ch === ' ' || $ch === "\t" ) ? strspn( $s, " \t", $i ) : 0;
+                        if ( $i + $ws >= $len ) {
+                            if ( ! $final && $ws < 256 ) {
+                                break 2;
+                            }
+                        } elseif ( strncasecmp( substr( $s, $i + $ws, 9 ), 'DELIMITER', min( 9, $len - $i - $ws ) ) === 0 ) {
+                            if ( $len - $i - $ws < 10 && ! $final ) {
+                                break 2; // too little left to tell
+                            }
+                            $nl = strpos( $s, "\n", $i + $ws );
+                            if ( $nl === false && ! $final ) {
+                                break 2; // the rest of the line is in the next piece
+                            }
+                            $line = $nl === false ? substr( $s, $i + $ws ) : substr( $s, $i + $ws, $nl - $i - $ws );
+                            if ( preg_match( '/^DELIMITER[ \t]+(\S+)[ \t]*\r?$/i', $line, $dm ) ) {
+                                $scan['delim'] = $dm[1];
+                                $i             = $nl === false ? $len : $nl + 1;
+                                $cur           = '';
+                                $scan['pos']   = $base + $i;
+                                break;
+                            }
                         }
                     }
                     $delim = $scan['delim'];
-                    $run   = strcspn( $s, "-#/'\"`\n" . $delim[0], $i );
+                    $run   = strcspn( $s, "-#/'\"`\n" . ( $exec ? '*' : $delim[0] ), $i );
                     if ( $run > 0 ) {
                         $cur .= substr( $s, $i, $run );
                         $i   += $run;
@@ -6387,15 +6771,38 @@ class Import {
                         break;
                     }
                     if ( $ch === '/' && $nxt === '*' ) {
-                        $state = 'block_comment';
-                        $cur  .= '/*';
-                        $i    += 2;
+                        if ( ! $exec ) {
+                            if ( ! $final && $i + 4 > $len ) {
+                                break 2; // need 4 bytes to tell /*M! from /*
+                            }
+                            if ( substr( $s, $i, 3 ) === '/*!' ) {
+                                $exec = true;
+                                $cur .= '/*!';
+                                $i   += 3;
+                                break;
+                            }
+                            if ( substr( $s, $i, 4 ) === '/*M!' ) {
+                                $exec = true;
+                                $cur .= '/*M!';
+                                $i   += 4;
+                                break;
+                            }
+                            $state = 'block_comment';
+                        }
+                        $cur .= '/*';
+                        $i   += 2;
+                        break;
+                    }
+                    if ( $exec && $ch === '*' && $nxt === '/' ) {
+                        $exec = false;
+                        $cur .= '*/';
+                        $i   += 2;
                         break;
                     }
                     if ( $ch === "'" ) { $state = 'squote';   $cur .= $ch; $i++; break; }
                     if ( $ch === '"' ) { $state = 'dquote';   $cur .= $ch; $i++; break; }
                     if ( $ch === '`' ) { $state = 'backtick'; $cur .= $ch; $i++; break; }
-                    if ( $ch === $delim[0] ) {
+                    if ( ! $exec && $ch === $delim[0] ) {
                         $dl = strlen( $delim );
                         if ( $dl > 2 && ! $final && $i + $dl > $len ) {
                             break 2; // the rest of the delimiter is in the next piece
@@ -6487,11 +6894,12 @@ class Import {
 
         $scan['buf']   = $scan['stopped'] ? '' : substr( $s, $i );
         $scan['state'] = $state;
+        $scan['exec']  = $exec;
         $scan['cur']   = $cur;
 
         if ( $final && ! $scan['stopped'] ) {
             // A dump that ends inside a quote or block comment was cut off.
-            $scan['ended_cleanly'] = ( $state === 'normal' || $state === 'line_comment' );
+            $scan['ended_cleanly'] = ( $state === 'normal' || $state === 'line_comment' ) && ! $exec;
             $scan['pos']           = $base + $len;
             $flush();
         }
