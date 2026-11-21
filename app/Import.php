@@ -6287,6 +6287,7 @@ class Import {
         // Each file's end state, step by step newest first: the oldest step
         // that touches a file decides (put back as it was, or removed).
         $final    = [];
+        $from     = []; // which step's saved copy a file comes back as
         foreach ( $steps as $i => $step ) {
             $m    = $step['id'] === $this->import_id ? $meta : (array) self::rollback_meta( Storage::base_dir() . '/_import_' . $step['id'] . '/rollback' );
             $with = ! self::files_spent( $m );
@@ -6296,6 +6297,7 @@ class Import {
                 $row['puts_back'] = count( $saved );
                 foreach ( $saved as $f => $unused ) {
                     $final[ $f ] = false;
+                    $from[ $f ]  = (string) $step['id'];
                 }
                 foreach ( (array) ( $m['deployed_files'] ?? [] ) as $f ) {
                     $f = (string) $f;
@@ -6307,10 +6309,14 @@ class Import {
                     }
                     $size = 0;
                     if ( ! $partial ) {
-                        if ( ! is_file( $root . '/' . $f ) && ! isset( $final[ $f ] ) ) {
+                        if ( is_file( $root . '/' . $f ) ) {
+                            $size = (int) @filesize( $root . '/' . $f );
+                        } elseif ( isset( $from[ $f ] ) ) {
+                            // Not here now: a newer step puts it back first.
+                            $size = (int) @filesize( ( new self( $from[ $f ] ) )->rollback_file( $f ) );
+                        } else {
                             continue;
                         }
-                        $size = (int) @filesize( $root . '/' . $f );
                     }
                     $row['removes']++;
                     $row['removes_bytes'] += $size;
