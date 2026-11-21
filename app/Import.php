@@ -1371,6 +1371,15 @@ class Import {
                     return true;
                 }
             }
+            // mysqldump puts each session setting back from a variable it
+            // saved a moment before (SET character_set_client =
+            // @saved_cs_client). A paced import runs in many requests, each
+            // its own database session, so the variable can be gone (NULL)
+            // and the line fails. The import sets the session itself, so
+            // these lines are left out.
+            if ( strlen( $statement ) < 400 && self::restores_saved_setting( $statement ) ) {
+                return true;
+            }
             // A storage engine or foreign key that reaches outside this
             // site's tables ends the import before the statement runs: the
             // copies go and the live tables stay (see reach_problem()).
@@ -2923,8 +2932,20 @@ class Import {
      * without counting them as refused, since every dump has them. Only
      * those exact shapes: anything else in the same SET is still refused.
      */
+    /** mysqldump's line that puts a session setting back from a variable it saved (see dump_session_restore()). */
+    private static function restores_saved_setting( $statement ) {
+        if ( stripos( $statement, '@saved_' ) === false && stripos( $statement, '@OLD_' ) === false ) {
+            return false;
+        }
+        $sql = trim( self::strip_leading_comments( $statement ) );
+        if ( preg_match( '/^\/\*M?!\d*\s?(.*)\*\/$/s', $sql, $m ) && strpos( $m[1], '*/' ) === false ) {
+            $sql = trim( $m[1] );
+        }
+        return self::dump_session_restore( $sql ) && preg_match( '/:?=\s*@(?:OLD|saved)_/i', $sql );
+    }
+
     private static function dump_session_restore( $sql ) {
-        $names = '(?:sql_mode|character_set_client|character_set_results|collation_connection|foreign_key_checks|unique_checks|sql_notes|time_zone)';
+        $names = '(?:sql_mode|character_set_client|character_set_results|collation_connection|foreign_key_checks|unique_checks|sql_notes|note_verbosity|time_zone)';
         $part  = '(?:(?:@@(?:SESSION\.|LOCAL\.)?|(?:SESSION|LOCAL)\s+)?' . $names . '\s*:?=\s*@(?:OLD|saved)_[A-Za-z_]+'
             . '|@OLD_[A-Za-z_]+\s*:?=\s*@@(?:SESSION\.)?' . $names
             . '|sql_mode\s*:?=\s*(?:\'NO_AUTO_VALUE_ON_ZERO\'|"NO_AUTO_VALUE_ON_ZERO"))';
