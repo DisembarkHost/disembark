@@ -34,21 +34,28 @@
   // work. Core moves notices around once the page is ready, so gather after
   // that, and again for any that arrive late.
   var NOTICE = '.notice, div.updated, div.error, .update-nag';
-  var trayList = h('div', { class: 'dsk-tray-list' });
-  var tray = h('div', { class: 'dsk-tray', id: 'dsk-tray', role: 'region', 'aria-label': 'Notices from WordPress and other plugins', hidden: true },
+  // Disembark's own notices (quiet mode) get their own heading, so they
+  // don't read as coming from another plugin.
+  var ownList = h('div', { class: 'dsk-tray-list' }), otherList = h('div', { class: 'dsk-tray-list' });
+  var ownSec = h('div', { class: 'dsk-tray-sec' }, h('span', { class: 'caps' }, 'From Disembark'), ownList);
+  var otherSec = h('div', { class: 'dsk-tray-sec' }, h('span', { class: 'caps' }, 'From WordPress & other plugins'), otherList);
+  var tray = h('div', { class: 'dsk-tray', id: 'dsk-tray', role: 'region', 'aria-label': 'Notices', hidden: true },
     h('div', { class: 'dsk-tray-head' },
-      h('span', { class: 'caps' }, 'From WordPress & other plugins'),
+      h('strong', null, 'Notices'),
       h('button', { class: 'dsk-btn ghost icon sm', type: 'button', 'aria-label': 'Close notices', onclick: function () { openTray(false); } }, D.icon('x'))),
-    trayList);
+    ownSec, otherSec);
+  function isOwn(n) { return n.classList.contains('disembark-notice') || /wp disembark quiet-mode|Disembark quiet mode|Quiet mode:/.test(n.textContent || ''); }
   var trayBtn = h('button', { class: 'dsk-btn ghost sm dsk-tray-btn', type: 'button', 'aria-expanded': 'false', 'aria-controls': 'dsk-tray', hidden: true, onclick: function () { openTray(tray.hidden); } });
   function shown(n) { return !n.classList.contains('hidden') && n.style.display !== 'none'; }
   function refreshTray() {
-    var items = Array.prototype.filter.call(trayList.children, shown);
+    var own = Array.prototype.filter.call(ownList.children, shown), other = Array.prototype.filter.call(otherList.children, shown);
+    var items = own.concat(other);
+    ownSec.hidden = !own.length; otherSec.hidden = !other.length;
     trayBtn.hidden = !items.length;
     if (!items.length) openTray(false);
     trayBtn.classList.toggle('has-error', items.some(function (n) { return n.matches('.notice-error, div.error'); }));
     D.mount(trayBtn, D.icon('bell'), h('span', { class: 'lbl' }, items.length + (items.length === 1 ? ' notice' : ' notices')), h('span', { class: 'n' }, String(items.length)));
-    trayBtn.setAttribute('aria-label', items.length + (items.length === 1 ? ' notice' : ' notices') + ' from WordPress and other plugins');
+    trayBtn.setAttribute('aria-label', items.length + (items.length === 1 ? ' notice' : ' notices'));
   }
   function openTray(on) {
     tray.hidden = !on;
@@ -61,10 +68,10 @@
       return !root.contains(n) && !(n.parentElement && n.parentElement.closest(NOTICE));
     });
     if (!found.length) return;
-    found.forEach(function (n) { trayList.appendChild(n); });
+    found.forEach(function (n) { (isOwn(n) ? ownList : otherList).appendChild(n); });
     refreshTray();
   }
-  new MutationObserver(refreshTray).observe(trayList, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] });
+  [ownList, otherList].forEach(function (l) { new MutationObserver(refreshTray).observe(l, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] }); });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !tray.hidden) { openTray(false); trayBtn.focus(); } });
   document.addEventListener('click', function (e) { if (!tray.hidden && !tray.contains(e.target) && !trayBtn.contains(e.target)) openTray(false); });
 
@@ -97,7 +104,7 @@
     h('header', { class: 'dsk-dh' }, h('div', { class: 'dsk-dh-in' },
       h('a', { class: 'dsk-brand', href: '#' + (tabs[0] ? tabs[0].id : 'move'), 'aria-label': 'Disembark: back to ' + (tabs[0] ? tabs[0].title : 'Move') }, D.mark(30), h('span', { class: 'dsk-word' }, 'Disembark')),
       nav,
-      h('span', { class: 'dsk-site', title: 'This site: ' + D.config.homeUrl }, h('i'), D.host(D.config.homeUrl), note ? h('small', null, ' · ' + note) : null),
+      h('span', { class: 'dsk-site', title: 'This site: ' + D.config.homeUrl + (note ? ' · ' + note : '') }, h('i'), h('span', { class: 'host' }, D.host(D.config.homeUrl)), note ? h('small', null, '· ' + note) : null),
       h('div', { class: 'dsk-top-tools' },
         trayBtn, tray,
         h('button', { class: 'dsk-btn ghost icon', id: 'dsk-theme', type: 'button', 'aria-label': 'Switch between light and dark', onclick: function () {

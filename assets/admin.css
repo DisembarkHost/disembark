@@ -92,7 +92,13 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
 .dsk-tabs a[aria-current="page"] svg.i { color: var(--accent); }
 .dsk-tabs a[aria-current="page"]::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: -1px; height: 2.5px; border-radius: 2px 2px 0 0; background: var(--accent); }
 .dsk .dsk-tabs a:focus-visible { outline: 2px solid var(--sea); outline-offset: -6px; border-radius: 8px; }
-.dsk-site { margin-left: auto; align-self: center; display: inline-flex; align-items: center; gap: 8px; font: 500 12px/1 var(--mono); color: var(--ink-2); border: 1px solid var(--line); border-radius: 999px; padding: 7px 12px; white-space: nowrap; background: var(--bg); max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
+.dsk-site { margin-left: auto; align-self: center; display: inline-flex; align-items: center; gap: 6px; font: 500 12px/1 var(--mono); color: var(--ink-2); border: 1px solid var(--line); border-radius: 999px; padding: 7px 12px; white-space: nowrap; background: var(--bg); max-width: 420px; min-width: 0; }
+.dsk-site .host { flex: none; }
+.dsk-site small { min-width: 0; flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+/* Narrower: the install note goes (it's in the pill's tooltip), then the
+   address may shorten. */
+@media (max-width: 1360px) { .dsk-site small { display: none; } }
+@media (max-width: 1200px) { .dsk-site { overflow: hidden; } .dsk-site .host { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; } }
 .dsk-site i { width: 7px; height: 7px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 0 3px var(--teal-soft); flex: none; }
 .dsk-site small { font: inherit; color: var(--ink-3); }
 .dsk-top-tools { display: flex; gap: 4px; align-items: center; margin-left: -16px; }
@@ -892,3 +898,15 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
 .dsk-combo-none { padding: 10px; color: var(--ink-3); font-size: 13.5px; }
 .dsk .dsk-bk-scope .dsk-combo { flex: 0 1 380px; }
 .dsk .dsk-into .dsk-combo { max-width: 460px; }
+
+/* Notices tray: Disembark's own apart from other plugins' */
+.dsk-tray-head strong { font-size: 14px; }
+.dsk-tray-sec { padding: 0 0 4px; }
+.dsk-tray-sec + .dsk-tray-sec { margin-top: 10px; }
+.dsk-tray-sec[hidden] { display: none; }
+.dsk-tray-sec > .caps { display: block; padding: 0 0 8px 4px; }
+
+/* A long backup zip name stays on one line, trimmed in the middle */
+.dsk .dsk-zipname { display: flex; min-width: 0; font-size: 13px; white-space: nowrap; }
+.dsk .dsk-zipname .h { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.dsk .dsk-zipname .t { flex: none; }

@@ -367,14 +367,14 @@ if ( ! class_exists( 'Disembark_Quiet_Mode' ) ) {
 				? ' <a href="' . esc_url( $link ) . '">Manage in Tools → Disembark → Settings</a>, or run <code>wp disembark quiet-mode off</code>.'
 				: ' Disembark isn\'t active: delete <code>' . esc_html( basename( __FILE__ ) ) . '</code> from the mu-plugins folder to turn it off.';
 			if ( ! self::active() ) {
-				echo '<div class="notice notice-info"><p><strong>Disembark quiet mode is standing down.</strong> It was turned on for '
+				echo '<div class="notice notice-info disembark-notice"><p><strong>Disembark quiet mode is standing down.</strong> It was turned on for '
 					. esc_html( self::address( $config['home'] ?? '' ) ) . ', and this site is now ' . esc_html( self::address( self::install_home() ) )
 					. ', so emails, scheduled jobs and checkout run normally.' . $manage . '</p></div>';
 				return;
 			}
 			$held   = self::held_total();
 			$source = $config['source'] ?? '';
-			echo '<div class="notice notice-warning"><p><strong>Quiet mode:</strong> this site is a copy'
+			echo '<div class="notice notice-warning disembark-notice"><p><strong>Quiet mode:</strong> this site is a copy'
 				. ( $source !== '' ? ' of ' . esc_html( self::address( $source ) ) : '' )
 				. '. Emails are held' . ( $held ? ' (' . esc_html( number_format_i18n( $held ) ) . ' so far)' : '' )
 				. ', scheduled jobs are paused, checkout is closed, and payment, marketing and shipping APIs are blocked.'
