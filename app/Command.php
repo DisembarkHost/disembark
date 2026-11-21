@@ -240,7 +240,7 @@ class Command {
         $this->say( '[1/9] Checking this site' );
         // In a subsite's or tenant's context, the pull would replace the
         // install's shared files: refused before anything is copied.
-        if ( empty( $assoc_args['into'] ) && ( $refused = Import::here_refusal() ) ) {
+        if ( $refused = Import::here_refusal() ) {
             $this->fail( $refused->get_error_message(), 'preflight' );
         }
         if ( ! $resuming ) {
@@ -599,6 +599,24 @@ class Command {
      * when the zip has no database, so a restore never ends as files only by
      * accident.
      *
+     * [--into=<where>]
+     * : When this site is the main site of a multisite network or a WP
+     * Freighter install: bring the backup in as a new subsite or tenant
+     * ("new"), or replace the subsite or tenant with this ID, instead of
+     * replacing this site. Its tables, uploads and settings stay its own;
+     * plugins and themes are added to the shared folders when missing (never
+     * replacing ones other sites run); on a network the incoming users join
+     * the network's (matched by email). Rolling back removes a new site
+     * completely. Quiet mode stays off, since it would cover every site.
+     *
+     * [--slug=<slug>]
+     * : With --into=new on a network: the new subsite's path or subdomain
+     * (defaults to the backup's).
+     *
+     * [--domain=<domain>]
+     * : With --into=new on a WP Freighter install with domain mapping: the
+     * new tenant's domain (defaults to the backup's).
+     *
      * [--yes]
      * : Don't ask for confirmation.
      *
@@ -609,6 +627,11 @@ class Command {
      * [--bring-host-files]
      * : Also put the backup's host files in place (mu-plugins and cache
      * drop-ins).
+     *
+     * [--notify=<to>]
+     * : Email address(es) and/or https:// webhook URLs (Slack, Discord or any
+     * URL that takes JSON), comma-separated, told when the restore finishes or
+     * stops. Sent even from a copy in quiet mode.
      *
      * [--skip-checks]
      * : Go ahead even when the checks before the move find a problem that
@@ -636,6 +659,7 @@ class Command {
      *     $ wp disembark restore ~/kinsta-backup.zip --yes --format=json
      *     $ wp disembark restore ~/cpanel-backup.zip --database=mysql/example_wp.sql --yes
      *     $ wp disembark restore ~/files.zip --files-only --yes
+     *     $ wp disembark restore ~/backups/shop.zip --into=new --slug=shop --yes
      */
     public function restore( $args, $assoc_args ) {
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
@@ -655,8 +679,26 @@ class Command {
         $import    = new Import( $import_id );
         $summary   = [ 'ok' => false, 'source' => $zip, 'import_id' => $import_id ];
         $started   = time();
+        if ( ! empty( $assoc_args['notify'] ) ) {
+            $set = Notify::set( $import_id, (string) $assoc_args['notify'] );
+            if ( is_wp_error( $set ) ) {
+                $this->fail( $set->get_error_message() );
+            }
+        }
+        $this->notify = [ 'import' => $import_id, 'kind' => 'restore', 'source' => basename( $zip ), 'destination' => home_url(), 'started' => $started ];
         // Before anything is saved, a stop leaves nothing behind.
         $stop = function ( $message, $step ) use ( $import ) {
+            if ( $this->notify ) {
+                Notify::send( $this->notify['import'], 'failed', [
+                    'kind'        => $this->notify['kind'],
+                    'source'      => $this->notify['source'],
+                    'destination' => $this->notify['destination'],
+                    'step'        => $step,
+                    'error'       => $message . ' Nothing on this site was changed.',
+                    'seconds'     => time() - (int) $this->notify['started'],
+                ] );
+                $this->notify = [];
+            }
             $import->cancel( 'cleanup' );
             $this->fail( $message . ' Nothing on this site was changed.', $step );
         };
@@ -666,7 +708,21 @@ class Command {
         $dest_prefix = (string) ( $pre['db_prefix'] ?? '' );
         $dest_home   = untrailingslashit( (string) ( $pre['home_url'] ?? home_url() ) );
         $summary['destination'] = $dest_home;
-        $this->confirm( $assoc_args, 'Replace ' . $dest_home . ' with the backup in ' . basename( $zip ) . '? A rollback point is saved first, and afterwards you log in with the backup\'s credentials.' );
+        $into = (string) ( $assoc_args['into'] ?? '' );
+        $this->confirm( $assoc_args, $into !== ''
+            ? 'Bring the backup in ' . basename( $zip ) . ' into ' . ( $into === 'new' ? 'a new subsite or tenant' : 'subsite or tenant ' . $into . ' (replacing it)' ) . ' here? A rollback point is saved first.'
+            : 'Replace ' . $dest_home . ' with the backup in ' . basename( $zip ) . '? A rollback point is saved first, and ' . ( is_multisite() ? 'the network keeps its users (the incoming site\'s users join them).' : 'afterwards you log in with the backup\'s credentials.' ) );
+        if ( $into !== '' ) {
+            $t = $import->set_target( $into, [ 'slug' => (string) ( $assoc_args['slug'] ?? '' ), 'domain' => (string) ( $assoc_args['domain'] ?? '' ) ] );
+            if ( is_wp_error( $t ) ) {
+                $stop( $t->get_error_message(), 'preflight' );
+            }
+            if ( ! empty( $t['target'] ) ) {
+                $this->say( '      It goes into ' . $t['target']['label'] . '. The rest of this ' . ( $t['target']['kind'] === 'multisite' ? 'network' : 'install' ) . ' stays as it is.' );
+            }
+        } elseif ( $install = Scope::install() ) {
+            $this->say( '      This is the main site of ' . ( $install['kind'] === 'multisite' ? 'a multisite network' : 'a WP Freighter install' ) . ', and the restore replaces it. To bring the backup in as a new ' . ( $install['kind'] === 'multisite' ? 'subsite' : 'tenant' ) . ' instead, use --into=new.' );
+        }
 
         $this->say( '[2/9] Unpacking ' . basename( $zip ) . ' (' . size_format( (int) filesize( $zip ) ) . ')' );
         $t0 = microtime( true );
@@ -680,9 +736,21 @@ class Command {
             $stop( (string) $checks['refused'], 'checks' );
         }
         if ( ! empty( $checks['blocked'] ) && empty( $assoc_args['skip-checks'] ) ) {
+            if ( $this->notify ) {
+                $blocks = array_filter( (array) ( $checks['checks'] ?? [] ), function ( $c ) { return $c['level'] === 'block'; } );
+                Notify::send( $this->notify['import'], 'failed', [
+                    'kind'        => $this->notify['kind'],
+                    'source'      => $this->notify['source'],
+                    'destination' => $this->notify['destination'],
+                    'step'        => 'checks',
+                    'error'       => 'Checks before the move found ' . self::plural( count( $blocks ), 'problem' ) . ' that would stop it: ' . implode( '; ', array_column( $blocks, 'title' ) ) . '.',
+                    'seconds'     => time() - (int) $this->notify['started'],
+                ] );
+                $this->notify = [];
+            }
             $import->cancel( 'cleanup' );
         }
-        $this->report_checks( $checks, $summary, ! empty( $assoc_args['skip-checks'] ) );
+        $this->report_checks( $checks, $summary, ! empty( $assoc_args['skip-checks'] ), false );
 
         $this->say( '[3/9] Reading the backup' );
         $choice = ! empty( $assoc_args['files-only'] ) ? 'none' : ( isset( $assoc_args['database'] ) ? trim( (string) $assoc_args['database'] ) : null );
@@ -730,16 +798,26 @@ class Command {
         }
 
         $this->say( '[4/9] Saving a rollback point' );
-        $this->check( $this->budgeted( function ( $r ) { return 'Saved ' . (int) $r['tables_done'] . ' of ' . (int) $r['tables_total'] . ' tables'; }, function ( $budget ) use ( $import, $zip ) { return $import->snapshot( 'Before restore of ' . basename( $zip ), $budget ); } ), 'snapshot' );
+        $snap = $this->check( $this->budgeted( function ( $r ) { return 'Saved ' . (int) $r['tables_done'] . ' of ' . (int) $r['tables_total'] . ' tables'; }, function ( $budget ) use ( $import, $zip ) { return $import->snapshot( 'Before restore of ' . basename( $zip ), $budget ); } ), 'snapshot' );
         $summary['rollback_id'] = $import_id;
         $summary['undo']        = "wp disembark rollback {$import_id}";
         $this->say( "      Saved. Undo any time with: wp disembark rollback {$import_id}" );
+        $target = (array) ( $snap['target'] ?? [] );
+        if ( $target ) {
+            $summary['into']             = $target;
+            $dest_home                   = untrailingslashit( (string) $target['home'] );
+            $dest_prefix                 = (string) $target['prefix'];
+            $summary['destination']      = $dest_home;
+            $this->notify['destination'] = $dest_home;
+            $this->say( '      ' . ( ! empty( $target['created'] ) ? 'Created ' : 'Replacing ' ) . ( $target['kind'] === 'multisite' ? 'subsite ' : 'tenant ' ) . $target['id'] . ' at ' . $dest_home . ' (tables ' . $dest_prefix . '*)' . ( ! empty( $target['created'] ) ? '; the rollback removes it.' : '.' ) );
+        }
 
         // Quiet mode goes on before the files and database arrive (or, when
         // only the imported database tells the old address, right after it).
+        // (Not for a subsite or tenant: it would cover every site here.)
         $quiet    = false;
-        $go_quiet = function ( $from ) use ( &$quiet, &$summary, $assoc_args, $dest_home, $import_id ) {
-            if ( $quiet || ! empty( $assoc_args['skip-quiet-mode'] ) || $from === '' || Quiet::address( $from ) === Quiet::address( $dest_home ) ) {
+        $go_quiet = function ( $from ) use ( &$quiet, &$summary, $assoc_args, $dest_home, $import_id, $target ) {
+            if ( $quiet || $target || ! empty( $assoc_args['skip-quiet-mode'] ) || $from === '' || Quiet::address( $from ) === Quiet::address( $dest_home ) ) {
                 return;
             }
             $this->check( Quiet::enable( $from, $import_id ), 'quiet-mode', $import_id );
@@ -756,10 +834,16 @@ class Command {
         $summary['host_files_kept'] = $dep['host_files_kept'] ?? [];
         $this->say( '      Placed ' . number_format( (int) $dep['deployed'] ) . ' files.' );
         if ( ! empty( $dep['removed'] ) ) {
+            $summary['files_removed'] = (int) $dep['removed'];
             $this->say( '      Removed ' . self::plural( (int) $dep['removed'], 'file' ) . ' that ' . ( (int) $dep['removed'] === 1 ? 'is' : 'are' ) . ' gone from the backup (kept in the rollback point).' );
         }
         if ( ! empty( $dep['loaders_disabled'] ) ) {
+            $summary['loaders_disabled'] = $dep['loaders_disabled'];
             $this->say( '      Disabled firewall loaders that point at files not on this server: ' . implode( ', ', $dep['loaders_disabled'] ) );
+        }
+        if ( ! empty( $dep['shared_kept'] ) ) {
+            $summary['shared_kept'] = $dep['shared_kept'];
+            $this->say( '      Kept the versions already here of ' . self::plural( count( $dep['shared_kept'] ), 'shared plugin or theme folder' ) . ' (other sites run them): ' . implode( ', ', array_map( 'basename', array_slice( $dep['shared_kept'], 0, 8 ) ) ) . ( count( $dep['shared_kept'] ) > 8 ? ', …' : '' ) );
         }
         if ( ! empty( $dep['host_files_kept'] ) ) {
             $this->say( '      Left out (host files; this site keeps its own): ' . implode( ', ', $dep['host_files_kept'] ) );
@@ -776,15 +860,38 @@ class Command {
             $summary['statements'] = (int) $sq['statements_executed'];
             $summary['database_seconds'] = (int) round( microtime( true ) - $t0 );
             foreach ( (array) ( $sq['converted'] ?? [] ) as $conversion => $tables ) {
+                $summary['converted'][ $conversion ] = (int) $tables;
                 $this->say( "      This database server doesn't support all of the source's table settings, so {$conversion} in " . self::plural( (int) $tables, 'table' ) . '.' );
             }
             if ( ! empty( $sq['definers_removed'] ) ) {
+                $summary['definers_removed'] = (int) $sq['definers_removed'];
                 $this->say( '      Removed the source server\'s DEFINER account from ' . (int) $sq['definers_removed'] . ' views, triggers or routines.' );
             }
             if ( ! empty( $sq['errors'] ) ) {
                 $this->fail( 'The database import reported ' . count( $sq['errors'] ) . ' errors (first: ' . $sq['errors'][0] . '). ' . ( ! empty( $sq['database_unchanged'] ) ? 'This site\'s database was not changed: the import works on copies of the tables and only swaps them in when every statement succeeds.' : 'Stopped before rewriting URLs.' ), 'database', $import_id );
             }
             $this->say( '      ' . number_format( (int) $sq['statements_executed'] ) . ' statements executed, ' . self::plural( (int) ( $sq['tables_swapped'] ?? 0 ), 'table' ) . ' swapped in (' . $summary['database_seconds'] . 's).' );
+            if ( ! empty( $sq['tables_other_sites'] ) ) {
+                $summary['tables_other_sites'] = (int) $sq['tables_other_sites'];
+                $this->say( '      Left out ' . self::plural( (int) $sq['tables_other_sites'], 'table' ) . ' that belong to other sites of this install.' );
+            }
+            if ( ! empty( $sq['tables_left_out'] ) ) {
+                $summary['tables_left_out'] = (int) $sq['tables_left_out'];
+                $this->say( '      Left out ' . self::plural( (int) $sq['tables_left_out'], 'table' ) . ' without the source\'s prefix (' . $src_prefix . '), so nothing else here is touched.' );
+            }
+            if ( isset( $sq['users'] ) && ( $sq['users']['created'] || $sq['users']['matched'] ) ) {
+                $summary['users'] = $sq['users'];
+                foreach ( (array) ( $sq['users']['renamed'] ?? [] ) as $r ) {
+                    $this->say( "      The login {$r['from']} ({$r['email']}) " . ( $r['why'] ?? 'was taken' ) . " on this network, so that user logs in as {$r['to']}." );
+                }
+                foreach ( (array) ( $sq['users']['unattributed'] ?? [] ) as $r ) {
+                    $this->say( "      ! {$r['login']} ({$r['email']}) couldn't be added ({$r['error']}): their posts, comments and orders here have no author now." );
+                }
+                if ( ! empty( $sq['users']['orphaned'] ) ) {
+                    $this->say( '      ' . self::plural( (int) $sq['users']['orphaned'], 'row' ) . ' named a user the source no longer has, so they have no author now (not someone else here).' );
+                }
+                $this->say( '      ' . ( empty( $sq['target'] ) ? 'The network keeps its users. ' : '' ) . 'Users joined the network: ' . self::plural( (int) $sq['users']['created'], 'new account' ) . ', ' . self::plural( (int) $sq['users']['matched'], 'existing account' ) . ' matched by email' . ( $sq['users']['renumbered'] ? ' (' . self::plural( (int) $sq['users']['renumbered'], 'row' ) . ' of posts, comments and orders renumbered to match)' : '' ) . '.' );
+            }
             if ( $src_home === '' && ! empty( $sq['source_home'] ) ) {
                 $src_home = untrailingslashit( (string) $sq['source_home'] );
                 $this->say( "      The database is {$src_home}'s." );
@@ -819,6 +926,11 @@ class Command {
             $summary['caches_cleared'] = array_keys( (array) $tidy['caches_cleared'] );
             $this->say( '      Cleared page caches so nothing serves the old site: ' . implode( ', ', $summary['caches_cleared'] ) . '.' );
         }
+        if ( ! empty( $tidy['tables_removed'] ) ) {
+            $gone = (array) $tidy['tables_removed'];
+            $summary['tables_removed'] = $gone;
+            $this->say( '      Removed ' . self::plural( count( $gone ), 'table' ) . ' the incoming site doesn\'t have (kept in the restore point): ' . implode( ', ', array_slice( $gone, 0, 8 ) ) . ( count( $gone ) > 8 ? ', …' : '' ) . '.' );
+        }
         foreach ( (array) ( $tidy['plugins_turned_off'] ?? [] ) as $plugin ) {
             $summary['plugins_turned_off'][] = $plugin['plugin'];
             $this->say( "      Turned off {$plugin['name']}: {$plugin['why']}." );
@@ -827,20 +939,44 @@ class Command {
             $summary['login_url'] = $tidy['login_url']['url'];
             $this->say( "      The login page is moved by {$tidy['login_url']['plugin']}: {$tidy['login_url']['url']}" );
         }
+
+        $lines = [ number_format( (int) ( $summary['files_deployed'] ?? 0 ) ) . ' files placed' . ( $info['sql_file'] ? ', ' . number_format( (int) ( $summary['statements'] ?? 0 ) ) . ' database statements run.' : ' (files only).' ) ];
         if ( empty( $assoc_args['skip-verify'] ) ) {
             $this->say( '[9/9] Checking the result' );
             $verify = Verify::run( $import_id );
             if ( ! is_wp_error( $verify ) ) {
                 $summary['verify'] = $this->report_verify( $verify );
+                $lines[]           = $verify['ok'] ? 'Checks after the move: all good.' : 'Checks after the move found ' . self::plural( (int) $verify['problems'], 'problem' ) . ': run wp disembark verify ' . $import_id . ' on the site for details.';
             }
         }
+        if ( ! empty( $summary['login_url'] ) ) {
+            $lines[] = 'Log in at ' . $summary['login_url'];
+        }
+        Notify::send( $import_id, 'finished', [ 'kind' => 'restore', 'source' => basename( $zip ), 'destination' => $dest_home, 'rollback_id' => $import_id, 'seconds' => time() - $started, 'lines' => $lines ] );
+        $this->notify = [];
+
         $summary['ok']      = true;
         $summary['seconds'] = time() - $started;
+        if ( ! $info['sql_file'] ) {
+            $summary['note'] = 'Files only; the database is this site\'s own.';
+        } elseif ( ! empty( $target ) ) {
+            $summary['note'] = $target['kind'] === 'multisite'
+                ? 'Its users joined the network and log in with their own passwords (an account that was already here keeps its own).'
+                : "User accounts are now the backup's: log in to it with the backup's credentials.";
+        } else {
+            $summary['note'] = is_multisite()
+                ? "The network kept its users; the backup's users joined them (an account already here keeps its own password)."
+                : "User accounts are now the backup's: log in with the backup's credentials.";
+        }
         if ( $this->json ) {
             \WP_CLI::line( wp_json_encode( $summary, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
             return;
         }
-        \WP_CLI::success( 'Restored ' . basename( $zip ) . " into {$dest_home}" . ( $info['sql_file'] ? '. Log in with the backup\'s credentials.' : ' (files only; the database is this site\'s own).' ) );
+        if ( ! empty( $target ) ) {
+            \WP_CLI::success( 'Restored ' . basename( $zip ) . ' into ' . ( $target['kind'] === 'multisite' ? 'subsite ' : 'tenant ' ) . "{$target['id']} at {$dest_home}" . ( $info['sql_file'] ? ( $target['kind'] === 'multisite' ? '. Its users log in with their own passwords (an account that was already here keeps its own).' : '. Log in to it with the backup\'s credentials.' ) : ' (files only; the database is this site\'s own).' ) );
+        } else {
+            \WP_CLI::success( 'Restored ' . basename( $zip ) . " into {$dest_home}" . ( $info['sql_file'] ? ( is_multisite() ? '. The network kept its users; the backup\'s users joined them (an account already here keeps its own password).' : '. Log in with the backup\'s credentials.' ) : ' (files only; the database is this site\'s own).' ) );
+        }
         \WP_CLI::log( "Undo: wp disembark rollback {$import_id}" );
         if ( $quiet ) {
             \WP_CLI::log( 'Quiet mode is on (this is a copy). Lift it with: wp disembark quiet-mode off' );
@@ -1030,16 +1166,20 @@ class Command {
         $import = new Import( $point['id'] );
         $r      = $this->check( $this->budgeted( function ( $x ) { return ( $x['phase'] ?? '' ) === 'files' ? 'Putting files back: ' . (int) $x['files_done'] . ' of ' . (int) $x['files_total'] : 'Putting the database back'; }, function ( $budget ) use ( $import ) { return $import->rollback( $budget ); } ), 'rollback' );
         unset( $r['done'] );
+        $has_errors = ! empty( $r['errors'] );
         if ( $this->json ) {
-            \WP_CLI::line( wp_json_encode( array_merge( [ 'ok' => true, 'id' => $point['id'] ], (array) $r ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
+            \WP_CLI::line( wp_json_encode( array_merge( [ 'ok' => ! $has_errors, 'id' => $point['id'] ], (array) $r ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT ) );
+            if ( $has_errors ) {
+                \WP_CLI::error( 'Rollback reported ' . self::plural( count( $r['errors'] ), 'problem' ) . ': ' . implode( '; ', array_slice( $r['errors'], 0, 3 ) ) );
+            }
             return;
-        }
-        if ( ! empty( $r['errors'] ) ) {
-            \WP_CLI::warning( count( $r['errors'] ) . ' problems: ' . implode( '; ', array_slice( $r['errors'], 0, 3 ) ) );
         }
         // A restore point from before 3.0's scope fix holds other sites' tables.
         foreach ( (array) ( $r['warnings'] ?? [] ) as $line ) {
             \WP_CLI::log( $line );
+        }
+        if ( $has_errors ) {
+            $this->fail( 'Rollback reported ' . self::plural( count( $r['errors'] ), 'problem' ) . ': ' . implode( '; ', array_slice( $r['errors'], 0, 3 ) ), 'rollback' );
         }
         $relogin = ( preg_match( '/^Before (restore|pull|push)/i', $point['label'] ) || ! empty( $point['deployed'] ) ) && empty( $r['logins_kept'] );
         \WP_CLI::success( 'Rolled back to "' . $point['label'] . '".' . ( $relogin ? ' User accounts are back to this site\'s own, so log in with the credentials from before.' : '' ) );
@@ -1164,7 +1304,8 @@ class Command {
             \WP_CLI::success( number_format( (int) $r['cells_changed'] ) . ' cells in ' . number_format( (int) $r['rows_changed'] ) . ' rows would change. Nothing was changed.' );
             return;
         }
-        \WP_CLI::success( number_format( (int) $r['cells_changed'] ) . ' cells changed in ' . number_format( (int) $r['rows_changed'] ) . " rows. Undo: wp disembark rollback {$out['rollback_id']}" );
+        $undo = ! empty( $out['rollback_id'] ) ? " Undo: wp disembark rollback {$out['rollback_id']}" : '';
+        \WP_CLI::success( number_format( (int) $r['cells_changed'] ) . ' cells changed in ' . number_format( (int) $r['rows_changed'] ) . ' rows.' . $undo );
     }
 
     // ------------------------------------------------------------------ helpers
@@ -1231,10 +1372,13 @@ class Command {
         }
         $brought = [];
         if ( isset( $assoc_args['bring-root'] ) && $root ) {
-            $brought = in_array( $assoc_args['bring-root'], [ true, '' ], true ) ? $root : array_values( array_intersect( $root, $split( 'bring-root' ) ) );
+            $all_root = in_array( $assoc_args['bring-root'], [ true, '' ], true );
+            $brought  = $all_root ? $root : array_values( array_intersect( $root, $split( 'bring-root' ) ) );
             $choice['skip_paths'] = array_values( array_diff( $choice['skip_paths'], $brought ) );
-            foreach ( array_diff( $split( 'bring-root' ), $root ) as $unknown ) {
-                $this->say( "      --bring-root: {$unknown} isn't one of the install's root files here (" . implode( ', ', $root ) . ').' );
+            if ( ! $all_root ) {
+                foreach ( array_diff( $split( 'bring-root' ), $root ) as $unknown ) {
+                    $this->say( "      --bring-root: {$unknown} isn't one of the install's root files here (" . implode( ', ', $root ) . ').' );
+                }
             }
         }
         // The network's super admins with no role on the site (see Scope).
@@ -1365,14 +1509,18 @@ class Command {
     private $notify       = [];
 
     /**
-     * Prints the checks before a move; stops on a blocking one unless
-     * $go_anyway.
+     * Prints the checks before a move; stops on a refusal or blocking check
+     * unless $go_anyway (refusals can never be overridden).
      */
-    private function report_checks( $result, &$summary, $go_anyway ) {
+    private function report_checks( $result, &$summary, $go_anyway, $resumable = true ) {
         $marks = [ 'block' => '✗', 'warn' => '!', 'info' => '·' ];
         foreach ( (array) ( $result['checks'] ?? [] ) as $check ) {
             $summary['checks'][] = [ 'level' => $check['level'], 'id' => $check['id'], 'title' => $check['title'] ];
             $this->say( '      ' . $marks[ $check['level'] ] . ' ' . $check['title'] . ( $check['detail'] !== '' ? ': ' . $check['detail'] : '' ) );
+        }
+        if ( ! empty( $result['refused'] ) ) {
+            $this->resume_hint = '';
+            $this->fail( (string) $result['refused'], 'checks' );
         }
         if ( empty( $result['blocked'] ) ) {
             return;
@@ -1382,7 +1530,10 @@ class Command {
             return;
         }
         $blocks = array_filter( (array) $result['checks'], function ( $c ) { return $c['level'] === 'block'; } );
-        $this->fail( 'Checks before the move found ' . self::plural( count( $blocks ), 'problem' ) . ' that would stop it: ' . implode( '; ', array_column( $blocks, 'title' ) ) . '. Nothing on this site has changed. Fix it and resume, or resume with --skip-checks to go ahead anyway.', 'checks' );
+        $hint   = $resumable
+            ? 'Fix it and resume, or resume with --skip-checks to go ahead anyway.'
+            : 'Fix it and run restore again, or pass --skip-checks.';
+        $this->fail( 'Checks before the move found ' . self::plural( count( $blocks ), 'problem' ) . ' that would stop it: ' . implode( '; ', array_column( $blocks, 'title' ) ) . '. Nothing on this site has changed. ' . $hint, 'checks' );
     }
 
     /** Prints the checks after a move; returns their JSON summary. */
@@ -1521,14 +1672,18 @@ class Command {
     private $pace = [ 'files' => 400, 'bytes' => 50331648, 'db' => 16777216, 'budget' => 0 ];
     private $pace_busy  = 0;
     private $pace_pause = 0;
+    /** True when the most recent run_step() replayed a cached result from Steps. */
+    private $last_step_replayed = false;
 
-    const PACE_LIMITS = [ 'files' => [ 50, 5000 ], 'bytes' => [ 4194304, 536870912 ], 'db' => [ 1048576, 134217728 ] ];
+    const PACE_LIMITS       = [ 'files' => [ 50, 5000 ], 'bytes' => [ 4194304, 536870912 ], 'db' => [ 1048576, 134217728 ] ];
+    const MAX_RETRIES       = 20;
+    const MAX_RETRY_SECONDS = 900;
 
     /**
      * Runs one request of a paced step (request id: the step's place in
      * the move, then the request's within the step), again with the same
      * id after a failure the source or this host may get past. $on_fail($error, $n)
-     * returns 'retry' or 'split'. Returns [ result, seconds, failures ],
+     * returns 'retry' or 'split'. Returns [ result, seconds, failures, replayed ],
      * with 'split' as the result when asked to split.
      */
     private function paced_step( $s, $k, $work, $on_fail = null ) {
@@ -1537,24 +1692,33 @@ class Command {
 
     /** Runs one recorded step under $rid, again after a failure worth trying again (see paced_step()). */
     private function run_step( $rid, $work, $on_fail = null ) {
+        $retry_started = microtime( true );
         for ( $n = 0; ; ) {
-            $t0     = microtime( true );
+            $t0       = microtime( true );
+            $replayed = $n === 0 && $this->steps_import !== '' && is_file( Storage::base_dir() . "/_import_{$this->steps_import}/steps/{$rid}.php" );
             // Outside a pull (a rollback, a search and replace), nothing is recorded to replay.
             $result = $this->steps_import === '' ? $work() : Steps::run( $this->steps_import, $rid, $work );
             if ( $result instanceof \WP_REST_Response ) {
                 $result = $result->get_data();
             }
             if ( ! is_wp_error( $result ) ) {
-                $this->pace_busy  = 0;
-                $this->pace_pause = 0;
-                return [ json_decode( (string) wp_json_encode( $result ), true ), microtime( true ) - $t0, $n ];
+                $this->last_step_replayed = $replayed;
+                if ( ! $replayed ) {
+                    $this->pace_busy  = 0;
+                    $this->pace_pause = 0;
+                }
+                return [ json_decode( (string) wp_json_encode( $result ), true ), microtime( true ) - $t0, $n, $replayed ];
             }
+            $this->last_step_replayed = false;
             $status = (int) ( $result->get_error_data()['status'] ?? 0 );
             // Only what the source (or the network to it) may get past.
             if ( ! in_array( $status, [ 429, 502, 503, 504 ], true ) || in_array( $result->get_error_code(), [ 'cancelled', 'unsafe_url', 'invalid_url' ], true ) ) {
-                return [ $result, 0, $n ];
+                return [ $result, 0, $n, false ];
             }
             $n++;
+            if ( $n >= self::MAX_RETRIES || ( microtime( true ) - $retry_started ) >= self::MAX_RETRY_SECONDS ) {
+                return [ $result, 0, $n, false ];
+            }
             $this->pace_busy = in_array( $status, [ 429, 503 ], true ) ? $this->pace_busy + 1 : 0;
             if ( $this->pace_busy >= 5 ) {
                 $secs = [ 30, 60, 120, 240, 300 ][ min( $this->pace_pause++, 4 ) ];
@@ -1564,10 +1728,13 @@ class Command {
             }
             $what = $on_fail ? $on_fail( $result, $n ) : 'retry';
             if ( $what === 'split' ) {
-                return [ 'split', 0, $n ];
+                return [ 'split', 0, $n, false ];
             }
             if ( $what === 'stop' ) {
-                return [ $result, 0, $n ];
+                return [ $result, 0, $n, false ];
+            }
+            if ( ( microtime( true ) - $retry_started ) >= self::MAX_RETRY_SECONDS ) {
+                return [ $result, 0, $n, false ];
             }
             $wait = min( 30, pow( 2, $n - 1 ) ) * ( 0.7 + mt_rand( 0, 600 ) / 1000 );
             $this->say( '      ' . $result->get_error_message() . ' Trying again in ' . max( 1, (int) round( $wait ) ) . 's (attempt ' . ( $n + 1 ) . ').' );
@@ -1696,7 +1863,7 @@ class Command {
                     }
                     continue;
                 }
-                if ( ! is_wp_error( $r ) ) {
+                if ( ! is_wp_error( $r ) && ! $this->last_step_replayed ) {
                     $this->adapt( 'files', $secs, $failures );
                     $this->adapt( 'bytes', $secs, $failures );
                 }
@@ -1711,7 +1878,9 @@ class Command {
                 $shown = $have;
                 $this->say( '      Copied ' . number_format( $have ) . ' of ' . number_format( $total ) . ' files (' . number_format( $this->pace['files'] ) . ' a batch)' );
             }
-            Pace::remember( $this->steps_import, $this->pace );
+            if ( ! $this->last_step_replayed ) {
+                Pace::remember( $this->steps_import, $this->pace );
+            }
         }
         return [ 'fetched' => $total, 'total' => $total ];
     }
@@ -1733,8 +1902,10 @@ class Command {
                 return 'retry';
             } );
             $r = $this->check( $r, 'database' );
-            $this->adapt( 'db', $secs, $failures );
-            Pace::remember( $this->steps_import, $this->pace );
+            if ( ! $this->last_step_replayed ) {
+                $this->adapt( 'db', $secs, $failures );
+                Pace::remember( $this->steps_import, $this->pace );
+            }
             if ( isset( $r['done'] ) && $r['done'] === false && ( $r['phase'] ?? '' ) === 'compare' ) {
                 $this->say( '      Comparing tables with the last pull (' . $r['side'] . '): ' . (int) $r['compared'] . ' of ' . (int) $r['total'] );
             } elseif ( isset( $r['done'] ) && $r['done'] === false ) {
