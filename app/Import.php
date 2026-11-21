@@ -4267,6 +4267,15 @@ class Import {
         // CREATE and the CREATE itself, a request that loads a plugin can make
         // the plugin's missing table again (Search & Filter does). Drop it and
         // create it once more.
+        // WordPress refuses a query it can't check for invalid characters:
+        // its check runs a regular expression over the whole query, which on
+        // a large batch of rows (a long option value among them) runs out of
+        // PHP's backtracking room and reads as "invalid data" though every
+        // byte is the database's own. The statement passed Disembark's own
+        // checks already, so it goes to the database as it is.
+        if ( $result === false && strpos( (string) $wpdb->last_error, 'contains invalid data' ) !== false ) {
+            $result = self::raw_query( $statement );
+        }
         if ( $result === false && preg_match( '/^CREATE\s+TABLE\s+`((?:[^`]|``)+)`/i', $statement, $cm ) && preg_match( '/already exists/i', (string) $wpdb->last_error ) ) {
             $wpdb->query( 'DROP TABLE IF EXISTS `' . $cm[1] . '`' );
             $result = $wpdb->query( $statement );
@@ -4290,6 +4299,26 @@ class Import {
         }
         $run['statements_executed']++;
         return true;
+    }
+
+    /**
+     * Runs $sql on WordPress's own database connection without wpdb's
+     * character check (see run_statement()). Rows affected, or false with
+     * wpdb's last_error set to the database's error.
+     */
+    private static function raw_query( $sql ) {
+        global $wpdb;
+        $dbh = $wpdb->dbh;
+        if ( ! ( $dbh instanceof \mysqli ) ) {
+            return false;
+        }
+        $ok = @mysqli_query( $dbh, $sql );
+        if ( $ok === false ) {
+            $wpdb->last_error = (string) mysqli_error( $dbh );
+            return false;
+        }
+        $wpdb->last_error = '';
+        return (int) mysqli_affected_rows( $dbh );
     }
 
     private function end_statements( $run ) {
