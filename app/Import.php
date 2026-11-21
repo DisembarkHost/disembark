@@ -5909,6 +5909,16 @@ class Import {
      * older client), all of it in this one request.
      */
     public function rollback( $budget = null, $opts = [] ) {
+        $r = $this->rollback_run( $budget, $opts );
+        // The maintenance page stays while the rollback carries on, and goes
+        // once it's done or stopped (see maintenance_on()).
+        if ( is_wp_error( $r ) || ! ( isset( $r['done'] ) && $r['done'] === false ) ) {
+            self::maintenance_off();
+        }
+        return $r;
+    }
+
+    private function rollback_run( $budget = null, $opts = [] ) {
         global $wpdb;
         // With files unless asked for the database only.
         $asked_files = ! array_key_exists( 'files', (array) $opts ) || ! empty( $opts['files'] );
@@ -5957,6 +5967,9 @@ class Import {
                 'phase'    => 'database',
                 'with_files' => ( $want_files || $created ) && ! $spent,
                 'spent'    => $spent && self::point_has_files( $meta ),
+                // A whole standalone site: visitors see WordPress's
+                // maintenance page while it runs (see maintenance_on()).
+                'maint'    => ( $owner['kind'] ?? '' ) === 'plain' && empty( $meta['partial'] ),
                 'files'    => array_map( 'basename', $sql_files ),
                 'f'        => 0,
                 'o'        => 0,
@@ -5987,6 +6000,9 @@ class Import {
             $st['left']  = self::rollback_left_tables( $st['owner'], $meta );
         }
         $owner = (array) $st['owner'];
+        if ( ! empty( $st['maint'] ) ) {
+            $this->maintenance_on();
+        }
         $save  = function () use ( &$st, $state_file, $paced ) {
             if ( $paced ) {
                 self::write_protected( $state_file, (string) wp_json_encode( $st ) );
@@ -6370,6 +6386,8 @@ class Import {
             'puts_back'     => count( $back ),
             'partial'       => $partial,
             'database'      => [ 'created_at' => (int) ( $meta['created_at'] ?? 0 ), 'tables' => count( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? [] ) ), 'partial' => ! empty( $meta['partial'] ) ],
+            // Visitors see the maintenance page while it runs (see maintenance_on()).
+            'maintenance'   => ( $this->rollback_owner( $meta )['kind'] ?? '' ) === 'plain' && empty( $meta['partial'] ),
         ];
     }
 
@@ -6377,6 +6395,40 @@ class Import {
     private static function undone_words( $undone ) {
         $labels = array_map( function ( $u ) { return '"' . $u['label'] . '"'; }, array_slice( $undone, 0, 5 ) );
         return 'Undid ' . count( $undone ) . ' later ' . ( count( $undone ) === 1 ? 'move' : 'moves' ) . ' first: ' . implode( ', ', $labels ) . ( count( $undone ) > 5 ? ', …' : '' ) . '.';
+    }
+
+    /** Marks the .maintenance file a rollback writes (see maintenance_on()). */
+    const MAINTENANCE_MARK = 'disembark-rollback';
+
+    /**
+     * Puts up WordPress's own maintenance page while a whole-site rollback
+     * runs. The site stays live otherwise, and a request that loads a plugin
+     * can make a table the rollback just dropped again, or a visitor can see
+     * half the old database. WordPress reads .maintenance as PHP before
+     * anything else loads; this one lets in Disembark's own import requests
+     * (the rollback's next steps) and WP-CLI, and answers everything else
+     * (visitors, wp-admin, WP-Cron) with "Briefly unavailable" and a 503.
+     * Written again on every step, so if a rollback stops for good,
+     * WordPress drops the page by itself 10 minutes after the last step. A
+     * .maintenance someone else wrote (a core update) is left alone.
+     */
+    private function maintenance_on() {
+        $file = ABSPATH . '.maintenance';
+        if ( is_file( $file ) && strpos( (string) @file_get_contents( $file ), self::MAINTENANCE_MARK ) === false ) {
+            return false;
+        }
+        $code = "<?php\n"
+            . '// ' . self::MAINTENANCE_MARK . ' ' . preg_replace( '/[^a-f0-9]/', '', (string) $this->import_id ) . ": Disembark is putting this site back to a restore point. Delete this file if it's still here after the rollback.\n"
+            . "\$upgrading = ( ( defined( 'WP_CLI' ) && WP_CLI ) || preg_match( '#/disembark/v1/import/#', rawurldecode( (string) ( \$_SERVER['REQUEST_URI'] ?? '' ) ) ) ) ? 0 : " . time() . ";\n";
+        return @file_put_contents( $file, $code, LOCK_EX ) !== false;
+    }
+
+    /** Takes down the maintenance page a rollback put up (never anyone else's). */
+    public static function maintenance_off() {
+        $file = ABSPATH . '.maintenance';
+        if ( is_file( $file ) && strpos( (string) @file_get_contents( $file ), self::MAINTENANCE_MARK ) !== false ) {
+            @unlink( $file );
+        }
     }
 
     /**
