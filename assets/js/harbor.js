@@ -33,7 +33,9 @@
   };
   K.check = function (x, y, r) { r = r || 12; var s = r / 12; return '<g transform="translate(' + x + ' ' + y + ') scale(' + s + ')"><circle r="12" fill="#2b8a7e" stroke="#fff" stroke-width="2.5"/><path d="M-5 .5l3.5 3.5 7-7.5" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></g>'; };
   K.sign = function (cx, y, text) {
+    text = String(text || '');
     var w = Math.max(80, text.length * 7 + 26);
+    text = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     return '<g transform="translate(' + cx + ' ' + y + ')"><rect x="' + (-w / 2) + '" y="-11" width="' + w + '" height="22" rx="11" class="s-sign"/><text y="4" text-anchor="middle" class="s-label">' + text + '</text></g>';
   };
   K.buoy = function (x, y, fill) { return '<g transform="translate(' + x + ' ' + y + ')"><circle r="9" fill="rgba(255,255,255,.35)"/><circle r="6.5" fill="' + (fill || '#c8553d') + '" stroke="#fff" stroke-width="2"/><path d="M-6 0h12" stroke="#fff" stroke-width="2"/></g>'; };

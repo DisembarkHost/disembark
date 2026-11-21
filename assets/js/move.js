@@ -117,7 +117,7 @@
     var k = kind(), r = remote(), L, R, you;
     if (k === 'push') { L = { kind: 'site', label: here }; R = { kind: 'site', label: r || 'another site', hot: !!r }; you = 'left'; }
     else {
-      L = k === 'pull' ? { kind: 'site', label: r || 'another site', hot: !!r } : { kind: 'zip', label: S.file ? S.file.name : 'backup.zip' };
+      L = k === 'pull' ? { kind: 'site', label: r || 'another site', hot: !!r } : { kind: 'zip', label: S.file ? D.midTrim(S.file.name, 30) : 'backup.zip' };
       if (S.to === 'new') {
         var idx = others.indexOf(intoSite());
         R = net ? { kind: 'network', label: here, newSlot: S.into === 'new', pick: S.into === 'new' ? null : Math.min(Math.max(idx, 0), 1) }
@@ -218,7 +218,7 @@
     var drop = h('div', { class: 'dsk-zipdrop' + (f ? ' has' : ''), role: 'button', tabindex: '0', 'aria-label': f ? 'Choose another backup zip' : 'Choose a backup zip',
       onclick: function () { fileInput.click(); }, onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } } },
       h('span', { html: crate, style: { display: 'contents' } }),
-      f ? h('div', { style: { minWidth: 0 } }, h('b', { class: 'mono', style: { fontSize: '13px', wordBreak: 'break-all' } }, f.name), h('div', { class: 'm' }, D.fmt.size(f.size) + ' · its address is read from the backup'))
+      f ? h('div', { style: { minWidth: 0 } }, h('b', { class: 'mono dsk-zipname', title: f.name }, f.name.length > 24 ? [h('span', { class: 'h' }, f.name.slice(0, -18)), h('span', { class: 't' }, f.name.slice(-18))] : f.name), h('div', { class: 'm' }, D.fmt.size(f.size) + ' · its address is read from the backup'))
         : h('div', null, h('b', null, 'Drop the zip here'), h('div', { class: 'm' }, 'or click to choose a file')),
       f ? h('span', { class: 'dsk-btn sm chg' }, 'Choose another') : null,
       fileInput);

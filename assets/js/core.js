@@ -486,6 +486,14 @@
     return el;
   };
 
+  /** "x9uncc1…201126162736.zip": keeps the start and the end of a long name. */
+  D.midTrim = function (s, max) {
+    s = String(s || ''); max = max || 32;
+    if (s.length <= max) return s;
+    var tail = Math.ceil((max - 1) * .6), head = max - 1 - tail;
+    return s.slice(0, head) + '…' + s.slice(-tail);
+  };
+
   /**
    * An autocomplete picker (ARIA combobox). options: [{ value, label, sub }];
    * typing filters on label and sub, arrows move, Enter picks, Escape
