@@ -902,19 +902,29 @@ class Import {
      * the encoding rather than a suffix alone. Every name that ends in
      * .dsk.php is itself encoded, so the mapping is exact.
      *
-     * A staged database dump (database-<name>.sql, as backup zips and the
-     * CLI carry it) waits as database-<name>.sql.php, behind the same exit
+     * A staged database dump waits as <name>.sql.php, behind the same exit
      * line: a full copy of a database (password hashes, the source's
-     * token) at a URL. The import reads past the exit line. A file that
-     * really is called database-x.sql.php is runnable, so it's staged as
-     * database-x%2Esql%2Ephp.dsk.php and the mapping stays exact.
+     * token) at a URL. That's every .sql and .sql.gz file, wherever it is:
+     * Disembark's own database-<name>.sql, and the dumps other hosts and
+     * tools put in their zips (Kinsta's <site>.sql at the zip's root, WP
+     * Engine's wp-content/mysql.sql, Duplicator's database.sql). The import
+     * reads past the exit line, and one that is put in place as a file
+     * gets its real bytes back (see take_staged()). A file that really is
+     * called x.sql.php is runnable, so it's staged as x%2Esql%2Ephp.dsk.php
+     * and the mapping stays exact.
      * ---------------------------------------------------------------- */
 
     const STAGED_SUFFIX = '.dsk.php';
 
-    /** Whether $base (a file name) is a database dump as backups stage it. */
+    /** Whether $base (a file name) is a database dump, staged behind the exit line. */
     private static function dump_name( $base ) {
-        return (bool) preg_match( '/^database-.*\.sql$/i', (string) $base );
+        return (bool) preg_match( '/\.sql(?:\.gz)?$/i', (string) $base );
+    }
+
+    /** Whether the staged path $path is a dump under its staged name (x.sql.php, x.sql.gz.php). */
+    private static function dump_staged( $path ) {
+        $path = (string) $path;
+        return substr( $path, -4 ) === '.php' && self::dump_name( basename( substr( $path, 0, -4 ) ) );
     }
 
     /** Whether a file named $name could run, or change what runs, on a web server. */
@@ -964,7 +974,7 @@ class Import {
             return false;
         }
         $head = (string) fread( $in, strlen( self::PHP_EXIT ) );
-        if ( substr( $from, -strlen( self::STAGED_SUFFIX ) ) !== self::STAGED_SUFFIX || $head !== self::PHP_EXIT ) {
+        if ( ( substr( $from, -strlen( self::STAGED_SUFFIX ) ) !== self::STAGED_SUFFIX && ! self::dump_staged( $from ) ) || $head !== self::PHP_EXIT ) {
             fclose( $in );
             if ( @rename( $from, $to ) ) {
                 return true;
@@ -1064,7 +1074,12 @@ class Import {
         if ( preg_match( '#\.(?:db|sql)\.txt$#i', $base ) || self::in_storage( $rel ) ) {
             return true;
         }
-        if ( strpos( $rel, '/' ) === false && preg_match( '#\.sql$#i', $rel ) ) {
+        if ( strpos( $rel, '/' ) === false && preg_match( '#\.sql(?:\.gz)?$#i', $rel ) ) {
+            return true;
+        }
+        // Where hosts keep the site's dump inside wp-content (WP Engine's
+        // mysql.sql, Pressidium's mysqldb-dump.sql.gz): never served here.
+        if ( preg_match( '#^wp-content/(?:mysql\.sql|mysqldb-dump\.sql(?:\.gz)?)$#i', $rel ) ) {
             return true;
         }
         // A quiet mode file belongs to the site it was turned on for: never
