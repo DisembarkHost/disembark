@@ -109,6 +109,14 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
 .dsk-tray-btn .n { display: none; font: 600 10px/1 var(--mono); background: var(--accent); color: var(--accent-ink); border-radius: 999px; padding: 3px 5px; }
 .dsk-tray-btn svg.i { width: 16px; height: 16px; }
 .dsk-btn.dsk-tray-btn.has-error svg.i { color: var(--danger); }
+.dsk-menu { position: absolute; top: calc(100% + 8px); right: 0; z-index: 31; min-width: 168px; background: var(--surface); border: 1px solid var(--line-2); border-radius: 12px; box-shadow: var(--shadow); padding: 5px; display: grid; gap: 2px; }
+.dsk-menu[hidden] { display: none; }
+.dsk-menu button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px; border: 0; border-radius: 8px; background: none; color: var(--ink); font: 500 13.5px/1.2 var(--sans); text-align: left; cursor: pointer; }
+.dsk-menu button:hover, .dsk-menu button:focus-visible { background: var(--surface-2); outline: none; }
+.dsk-menu button svg { width: 16px; height: 16px; flex: none; }
+.dsk-menu button span:not(.tick) { flex: 1; }
+.dsk-menu .tick { visibility: hidden; color: var(--accent); display: inline-flex; }
+.dsk-menu [aria-checked="true"] .tick { visibility: visible; }
 .dsk-tray { position: absolute; top: calc(100% + 12px); right: 0; z-index: 30; width: min(560px, calc(100vw - 32px)); max-height: min(70vh, 640px); overflow: auto; background: var(--surface); border: 1px solid var(--line-2); border-radius: 14px; box-shadow: var(--shadow); padding: 10px 12px 12px; }
 .dsk-tray-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 0 8px 4px; }
 .dsk-tray-list > :is(.notice, div.updated, div.error, .update-nag) { margin: 0 0 8px; max-width: none; border-radius: 0 8px 8px 0; box-shadow: none; }

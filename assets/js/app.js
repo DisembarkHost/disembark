@@ -20,6 +20,32 @@
     document.body.classList.toggle('dsk-dark', dark);
     var btn = root.querySelector('#dsk-theme');
     if (btn) D.mount(btn, D.icon(dark ? 'sun' : 'moon'));
+    if (themeMenu) Array.prototype.forEach.call(themeMenu.children, function (b) { b.setAttribute('aria-checked', b.dataset.pref === pref ? 'true' : 'false'); });
+  }
+  // Click flips light and dark; right-click (or the context menu key) opens
+  // Light, Dark and System, System following the computer's setting.
+  var themeMenu = null;
+  function themeMenuOpen(on) {
+    if (!themeMenu) return;
+    themeMenu.hidden = !on;
+    var btn = root.querySelector('#dsk-theme');
+    if (btn) btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+    if (on) { var cur = themeMenu.querySelector('[aria-checked="true"]') || themeMenu.firstChild; cur.focus(); }
+  }
+  function buildThemeMenu() {
+    themeMenu = h('div', { class: 'dsk-menu', id: 'dsk-theme-menu', role: 'menu', 'aria-label': 'Theme', hidden: true },
+      [['light', 'Light', 'sun'], ['dark', 'Dark', 'moon'], ['system', 'System', 'monitor']].map(function (o) {
+        return h('button', { type: 'button', role: 'menuitemradio', 'data-pref': o[0], 'aria-checked': 'false', onclick: function () { D.setTheme(o[0]); themeMenuOpen(false); root.querySelector('#dsk-theme').focus(); } },
+          D.icon(o[2]), h('span', null, o[1]), h('span', { class: 'tick' }, D.icon('check')));
+      }));
+    themeMenu.addEventListener('keydown', function (e) {
+      var items = Array.prototype.slice.call(themeMenu.children), i = items.indexOf(document.activeElement);
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); items[(i + (e.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length].focus(); }
+      else if (e.key === 'Home' || e.key === 'End') { e.preventDefault(); items[e.key === 'Home' ? 0 : items.length - 1].focus(); }
+      else if (e.key === 'Escape' || e.key === 'Tab') { if (e.key === 'Escape') e.preventDefault(); themeMenuOpen(false); if (e.key === 'Escape') root.querySelector('#dsk-theme').focus(); }
+    });
+    document.addEventListener('click', function (e) { if (!themeMenu.hidden && !themeMenu.contains(e.target)) themeMenuOpen(false); });
+    return themeMenu;
   }
   D.setTheme = function (pref) {
     try { if (pref === 'system') localStorage.removeItem(KEY); else localStorage.setItem(KEY, pref); } catch (e) { /* private mode */ }
@@ -118,9 +144,10 @@
       h('span', { class: 'dsk-site', title: 'This site: ' + D.config.homeUrl + (note ? ' · ' + note : '') }, h('i'), h('span', { class: 'host' }, D.host(D.config.homeUrl)), note ? h('small', null, '· ' + note) : null),
       h('div', { class: 'dsk-top-tools' },
         trayBtn, tray,
-        h('button', { class: 'dsk-btn ghost icon', id: 'dsk-theme', type: 'button', 'aria-label': 'Switch between light and dark', onclick: function () {
-          D.setTheme(root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
-        } })))),
+        h('button', { class: 'dsk-btn ghost icon', id: 'dsk-theme', type: 'button', 'aria-label': 'Switch between light and dark (right-click for system)', title: 'Light or dark. Right-click for System.', 'aria-haspopup': 'menu', 'aria-controls': 'dsk-theme-menu', 'aria-expanded': 'false',
+          onclick: function () { themeMenuOpen(false); D.setTheme(root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark'); },
+          oncontextmenu: function (e) { e.preventDefault(); openTray(false); themeMenuOpen(themeMenu.hidden); } }),
+        buildThemeMenu()))),
     main));
   applyTheme();
   // The brand goes back to the first tab even when it's already showing
