@@ -1135,7 +1135,7 @@ class Command {
                 'id'          => $p['id'],
                 'label'       => $p['label'],
                 'created'     => wp_date( 'Y-m-d H:i', $p['created_at'] ),
-                'rolled_back' => $p['rolled_back_at'] ? wp_date( 'Y-m-d H:i', $p['rolled_back_at'] ) : '',
+                'rolled_back' => $p['rolled_back_at'] ? wp_date( 'Y-m-d H:i', $p['rolled_back_at'] ) : ( ! empty( $p['rolled_back_legacy'] ) ? 'yes (older version)' : '' ),
                 'files'       => ! $p['files'] && ! $p['deployed'] ? '-' : ( ! empty( $p['files_spent'] ) ? 'put back' : 'kept' ),
                 'size'        => size_format( $p['size'] ),
             ];

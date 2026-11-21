@@ -104,7 +104,12 @@ class Import {
             $raw = self::read_protected( rtrim( $rollback_dir, '/' ) . '/' . $name );
             if ( $raw !== null ) {
                 $meta = json_decode( $raw, true );
-                return is_array( $meta ) ? $meta : [];
+                $meta = is_array( $meta ) ? $meta : [];
+                // Older builds didn't record whose point it is: its folder says.
+                if ( empty( $meta['import_id'] ) && preg_match( '#/_import_([a-f0-9]+)/rollback/?$#', wp_normalize_path( (string) $rollback_dir ), $m ) ) {
+                    $meta['import_id'] = $m[1];
+                }
+                return $meta;
             }
         }
         return null;
@@ -4855,9 +4860,11 @@ class Import {
             }
             $points[] = [
                 'id'             => substr( basename( $dir ), strlen( '_import_' ) ),
-                'label'          => (string) ( $meta['label'] ?? '' ),
+                'label'          => self::point_label( $meta + [ 'created_at' => filemtime( $meta_file ) ] ),
                 'created_at'     => (int) ( $meta['created_at'] ?? filemtime( $meta_file ) ),
                 'rolled_back_at' => (int) ( $meta['rolled_back_at'] ?? 0 ),
+                // Rolled back by 2.9.0 or earlier, which didn't say when.
+                'rolled_back_legacy' => self::legacy_rolled_back( $meta ),
                 'tables'         => count( (array) ( $meta['tables'] ?? [] ) ),
                 'files'          => count( (array) ( $meta['backed_up_files'] ?? [] ) ),
                 'deployed'       => count( (array) ( $meta['deployed_files'] ?? [] ) ),
@@ -4893,7 +4900,40 @@ class Import {
         if ( array_key_exists( 'files_put_back_at', (array) $meta ) ) {
             return (int) $meta['files_put_back_at'] > 0;
         }
-        return ! empty( $meta['rolled_back_at'] );
+        return ! empty( $meta['rolled_back_at'] ) || self::legacy_rolled_back( $meta );
+    }
+
+    /**
+     * Whether 2.9.0 or earlier rolled this point back: those builds recorded
+     * no rollback time, but a rollback moves the saved copies back into
+     * place, so a point whose saved files are all gone from its folder was
+     * rolled back. (A point that placed new files and saved none can't be
+     * told this way.) Looks at the first few saved files only.
+     */
+    public static function legacy_rolled_back( $meta ) {
+        static $seen = [];
+        $meta = (array) $meta;
+        if ( ! empty( $meta['rolled_back_at'] ) || array_key_exists( 'files_put_back_at', $meta ) || empty( $meta['backed_up_files'] ) || empty( $meta['import_id'] ) ) {
+            return false;
+        }
+        $id = preg_replace( '/[^a-f0-9]/', '', (string) $meta['import_id'] );
+        if ( ! isset( $seen[ $id ] ) ) {
+            $point       = new self( $id );
+            $seen[ $id ] = true;
+            foreach ( array_slice( (array) $meta['backed_up_files'], 0, 25 ) as $rel ) {
+                if ( file_exists( $point->rollback_file( (string) $rel ) ) ) {
+                    $seen[ $id ] = false;
+                    break;
+                }
+            }
+        }
+        return $seen[ $id ];
+    }
+
+    /** A restore point's label, or one made from its date for points older builds saved without one. */
+    public static function point_label( $meta ) {
+        $label = trim( (string) ( $meta['label'] ?? '' ) );
+        return $label !== '' ? $label : 'Restore point from ' . wp_date( 'M j, Y g:i a', (int) ( $meta['created_at'] ?? 0 ) );
     }
 
     /**
@@ -6205,9 +6245,9 @@ class Import {
             if ( ! is_array( $m ) || ! self::point_is_here( $m ) || (int) ( $m['created_at'] ?? 0 ) <= $since ) {
                 continue;
             }
-            $open = empty( $m['rolled_back_at'] ) || ( $files && self::point_has_files( $m ) && ! self::files_spent( $m ) );
+            $open = ( empty( $m['rolled_back_at'] ) && ! self::legacy_rolled_back( $m ) ) || ( $files && self::point_has_files( $m ) && ! self::files_spent( $m ) );
             if ( $open ) {
-                $later[] = [ 'id' => $id, 'label' => (string) ( $m['label'] ?? '' ), 'created_at' => (int) ( $m['created_at'] ?? 0 ) ];
+                $later[] = [ 'id' => $id, 'label' => self::point_label( $m ), 'created_at' => (int) ( $m['created_at'] ?? 0 ) ];
             }
         }
         usort( $later, function ( $a, $b ) { return $b['created_at'] - $a['created_at']; } );
@@ -6236,7 +6276,7 @@ class Import {
                 return new \WP_Error( 'other_site_point', $elsewhere . ' Nothing was changed.', [ 'status' => 409 ] );
             }
             $steps   = self::later_points( $meta, $files );
-            $steps[] = [ 'id' => $this->import_id, 'label' => (string) ( $meta['label'] ?? '' ), 'created_at' => (int) ( $meta['created_at'] ?? 0 ) ];
+            $steps[] = [ 'id' => $this->import_id, 'label' => self::point_label( $meta ), 'created_at' => (int) ( $meta['created_at'] ?? 0 ) ];
             $ch      = [ 'steps' => $steps, 'i' => 0, 'files' => $files, 'undone' => [], 'logins_kept' => true, 'at' => time() ];
             if ( $paced ) {
                 $this->prepare_import_dir();
@@ -6324,7 +6364,7 @@ class Import {
             return new \WP_Error( 'other_site_point', $elsewhere, [ 'status' => 409 ] );
         }
         $steps    = self::later_points( $meta, true );
-        $steps[]  = [ 'id' => $this->import_id, 'label' => (string) ( $meta['label'] ?? '' ), 'created_at' => (int) ( $meta['created_at'] ?? 0 ) ];
+        $steps[]  = [ 'id' => $this->import_id, 'label' => self::point_label( $meta ), 'created_at' => (int) ( $meta['created_at'] ?? 0 ) ];
         $root     = rtrim( wp_normalize_path( dirname( WP_CONTENT_DIR ) ), '/' );
         $uploads  = ltrim( substr( wp_normalize_path( (string) wp_upload_dir( null, false )['basedir'] ), strlen( $root ) ), '/' ) . '/';
         $deadline = microtime( true ) + 6;

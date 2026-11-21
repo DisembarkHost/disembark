@@ -1395,7 +1395,8 @@
         h('div', null,
           h('b', null, p.label || 'Restore point'),
           i === 0 ? h('span', { class: 'dsk-tag ok', style: { marginLeft: '8px' } }, 'latest') : null,
-          p.rolled_back_at ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' } }, (hasFiles(p) && !p.files_spent ? 'database rolled back ' : 'rolled back ') + D.fmt.ago(p.rolled_back_at)) : null,
+          p.rolled_back_at ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' } }, (hasFiles(p) && !p.files_spent ? 'database rolled back ' : 'rolled back ') + D.fmt.ago(p.rolled_back_at))
+            : p.rolled_back_legacy ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' }, title: 'An earlier version of Disembark rolled this back without saying when.' }, 'rolled back') : null,
           hasFiles(p) && p.files_spent ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' }, title: 'A rollback moved this point’s saved files back into place, so it can put back the database only.' }, 'files put back') : null,
           h('div', { class: 'when' }, D.fmt.date(p.created_at) + ' · ' + D.fmt.size(p.size) + ' · ' + (!hasFiles(p) ? 'database only' : p.files_spent ? 'database (its files were put back)' : 'files and database')),
           p.left_alone ? h('div', { class: 'when' }, D.OLD_POINT_NOTE) : null),
@@ -1432,7 +1433,7 @@
     /** The restore points made after p that rolling back to it undoes first, newest first (matches Import::later_points()). */
     function laterThan(p, files) {
       return points.filter(function (q) {
-        return q.id !== p.id && q.created_at > p.created_at && (!q.rolled_back_at || (files && hasFiles(q) && !q.files_spent));
+        return q.id !== p.id && q.created_at > p.created_at && ((!q.rolled_back_at && !q.rolled_back_legacy) || (files && hasFiles(q) && !q.files_spent));
       }).sort(function (a, b) { return b.created_at - a.created_at; });
     }
     async function rollback(p, btn) {
