@@ -1586,6 +1586,17 @@ class Import {
         $result['database_unchanged'] = ! empty( $result['errors'] ) && empty( $swap['direct'] ) && ! $swapped;
         $result['converted']          = $compat['converted'];
         $result['definers_removed']   = $compat['definers_removed'];
+        // This site's own tables were just swapped for the source's, whose
+        // roles and logins sit under the source's prefix (stacked_1_user_roles
+        // when the source was a WP Freighter tenant). Until they're renamed,
+        // WordPress has no roles, and a plugin that expects them stops every
+        // request with a fatal error, the move's own next step included. So
+        // they're renamed here, in the request that swapped the tables in.
+        if ( ! $target && empty( $result['errors'] ) && ( $swapped || ! empty( $swap['direct'] ) ) && $old_prefix !== '' && $new_prefix !== '' && $old_prefix !== $new_prefix ) {
+            $rp = $this->remap_table_prefix( $old_prefix, $new_prefix );
+            $result['prefix_keys_changed'] = (int) ( $rp['keys_changed'] ?? 0 );
+            self::write_protected( $this->import_path . '/prefix-remapped.php', (string) wp_json_encode( [ 'from' => $old_prefix, 'to' => $new_prefix, 'keys_changed' => $result['prefix_keys_changed'] ] ) );
+        }
         if ( $target ) {
             $result['target']         = $target->info();
             $result['tables_left_out'] = $foreign;
@@ -5621,6 +5632,11 @@ class Import {
         if ( $old_prefix === '' || $old_prefix === $new_prefix ) {
             return [ 'keys_changed' => 0 ];
         }
+        // The import renamed them already, right after the swap (see
+        // import_staged_sql()): the same answer again, and a second look for
+        // anything left (a catch-up's second import).
+        $done = json_decode( (string) self::read_protected( $this->import_path . '/prefix-remapped.php' ), true );
+        $before = is_array( $done ) && ( $done['from'] ?? '' ) === $old_prefix && ( $done['to'] ?? '' ) === $new_prefix ? (int) ( $done['keys_changed'] ?? 0 ) : 0;
 
         $changed = 0;
 
@@ -5669,7 +5685,7 @@ class Import {
 
         wp_cache_flush();
 
-        return [ 'keys_changed' => $changed ];
+        return [ 'keys_changed' => $changed + $before ];
     }
 
     /**
