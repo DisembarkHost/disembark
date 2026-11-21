@@ -5694,8 +5694,43 @@ class Import {
                 $out['plugins_turned_off'][] = [ 'plugin' => 'wordfence', 'name' => 'Wordfence login reCAPTCHA', 'why' => 'its reCAPTCHA keys belong to ' . wp_parse_url( $from, PHP_URL_HOST ) ];
             }
         }
+        if ( $moved && ( $loops = self::redirect_loops_off( $from, $here ) ) ) {
+            $out['plugins_turned_off'][] = [ 'plugin' => 'redirection', 'name' => ( $loops === 1 ? 'a Redirection rule' : $loops . ' Redirection rules' ), 'why' => ( $loops === 1 ? 'it' : 'they' ) . ' sent one spelling of ' . wp_parse_url( $from, PHP_URL_HOST ) . ' to another (www to the bare domain, or back), and on this one address ' . ( $loops === 1 ? 'it' : 'each' ) . ' would redirect to itself' ];
+        }
         $out['login_url'] = self::custom_login_url();
         return $out;
+    }
+
+    /**
+     * Redirection's rules that match by server and send one spelling of the
+     * old address to another (https://www.example.com → https://example.com).
+     * The address rewrite turns every spelling into this site's one, so such
+     * a rule redirects a page to itself forever. Those rules are disabled
+     * (they stay in the list). Returns how many.
+     */
+    private static function redirect_loops_off( $from, $here ) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'redirection_items';
+        if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) !== $table ) {
+            return 0;
+        }
+        $host = strtolower( (string) wp_parse_url( $here, PHP_URL_HOST ) );
+        $rows = (array) $wpdb->get_results( "SELECT id, url, action_data FROM `{$table}` WHERE status = 'enabled' AND match_type = 'server' AND action_type = 'url' LIMIT 500", ARRAY_A );
+        $off  = 0;
+        foreach ( $rows as $row ) {
+            $data = maybe_unserialize( (string) $row['action_data'] );
+            if ( ! is_array( $data ) || empty( $data['url_from'] ) || empty( $data['server'] ) ) {
+                continue;
+            }
+            $server = strtolower( (string) wp_parse_url( (string) $data['server'], PHP_URL_HOST ) );
+            $to     = (string) $data['url_from'];
+            $to_host = strtolower( (string) wp_parse_url( $to, PHP_URL_HOST ) );
+            $path   = '/' . trim( (string) wp_parse_url( $to, PHP_URL_PATH ), '/' );
+            if ( $server === $host && $to_host === $host && strtolower( $path ) === strtolower( '/' . trim( (string) $row['url'], '/' ) ) ) {
+                $off += (int) $wpdb->update( $table, [ 'status' => 'disabled' ], [ 'id' => (int) $row['id'] ] );
+            }
+        }
+        return $off;
     }
 
     /** Plugin folders that force https (redirects, or rewriting the site URL). */

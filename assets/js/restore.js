@@ -1180,7 +1180,7 @@
         if (gone.length) rlog('Removed ' + D.fmt.plural(gone.length, 'table') + ' the incoming site doesn\u2019t have (kept in the restore point): ' + gone.slice(0, 8).join(', ') + (gone.length > 8 ? ', \u2026' : '') + '.');
         var caches = Object.keys(tidy.caches_cleared || {});
         if (caches.length) rlog('Cleared page caches so nothing serves the old site: ' + caches.join(', ') + '.', 'dim');
-        (tidy.plugins_turned_off || []).forEach(function (p) { rlog('Turned off ' + p.name + ': ' + p.why + '. Turn it back on once this site has its own keys or certificate.', 'dim'); });
+        (tidy.plugins_turned_off || []).forEach(function (p) { rlog('Turned off ' + p.name + ': ' + p.why + (p.plugin === 'redirection' ? '.' : '. Turn it back on once this site has its own keys or certificate.'), 'dim'); });
         if (tidy.login_url) { ctx.loginUrl = tidy.login_url.url; rlog('The login page is moved by ' + tidy.login_url.plugin + ': log in at ' + tidy.login_url.url, 'ok'); }
 
         step('check');
