@@ -3878,6 +3878,22 @@ class Import {
                 $wpdb->update( $wpdb->options, [ 'option_value' => serialize( array_values( $active ) ) ], [ 'option_name' => 'active_plugins' ] );
             }
         }
+        // Disembark itself stays on: the rest of the move (the address
+        // rewrite, the tidy-up, the checks) and its undo run through it, and
+        // a backup of a site without Disembark (another host's zip) turned
+        // it off mid-move, so the dashboard's next step found no route.
+        $own     = plugin_basename( dirname( __DIR__ ) . '/disembark.php' );
+        $network = is_multisite() ? (array) get_site_option( 'active_sitewide_plugins', [] ) : [];
+        if ( ! isset( $network[ $own ] ) ) {
+            $active = maybe_unserialize( (string) $wpdb->get_var( "SELECT option_value FROM `{$wpdb->options}` WHERE option_name = 'active_plugins'" ) );
+            $active = is_array( $active ) ? $active : [];
+            if ( ! in_array( $own, $active, true ) ) {
+                $active[] = $own;
+                if ( ! $wpdb->update( $wpdb->options, [ 'option_value' => serialize( array_values( $active ) ) ], [ 'option_name' => 'active_plugins' ] ) ) {
+                    $wpdb->insert( $wpdb->options, [ 'option_name' => 'active_plugins', 'option_value' => serialize( array_values( $active ) ), 'autoload' => 'yes' ] );
+                }
+            }
+        }
         // The host's options: this server's, never the incoming site's.
         $table = (string) ( $keep['table'] ?? '' );
         if ( array_key_exists( 'host', $keep ) && $table !== '' && $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) === $table ) {
