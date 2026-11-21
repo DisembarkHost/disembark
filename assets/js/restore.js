@@ -342,7 +342,7 @@
           progress('');
           rolledBack = !(r.errors && r.errors.length);
           (r.errors || []).slice(0, 5).forEach(function (e) { rlog('  ' + e, 'err'); });
-          if (r.quiet_mode_lifted) rlog('Quiet mode lifted with it.', 'dim');
+          if (r.quiet_mode_lifted) { rlog('Quiet mode lifted with it.', 'dim'); if (opts.local && D.quietOff) D.quietOff(); }
         } catch (e) { rlog('ERROR: ' + D.errorText(e), 'err'); }
       }
       var kept = !!rollbackId && !rolledBack;
@@ -1345,7 +1345,7 @@
           }
           rlog('Rolled back.', 'ok');
           (r.warnings || []).forEach(function (w) { rlog(w, 'dim'); });
-          if (r.quiet_mode_lifted) rlog('Quiet mode lifted with it.', 'dim');
+          if (r.quiet_mode_lifted) { rlog('Quiet mode lifted with it.', 'dim'); if (opts.local && D.quietOff) D.quietOff(); }
           setTitle('Rolled', 'back.');
           live.className = 'dsk-live ok'; capsText.textContent = KIND + ' undone';
           lineState();
@@ -1491,6 +1491,7 @@
             if (was === null) return;
             label.textContent = x.steps ? 'Undoing ' + x.step + ' of ' + x.steps + '…' : (x.phase === 'files' ? 'Files ' + D.fmt.num(x.files_done || 0) + ' of ' + D.fmt.num(x.files_total || 0) : 'Database…');
           });
+          if (r.quiet_mode_lifted && D.quietOff) D.quietOff();
           if (r.errors && r.errors.length) throw new Error(D.fmt.plural(r.errors.length, 'error') + ': ' + r.errors.slice(0, 2).join(' · '));
           D.toast('Rolled back to ' + D.fmt.date(p.created_at) + (r.files === false ? ' (database only)' : '') + '.' + (r.warnings && r.warnings.length ? ' ' + r.warnings.join(' ') : ''));
           // User accounts went back with a whole-site move's database: log in again.

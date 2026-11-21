@@ -71,6 +71,17 @@
     found.forEach(function (n) { (isOwn(n) ? ownList : otherList).appendChild(n); });
     refreshTray();
   }
+  /**
+   * Quiet mode went off (Settings, or a rollback that lifted it): its admin
+   * bar item and notice, printed when the page loaded, go now rather than on
+   * the next load.
+   */
+  D.quietOff = function () {
+    var bar = document.getElementById('wp-admin-bar-disembark-quiet-mode');
+    if (bar) bar.remove();
+    Array.prototype.slice.call(ownList.children).forEach(function (n) { if (/Quiet mode/i.test(n.textContent || '')) n.remove(); });
+    refreshTray();
+  };
   [ownList, otherList].forEach(function (l) { new MutationObserver(refreshTray).observe(l, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style'] }); });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !tray.hidden) { openTray(false); trayBtn.focus(); } });
   document.addEventListener('click', function (e) { if (!tray.hidden && !tray.contains(e.target) && !trayBtn.contains(e.target)) openTray(false); });

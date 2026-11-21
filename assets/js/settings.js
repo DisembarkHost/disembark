@@ -194,7 +194,7 @@
           if (!ok) return;
         }
         await D.busy(btn, async function () {
-          try { render(await D.api.post('quiet-mode', { action: action })); load(); D.toast(action === 'on' ? 'Quiet mode is on.' : 'Quiet mode is off.'); }
+          try { render(await D.api.post('quiet-mode', { action: action })); load(); D.toast(action === 'on' ? 'Quiet mode is on.' : 'Quiet mode is off.'); if (action === 'off' && D.quietOff) D.quietOff(); }
           catch (e) { D.toast('Could not change quiet mode: ' + D.errorText(e), 'error'); }
         });
       }

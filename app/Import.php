@@ -6228,6 +6228,7 @@ class Import {
                 return $r + $where;
             }
             $ch['logins_kept'] = $ch['logins_kept'] && ! empty( $r['logins_kept'] );
+            $ch['quiet']       = ! empty( $ch['quiet'] ) || ! empty( $r['quiet_mode_lifted'] );
             if ( ! empty( $r['errors'] ) ) {
                 @unlink( $chain_file );
                 if ( $ch['i'] < $total - 1 ) {
@@ -6250,6 +6251,7 @@ class Import {
         $last                = (array) $last;
         $last['undone']      = $ch['undone'];
         $last['logins_kept'] = $ch['logins_kept'];
+        $last['quiet_mode_lifted'] = ! empty( $ch['quiet'] ) || ! empty( $last['quiet_mode_lifted'] );
         if ( $ch['undone'] ) {
             $last['warnings'] = array_merge( [ self::undone_words( $ch['undone'] ) ], (array) ( $last['warnings'] ?? [] ) );
         }
