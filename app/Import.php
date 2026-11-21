@@ -4839,6 +4839,10 @@ class Import {
                 'tables'         => count( (array) ( $meta['tables'] ?? [] ) ),
                 'files'          => count( (array) ( $meta['backed_up_files'] ?? [] ) ),
                 'deployed'       => count( (array) ( $meta['deployed_files'] ?? [] ) ),
+                // Its files went back already: it can roll back the database only.
+                'files_spent'    => self::files_spent( $meta ),
+                // A subsite or tenant it created goes whole, files and all.
+                'creates_site'   => ! empty( $meta['target']['created'] ),
                 'size'           => $size,
                 // A restore point from before 3.0's scope fix that holds
                 // other sites' tables: a rollback leaves those alone.
@@ -4847,6 +4851,27 @@ class Import {
         }
         usort( $points, function ( $a, $b ) { return $b['created_at'] - $a['created_at']; } );
         return $points;
+    }
+
+    /** Whether a restore point holds files: ones its move replaced or placed. */
+    public static function point_has_files( $meta ) {
+        return ! empty( $meta['backed_up_files'] ) || ! empty( $meta['deployed_files'] );
+    }
+
+    /**
+     * Whether a restore point's files were already put back. A rollback
+     * moves the saved copies into place rather than copying them, so that
+     * happens once. Before 3.0 every rollback did, so an older rolled-back
+     * point counts as spent.
+     */
+    public static function files_spent( $meta ) {
+        if ( ! self::point_has_files( $meta ) ) {
+            return false;
+        }
+        if ( array_key_exists( 'files_put_back_at', (array) $meta ) ) {
+            return (int) $meta['files_put_back_at'] > 0;
+        }
+        return ! empty( $meta['rolled_back_at'] );
     }
 
     /**
@@ -5861,8 +5886,10 @@ class Import {
      * checkpoint are journaled, so none runs twice. Without a budget (an
      * older client), all of it in this one request.
      */
-    public function rollback( $budget = null ) {
+    public function rollback( $budget = null, $opts = [] ) {
         global $wpdb;
+        // With files unless asked for the database only.
+        $asked_files = ! array_key_exists( 'files', (array) $opts ) || ! empty( $opts['files'] );
         $paced      = $budget !== null;
         $deadline   = $paced ? Pace::deadline( $budget ) : 0;
         $state_file = $this->import_path . '/rollback-state.php';
@@ -5872,7 +5899,7 @@ class Import {
             // Asked again right after it finished (a lost answer): the same
             // answer, not a second rollback.
             $done = json_decode( (string) self::read_protected( $done_file ), true );
-            if ( $paced && is_array( $done ) && (int) ( $done['at'] ?? 0 ) > time() - 600 ) {
+            if ( $paced && is_array( $done ) && (int) ( $done['at'] ?? 0 ) > time() - 600 && (bool) ( $done['files_asked'] ?? true ) === $asked_files ) {
                 return (array) $done['result'];
             }
             // A paced deploy that stopped partway journaled what it placed.
@@ -5897,8 +5924,17 @@ class Import {
             // rollback_owner()).
             $owner = $this->rollback_owner( $meta );
             $left  = self::rollback_left_tables( $owner, $meta );
+            // Database only leaves the files as they are now and keeps the
+            // point's saved files for a later rollback with files. A subsite
+            // or tenant the move created goes whole (tables, folders and its
+            // registry row), so its point always rolls back with files.
+            $want_files = $asked_files;
+            $created    = ! empty( $meta['target']['created'] );
+            $spent      = self::files_spent( $meta );
             $st = [
                 'phase'    => 'database',
+                'with_files' => ( $want_files || $created ) && ! $spent,
+                'spent'    => $spent && self::point_has_files( $meta ),
                 'files'    => array_map( 'basename', $sql_files ),
                 'f'        => 0,
                 'o'        => 0,
@@ -5963,10 +5999,13 @@ class Import {
             $save();
         }
 
-        // 2. Files: the ones the move replaced come back, the ones it added go.
+        // 2. Files: the ones the move replaced come back, the ones it added go
+        // (not for a database-only rollback, nor when an earlier rollback
+        // already put this point's files back).
+        $with_files = ! array_key_exists( 'with_files', $st ) || ! empty( $st['with_files'] );
         $web_root  = dirname( WP_CONTENT_DIR );
-        $backed_up = array_values( (array) ( $meta['backed_up_files'] ?? [] ) );
-        $deployed  = array_values( (array) ( $meta['deployed_files'] ?? [] ) );
+        $backed_up = $with_files ? array_values( (array) ( $meta['backed_up_files'] ?? [] ) ) : [];
+        $deployed  = $with_files ? array_values( (array) ( $meta['deployed_files'] ?? [] ) ) : [];
         $was_saved = array_flip( $backed_up );
         $removed   = false;
         $total     = count( $backed_up ) + count( $deployed );
@@ -6017,7 +6056,9 @@ class Import {
         $keep    = function ( $dir ) use ( $content ) {
             return in_array( $dir, [ 'wp-admin', 'wp-includes', 'wp-content', $content ], true ) || dirname( $dir ) === $content || dirname( $dir ) === 'wp-content';
         };
-        if ( isset( $meta['created_dirs'] ) ) {
+        if ( ! $with_files ) {
+            // Database only: every folder stays as it is.
+        } elseif ( isset( $meta['created_dirs'] ) ) {
             // The deploy recorded the folders it added: those go (deepest
             // first, once empty), and folders that were here before stay,
             // empty or not.
@@ -6046,7 +6087,7 @@ class Import {
         }
 
         // A subsite or tenant this move created goes completely.
-        if ( $target && ! empty( $meta['target']['created'] ) ) {
+        if ( $with_files && $target && ! empty( $meta['target']['created'] ) ) {
             $target->undo();
         }
 
@@ -6067,6 +6108,13 @@ class Import {
             $saved = self::rollback_meta( $this->rollback_path );
             if ( $saved !== null ) {
                 $saved['rolled_back_at'] = time();
+                // Whether its saved files went back into place (a rollback
+                // moves them, so they can be put back only once).
+                if ( $with_files ) {
+                    $saved['files_put_back_at'] = time();
+                } elseif ( ! isset( $saved['files_put_back_at'] ) ) {
+                    $saved['files_put_back_at'] = 0;
+                }
                 $this->save_rollback_meta( $saved );
             }
         }
@@ -6086,16 +6134,135 @@ class Import {
             // What a restore point from an earlier build holds of other
             // sites (see rollback_owner()), which stays as it is now.
             'left_alone'       => [ 'tables' => count( $left_tables ), 'files' => $left_files, 'names' => array_slice( $left_tables, 0, 50 ) ],
-            'warnings'         => self::rollback_left_words( $owner, count( $left_tables ), $left_files ),
+            'warnings'         => array_merge( self::rollback_left_words( $owner, count( $left_tables ), $left_files ), ! empty( $st['spent'] ) && empty( $st['with_files'] ) && $asked_files ? [ 'Only the database went back: an earlier rollback already put this restore point\'s files back.' ] : [] ),
+            'files'            => $with_files,
             'errors'           => $errors,
         ];
         @unlink( $state_file );
         @unlink( $this->import_path . '/rollback-journal.php' );
         if ( $paced ) {
             $result['done'] = true;
-            self::write_protected( $done_file, (string) wp_json_encode( [ 'at' => time(), 'result' => $result ] ) );
+            self::write_protected( $done_file, (string) wp_json_encode( [ 'at' => time(), 'files_asked' => $asked_files, 'result' => $result ] ) );
         }
         return $result;
+    }
+
+    /**
+     * Restore points made on this site after $meta's, which a rollback to it
+     * undoes first, newest first: every one not rolled back yet, and with
+     * $files, also one rolled back database only whose files are still out.
+     * [ [ id, label, created_at ], … ].
+     */
+    public static function later_points( $meta, $files = true ) {
+        $since = (int) ( $meta['created_at'] ?? 0 );
+        $self  = (string) ( $meta['import_id'] ?? '' );
+        $later = [];
+        foreach ( (array) glob( Storage::base_dir() . '/_import_*', GLOB_ONLYDIR ) as $dir ) {
+            $id = substr( basename( $dir ), strlen( '_import_' ) );
+            if ( $id === $self || ! preg_match( '/^[a-f0-9]+$/', $id ) ) {
+                continue;
+            }
+            $m = self::rollback_meta( $dir . '/rollback' );
+            if ( ! is_array( $m ) || ! self::point_is_here( $m ) || (int) ( $m['created_at'] ?? 0 ) <= $since ) {
+                continue;
+            }
+            $open = empty( $m['rolled_back_at'] ) || ( $files && self::point_has_files( $m ) && ! self::files_spent( $m ) );
+            if ( $open ) {
+                $later[] = [ 'id' => $id, 'label' => (string) ( $m['label'] ?? '' ), 'created_at' => (int) ( $m['created_at'] ?? 0 ) ];
+            }
+        }
+        usort( $later, function ( $a, $b ) { return $b['created_at'] - $a['created_at']; } );
+        return $later;
+    }
+
+    /**
+     * Rolls back to this restore point the way the site was then: the
+     * restore points made after it are undone first, newest first, each with
+     * the same choice of files (see rollback()), then this one. Stops at the
+     * first that reports errors, saying which. Paced like rollback(): while
+     * it runs, { done: false, step, steps, label, … } says where it is.
+     */
+    public function rollback_through( $budget = null, $opts = [] ) {
+        $paced      = $budget !== null;
+        $deadline   = $paced ? Pace::deadline( $budget ) : 0;
+        $chain_file = $this->import_path . '/rollback-chain.php';
+        $files      = ! array_key_exists( 'files', (array) $opts ) || ! empty( $opts['files'] );
+        $ch         = $paced ? json_decode( (string) self::read_protected( $chain_file ), true ) : null;
+        if ( ! is_array( $ch ) || (bool) ( $ch['files'] ?? true ) !== $files || (int) ( $ch['at'] ?? 0 ) < time() - DAY_IN_SECONDS ) {
+            $meta = self::rollback_meta( $this->rollback_path );
+            if ( $meta === null ) {
+                return new \WP_Error( 'no_rollback', 'No rollback data found for this import ID.', [ 'status' => 404 ] );
+            }
+            if ( $elsewhere = self::point_elsewhere( $meta ) ) {
+                return new \WP_Error( 'other_site_point', $elsewhere . ' Nothing was changed.', [ 'status' => 409 ] );
+            }
+            $steps   = self::later_points( $meta, $files );
+            $steps[] = [ 'id' => $this->import_id, 'label' => (string) ( $meta['label'] ?? '' ), 'created_at' => (int) ( $meta['created_at'] ?? 0 ) ];
+            $ch      = [ 'steps' => $steps, 'i' => 0, 'files' => $files, 'undone' => [], 'logins_kept' => true, 'at' => time() ];
+            if ( $paced ) {
+                $this->prepare_import_dir();
+                self::write_protected( $chain_file, (string) wp_json_encode( $ch ) );
+            }
+        }
+        $save = function () use ( &$ch, $chain_file, $paced ) {
+            if ( $paced ) {
+                self::write_protected( $chain_file, (string) wp_json_encode( $ch ) );
+            }
+        };
+        $total = count( $ch['steps'] );
+        $last  = null;
+        while ( $ch['i'] < $total ) {
+            $step = $ch['steps'][ $ch['i'] ];
+            $one  = ( new self( (string) $step['id'] ) )->set_request_token( $this->request_token );
+            $r    = $one->rollback( $paced ? max( 2, (int) floor( Pace::left( $deadline ) ) ) : null, [ 'files' => $files ] );
+            $where = $total > 1 ? [ 'step' => $ch['i'] + 1, 'steps' => $total, 'label' => $step['label'] ] : [];
+            if ( is_wp_error( $r ) ) {
+                @unlink( $chain_file );
+                if ( $ch['i'] < $total - 1 ) {
+                    return new \WP_Error( $r->get_error_code(), 'Undoing the later "' . $step['label'] . '" first: ' . $r->get_error_message() . ( $ch['undone'] ? ' ' . self::undone_words( $ch['undone'] ) : '' ), $r->get_error_data() );
+                }
+                return $r;
+            }
+            if ( isset( $r['done'] ) && $r['done'] === false ) {
+                $save();
+                return $r + $where;
+            }
+            $ch['logins_kept'] = $ch['logins_kept'] && ! empty( $r['logins_kept'] );
+            if ( ! empty( $r['errors'] ) ) {
+                @unlink( $chain_file );
+                if ( $ch['i'] < $total - 1 ) {
+                    array_unshift( $r['errors'], 'Stopped while undoing the later "' . $step['label'] . '"; ' . ( $ch['undone'] ? self::undone_words( $ch['undone'] ) : 'nothing before it was undone.' ) );
+                }
+                $r['undone'] = $ch['undone'];
+                return $r;
+            }
+            if ( $ch['i'] < $total - 1 ) {
+                $ch['undone'][] = $step;
+            }
+            $last = $r;
+            $ch['i']++;
+            $save();
+            if ( $paced && $ch['i'] < $total && Pace::left( $deadline ) < 3 ) {
+                return [ 'done' => false, 'phase' => 'next' ] + [ 'step' => $ch['i'] + 1, 'steps' => $total, 'label' => $ch['steps'][ $ch['i'] ]['label'] ];
+            }
+        }
+        @unlink( $chain_file );
+        $last                = (array) $last;
+        $last['undone']      = $ch['undone'];
+        $last['logins_kept'] = $ch['logins_kept'];
+        if ( $ch['undone'] ) {
+            $last['warnings'] = array_merge( [ self::undone_words( $ch['undone'] ) ], (array) ( $last['warnings'] ?? [] ) );
+        }
+        if ( $paced ) {
+            $last['done'] = true;
+        }
+        return $last;
+    }
+
+    /** The later restore points a rollback undid first, in words. */
+    private static function undone_words( $undone ) {
+        $labels = array_map( function ( $u ) { return '"' . $u['label'] . '"'; }, array_slice( $undone, 0, 5 ) );
+        return 'Undid ' . count( $undone ) . ' later ' . ( count( $undone ) === 1 ? 'move' : 'moves' ) . ' first: ' . implode( ', ', $labels ) . ( count( $undone ) > 5 ? ', …' : '' ) . '.';
     }
 
     /**

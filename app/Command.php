@@ -1136,22 +1136,37 @@ class Command {
                 'label'       => $p['label'],
                 'created'     => wp_date( 'Y-m-d H:i', $p['created_at'] ),
                 'rolled_back' => $p['rolled_back_at'] ? wp_date( 'Y-m-d H:i', $p['rolled_back_at'] ) : '',
+                'files'       => ! $p['files'] && ! $p['deployed'] ? '-' : ( ! empty( $p['files_spent'] ) ? 'put back' : 'kept' ),
                 'size'        => size_format( $p['size'] ),
             ];
         }, $points );
-        \WP_CLI\Utils\format_items( 'table', $rows, [ 'id', 'label', 'created', 'rolled_back', 'size' ] );
+        \WP_CLI\Utils\format_items( 'table', $rows, [ 'id', 'label', 'created', 'rolled_back', 'files', 'size' ] );
     }
 
     /**
      * Puts this site back as it was before a restore, push or search & replace.
      *
-     * The database is replaced with the rollback point's snapshot, and files a
-     * restore changed are put back. Anything changed since is lost.
+     * The database is replaced with the rollback point's snapshot, and the
+     * files the move replaced come back while the ones it added go. Restore
+     * points made after this one are undone first, newest first, so the site
+     * is as it was then. Anything changed since is lost.
+     *
+     * A rollback moves the point's saved files back into place, so they go
+     * back once: a point whose files were already put back (the files column
+     * of `wp disembark restore-points` says so) rolls back its database only.
      *
      * ## OPTIONS
      *
      * <id>
      * : A rollback point id from `wp disembark restore-points`, or "latest".
+     *
+     * [--database-only]
+     * : Put back the database only and leave the files as they are now. The
+     * point keeps its saved files, so a later rollback can still put them back.
+     *
+     * [--only]
+     * : Undo this restore point alone, leaving the ones made after it as they
+     * are.
      *
      * [--yes]
      * : Don't ask for confirmation.
@@ -1168,11 +1183,27 @@ class Command {
     public function rollback( $args, $assoc_args ) {
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
         $point      = $this->find_point( $args[0] );
-        $this->confirm( $assoc_args, 'Roll ' . home_url() . " back to \"{$point['label']}\"? Anything changed since is lost." );
+        $files      = empty( $assoc_args['database-only'] );
+        $through    = empty( $assoc_args['only'] );
+        $meta       = (array) Import::rollback_meta( Storage::base_dir() . "/_import_{$point['id']}/rollback" );
+        $later      = $through ? Import::later_points( $meta, $files ) : [];
+        $what       = $files ? 'database and files' : 'database only (files stay as they are)';
+        if ( $files && ! empty( $point['files_spent'] ) ) {
+            $what = 'database only: an earlier rollback already put this point\'s files back';
+        }
+        $this->say( "Rolling back to \"{$point['label']}\" (" . wp_date( 'Y-m-d H:i', $point['created_at'] ) . "): {$what}." );
+        if ( $later ) {
+            $this->say( 'First undoing ' . self::plural( count( $later ), 'later restore point' ) . ', newest first:' );
+            foreach ( $later as $l ) {
+                $this->say( '  - ' . wp_date( 'Y-m-d H:i', $l['created_at'] ) . "  {$l['label']}" );
+            }
+        }
+        $this->confirm( $assoc_args, 'Roll ' . home_url() . " back to \"{$point['label']}\"" . ( $later ? ', undoing ' . self::plural( count( $later ), 'later move' ) . ' first' : '' ) . '? Anything changed since is lost.' );
         @set_time_limit( 0 );
         $this->say( 'Rolling back…' );
         $import = new Import( $point['id'] );
-        $r      = $this->check( $this->budgeted( function ( $x ) { return ( $x['phase'] ?? '' ) === 'files' ? 'Putting files back: ' . (int) $x['files_done'] . ' of ' . (int) $x['files_total'] : 'Putting the database back'; }, function ( $budget ) use ( $import ) { return $import->rollback( $budget ); } ), 'rollback' );
+        $opts   = [ 'files' => $files ];
+        $r      = $this->check( $this->budgeted( function ( $x ) { return ( isset( $x['step'] ) ? '[' . (int) $x['step'] . '/' . (int) $x['steps'] . '] ' . $x['label'] . ': ' : '' ) . ( ( $x['phase'] ?? '' ) === 'files' ? 'Putting files back: ' . (int) $x['files_done'] . ' of ' . (int) $x['files_total'] : ( ( $x['phase'] ?? '' ) === 'next' ? 'Done' : 'Putting the database back' ) ); }, function ( $budget ) use ( $import, $opts, $through ) { return $through ? $import->rollback_through( $budget, $opts ) : $import->rollback( $budget, $opts ); } ), 'rollback' );
         unset( $r['done'] );
         $has_errors = ! empty( $r['errors'] );
         if ( $this->json ) {

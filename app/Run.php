@@ -1989,7 +1989,13 @@ class Run {
 
         $import = new Import( $import_id );
         $import->set_request_token( User::request_token( $request ) );
-        return $import->rollback( self::paced( $params ) );
+        // files: false rolls back the database only. later: true undoes the
+        // restore points made after this one first, newest first.
+        $opts = [ 'files' => ! isset( $params['files'] ) || ! empty( $params['files'] ) ];
+        if ( ! empty( $params['later'] ) ) {
+            return $import->rollback_through( self::paced( $params ), $opts );
+        }
+        return $import->rollback( self::paced( $params ), $opts );
     }
 
     function import_finalize( $request ) {
