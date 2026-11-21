@@ -68,6 +68,15 @@ class Command {
      * ("disembark connect <url> <token>"), from its Tools → Disembark → Settings
      * or `wp disembark connect-line`.
      *
+     * [--max-retries=<n>]
+     * : How many times a step is tried again after the source or this host
+     * fails (429, 502, 503, 504, a dropped connection). Default 20; 0 for no
+     * limit.
+     *
+     * [--max-retry-minutes=<n>]
+     * : How long a step keeps trying after such a failure. Default 15; 0 for
+     * no limit. With both 0 it keeps trying, as the dashboard does.
+     *
      * [--yes]
      * : Don't ask for confirmation.
      *
@@ -199,6 +208,7 @@ class Command {
      *     $ wp disembark pull https://freighter.example.com 9fXc... --site=8 --yes
      */
     public function pull( $args, $assoc_args ) {
+        $this->retry_limits( $assoc_args );
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
         @set_time_limit( 0 );
 
@@ -621,6 +631,15 @@ class Command {
      * : With --into=new on a WP Freighter install with domain mapping: the
      * new tenant's domain (defaults to the backup's).
      *
+     * [--max-retries=<n>]
+     * : How many times a step is tried again after the source or this host
+     * fails (429, 502, 503, 504, a dropped connection). Default 20; 0 for no
+     * limit.
+     *
+     * [--max-retry-minutes=<n>]
+     * : How long a step keeps trying after such a failure. Default 15; 0 for
+     * no limit. With both 0 it keeps trying, as the dashboard does.
+     *
      * [--yes]
      * : Don't ask for confirmation.
      *
@@ -666,6 +685,7 @@ class Command {
      *     $ wp disembark restore ~/backups/shop.zip --into=new --slug=shop --yes
      */
     public function restore( $args, $assoc_args ) {
+        $this->retry_limits( $assoc_args );
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
         @set_time_limit( 0 );
         $zip = (string) ( $args[0] ?? '' );
@@ -1168,6 +1188,15 @@ class Command {
      * : Undo this restore point alone, leaving the ones made after it as they
      * are.
      *
+     * [--max-retries=<n>]
+     * : How many times a step is tried again after the source or this host
+     * fails (429, 502, 503, 504, a dropped connection). Default 20; 0 for no
+     * limit.
+     *
+     * [--max-retry-minutes=<n>]
+     * : How long a step keeps trying after such a failure. Default 15; 0 for
+     * no limit. With both 0 it keeps trying, as the dashboard does.
+     *
      * [--yes]
      * : Don't ask for confirmation.
      *
@@ -1181,6 +1210,7 @@ class Command {
      * ---
      */
     public function rollback( $args, $assoc_args ) {
+        $this->retry_limits( $assoc_args );
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
         $point      = $this->find_point( $args[0] );
         $files      = empty( $assoc_args['database-only'] );
@@ -1273,6 +1303,15 @@ class Command {
      * [--all-tables]
      * : Every table in the database.
      *
+     * [--max-retries=<n>]
+     * : How many times a step is tried again after the source or this host
+     * fails (429, 502, 503, 504, a dropped connection). Default 20; 0 for no
+     * limit.
+     *
+     * [--max-retry-minutes=<n>]
+     * : How long a step keeps trying after such a failure. Default 15; 0 for
+     * no limit. With both 0 it keeps trying, as the dashboard does.
+     *
      * [--yes]
      * : Don't ask for confirmation.
      *
@@ -1288,6 +1327,7 @@ class Command {
      * @subcommand search-replace
      */
     public function search_replace( $args, $assoc_args ) {
+        $this->retry_limits( $assoc_args );
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
         list( $from, $to ) = $args;
         if ( $from === '' ) {
@@ -1720,6 +1760,11 @@ class Command {
     const PACE_LIMITS       = [ 'files' => [ 50, 5000 ], 'bytes' => [ 4194304, 536870912 ], 'db' => [ 1048576, 134217728 ] ];
     const MAX_RETRIES       = 20;
     const MAX_RETRY_SECONDS = 900;
+    /** How long a step keeps trying after the source or this host fails (see retry_limits()); 0 is no limit. */
+    private $max_retries       = self::MAX_RETRIES;
+    private $max_retry_seconds = self::MAX_RETRY_SECONDS;
+    /** The failures in a row so far, [ n, at ], or null after an answer (see run_step()). */
+    private $fail_streak = null;
 
     /**
      * Runs one request of a paced step (request id: the step's place in
@@ -1734,7 +1779,6 @@ class Command {
 
     /** Runs one recorded step under $rid, again after a failure worth trying again (see paced_step()). */
     private function run_step( $rid, $work, $on_fail = null ) {
-        $retry_started = microtime( true );
         for ( $n = 0; ; ) {
             $t0       = microtime( true );
             $replayed = $n === 0 && $this->steps_import !== '' && is_file( Storage::base_dir() . "/_import_{$this->steps_import}/steps/{$rid}.php" );
@@ -1744,6 +1788,8 @@ class Command {
                 $result = $result->get_data();
             }
             if ( ! is_wp_error( $result ) ) {
+                // An answer ends the run of failures the limits count.
+                $this->fail_streak = null;
                 $this->last_step_replayed = $replayed;
                 if ( ! $replayed ) {
                     $this->pace_busy  = 0;
@@ -1758,7 +1804,13 @@ class Command {
                 return [ $result, 0, $n, false ];
             }
             $n++;
-            if ( $n >= self::MAX_RETRIES || ( microtime( true ) - $retry_started ) >= self::MAX_RETRY_SECONDS ) {
+            // The limits count failures in a row across the whole move: a
+            // batch that fails is split, and its pieces carry the count on.
+            if ( $this->fail_streak === null ) {
+                $this->fail_streak = [ 'n' => 0, 'at' => microtime( true ) ];
+            }
+            $this->fail_streak['n']++;
+            if ( $this->retries_spent( $this->fail_streak['n'], $this->fail_streak['at'], $result ) ) {
                 return [ $result, 0, $n, false ];
             }
             $this->pace_busy = in_array( $status, [ 429, 503 ], true ) ? $this->pace_busy + 1 : 0;
@@ -1775,13 +1827,46 @@ class Command {
             if ( $what === 'stop' ) {
                 return [ $result, 0, $n, false ];
             }
-            if ( ( microtime( true ) - $retry_started ) >= self::MAX_RETRY_SECONDS ) {
+            if ( $this->retries_spent( $this->fail_streak['n'], $this->fail_streak['at'], $result, false ) ) {
                 return [ $result, 0, $n, false ];
             }
             $wait = min( 30, pow( 2, $n - 1 ) ) * ( 0.7 + mt_rand( 0, 600 ) / 1000 );
-            $this->say( '      ' . $result->get_error_message() . ' Trying again in ' . max( 1, (int) round( $wait ) ) . 's (attempt ' . ( $n + 1 ) . ').' );
+            $this->say( '      ' . $result->get_error_message() . ' Trying again in ' . max( 1, (int) round( $wait ) ) . 's (attempt ' . ( $this->fail_streak['n'] + 1 ) . ( $this->max_retries > 0 ? ' of ' . ( $this->max_retries + 1 ) : '' ) . ').' );
             usleep( (int) ( $wait * 1000000 ) );
         }
+    }
+
+    /**
+     * --max-retries and --max-retry-minutes: how many times, and for how
+     * long, a step is tried again after the source or this host fails
+     * (429, 502, 503, 504, a dropped connection). 0 lifts that limit, so
+     * both 0 keep trying the way the dashboard does.
+     */
+    private function retry_limits( $assoc_args ) {
+        foreach ( [ 'max-retries' => 'max_retries', 'max-retry-minutes' => 'max_retry_seconds' ] as $flag => $prop ) {
+            if ( ! isset( $assoc_args[ $flag ] ) ) {
+                continue;
+            }
+            $v = trim( (string) $assoc_args[ $flag ] );
+            if ( ! preg_match( '/^\d+$/', $v ) ) {
+                \WP_CLI::error( "--{$flag} takes a whole number (0 for no limit)." );
+            }
+            $this->$prop = $flag === 'max-retry-minutes' ? (int) $v * 60 : (int) $v;
+        }
+    }
+
+    /** Whether a failing step has used up its retries (see retry_limits()), saying so when it has. */
+    private function retries_spent( $n, $started, $error, $count_tries = true ) {
+        $secs  = microtime( true ) - $started;
+        $tries = $count_tries && $this->max_retries > 0 && $n > $this->max_retries;
+        $time  = $this->max_retry_seconds > 0 && $secs >= $this->max_retry_seconds;
+        if ( ! $tries && ! $time ) {
+            return false;
+        }
+        $took = $secs < 90 ? max( 1, (int) round( $secs ) ) . 's' : (int) round( $secs / 60 ) . ' min';
+        $why  = rtrim( is_wp_error( $error ) ? $error->get_error_message() : 'it kept failing', '. ' );
+        $this->say( '      Gave up after ' . ( (int) $n === 1 ? '1 try' : number_format( (int) $n ) . ' tries' ) . " in {$took} ({$why}). --max-retries and --max-retry-minutes set how long to keep trying; 0 keeps trying." );
+        return true;
     }
 
     /** A step that works until its budget, asked again until done (see Pace). */
@@ -2029,10 +2114,20 @@ class Command {
      * <id>
      * : The move's id, from `wp disembark unfinished`.
      *
+     * [--max-retries=<n>]
+     * : How many times a step is tried again after the source or this host
+     * fails (429, 502, 503, 504, a dropped connection). Default 20; 0 for no
+     * limit.
+     *
+     * [--max-retry-minutes=<n>]
+     * : How long a step keeps trying after such a failure. Default 15; 0 for
+     * no limit. With both 0 it keeps trying, as the dashboard does.
+     *
      * [--yes]
      * : Don't ask for confirmation.
      */
     public function discard( $args, $assoc_args ) {
+        $this->retry_limits( $assoc_args );
         $move = $this->find_unfinished( (string) ( $args[0] ?? '' ) );
         $this->confirm( $assoc_args, $move['rollback_point'] ? 'Roll this site back to before the move, then delete what it copied and its rollback point?' : 'Delete what this move copied so far? Nothing on this site has changed.' );
         $import      = new Import( $move['id'] );
