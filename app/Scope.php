@@ -107,9 +107,20 @@ class Scope {
         // stacked_sites appears with the first tenant; an install converted
         // a moment ago, with none yet, has only its settings.
         $found = $wpdb->get_var( "SELECT COUNT(*) FROM `{$candidate}options` WHERE option_name IN ( 'stacked_sites', 'stacked_configurations' )" );
-        if ( (int) $found > 0 ) {
-            $primary = $candidate;
+        if ( (int) $found < 1 ) {
+            return $primary;
         }
+        // Deleting WP Freighter leaves its bootstrap, the wp-config line and
+        // its settings behind. With the plugin gone and no tenants listed,
+        // this is a plain site again.
+        $plugin_dir = ( defined( 'WP_PLUGIN_DIR' ) ? WP_PLUGIN_DIR : ABSPATH . 'wp-content/plugins' ) . '/wp-freighter';
+        if ( ! is_dir( $plugin_dir ) ) {
+            $tenants = array_filter( (array) self::freighter_option( $candidate, 'stacked_sites' ), function ( $s ) { return is_array( $s ) && (int) ( $s['stacked_site_id'] ?? 0 ) > 0; } );
+            if ( ! $tenants ) {
+                return $primary;
+            }
+        }
+        $primary = $candidate;
         return $primary;
     }
 
