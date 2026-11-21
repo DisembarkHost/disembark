@@ -1156,6 +1156,10 @@ class Import {
         if ( ! is_dir( $root ) ) {
             return $files;
         }
+        // The dump this restore imports, wherever it is in the zip (a deep
+        // one, picked by hand, would otherwise be put in place as a file).
+        $choice = json_decode( (string) self::read_protected( $this->import_path . '/db-choice.php' ), true );
+        $dump   = is_array( $choice ) && ! empty( $choice['file'] ) && self::is_safe_relative_path( $choice['file'] ) ? $this->staging_path . '/' . $choice['file'] : '';
         $it = new \RecursiveIteratorIterator(
             new \RecursiveDirectoryIterator( $root, \RecursiveDirectoryIterator::SKIP_DOTS )
         );
@@ -1164,7 +1168,7 @@ class Import {
                 continue;
             }
             $rel = self::unstaged_name( ltrim( str_replace( '\\', '/', substr( $file->getPathname(), strlen( $root ) ) ), '/' ) );
-            if ( self::never_deploy( $rel ) ) {
+            if ( self::never_deploy( $rel ) || ( $dump !== '' && $root . '/' . $rel === $dump ) ) {
                 continue;
             }
             $files[] = $rel;
@@ -1484,7 +1488,7 @@ class Import {
             return [
                 'done'                => false,
                 'bytes_done'          => $stop_at,
-                'bytes_total'         => (int) filesize( $path ),
+                'bytes_total'         => self::dump_bytes( $path ),
                 'statements_executed' => $run['statements_executed'],
                 'errors'              => [],
             ];
@@ -1514,7 +1518,8 @@ class Import {
         file_put_contents( $this->import_path . '/imported-tables.json', wp_json_encode( $names ) );
         // Rows are counted right after the swap, before this site's own
         // token is written back into the options table.
-        $rows   = empty( $run['errors'] ) ? $this->check_rows( $expected, $merge ) : null;
+        // A dump from another tool records no counts: nothing to compare.
+        $rows   = empty( $run['errors'] ) && ( $expected || $merge ) ? $this->check_rows( $expected, $merge ) : null;
         $result = $this->end_statements( $run );
         if ( $paced ) {
             $result['done'] = true;
@@ -1548,6 +1553,16 @@ class Import {
         }
         if ( empty( $result['errors'] ) && $rows !== null ) {
             $result['rows'] = $rows;
+        }
+        // The address the dump came from, for a zip that doesn't say (see
+        // staged_info()): its home, now in this site's options table.
+        $options = ( $target ? $target->prefix : ( $new_prefix !== '' ? $new_prefix : $wpdb->prefix ) ) . 'options';
+        if ( empty( $result['errors'] ) && preg_match( '/^[A-Za-z0-9_]+$/', $options ) ) {
+            $home = (string) $wpdb->get_var( "SELECT option_value FROM `{$options}` WHERE option_name = 'home' LIMIT 1" );
+            if ( preg_match( '#^https?://[^\s\'"<>]+$#i', $home ) ) {
+                $result['source_home'] = untrailingslashit( $home );
+                self::write_protected( $this->import_path . '/source-home.php', $result['source_home'] );
+            }
         }
         return $result;
     }
@@ -1880,28 +1895,426 @@ class Import {
     /**
      * Reports what is staged for a dashboard restore: file count, the located
      * SQL dump, and the captured source metadata.
+     *
+     * $database: the database to restore, when the person picked one (a
+     * path in the zip, as 'database' lists it), or 'none' to restore the
+     * files only. Remembered for the rest of the move.
      */
-    public function staged_info() {
-        $sql_rel = null;
-        foreach ( [ '/public', '' ] as $sub ) {
-            // Staged as database-x.sql.php; an older build left database-x.sql.
-            $matches = array_merge( glob( $this->staging_path . $sub . '/database-*.sql.php' ) ?: [], glob( $this->staging_path . $sub . '/database-*.sql' ) ?: [] );
-            if ( ! empty( $matches ) ) {
-                $sql_rel = self::unstaged_name( ltrim( str_replace( '\\', '/', substr( $matches[0], strlen( $this->staging_path ) ) ), '/' ) );
-                break;
+    public function staged_info( $database = null ) {
+        if ( $database !== null && $database !== '' ) {
+            $chosen = $this->choose_database( (string) $database );
+            if ( is_wp_error( $chosen ) ) {
+                return $chosen;
             }
         }
+        $db      = $this->database_info();
         $source  = $this->staged_source();
+        // A zip that isn't Disembark's says nothing about its source: what
+        // the dump and the zip's wp-config.php tell stands in, so the prefix
+        // is remapped and the old address rewritten.
+        if ( $db['file'] !== null && ( $db['prefix'] !== '' || $db['home'] !== '' ) ) {
+            $source = is_object( $source ) ? $source : new \stdClass();
+            if ( empty( $source->db_prefix ) && $db['prefix'] !== '' ) {
+                $source->db_prefix = $db['prefix'];
+            }
+            if ( empty( $source->home_url ) && $db['home'] !== '' ) {
+                $source->home_url = $db['home'];
+            }
+        }
         $refused = $this->refused();
         return [
             'refused'   => $refused ? $refused->get_error_message() : null,
             'files'     => $this->count_staged_files(),
-            'sql_file'  => $sql_rel,
+            'sql_file'  => $db['file'],
+            'database'  => $db,
             'source'    => $source,
             'multisite' => ! empty( $source->scope ) ? [] : $this->staged_multisite_constants(),
             'paths'     => self::path_pairs( $source ),
             'moved'     => self::scope_pairs( $source ),
         ];
+    }
+
+    /* ------------------------------------------------------------------
+     * Which database dump a zip restores
+     *
+     * Disembark's own zips carry database-<name>.sql. Other hosts' and
+     * tools' zips carry their own: Kinsta's <site>.sql beside public/, WP
+     * Engine's wp-content/mysql.sql, Duplicator's database.sql, a cPanel
+     * backup's mysql/<db>.sql. When the answer is clear it's found on its
+     * own (and the reason said); when it isn't, or the only dumps are deep
+     * in the tree, the move stops before the restore point and asks, with
+     * what a quick look at each one shows. A zip with no dump at all asks
+     * too, so a restore never ends as files only by accident.
+     * ---------------------------------------------------------------- */
+
+    /** Where hosts keep the dump inside the site, beside the zip's own root (relative to the site's root). */
+    const HOST_DUMPS = [ 'wp-content/mysql.sql' => 'where WP Engine keeps the database', 'wp-content/mysqldb-dump.sql.gz' => 'where Pressidium keeps the database', 'wp-content/mysqldb-dump.sql' => 'where Pressidium keeps the database' ];
+
+    /**
+     * The database this restore uses: [ file (path in staging, or null),
+     * why, ask ('' | 'pick' | 'none'), files_only, prefix, home,
+     * candidates (for 'pick': each dump found, with what a look at it shows) ].
+     */
+    public function database_info() {
+        $out = [ 'file' => null, 'why' => '', 'ask' => '', 'files_only' => false, 'prefix' => '', 'home' => '', 'candidates' => [] ];
+        // Disembark's own export, as before: no need to look any further.
+        foreach ( [ '/public', '' ] as $sub ) {
+            // Staged as database-x.sql.php; an older build left database-x.sql.
+            $matches = array_merge( glob( $this->staging_path . $sub . '/database-*.sql.php' ) ?: [], glob( $this->staging_path . $sub . '/database-*.sql' ) ?: [] );
+            if ( ! empty( $matches ) ) {
+                $out['file'] = self::unstaged_name( ltrim( str_replace( '\\', '/', substr( $matches[0], strlen( $this->staging_path ) ) ), '/' ) );
+                $out['why']  = 'Disembark\'s own database export';
+                return $out;
+            }
+        }
+        $found  = $this->find_dumps();
+        $config = $this->staged_config();
+        $choice = json_decode( (string) self::read_protected( $this->import_path . '/db-choice.php' ), true );
+        if ( is_array( $choice ) && ! empty( $choice['none'] ) ) {
+            $out['files_only'] = true;
+            $out['why']        = 'files only, as asked';
+            return $out;
+        }
+        $pick = function ( $rel, $why ) use ( &$out, $found, $config ) {
+            $peek          = $this->peek_cached( $rel, $config['prefix'], 20 );
+            $out['file']   = $rel;
+            $out['why']    = $why;
+            $out['prefix'] = self::dump_prefix( $peek, $config['prefix'] );
+            $out['home']   = (string) ( $peek['home'] ?? '' );
+            return $out;
+        };
+        if ( is_array( $choice ) && isset( $choice['file'], $found[ $choice['file'] ] ) ) {
+            return $pick( $choice['file'], (string) ( $choice['why'] ?? 'you picked it' ) );
+        }
+        if ( ! $found ) {
+            $out['ask'] = 'none';
+            return $out;
+        }
+        $top = array_filter( $found, function ( $f ) { return $f['spot'] !== 'deep'; } );
+        if ( count( $top ) === 1 ) {
+            $rel = (string) key( $top );
+            return $pick( $rel, $top[ $rel ]['spot'] === 'host' ? $top[ $rel ]['where'] : 'the only database dump ' . $top[ $rel ]['where'] );
+        }
+        if ( count( $top ) > 1 ) {
+            // Named for the database in the zip's wp-config.php.
+            if ( $config['db_name'] !== '' ) {
+                $named = array_filter( array_keys( $top ), function ( $rel ) use ( $config ) {
+                    return strcasecmp( (string) preg_replace( '/\.sql(?:\.gz)?$/i', '', basename( $rel ) ), $config['db_name'] ) === 0;
+                } );
+                if ( count( $named ) === 1 ) {
+                    return $pick( (string) reset( $named ), 'its name matches DB_NAME (' . $config['db_name'] . ') in the zip\'s wp-config.php' );
+                }
+            }
+            // The only one holding the site's options table.
+            if ( $config['prefix'] !== '' ) {
+                $with = [];
+                foreach ( array_keys( $top ) as $rel ) {
+                    $peek = $this->peek_cached( $rel, $config['prefix'], 5 );
+                    if ( ( $peek['options'] ?? '' ) === $config['prefix'] . 'options' ) {
+                        $with[] = $rel;
+                    }
+                }
+                if ( count( $with ) === 1 ) {
+                    return $pick( $with[0], 'the only one with the site\'s options table (' . $config['prefix'] . 'options)' );
+                }
+            }
+        }
+        // Not sure: everything found, with what a look shows, the best guess first.
+        $out['ask'] = 'pick';
+        $budget     = microtime( true ) + 20;
+        foreach ( $found as $rel => $f ) {
+            $peek  = $this->peek_cached( $rel, $config['prefix'], max( 1, min( 5, $budget - microtime( true ) ) ) );
+            $score = ( $config['db_name'] !== '' && strcasecmp( (string) preg_replace( '/\.sql(?:\.gz)?$/i', '', basename( $rel ) ), $config['db_name'] ) === 0 ? 8 : 0 )
+                + ( ! empty( $peek['options'] ) ? 4 : 0 ) + ( $f['spot'] !== 'deep' ? 2 : 0 ) + ( ! empty( $peek['sql'] ) ? 1 : 0 );
+            $out['candidates'][] = [
+                'file'    => $rel,
+                'size'    => $f['size'],
+                'where'   => $f['where'],
+                'spot'    => $f['spot'],
+                'prefix'  => self::dump_prefix( $peek, $config['prefix'] ),
+                'options' => (string) ( $peek['options'] ?? '' ),
+                'home'    => (string) ( $peek['home'] ?? '' ),
+                'tables'  => count( (array) ( $peek['tables'] ?? [] ) ),
+                'looked'  => (int) ( $peek['looked'] ?? 0 ),
+                'whole'   => ! empty( $peek['whole'] ),
+                'usable'  => ! empty( $peek['sql'] ),
+                'note'    => (string) ( $peek['note'] ?? '' ),
+                'score'   => $score,
+            ];
+        }
+        usort( $out['candidates'], function ( $a, $b ) { return $b['score'] - $a['score'] ?: $b['size'] - $a['size'] ?: strcmp( $a['file'], $b['file'] ); } );
+        foreach ( $out['candidates'] as $i => &$c ) {
+            $c['guess'] = $i === 0 && $c['usable'];
+            unset( $c['score'] );
+        }
+        unset( $c );
+        return $out;
+    }
+
+    /**
+     * Records which dump to restore: a path database_info() listed, or
+     * 'none' for the files only. Only before the restore point is saved.
+     */
+    public function choose_database( $file, $why = 'you picked it' ) {
+        $file = trim( (string) $file );
+        // Remembered with the restore point it was saved for: once a
+        // restore is under way, a request can't change what it imports.
+        if ( self::has_restore_point( $this->import_path ) && is_file( $this->import_path . '/db-choice.php' ) ) {
+            $was = json_decode( (string) self::read_protected( $this->import_path . '/db-choice.php' ), true );
+            if ( is_array( $was ) && ( $file === 'none' ? ! empty( $was['none'] ) : ( $was['file'] ?? '' ) === $file ) ) {
+                return true;
+            }
+            return new \WP_Error( 'database_chosen', 'This restore has already started with another database choice.', [ 'status' => 409 ] );
+        }
+        if ( $file === 'none' ) {
+            $this->prepare_import_dir();
+            self::write_protected( $this->import_path . '/db-choice.php', (string) wp_json_encode( [ 'none' => true ] ) );
+            return true;
+        }
+        if ( ! self::is_safe_relative_path( $file ) || ! isset( $this->find_dumps()[ $file ] ) ) {
+            return new \WP_Error( 'no_such_database', "There's no database dump called {$file} in this zip.", [ 'status' => 400 ] );
+        }
+        $this->prepare_import_dir();
+        self::write_protected( $this->import_path . '/db-choice.php', (string) wp_json_encode( [ 'file' => $file, 'why' => $why ] ) );
+        return true;
+    }
+
+    /**
+     * Every .sql and .sql.gz in staging (paths as the zip has them):
+     * [ rel => [ size, spot (own|top|host|deep), where ] ]. "top" is the
+     * zip's root or the root of its public/ folder.
+     */
+    private function find_dumps() {
+        $out = [];
+        if ( ! is_dir( $this->staging_path ) ) {
+            return $out;
+        }
+        $base = $this->staging_path;
+        $site = $this->staging_root() === $base ? '' : 'public/';
+        try {
+            $it = new \RecursiveIteratorIterator( new \RecursiveDirectoryIterator( $base, \FilesystemIterator::SKIP_DOTS ) );
+            foreach ( $it as $file ) {
+                if ( ! $file->isFile() ) {
+                    continue;
+                }
+                $rel = self::unstaged_name( ltrim( str_replace( '\\', '/', substr( $file->getPathname(), strlen( $base ) ) ), '/' ) );
+                if ( ! preg_match( '/\.sql(?:\.gz)?$/i', $rel ) || self::in_storage( $rel ) || preg_match( '#(?:^|/)(?:_chunks|\.disembark-db-parts|\.disembark-manifests)/#', $rel ) ) {
+                    continue;
+                }
+                $dir  = strpos( $rel, '/' ) === false ? '' : dirname( $rel ) . '/';
+                $in   = $site !== '' && strpos( $rel, $site ) === 0 ? substr( $rel, strlen( $site ) ) : null;
+                if ( $dir === '' ) {
+                    $spot  = 'top';
+                    $where = 'at the zip\'s root';
+                } elseif ( $site !== '' && $dir === $site ) {
+                    $spot  = 'top';
+                    $where = 'at the root of the zip\'s ' . $site . ' folder';
+                } elseif ( isset( self::HOST_DUMPS[ strtolower( (string) ( $in ?? $rel ) ) ] ) ) {
+                    $spot  = 'host';
+                    $where = self::HOST_DUMPS[ strtolower( (string) ( $in ?? $rel ) ) ];
+                } else {
+                    $spot  = 'deep';
+                    $where = 'inside the site\'s files';
+                }
+                $out[ $rel ] = [ 'size' => (int) $file->getSize(), 'spot' => $spot, 'where' => $where ];
+            }
+        } catch ( \Throwable $e ) {
+            return $out;
+        }
+        ksort( $out );
+        return $out;
+    }
+
+    /** DB_NAME and $table_prefix from the zip's wp-config.php ('' when it has none). */
+    private function staged_config() {
+        foreach ( [ 'public/wp-config.php', 'wp-config.php' ] as $rel ) {
+            $file = self::staged_file( $this->staging_path, $rel );
+            if ( ! is_file( $file ) ) {
+                continue;
+            }
+            $config = substr( (string) self::read_protected( $file ), 0, 262144 );
+            $name   = preg_match( '/define\(\s*[\'"]DB_NAME[\'"]\s*,\s*[\'"]([^\'"]{1,64})[\'"]\s*\)/i', $config, $m ) ? $m[1] : '';
+            $prefix = preg_match( '/^\s*\$table_prefix\s*=\s*[\'"]([A-Za-z0-9_]{1,40})[\'"]\s*;/m', $config, $m ) ? $m[1] : '';
+            return [ 'db_name' => $name, 'prefix' => $prefix ];
+        }
+        return [ 'db_name' => '', 'prefix' => '' ];
+    }
+
+    /** The table prefix a dump uses: its options table's, the zip's wp-config.php one when its tables carry it, or its first table's. */
+    private static function dump_prefix( $peek, $config_prefix ) {
+        if ( ! empty( $peek['options'] ) ) {
+            return (string) substr( $peek['options'], 0, -strlen( 'options' ) );
+        }
+        $tables = (array) ( $peek['tables'] ?? [] );
+        if ( $config_prefix !== '' && ( ! $tables || array_filter( $tables, function ( $t ) use ( $config_prefix ) { return strpos( $t, $config_prefix ) === 0; } ) ) ) {
+            return $config_prefix;
+        }
+        return $tables && preg_match( '/^([A-Za-z0-9]+_)/', $tables[0], $m ) ? $m[1] : '';
+    }
+
+    /** peek_dump() of a staged dump, kept for the rest of the move (one look per file). */
+    private function peek_cached( $rel, $prefix, $seconds ) {
+        $cache_file = $this->import_path . '/db-peek.php';
+        $cache      = json_decode( (string) self::read_protected( $cache_file ), true );
+        $cache      = is_array( $cache ) ? $cache : [];
+        $path       = self::staged_file( $this->staging_path, $rel );
+        $size       = is_file( $path ) ? (int) filesize( $path ) : -1;
+        $hit        = $cache[ $rel ] ?? null;
+        // A look cut short by its time is taken again with more time.
+        if ( is_array( $hit ) && (int) ( $hit['size'] ?? -2 ) === $size && ( ! empty( $hit['whole'] ) || ! empty( $hit['home'] ) || (float) ( $hit['seconds'] ?? 0 ) >= $seconds ) ) {
+            return $hit;
+        }
+        $peek            = self::peek_dump( $path, $prefix, $seconds );
+        $peek['size']    = $size;
+        $peek['seconds'] = $seconds;
+        $cache[ $rel ]   = $peek;
+        $this->prepare_import_dir();
+        self::write_protected( $cache_file, (string) wp_json_encode( $cache ) );
+        return $peek;
+    }
+
+    /**
+     * A quick look at a dump, for at most $seconds: whether it reads as SQL,
+     * the tables it creates (the first 200), its options table (the one
+     * named $prefix.options, else the shortest name ending in options), and
+     * that table's siteurl and home. Reads a .sql.gz through gzip as it goes.
+     */
+    private static function peek_dump( $path, $prefix, $seconds ) {
+        $out = [ 'sql' => false, 'tables' => [], 'options' => '', 'home' => '', 'siteurl' => '', 'looked' => 0, 'whole' => false, 'note' => '' ];
+        $open = self::open_dump( $path );
+        if ( is_wp_error( $open ) ) {
+            $out['note'] = 'unreadable';
+            return $out;
+        }
+        list( $handle ) = $open;
+        $deadline  = microtime( true ) + max( 0.5, (float) $seconds );
+        $tail      = '';
+        $in_opts   = false;
+        $first     = true;
+        while ( ! feof( $handle ) && microtime( true ) < $deadline ) {
+            $chunk = fread( $handle, 1048576 );
+            if ( $chunk === false || $chunk === '' ) {
+                break;
+            }
+            $out['looked'] += strlen( $chunk );
+            $s    = $tail . $chunk;
+            $tail = substr( $s, -4096 );
+            if ( $first ) {
+                $first = false;
+                if ( strpos( $s, "\0" ) !== false && ! preg_match( '/\b(?:CREATE\s+TABLE|INSERT\s+INTO)\b/i', substr( $s, 0, 65536 ) ) ) {
+                    $out['note'] = 'not a text SQL dump';
+                    break;
+                }
+            }
+            if ( ! $out['sql'] && preg_match( '/^\s*(?:CREATE\s+TABLE|INSERT\s+INTO|DROP\s+TABLE)\b/im', $s ) ) {
+                $out['sql'] = true;
+            }
+            if ( preg_match_all( '/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`([^`]{1,64})`/i', $s, $m, PREG_OFFSET_CAPTURE ) ) {
+                foreach ( $m[1] as $hit ) {
+                    $name = $hit[0];
+                    if ( count( $out['tables'] ) < 200 && ! in_array( $name, $out['tables'], true ) ) {
+                        $out['tables'][] = $name;
+                    }
+                    if ( substr( $name, -7 ) === 'options' && preg_match( '/^[A-Za-z0-9_]*$/', $name ) ) {
+                        $mine = $prefix !== '' && $name === $prefix . 'options';
+                        if ( $mine || $out['options'] === '' || ( strlen( $name ) < strlen( $out['options'] ) && $out['options'] !== $prefix . 'options' ) ) {
+                            $out['options'] = $name;
+                            $in_opts        = true;
+                        }
+                    } elseif ( $in_opts && $out['home'] !== '' ) {
+                        $in_opts = false;
+                    }
+                }
+            }
+            if ( $in_opts && preg_match_all( "/\\(\\s*'?\\d+'?\\s*,\\s*'(siteurl|home)'\\s*,\\s*'([^'\\\\]*+(?:\\\\.[^'\\\\]*+)*+)'/", $s, $m, PREG_SET_ORDER ) ) {
+                foreach ( $m as $row ) {
+                    $value = stripslashes( $row[2] );
+                    if ( preg_match( '#^https?://[^\s\'"<>]+$#i', $value ) && $out[ $row[1] ] === '' ) {
+                        $out[ $row[1] ] = untrailingslashit( $value );
+                    }
+                }
+            }
+            if ( $out['home'] !== '' && $out['siteurl'] !== '' ) {
+                break;
+            }
+        }
+        $out['whole'] = feof( $handle );
+        fclose( $handle );
+        if ( $out['home'] === '' ) {
+            $out['home'] = $out['siteurl'];
+        }
+        if ( ! $out['sql'] && $out['note'] === '' ) {
+            $out['note'] = $out['looked'] ? 'no CREATE TABLE or INSERT in the part read' : 'empty';
+        }
+        return $out;
+    }
+
+    /**
+     * Opens a staged dump for reading past its exit line, through gzip when
+     * it's compressed. [ handle, gz, base (bytes before the dump) ] or WP_Error.
+     */
+    private static function open_dump( $path ) {
+        $handle = @fopen( $path, 'rb' );
+        if ( ! $handle ) {
+            return new \WP_Error( 'sql_unreadable', 'Could not read ' . basename( $path ) . '.', [ 'status' => 500 ] );
+        }
+        $base = fread( $handle, strlen( self::PHP_EXIT ) ) === self::PHP_EXIT ? strlen( self::PHP_EXIT ) : 0;
+        fseek( $handle, $base );
+        $gz = fread( $handle, 2 ) === "\x1f\x8b";
+        fseek( $handle, $base );
+        if ( $gz && ! @stream_filter_append( $handle, 'zlib.inflate', STREAM_FILTER_READ, [ 'window' => 31 ] ) ) {
+            fclose( $handle );
+            return new \WP_Error( 'sql_unreadable', 'Could not read ' . basename( $path ) . ': this server can\'t unpack gzip.', [ 'status' => 500 ] );
+        }
+        return [ $handle, $gz, $base ];
+    }
+
+    /** How many bytes a staged dump holds once unpacked (a .sql.gz's from its gzip trailer). */
+    private static function dump_bytes( $path ) {
+        $size = (int) @filesize( $path );
+        $open = self::open_dump( $path );
+        if ( is_wp_error( $open ) ) {
+            return $size;
+        }
+        list( $handle, $gz, $base ) = $open;
+        fclose( $handle );
+        if ( ! $gz || $size < $base + 18 ) {
+            return $size;
+        }
+        $raw = @fopen( $path, 'rb' );
+        fseek( $raw, -4, SEEK_END );
+        $isize = unpack( 'V', (string) fread( $raw, 4 ) );
+        fclose( $raw );
+        // The trailer keeps the size modulo 4 GB.
+        $bytes = (int) ( $isize[1] ?? 0 );
+        while ( $bytes < $size - $base ) {
+            $bytes += 4294967296;
+        }
+        return $bytes;
+    }
+
+    /**
+     * The source's details for the end of a move: disembark-source.json, or
+     * for another host's zip the address its database told (see
+     * staged_info()), so the tidy-up and the checks after the move know
+     * where the site came from.
+     */
+    private function move_source() {
+        $source = $this->staged_source();
+        if ( is_object( $source ) && ! empty( $source->home_url ) ) {
+            return $source;
+        }
+        $home = (string) self::read_protected( $this->import_path . '/source-home.php' );
+        if ( $home === '' && ! is_object( $source ) ) {
+            $db   = $this->database_info();
+            $home = $db['file'] !== null ? (string) $db['home'] : '';
+        }
+        if ( ! preg_match( '#^https?://[^\s\'"<>]+$#i', $home ) ) {
+            return $source;
+        }
+        $source           = is_object( $source ) ? $source : new \stdClass();
+        $source->home_url = $home;
+        return $source;
     }
 
     /** The source's metadata (disembark-source.json) from staging, or null. */
@@ -5072,7 +5485,7 @@ class Import {
     /** The working files of paced steps (see Pace), once a move is done or cancelled. */
     private function remove_pace_files() {
         $this->merge_deploy_journal();
-        foreach ( [ 'sql-state.php', 'sql-journal.php', 'deploy-list.php', 'deploy-journal.php', 'replace-state.php', 'replace-journal.php', 'extract-state.php', 'fetched.php', 'fetched.lock', 'database-state.php', 'pace.php', 'db-plan.php', 'settle-state.php', 'fingerprints.php', 'rollback/snapshot-state.php', 'rollback/snapshot-add-state.php' ] as $name ) {
+        foreach ( [ 'sql-state.php', 'sql-journal.php', 'deploy-list.php', 'deploy-journal.php', 'replace-state.php', 'replace-journal.php', 'extract-state.php', 'fetched.php', 'fetched.lock', 'database-state.php', 'pace.php', 'db-plan.php', 'db-peek.php', 'settle-state.php', 'fingerprints.php', 'rollback/snapshot-state.php', 'rollback/snapshot-add-state.php' ] as $name ) {
             @unlink( $this->import_path . '/' . $name );
         }
         foreach ( (array) glob( $this->rollback_path . '/*.db.php.part' ) as $part ) {
@@ -5088,7 +5501,7 @@ class Import {
         }
 
         // Read before staging (which holds the source's details) goes.
-        $source = $this->staged_source();
+        $source = $this->move_source();
         if ( $target ) {
             // A subsite or tenant: its own settings, and the page caches.
             $target->finish();
@@ -5522,21 +5935,31 @@ class Import {
      * (statements, ended_cleanly, stopped) or WP_Error if the file can't be read.
      */
     private static function each_sql_statement_in_file( $path, $callback, $start = 0, $delim = ';' ) {
-        $handle = @fopen( $path, 'rb' );
-        if ( ! $handle ) {
-            return new \WP_Error( 'sql_unreadable', 'Could not read ' . basename( $path ) . '.', [ 'status' => 500 ] );
+        // A staged dump or a restore point's starts with the exit line (see
+        // copy_protected()); a .sql.gz is read through gzip.
+        $open = self::open_dump( $path );
+        if ( is_wp_error( $open ) ) {
+            return $open;
         }
+        list( $handle, $gz, $base ) = $open;
         // $delim: the statement delimiter in force at $start (see sql_scan()).
         $scan = self::sql_scanner( $start > 0 ? $delim : ';' );
-        if ( $start > 0 ) {
+        if ( $start > 0 && $gz ) {
+            // Offsets count unpacked bytes: read up to where it stopped.
+            for ( $left = (int) $start; $left > 0 && ! feof( $handle ); ) {
+                $skipped = fread( $handle, (int) min( 1048576, $left ) );
+                if ( $skipped === false || $skipped === '' ) {
+                    break;
+                }
+                $left -= strlen( $skipped );
+            }
+            $scan['fed'] = (int) $start;
+        } elseif ( $start > 0 ) {
             // Carrying on from a statement boundary an earlier call recorded.
             fseek( $handle, (int) $start );
             $scan['fed'] = (int) $start;
-        } elseif ( fread( $handle, strlen( self::PHP_EXIT ) ) !== self::PHP_EXIT ) {
-            // A restore point's dump starts with the exit line (see copy_protected()).
-            rewind( $handle );
         } else {
-            $scan['fed'] = strlen( self::PHP_EXIT );
+            $scan['fed'] = $gz ? 0 : $base;
         }
         $count = 0;
         // The callback also gets the byte offset just past the statement,

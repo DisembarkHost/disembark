@@ -129,7 +129,7 @@ class Checks {
                             continue;
                         }
                         $rel = ltrim( str_replace( '\\', '/', substr( $file->getPathname(), strlen( $root ) ) ), '/' );
-                        if ( preg_match( '/^database-.*\.sql(?:\.php)?$/', $rel ) ) {
+                        if ( preg_match( '/^database-.*\.sql(?:\.php)?$/', $rel ) || ( strpos( $rel, '/' ) === false && preg_match( '/\.sql(?:\.gz)?(?:\.php)?$/i', $rel ) ) ) {
                             $db_in += $file->getSize();
                             continue;
                         }
@@ -144,6 +144,14 @@ class Checks {
                     }
                 } catch ( \Throwable $e ) {
                     // Unreadable staging: the move itself will say so.
+                }
+                // A dump beside the site's folder (Kinsta's <site>.sql next to public/).
+                if ( $root !== "{$dir}/staging" ) {
+                    foreach ( glob( "{$dir}/staging/*" ) ?: [] as $file ) {
+                        if ( is_file( $file ) && preg_match( '/\.sql(?:\.gz)?(?:\.php)?$/i', $file ) ) {
+                            $db_in += (int) filesize( $file );
+                        }
+                    }
                 }
             }
         }

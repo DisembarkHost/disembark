@@ -1917,7 +1917,8 @@ class Run {
         if ( empty( $import_id ) ) {
             return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
         }
-        return ( new Import( $import_id ) )->staged_info();
+        // database: the dump picked when the zip's was unclear, or "none" for the files only.
+        return ( new Import( $import_id ) )->staged_info( isset( $params['database'] ) ? (string) $params['database'] : null );
     }
 
     function import_staged_sql( $request ) {
