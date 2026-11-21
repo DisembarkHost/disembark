@@ -59,7 +59,7 @@
       catch (e) { D.toast(D.errorText(e), 'error'); unfinished(box, onResume); return; }
       if (!data) return;
       D.mount(box);
-      onResume({ site: m.source, token: '', quiet: !!(m.move && m.move.quiet), label: (m.move && m.move.label) || 'Before pull from ' + D.host(m.source),
+      onResume({ site: m.source, token: '', quiet: !!(m.move && m.move.quiet), catchUp: !!m.catch_up, label: (m.move && m.move.label) || 'Before pull from ' + D.host(m.source),
         resume: { id: m.id, steps: data.steps || {}, started: m.started, pace: data.pace || null } });
     }
 
@@ -90,12 +90,12 @@
    * Runs a pull into view. o: { site, token, quiet, catchUp, into, scene,
    * label, resume }. back() goes back to the Move form.
    */
-  function run(view, o, back) {
+  function run(view, o, back, onFinish) {
     D.runMove(view, {
       api: D.api, local: true, mode: 'site', site: o.site, token: o.token, quiet: o.quiet, catchUp: o.catchUp, resume: o.resume, into: o.into,
       scene: o.scene, kind: 'pull',
       targetHome: D.config.homeUrl, label: o.label, title: o.resume ? 'Resuming' : 'Pulling', doneTitle: 'Pulled', againLabel: 'Start another move', icon: 'ship',
-      back: back,
+      back: back, onFinish: onFinish,
       done: function (outcome, ctx) { D.arrivedView(outcome, ctx, 'Undo pull'); }
     });
   }

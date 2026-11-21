@@ -390,7 +390,7 @@
         footer.appendChild(b);
       });
       append(dlg, [h('form', { method: 'dialog', onsubmit: function (e) { e.preventDefault(); } },
-        h('header', null, h('h2', null, o.title || ''), h('button', { type: 'button', class: 'dsk-btn ghost icon sm', 'aria-label': 'Close', onclick: function () { done(null); } }, D.icon('x'))),
+        h('header', null, h('h2', null, o.title || ''), o.persistent ? null : h('button', { type: 'button', class: 'dsk-btn ghost icon sm', 'aria-label': 'Close', onclick: function () { done(null); } }, D.icon('x'))),
         h('div', { class: 'body' }, o.body || null),
         footer)]);
       dlg.addEventListener('cancel', function (e) { e.preventDefault(); if (!o.persistent) done(null); });

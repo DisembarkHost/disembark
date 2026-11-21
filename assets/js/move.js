@@ -25,7 +25,7 @@
 
   var DEFAULTS = { from: subHere ? 'this' : 'other', to: subHere ? 'other' : 'this', connect: null, file: null, sourceUrl: '', into: 'new', quiet: true, catchUp: true };
   var S = Object.assign({}, DEFAULTS);
-  var root = null, running = false, points = null;
+  var root = null, running = false, finished = false, points = null;
 
   function valid(from, to) {
     if (from === 'this') return to === 'other';
@@ -48,7 +48,7 @@
       D.remoteApi(S.connect.url, S.connect.token).then(function (api) {
         var pre = (api && api.preflight) || {}, prof = pre.profile || {};
         var k = pre.refused ? '' : (prof.install && prof.install.kind) || (prof.multisite ? 'multisite' : '');
-        if (dest.key === key && k) { dest.kind = k; if (!running) render(); }
+        if (dest.key === key && k) { dest.kind = k; if (!running && !finished) render(); }
       }).catch(function () { /* the push says why when it starts */ });
     }
     return dest.kind;
@@ -59,6 +59,7 @@
 
   function route(asked) {
     if (running) return;
+    if (finished) { finished = false; S.connect = null; S.file = null; loadPoints(); }
     if (asked === 'pull') { S.from = 'other'; S.to = subHere ? null : 'this'; }
     else if (asked === 'push') { S.from = 'this'; S.to = 'other'; S.quiet = false; }
     else if (asked === 'restore') { S.from = 'zip'; S.to = subHere ? null : 'this'; }
@@ -66,13 +67,14 @@
   }
   function home() {
     if (running) return;
+    if (finished) { finished = false; loadPoints(); }
     S = Object.assign({}, DEFAULTS);
     render();
   }
 
   function mount(el) {
     root = el;
-    D.pull.loadLastPulls().then(function () { if (!running && S.connect) render(); });
+    D.pull.loadLastPulls().then(function () { if (!running && !finished && S.connect) render(); });
     loadPoints();
     render();
   }
@@ -130,7 +132,7 @@
 
   /* ------------------------------------------------------------ render */
   function render() {
-    if (running || !root) return;
+    if (running || finished || !root) return;
     var unfinishedBox = h('div');
     D.mount(root,
       D.pageHead({ caps: 'Move', icon: 'ship', title: ['Where’s it ', 'going?'],
@@ -141,7 +143,7 @@
       voyage(),
       panel());
     D.pull.unfinished(unfinishedBox, function (o) {
-      start(function (view, back) { D.pull.run(view, Object.assign(o, { scene: { left: { kind: 'site', label: D.host(o.site) }, right: { kind: 'site', label: here }, you: 'right' } }), back); });
+      start(function (view, back, onFinish) { D.pull.run(view, Object.assign(o, { scene: { left: { kind: 'site', label: D.host(o.site) }, right: { kind: 'site', label: here }, you: 'right' } }), back, onFinish); });
     });
   }
 
@@ -316,9 +318,12 @@
   /** Swaps the form for the running move; back() brings the form back. */
   function start(runner) {
     running = true;
+    finished = false;
     var view = h('div');
     D.mount(root, view);
-    runner(view, function () { running = false; S.connect = null; S.file = null; loadPoints(); render(); window.scrollTo({ top: 0 }); });
+    runner(view,
+      function () { running = false; finished = false; S.connect = null; S.file = null; loadPoints(); render(); window.scrollTo({ top: 0 }); },
+      function () { running = false; finished = true; loadPoints(); });
   }
 
   async function go(btn) {
@@ -331,7 +336,7 @@
         { title: (catchUp ? 'Catch up from ' : 'Pull ') + r + '?', confirmLabel: catchUp ? 'Catch up' : 'Pull', danger: S.into !== 'new' || S.to === 'this' });
       if (!ok) return;
       var o = { site: S.connect.url, token: S.connect.token, quiet: S.to === 'this' && S.quiet, catchUp: catchUp, into: into, scene: sc, label: (catchUp ? 'Before catch-up from ' : 'Before pull from ') + r };
-      start(function (view, back) { D.pull.run(view, o, back); });
+      start(function (view, back, onFinish) { D.pull.run(view, o, back, onFinish); });
       return;
     }
     if (k === 'push') {
@@ -344,7 +349,10 @@
       var view = h('div'), reached = false;
       var st = { site: S.connect.url, token: S.connect.token, quiet: S.quiet, scene: sc };
       running = true;
-      reached = await D.pushRun(view, st, btn, function () { running = false; S.connect = null; loadPoints(); render(); window.scrollTo({ top: 0 }); });
+      finished = false;
+      reached = await D.pushRun(view, st, btn,
+        function () { running = false; finished = false; S.connect = null; loadPoints(); render(); window.scrollTo({ top: 0 }); },
+        function () { running = false; finished = true; loadPoints(); });
       if (!reached) { running = false; return; }
       D.mount(root, view);
       return;
@@ -355,11 +363,11 @@
       h('p', { class: 'muted' }, 'A restore point is saved first.' + (S.to === 'this' ? ' You’ll need to log in again afterwards.' : ''))), { title: 'Restore ' + (S.to === 'this' ? 'this site' : 'the backup') + '?', confirmLabel: 'Restore', danger: !(S.to === 'new' && S.into === 'new') });
     if (!ok3) return;
     var file = S.file, sourceUrl = S.sourceUrl, quiet = S.to === 'this' && S.quiet;
-    start(function (view, back) {
+    start(function (view, back, onFinish) {
       D.runMove(view, {
         api: D.api, local: true, mode: 'file', file: file, sourceUrl: sourceUrl, quiet: quiet, into: into, scene: sc, kind: 'restore',
         targetHome: D.config.homeUrl, label: 'Before restore from ' + what, title: 'Restoring', doneTitle: 'Restored', againLabel: 'Start another move', icon: 'ship',
-        back: back,
+        back: back, onFinish: onFinish,
         done: function (outcome, ctx) { D.arrivedView(outcome, ctx, 'Undo restore'); }
       });
     });

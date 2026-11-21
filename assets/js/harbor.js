@@ -8,10 +8,13 @@
   'use strict';
   var K = window.Disembark.H = {};
   var f = function (n) { return Math.round(n * 10) / 10; };
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
 
   /* ---------------------------------------------------------- pieces */
   K.tree = function (x, y, s) { s = s || 1; return '<g transform="translate(' + x + ' ' + y + ') scale(' + s + ')"><circle r="11" class="s-tree-2" cx="1.5" cy="2"/><circle r="10" class="s-tree"/><circle r="4" cx="-3" cy="-3" fill="rgba(255,255,255,.18)"/></g>'; };
-  K.crate = function (x, y, fill) { return '<g transform="translate(' + x + ' ' + y + ')"><rect width="14" height="11" rx="2" fill="' + fill + '"/><path d="M2 5.5h10" stroke="rgba(255,255,255,.45)" stroke-width="1.4"/></g>'; };
+  K.crate = function (x, y, fill) { return '<g transform="translate(' + x + ' ' + y + ')"><rect width="14" height="11" rx="2" fill="' + esc(fill) + '"/><path d="M2 5.5h10" stroke="rgba(255,255,255,.45)" stroke-width="1.4"/></g>'; };
   K.COLORS = ['#c8553d', '#2b8a7e', '#d9a441', '#3f78a8'];
   K.cargo = function (x, y, n) {
     n = n == null ? 4 : n; var out = '';
@@ -24,21 +27,21 @@
       '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + h + '" rx="4" fill="' + base + '"/>' +
       '<rect x="' + x + '" y="' + y + '" width="' + w + '" height="' + (h / 2) + '" rx="4" fill="' + top + '"/><rect x="' + x + '" y="' + (y + h / 2 - 4) + '" width="' + w + '" height="4" fill="' + top + '"/>' +
       '<path d="M' + x + ' ' + (y + h / 2) + 'h' + w + '" stroke="rgba(255,255,255,.3)" stroke-width="1.5"/>' +
-      (tag ? '<text x="' + (x + w / 2) + '" y="' + (y + h / 2 - 6) + '" text-anchor="middle" class="s-tag">' + tag + '</text>' : '');
+      (tag ? '<text x="' + (x + w / 2) + '" y="' + (y + h / 2 - 6) + '" text-anchor="middle" class="s-tag">' + esc(tag) + '</text>' : '');
   };
   K.container = function (x, y, fill, tag) {
-    return '<rect x="' + (x + 2) + '" y="' + (y + 3) + '" width="44" height="24" rx="3" fill="rgba(0,0,0,.1)"/><rect x="' + x + '" y="' + y + '" width="44" height="24" rx="3" fill="' + fill + '"/>' +
+    return '<rect x="' + (x + 2) + '" y="' + (y + 3) + '" width="44" height="24" rx="3" fill="rgba(0,0,0,.1)"/><rect x="' + x + '" y="' + y + '" width="44" height="24" rx="3" fill="' + esc(fill) + '"/>' +
       '<path d="M' + (x + 11) + ' ' + (y + 4) + 'v16M' + (x + 22) + ' ' + (y + 4) + 'v16M' + (x + 33) + ' ' + (y + 4) + 'v16" stroke="rgba(0,0,0,.14)" stroke-width="1.5"/>' +
-      (tag ? '<text x="' + (x + 22) + '" y="' + (y + 15.5) + '" text-anchor="middle" class="s-tag">' + tag + '</text>' : '');
+      (tag ? '<text x="' + (x + 22) + '" y="' + (y + 15.5) + '" text-anchor="middle" class="s-tag">' + esc(tag) + '</text>' : '');
   };
   K.check = function (x, y, r) { r = r || 12; var s = r / 12; return '<g transform="translate(' + x + ' ' + y + ') scale(' + s + ')"><circle r="12" fill="#2b8a7e" stroke="#fff" stroke-width="2.5"/><path d="M-5 .5l3.5 3.5 7-7.5" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></g>'; };
   K.sign = function (cx, y, text) {
     text = String(text || '');
     var w = Math.max(80, text.length * 7 + 26);
-    text = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    text = esc(text);
     return '<g transform="translate(' + cx + ' ' + y + ')"><rect x="' + (-w / 2) + '" y="-11" width="' + w + '" height="22" rx="11" class="s-sign"/><text y="4" text-anchor="middle" class="s-label">' + text + '</text></g>';
   };
-  K.buoy = function (x, y, fill) { return '<g transform="translate(' + x + ' ' + y + ')"><circle r="9" fill="rgba(255,255,255,.35)"/><circle r="6.5" fill="' + (fill || '#c8553d') + '" stroke="#fff" stroke-width="2"/><path d="M-6 0h12" stroke="#fff" stroke-width="2"/></g>'; };
+  K.buoy = function (x, y, fill) { return '<g transform="translate(' + x + ' ' + y + ')"><circle r="9" fill="rgba(255,255,255,.35)"/><circle r="6.5" fill="' + esc(fill || '#c8553d') + '" stroke="#fff" stroke-width="2"/><path d="M-6 0h12" stroke="#fff" stroke-width="2"/></g>'; };
   K.pier = function (x, y, len, dir) {
     // a wooden jetty from (x,y) toward +x (dir 1) or -x (dir -1), 14 tall
     var x0 = dir > 0 ? x : x - len, out = '<rect x="' + x0 + '" y="' + (y - 7) + '" width="' + len + '" height="14" class="s-wood"/>';
@@ -116,7 +119,7 @@
   K.harbor = function (o) {
     var W = o.w || 1000, H = o.h || 300, mid = H * 0.62, L = o.left || {}, R = o.right || {};
     var lx = W * 0.3, rx = W * 0.7;
-    var out = '<svg viewBox="0 0 ' + W + ' ' + H + '" class="harbor" role="img" aria-label="' + (o.alt || 'Harbor scene') + '">';
+    var out = '<svg viewBox="0 0 ' + W + ' ' + H + '" class="harbor" role="img" aria-label="' + esc(o.alt || 'Harbor scene') + '">';
     out += '<rect width="' + W + '" height="' + H + '" class="s-water"/>';
     if (o.night) out += '<rect width="' + W + '" height="' + H + '" fill="var(--night)" opacity=".55"/><circle cx="' + (W * .5) + '" cy="46" r="26" fill="#f4efe6" opacity=".08"/><circle cx="' + (W * .5) + '" cy="46" r="14" fill="#f4efe6" opacity=".92"/>';
     var shoreL = 'M0 0H' + (lx - 10) + 'C' + (lx + 12) + ' ' + (H * .2) + ' ' + (lx - 16) + ' ' + (H * .42) + ' ' + lx + ' ' + (H * .6) + 'S' + (lx - 14) + ' ' + (H * .86) + ' ' + (lx + 6) + ' ' + H + 'H0Z';
@@ -144,9 +147,9 @@
     if (L.label) out += K.sign(W * .15, H - 26, L.label);
     if (R.label) out += K.sign(W * .85, H - 26, R.label);
     if (o.you) {
-      var ycx = o.you === 'left' ? W * .15 : W * .85, txt = o.youText || 'You are here';
+      var ycx = o.you === 'left' ? W * .15 : W * .85, txt = String(o.youText || 'You are here');
       var tw = txt.length * 6.6 + 24;
-      out += '<g transform="translate(' + ycx + ' ' + (top - 16) + ')"><rect x="' + (-tw / 2) + '" y="-12" width="' + tw + '" height="24" rx="12" fill="var(--accent)"/><text y="4.5" text-anchor="middle" style="font:600 11.5px var(--sans);fill:var(--accent-ink)">' + txt + '</text></g>';
+      out += '<g transform="translate(' + ycx + ' ' + (top - 16) + ')"><rect x="' + (-tw / 2) + '" y="-12" width="' + tw + '" height="24" rx="12" fill="var(--accent)"/><text y="4.5" text-anchor="middle" style="font:600 11.5px var(--sans);fill:var(--accent-ink)">' + esc(txt) + '</text></g>';
     }
     if (o.buoys) o.buoys.forEach(function (bp) { out += K.buoy(W * bp[0], H * bp[1]); });
     // boat

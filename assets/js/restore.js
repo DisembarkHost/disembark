@@ -16,9 +16,16 @@
     if (parts.length >= 2 && parts[0].toLowerCase() === 'disembark' && parts[1].toLowerCase() === 'connect') parts.splice(0, 2);
     if (parts.length !== 2) return null;
     var url = parts[0], token = parts[1];
-    if (!/^https?:\/\//i.test(url)) { if (url.indexOf('.') === -1) return null; url = 'https://' + url; }
+    if (!/^https?:\/\//i.test(url)) {
+      if (/^[a-z][a-z0-9+.-]*:/i.test(url) && !/^[a-z0-9.-]+:\d+(\/|$)/i.test(url)) return null;
+      if (url.indexOf('.') === -1) return null;
+      url = 'https://' + url;
+    }
+    var parsed;
+    try { parsed = new URL(url); } catch (e) { return null; }
+    if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || !parsed.hostname) return null;
     if (!/^[A-Za-z0-9]{20,}$/.test(token)) return null;
-    return { url: url.replace(/\/+$/, ''), token: token };
+    return { url: parsed.href.replace(/\/+$/, ''), token: token };
   };
 
   /** "example.com/path": scheme, www. and trailing slash don't count (matches Quiet::address). */
@@ -83,7 +90,8 @@
         (install.sites || []).map(function (s) {
           return h('option', { value: s.id }, D.host(s.url) + (s.name ? ' \u2014 ' + s.name : '') + ' (' + (s.id === 'main' ? 'main site' : (install.kind === 'multisite' ? 'site ' : 'tenant ') + s.id) + ')');
         }));
-      function done(v) { D.mount(box); resolve(v); }
+      function done(v) { box.cancelChoice = null; D.mount(box); resolve(v); }
+      box.cancelChoice = function () { done(null); };
       D.mount(box, D.decideCard({ title: ['Which ', 'site?'],
         text: D.host(install.home) + ' is a ' + kind + '. Bring one of its sites as a standalone site: its own tables, its users, its uploads, and the plugins and themes it uses. Moving the whole ' + kind + ' as one is planned for a later version.',
         body: sel,
@@ -106,7 +114,8 @@
           return h('option', { value: s.id }, 'Replace ' + one + ' ' + s.id + ': ' + D.host(s.url) + (s.name ? ' (' + s.name + ')' : ''));
         }),
         h('option', { value: 'site' }, 'Replace the main site, ' + destHost + ' (the whole ' + (net ? 'network\u2019s users too' : 'install\u2019s main site') + ')'));
-      function done(v) { D.mount(box); resolve(v); }
+      function done(v) { box.cancelChoice = null; D.mount(box); resolve(v); }
+      box.cancelChoice = function () { done(null); };
       D.mount(box, D.decideCard({ title: ['Where should it ', 'go?'],
         text: destHost + ' is the main site of a ' + (net ? 'multisite network' : 'WP Freighter install') + '. Bring the site in as its own ' + one + ' (its tables, uploads and settings stay its own' + (net ? ', and its users join the network\u2019s' : '') + '), or replace one.',
         body: sel,
@@ -125,7 +134,8 @@
    */
   D.chooseDatabase = function (box, db, zipName) {
     return new Promise(function (resolve) {
-      function done(v) { D.mount(box); resolve(v); }
+      function done(v) { box.cancelChoice = null; D.mount(box); resolve(v); }
+      box.cancelChoice = function () { done(null); };
       if (db.ask === 'none') {
         D.mount(box, D.decideCard({ title: ['No ', 'database.'],
           text: 'This zip has no database Disembark can use: there’s no .sql or .sql.gz file in ' + zipName + '. Restore the files only (this site keeps its own database), or cancel?',
@@ -355,6 +365,7 @@
           ? D.note('error', [h('strong', null, 'Cancelled, but the rollback didn\u2019t finish. '), 'The restore point is kept: roll back from Backups \u2192 Restore points or with ', h('code', null, 'wp disembark rollback ' + rollbackId), '.'])
           : D.note('ok', [h('strong', null, 'Cancelled. '), rollbackId ? D.host(opts.targetHome) + ' is back to how it was, and the copied files are gone.' : 'Nothing on ' + D.host(opts.targetHome) + ' changed, and the copied files are gone.']),
         h('div', null, h('button', { class: 'dsk-btn', type: 'button', onclick: opts.back }, D.icon('ship'), 'Back to Move'))));
+      if (opts.onFinish) opts.onFinish();
     }
 
     // Calls outside the numbered steps (checks, notifications): they run
@@ -1047,6 +1058,7 @@
       cancelBtn.hidden = true;
       D.mount(chooser);
       D.mount(outcome, h('div', { class: 'dsk-after dsk-fade' }, doneBox, checks));
+      if (opts.onFinish) opts.onFinish();
     }
 
     var ctx = {
@@ -1059,6 +1071,9 @@
       rollbackId: function () { return rollbackId; },
       cliUndo: function () { return D.cmd('disembark restore ' + opts.targetHome + ' --rollback=' + rollbackId); },
       rollback: rollback,
+      back: opts.back,
+      againLabel: opts.againLabel || 'Start another move',
+      icon: opts.icon || 'ship',
       log: rlog,
       quietOn: function () { return quietOn; }
     };
@@ -1081,10 +1096,15 @@
         rlog('Destination: ' + destHome + ' (prefix ' + destPrefix + ').', 'dim');
         // The main site of a network or WP Freighter install: a new subsite
         // or tenant, or one to replace (asked once; replayed on a resume).
+        // A resumed pull that originally targeted the main site skipped
+        // import/target, so replay[seq+1] is import/pull/connect (no 'target'
+        // key) — skip import/target here too so step replay stays aligned.
         var inst = pre.install;
-        if (inst && inst.current === inst.main && (inst.sites || []).length && opts.into !== 'site') {
+        var nextKey = ridAt(seq + 1), hasNext = Object.prototype.hasOwnProperty.call(replay, nextKey);
+        var resumedMain = !!(opts.resume && !opts.into && hasNext && !(replay[nextKey] && typeof replay[nextKey] === 'object' && 'target' in replay[nextKey]));
+        if (inst && inst.current === inst.main && (inst.sites || []).length && opts.into !== 'site' && !resumedMain) {
           var into = opts.into || 'site';
-          if (!opts.into && !Object.prototype.hasOwnProperty.call(replay, ridAt(seq + 1))) {
+          if (!opts.into && !hasNext) {
             progress('Choose where it goes\u2026');
             into = await D.chooseInto(chooser, inst, D.host(destHome));
             if (!into) { cancelled = true; throw Cancelled(); }
@@ -1303,14 +1323,20 @@
             h('div', { class: 'dsk-row' }, h('button', { class: 'dsk-btn primary', type: 'button', onclick: function (ev) { rollback(ev.currentTarget, outcome); } }, D.icon('restore'), 'Roll back'),
               h('button', { class: 'dsk-btn ghost', type: 'button', onclick: opts.back }, 'Back to Move')), ctx.cliUndo())
             : h('div', null, h('button', { class: 'dsk-btn', type: 'button', onclick: opts.back }, D.icon('ship'), 'Back to Move'))));
+        if (opts.onFinish) opts.onFinish();
       }
     })();
 
     async function rollback(btn, into) {
       await D.busy(btn, async function () {
+        var prevLive = live.className, prevCaps = capsText.textContent;
+        live.className = 'dsk-live';
+        capsText.textContent = 'Rolling back';
+        lineState();
         rlog('Rolling back to the snapshot…');
+        progress('Rolling back to the snapshot\u2026');
         try {
-          var r = await D.paced(api, 'import/rollback', { import_id: rollbackId }, function (x) { progress('Rolling back\u2026 ' + (x.phase === 'files' ? D.fmt.num(x.files_done || 0) + ' of ' + D.fmt.plural(x.files_total || 0, 'file') : 'the database')); });
+          var r = await D.paced(opts.api, 'import/rollback', { import_id: rollbackId }, function (x) { progress('Rolling back\u2026 ' + (x.phase === 'files' ? D.fmt.num(x.files_done || 0) + ' of ' + D.fmt.plural(x.files_total || 0, 'file') : 'the database')); });
           progress('');
           if (r.errors && r.errors.length) {
             r.errors.slice(0, 5).forEach(function (e) { rlog('  ' + e, 'err'); });
@@ -1321,6 +1347,7 @@
           if (r.quiet_mode_lifted) rlog('Quiet mode lifted with it.', 'dim');
           setTitle('Rolled', 'back.');
           live.className = 'dsk-live ok'; capsText.textContent = KIND + ' undone';
+          lineState();
           sub.textContent = D.host(opts.targetHome) + ' is back to how it was before the move.';
           headK.textContent = 'Undone.';
           setHead(['The crates went back to ', { b: srcLabel }, '. Nothing from the move is left on ', { b: D.host(opts.targetHome) }, '.'], 'Rolled back', 'ok');
@@ -1332,6 +1359,10 @@
             D.note('ok', [h('strong', null, 'Rolled back. '), D.host(opts.targetHome) + ' is back to how it was before.']),
             h('div', null, h('button', { class: 'dsk-btn', type: 'button', onclick: opts.back }, D.icon(opts.icon || 'ship'), opts.againLabel || 'Start another move'))));
         } catch (e) {
+          progress('');
+          live.className = prevLive;
+          capsText.textContent = prevCaps;
+          lineState();
           rlog('ERROR: ' + D.errorText(e), 'err');
           D.toast('Rollback failed: ' + D.errorText(e), 'error');
         }
@@ -1412,6 +1443,7 @@
 
   /** What to do after a move into this site (Restore and Pull), in the arrival's left card. */
   D.arrivedView = function (box, ctx, undoLabel) {
+    var again = ctx.back ? h('button', { class: 'dsk-btn', type: 'button', onclick: ctx.back }, D.icon(ctx.icon || 'ship'), ctx.againLabel || 'Start another move') : null;
     if (ctx.target) {
       var tg = ctx.target, net = tg.kind === 'multisite', own = D.address(tg.home) !== D.address(D.config.homeUrl);
       D.mount(box,
@@ -1421,7 +1453,8 @@
           : 'It has its own users: log in to it with the source site’s credentials' + (own ? '.' : ', from Tools → WP Freighter.')),
         h('div', { class: 'row' },
           own && D.safeHref(tg.home) ? h('a', { class: 'dsk-btn primary', href: D.safeHref(tg.home), target: '_blank', rel: 'noopener' }, 'Open ' + D.host(tg.home)) : null,
-          h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
+          h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel),
+          again),
         ctx.undoDetails());
       return;
     }
@@ -1430,7 +1463,9 @@
         h('h3', null, D.icon('checkCircle'), 'The network kept its users'),
         h('p', null, D.host(D.config.homeUrl) + ' now holds the copied site, and you’re still logged in. The network’s users, super admins and every subsite’s members are as they were.'),
         h('p', { style: { marginTop: '8px' } }, 'The incoming site’s users joined the network: they log in with their own passwords, and an account that was already here keeps its own.'),
-        h('div', { class: 'row' }, h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
+        h('div', { class: 'row' },
+          again,
+          h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
         ctx.undoDetails());
       return;
     }
@@ -1439,7 +1474,8 @@
       h('p', null, 'User accounts came over with the copy, so your current login no longer applies here. ', h('strong', { style: { color: 'var(--ink)' } }, 'Log in with the source site’s credentials.')),
       h('div', { class: 'row' },
         h('a', { class: 'dsk-btn primary', href: ctx.loginUrl || D.config.loginUrl }, 'Log in again'),
-        h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel)),
+        h('button', { class: 'dsk-btn', type: 'button', onclick: function (e) { ctx.rollback(e.currentTarget); } }, D.icon('restore'), undoLabel),
+        again),
       ctx.undoDetails());
   };
 })();

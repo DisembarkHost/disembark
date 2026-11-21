@@ -324,6 +324,7 @@
         }
         line.textContent = 'Finishing the zip…';
         var fin = await step({ step: 'finish' });
+        if (cancelled) throw new Error('cancelled');
         bar.set(100);
         if (close) close(null);
         await D.downloadSiteFile(fin.url, fin.file_name);

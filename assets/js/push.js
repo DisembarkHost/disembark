@@ -69,8 +69,8 @@
       var text = await res.text(), data = text;
       try { data = text === '' ? null : JSON.parse(text); } catch (e) { /* not JSON */ }
       // The destination took a database with plain permalinks mid-push, so
-      // /wp-json/ now answers with a page: carry on through ?rest_route=.
-      if (res.ok && root.indexOf('/wp-json/') !== -1 && typeof data === 'string' && /<html|<!doctype/i.test(data.slice(0, 500))) {
+      // /wp-json/ now answers with a page (200 or 404): carry on through ?rest_route=.
+      if (!usePlain && (res.ok || res.status === 404) && root.indexOf('/wp-json/') !== -1 && (/text\/html/i.test(res.headers.get('content-type') || '') || (typeof data === 'string' && /<html|<!doctype/i.test(data.slice(0, 500))))) {
         usePlain = true;
         return call(root, endpoint, body, o);
       }
@@ -109,7 +109,7 @@
    * rendering into view. Resolves false when the destination can't be
    * reached (the form stays). back() goes back to the Move form.
    */
-  D.pushRun = async function (view, st, btn, back) {
+  D.pushRun = async function (view, st, btn, back, onFinish) {
     var api, local = D.localToLive(st.site);
     if (local) { D.toast(local, 'error'); return false; }
     try { api = await D.busy(btn, function () { return D.remoteApi(st.site, st.token); }); }
@@ -123,9 +123,10 @@
       api: api, mode: 'site', site: D.config.homeUrl, token: S.token, quiet: st.quiet, scene: st.scene, kind: 'push',
       targetHome: api.preflight.home_url || st.site, label: 'Before push from ' + D.host(D.config.homeUrl),
       title: 'Pushing to', doneTitle: 'Delivered', againLabel: 'Start another move', icon: 'ship',
-      back: back,
+      back: back, onFinish: onFinish,
       done: function (outcome, ctx) {
         var target = api.preflight.home_url || st.site, href = D.safeHref(target);
+        var again = ctx.back ? h('button', { class: 'dsk-btn', type: 'button', onclick: ctx.back }, D.icon(ctx.icon || 'ship'), ctx.againLabel || 'Start another move') : null;
         // Into a new or replaced subsite or tenant there: that site, not the whole destination.
         if (ctx.target) {
           var tg = ctx.target, net = tg.kind === 'multisite', own = D.address(tg.home) !== D.address(target), open = own ? D.safeHref(tg.home) : '';
@@ -136,7 +137,8 @@
               : 'It has its own users: log in to it with your credentials from ' + D.host(D.config.homeUrl) + (own ? '.' : ', from Tools \u2192 WP Freighter there.')),
             h('div', { class: 'row' },
               open ? h('a', { class: 'dsk-btn primary', href: open, target: '_blank', rel: 'noopener' }, 'Open ' + D.host(tg.home)) : null,
-              h('button', { class: 'dsk-btn', type: 'button', onclick: function (ev) { ctx.rollback(ev.currentTarget); } }, D.icon('restore'), 'Undo push')),
+              h('button', { class: 'dsk-btn', type: 'button', onclick: function (ev) { ctx.rollback(ev.currentTarget); } }, D.icon('restore'), 'Undo push'),
+              again),
             ctx.undoDetails());
           return;
         }
@@ -146,7 +148,8 @@
             h('p', null, D.host(target) + ' is the main site of a network, so its users stay as they were. This site’s users joined them: they log in with their own passwords, and an account that was already there keeps its own.'),
             h('div', { class: 'row' },
               href ? h('a', { class: 'dsk-btn primary', href: href, target: '_blank', rel: 'noopener' }, 'Open ' + D.host(target)) : null,
-              h('button', { class: 'dsk-btn', type: 'button', onclick: function (ev) { ctx.rollback(ev.currentTarget); } }, D.icon('restore'), 'Undo push')),
+              h('button', { class: 'dsk-btn', type: 'button', onclick: function (ev) { ctx.rollback(ev.currentTarget); } }, D.icon('restore'), 'Undo push'),
+              again),
             ctx.undoDetails());
           return;
         }
@@ -155,7 +158,8 @@
           h('p', null, D.host(target) + ' now holds a copy of this site, user accounts included, so log in there with your credentials from ', h('strong', null, D.host(D.config.homeUrl)), '.'),
           h('div', { class: 'row' },
             href ? h('a', { class: 'dsk-btn primary', href: href, target: '_blank', rel: 'noopener' }, 'Open ' + D.host(target)) : null,
-            h('button', { class: 'dsk-btn', type: 'button', onclick: function (ev) { ctx.rollback(ev.currentTarget); } }, D.icon('restore'), 'Undo push')),
+            h('button', { class: 'dsk-btn', type: 'button', onclick: function (ev) { ctx.rollback(ev.currentTarget); } }, D.icon('restore'), 'Undo push'),
+            again),
           ctx.undoDetails());
       }
     });
