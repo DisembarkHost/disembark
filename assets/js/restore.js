@@ -83,12 +83,12 @@
    * whole install as one isn't offered: it isn't built yet (the server
    * refuses it too, see Import::whole_install_refusal()).
    */
-  D.chooseSite = function (box, install) {
+  D.chooseSite = function (box, install, preselect) {
     var kind = install.kind === 'multisite' ? 'network' : 'WP Freighter install';
     return new Promise(function (resolve) {
       var sel = h('select', { class: 'dsk-select' },
         (install.sites || []).map(function (s) {
-          return h('option', { value: s.id }, D.host(s.url) + (s.name ? ' \u2014 ' + s.name : '') + ' (' + (s.id === 'main' ? 'main site' : (install.kind === 'multisite' ? 'site ' : 'tenant ') + s.id) + ')');
+          return h('option', { value: s.id, selected: preselect && String(s.id) === String(preselect) ? true : null }, D.host(s.url) + (s.name ? ' \u2014 ' + s.name : '') + ' (' + (s.id === 'main' ? 'main site' : (install.kind === 'multisite' ? 'site ' : 'tenant ') + s.id) + ')' + (preselect && String(s.id) === String(preselect) ? ' \u00b7 pulled before' : ''));
         }));
       function done(v) { box.cancelChoice = null; D.mount(box); resolve(v); }
       box.cancelChoice = function () { done(null); };
@@ -917,7 +917,7 @@
         var pick = 'all';
         if (!Object.prototype.hasOwnProperty.call(replay, ridAt(seq + 1))) {
           progress('Choose which site to bring\u2026');
-          pick = await D.chooseSite(chooser, c.install);
+          pick = await D.chooseSite(chooser, c.install, opts.lastSite);
           if (!pick) { cancelled = true; throw Cancelled(); }
         }
         c = await api.post('import/pull/site', t({ site: pick }));

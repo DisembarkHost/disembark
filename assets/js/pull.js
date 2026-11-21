@@ -20,7 +20,9 @@
     /** The last pull from site, or null. */
     lastPullFor: function (site) {
       var a = D.address(site);
-      return a ? lastPulls.find(function (p) { return D.address(p.source) === a; }) || null : null;
+      // A site pulled out of a network or WP Freighter install is remembered
+      // by its own address and by the install's connect line it came through.
+      return a ? lastPulls.find(function (p) { return D.address(p.source) === a; }) || lastPulls.find(function (p) { return p.via && D.address(p.via) === a; }) || null : null;
     },
     unfinished: unfinished,
     run: run
@@ -92,7 +94,7 @@
    */
   function run(view, o, back, onFinish) {
     D.runMove(view, {
-      api: D.api, local: true, mode: 'site', site: o.site, token: o.token, quiet: o.quiet, catchUp: o.catchUp, resume: o.resume, into: o.into,
+      api: D.api, local: true, mode: 'site', site: o.site, token: o.token, quiet: o.quiet, catchUp: o.catchUp, lastSite: o.lastSite, resume: o.resume, into: o.into,
       scene: o.scene, kind: 'pull',
       targetHome: D.config.homeUrl, label: o.label, title: o.resume ? 'Resuming' : 'Pulling', doneTitle: 'Pulled', againLabel: 'Start another move', icon: 'ship',
       back: back, onFinish: onFinish,

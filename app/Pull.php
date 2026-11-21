@@ -968,7 +968,7 @@ class Pull {
             $nl   = strpos( $raw, "\n" );
             $data = $nl === false ? null : json_decode( substr( $raw, $nl + 1 ), true );
             if ( is_array( $data ) && ! empty( $data['source'] ) ) {
-                $out[] = [ 'source' => (string) $data['source'], 'at' => (int) $data['at'], 'files' => count( (array) $data['files'] ) ];
+                $out[] = [ 'source' => (string) $data['source'], 'at' => (int) $data['at'], 'files' => count( (array) $data['files'] ), 'via' => (string) ( $data['via'] ?? '' ), 'site' => (string) ( $data['site'] ?? '' ) ];
             }
         }
         usort( $out, function ( $a, $b ) { return $b['at'] - $a['at']; } );
@@ -1006,6 +1006,14 @@ class Pull {
             self::write_protected_json( $rollback . '/pull-memory.php', [ 'file' => self::pull_file( $source ), 'previous' => $previous ] );
         }
         $memory = [ 'source' => untrailingslashit( $source ), 'at' => time(), 'files' => $files ];
+        // One site of a network or WP Freighter install: the connect line it
+        // came through (the install's address) and which site, so the
+        // dashboard offers a catch-up when that connect line is pasted again.
+        $via = untrailingslashit( (string) ( $state['source_url'] ?? '' ) );
+        if ( $via !== '' && Quiet::address( $via ) !== Quiet::address( $source ) && ! empty( $state['site'] ) ) {
+            $memory['via']  = $via;
+            $memory['site'] = (string) $state['site'];
+        }
         // What "What to bring" left behind, so the next catch-up can say
         // those files aren't new.
         $memory['left_out'] = [ 'paths' => (array) ( $state['left_out']['paths'] ?? [] ), 'names' => (array) ( $state['left_out']['names'] ?? [] ) ];

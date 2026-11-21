@@ -335,7 +335,8 @@
         h('p', { class: 'muted' }, (catchUp ? 'Only changed files and tables come across. ' : '') + (S.to === 'this' ? (S.quiet ? 'Quiet mode goes on before anything arrives. ' : 'Quiet mode is off: this copy will send emails and run scheduled jobs. ') : '') + 'A restore point is saved first.' + (S.to === 'this' && !(isMain && net) ? ' You’ll need to log in again afterwards.' : ''))),
         { title: (catchUp ? 'Catch up from ' : 'Pull ') + r + '?', confirmLabel: catchUp ? 'Catch up' : 'Pull', danger: S.into !== 'new' || S.to === 'this' });
       if (!ok) return;
-      var o = { site: S.connect.url, token: S.connect.token, quiet: S.to === 'this' && S.quiet, catchUp: catchUp, into: into, scene: sc, label: (catchUp ? 'Before catch-up from ' : 'Before pull from ') + r };
+      var lastPull = catchUp ? D.pull.lastPullFor(S.connect.url) : null;
+      var o = { site: S.connect.url, token: S.connect.token, quiet: S.to === 'this' && S.quiet, catchUp: catchUp, lastSite: (lastPull && lastPull.site) || '', into: into, scene: sc, label: (catchUp ? 'Before catch-up from ' : 'Before pull from ') + r };
       start(function (view, back, onFinish) { D.pull.run(view, o, back, onFinish); });
       return;
     }
