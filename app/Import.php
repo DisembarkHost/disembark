@@ -1268,6 +1268,8 @@ class Import {
         }
         $journal  = $paced ? Pace::journal_open( $journal_file ) : null;
         $stop_at  = 0;
+        // The statement delimiter where it stops (a DELIMITER line can change it).
+        $stop_delim = $saved ? (string) ( $saved['delim'] ?? ';' ) : ';';
         $tolerant = $replay_to > 0;
         // Rows go in many at a time: a dump has one INSERT per row, and one
         // round trip per row is most of an import's time. Consecutive
@@ -1306,7 +1308,7 @@ class Import {
             }
             return true;
         };
-        $read     = self::each_sql_statement_in_file( $path, function ( $statement, $end ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, &$imported, &$stop_at, &$pending, $exec, $flush, $max, $old_prefix, $new_prefix, $skip_rows, $target, $paced, $deadline, $replay_to, $journal, $shared_main, $in_users ) {
+        $read     = self::each_sql_statement_in_file( $path, function ( $statement, $end, $delim = ';' ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, &$imported, &$stop_at, &$stop_delim, &$pending, $exec, $flush, $max, $old_prefix, $new_prefix, $skip_rows, $target, $paced, $deadline, $replay_to, $journal, $shared_main, $in_users ) {
             $dry = $end <= $replay_to;
             if ( ++$count % 500 === 0 && ! $dry && $this->cancelled() ) {
                 $run['errors'][] = 'Cancelled.';
@@ -1414,12 +1416,13 @@ class Import {
                     if ( ! $flush() ) {
                         return false;
                     }
-                    $stop_at = $end;
+                    $stop_at    = $end;
+                    $stop_delim = $delim;
                     return false;
                 }
             }
             return true;
-        }, $start );
+        }, $start, $stop_delim );
         // The last rows of the dump.
         if ( ! is_wp_error( $read ) && empty( $run['errors'] ) ) {
             $flush();
@@ -1438,6 +1441,7 @@ class Import {
                 'file'     => $sql_file,
                 'size'     => filesize( $path ),
                 'offset'   => $stop_at,
+                'delim'    => $stop_delim,
                 'count'    => $count,
                 'executed' => $run['statements_executed'],
                 'warnings' => $run['warnings'] ?? [],
@@ -1493,7 +1497,9 @@ class Import {
         }
         $result['tables_swapped']     = $swapped;
         $result['tables_direct']      = array_keys( $swap['direct'] );
-        $result['database_unchanged'] = ! empty( $result['errors'] ) && empty( $swap['direct'] );
+        // Unchanged only when nothing was swapped in or imported in place
+        // (a deferred view, trigger or routine fails after the swap).
+        $result['database_unchanged'] = ! empty( $result['errors'] ) && empty( $swap['direct'] ) && ! $swapped;
         $result['converted']          = $compat['converted'];
         $result['definers_removed']   = $compat['definers_removed'];
         if ( $target ) {
@@ -1623,12 +1629,23 @@ class Import {
             if ( preg_match( '/^(?:DROP\s+TABLE\b|LOCK\s+TABLES\b|UNLOCK\s+TABLES\b)/i', $statement ) ) {
                 continue;
             }
+            // The statement's start with executable-comment markers taken
+            // out: mysqldump splits a view's or trigger's CREATE across
+            // several (CREATE ALGORITHM=… then DEFINER=… then VIEW …).
+            $flat = trim( (string) preg_replace( '/\s+/', ' ', (string) preg_replace( '/\/\*M?!\d*|\*\//', ' ', substr( $statement, 0, 600 ) ) ) );
+            // Triggers, routines and events wait for the swap too: a trigger
+            // on a table's copy would go with the table it replaces, and
+            // none of them may change the site before the import succeeds.
+            if ( preg_match( '/^(?:CREATE|DROP)\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:AGGREGATE\s+)?(?:TRIGGER|PROCEDURE|FUNCTION|EVENT)\b/i', $flat ) ) {
+                $swap['deferred'][] = $statement;
+                continue;
+            }
             // Views wait for the swap: they read the live tables by name, and
             // creating them earlier would change the site before the import
             // has succeeded. Rows an older exporter wrote for a view would
             // land in the table behind it, so they're dropped.
-            if ( preg_match( '/^(?:\/\*!\d+\s+)?(?:DROP\s+VIEW\b|CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW\s+' . $ident . ')/i', $statement, $m ) ) {
-                if ( stripos( $statement, 'DROP' ) !== 0 && isset( $m[1] ) ) {
+            if ( preg_match( '/^(?:DROP\s+VIEW\b|CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW\s+' . $ident . ')/i', $flat, $m ) ) {
+                if ( stripos( $flat, 'DROP' ) !== 0 && isset( $m[1] ) ) {
                     $view = str_replace( '``', '`', $m[1] !== '' ? $m[1] : ( $m[2] ?? '' ) );
                     $swap['views'][ $view ] = true;
                     $swap['deferred'][]     = 'DROP VIEW IF EXISTS `' . str_replace( '`', '``', $view ) . '`';
@@ -2899,6 +2916,85 @@ class Import {
         return (bool) preg_match( '/^SET\s+' . $part . '(?:\s*,\s*' . $part . ')*\s*;?\s*$/i', trim( $sql ) );
     }
 
+    /**
+     * The first word of a statement, past comments and the opening of an
+     * executable comment (uppercase; '' when there's none). Cheap: it looks
+     * no further than the start, so every row of a dump can be asked.
+     */
+    private static function statement_word( $sql ) {
+        // Most statements start with their word.
+        $n = strspn( $sql, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_' );
+        if ( $n > 0 ) {
+            return strtoupper( substr( $sql, 0, $n ) );
+        }
+        $i   = 0;
+        $len = strlen( $sql );
+        while ( $i < $len && preg_match( '/\G(?:\s+|(?:--(?=\s)|#)[^\n]*\n?|\/\*M?!\d*|\/\*(?!M?!).*?\*\/)/s', $sql, $m, 0, $i ) && $m[0] !== '' ) {
+            $i += strlen( $m[0] );
+        }
+        return preg_match( '/\G[A-Za-z_]+/', $sql, $m, 0, $i ) ? strtoupper( $m[0] ) : '';
+    }
+
+    /**
+     * Statements no WordPress database needs, which reach past the site's
+     * tables to the database server itself: installing server plugins or
+     * libraries (INSTALL PLUGIN/SONAME, CREATE FUNCTION … SONAME), links to
+     * other servers (CREATE SERVER), reading or writing files on it (LOAD
+     * DATA/XML, LOAD_FILE(), INTO OUTFILE/DUMPFILE), accounts and privileges
+     * (GRANT, REVOKE, CREATE/ALTER/DROP/RENAME USER or ROLE, SET PASSWORD or
+     * ROLE), server-wide settings (SET GLOBAL/PERSIST, @@GLOBAL), server
+     * administration (FLUSH, RESET, SHUTDOWN, KILL, BINLOG, PURGE LOGS),
+     * replication (CHANGE MASTER/REPLICATION, START/STOP SLAVE/REPLICA),
+     * other databases (CREATE/ALTER/DROP DATABASE or SCHEMA, USE of any but
+     * this site's database), and, with $lock_prefix (the batch import runs
+     * LOCK TABLES as sent), a lock on a table without that prefix.
+     * Matched at the start of the statement and of each statement in a
+     * trigger's, routine's or event's body (after BEGIN, DO, THEN, ELSE,
+     * LOOP, REPEAT or ";"), and anywhere for SONAME, LOAD_FILE(), INTO
+     * OUTFILE/DUMPFILE and global settings. $sql is sql_skeleton() with
+     * names kept: strings are blanked, comments gone, executable comments
+     * unwrapped, so case, spacing and comment wrapping don't hide anything.
+     * The reason, or null.
+     */
+    private static function server_problem( $sql, $lock_prefix = null ) {
+        $names = $sql;
+        $sql   = preg_replace( '/`(?:[^`]|``)*`/', '`i`', $sql );
+        $at    = '(?:^|;|\b(?:BEGIN|DO|THEN|ELSE|LOOP|REPEAT)\b)\s*';
+        $rules = [
+            'installs or removes a plugin or library in the database server (INSTALL PLUGIN, SONAME)' => '/' . $at . '(?:UN)?INSTALL\s+(?:PLUGIN|SONAME)\b|\bSONAME\b/i',
+            'defines a link to another database server (CREATE SERVER)'                      => '/' . $at . '(?:CREATE|ALTER|DROP)\s+(?:OR\s+REPLACE\s+)?SERVER\b/i',
+            'reads a file on the database server (LOAD DATA, LOAD XML, LOAD_FILE)'            => '/' . $at . 'LOAD\s+(?:DATA|XML)\b|\bLOAD_FILE\s*\(/i',
+            'writes a file on the database server (INTO OUTFILE, INTO DUMPFILE)'             => '/\bINTO\s+(?:OUTFILE|DUMPFILE)\b/i',
+            'changes database accounts or privileges (GRANT, REVOKE, USER, ROLE, PASSWORD)'  => '/' . $at . '(?:GRANT|REVOKE)\b|' . $at . '(?:CREATE|ALTER|DROP|RENAME)\s+(?:USER|ROLE)\b|' . $at . 'SET\s+(?:PASSWORD|(?:DEFAULT\s+)?ROLE)\b/i',
+            'changes a setting for the whole database server (SET GLOBAL)'                   => '/@@(?:GLOBAL|PERSIST(?:_ONLY)?)\b|\b(?:GLOBAL|PERSIST|PERSIST_ONLY)\s+[A-Za-z_][\w.]*\s*:?=/i',
+            'runs a database server command (FLUSH, RESET, SHUTDOWN, KILL, BINLOG, PURGE LOGS)' => '/' . $at . '(?:FLUSH|RESET|SHUTDOWN|KILL|BINLOG)\b|' . $at . 'PURGE\s+(?:BINARY|MASTER)\s+LOGS\b/i',
+            'changes replication (CHANGE MASTER, START or STOP SLAVE)'                       => '/' . $at . 'CHANGE\s+(?:MASTER|REPLICATION)\b|' . $at . '(?:START|STOP)\s+(?:ALL\s+)?(?:SLAVES?|REPLICAS?)\b/i',
+            'creates, changes or drops a whole database (CREATE DATABASE, DROP DATABASE)'    => '/' . $at . '(?:CREATE|ALTER|DROP)\s+(?:DATABASE|SCHEMA)\b/i',
+        ];
+        foreach ( $rules as $what => $rule ) {
+            if ( preg_match( $rule, $sql ) ) {
+                $more = strpos( $what, 'whole database' ) !== false ? ' (A dump made with mysqldump --databases or --all-databases does this: export just this site\'s database instead.)' : '';
+                return "The incoming database has a statement that {$what}, which no WordPress database needs, so a move doesn't accept it.{$more} Nothing was imported from it.";
+            }
+        }
+        if ( preg_match( '/^\s*USE\s+(`(?:[^`]|``)+`|[A-Za-z0-9_$]+)\s*$/i', $names, $m ) ) {
+            $db = str_replace( '``', '`', trim( $m[1], '`' ) );
+            if ( $db !== DB_NAME ) {
+                return "The incoming database switches to another database ({$db}), so a move doesn't accept it. A dump made with mysqldump --databases or --all-databases does this: export just this site's database instead. Nothing was imported from it.";
+            }
+        } elseif ( preg_match( '/^\s*USE\b/i', $sql ) ) {
+            return "The incoming database switches to another database, so a move doesn't accept it. Nothing was imported from it.";
+        }
+        if ( $lock_prefix !== null && $lock_prefix !== '' && preg_match( '/^\s*LOCK\s+TABLES?\s+(.+)$/is', $names, $m ) ) {
+            foreach ( preg_split( '/\s*,\s*/', trim( $m[1] ) ) as $part ) {
+                if ( preg_match( '/^(`(?:[^`]|``)+`|[A-Za-z0-9_$]+)/', $part, $t ) && stripos( str_replace( '``', '`', trim( $t[1], '`' ) ), $lock_prefix ) !== 0 ) {
+                    return "The incoming database locks {$t[1]}, a table outside this site's own ({$lock_prefix}*), so a move doesn't accept it. Nothing was imported from it.";
+                }
+            }
+        }
+        return null;
+    }
+
     /** Storage engines a dump may create tables with: none that reaches outside the database (FEDERATED, CONNECT, SPIDER, S3), reads other tables (MRG_MyISAM) or files on the server (CSV, CONNECT). */
     const ALLOWED_ENGINES = [ 'innodb', 'myisam', 'aria', 'memory', 'heap', 'archive', 'rocksdb', 'tokudb' ];
 
@@ -2921,9 +3017,22 @@ class Import {
      * keyword inside a string or comment doesn't count, and one hidden in
      * an executable comment does.
      */
-    private static function reach_problem( $statement, $prefix, $shared = false, $old = '', $new = '' ) {
-        $sql = self::sql_skeleton( trim( self::strip_leading_comments( (string) $statement ) ), true );
-        if ( $sql === null || ! preg_match( '/^\s*(CREATE\s+(?:TEMPORARY\s+)?TABLE|ALTER\s+(?:ONLINE\s+|IGNORE\s+)*TABLE)\b/i', $sql, $head ) ) {
+    private static function reach_problem( $statement, $prefix, $shared = false, $old = '', $new = '', $locks = false ) {
+        $raw = trim( (string) $statement );
+        // Rows, most of any dump, are read through only when one could
+        // name a file (INSERT … SELECT LOAD_FILE(), … INTO OUTFILE).
+        $word = self::statement_word( $raw );
+        if ( ( $word === 'INSERT' || $word === 'REPLACE' ) && stripos( $raw, 'FILE' ) === false ) {
+            return null;
+        }
+        $sql = self::sql_skeleton( $raw, true );
+        if ( $sql === null ) {
+            return "The incoming database has a statement this can't read safely (an executable comment inside another, or one that doesn't end), so a move doesn't accept it. Nothing was imported from it.";
+        }
+        if ( $why = self::server_problem( $sql, $locks ? (string) $prefix : null ) ) {
+            return $why;
+        }
+        if ( ! preg_match( '/^\s*(CREATE\s+(?:TEMPORARY\s+)?TABLE|ALTER\s+(?:ONLINE\s+|IGNORE\s+)*TABLE)\b/i', $sql, $head ) ) {
             return null;
         }
         $name  = self::statement_table( $statement );
@@ -3122,7 +3231,7 @@ class Import {
         // in the batch runs when one statement reaches outside it.
         global $wpdb;
         foreach ( $statements as $statement ) {
-            if ( $problem = self::reach_problem( $statement, (string) $wpdb->prefix, (bool) Scope::install() ) ) {
+            if ( $problem = self::reach_problem( $statement, (string) $wpdb->prefix, (bool) Scope::install(), '', '', true ) ) {
                 return new \WP_Error( 'sql_refused', $problem, [ 'status' => 400 ] );
             }
         }
@@ -5376,12 +5485,13 @@ class Import {
      * $callback returns false to stop early. Returns a summary
      * (statements, ended_cleanly, stopped) or WP_Error if the file can't be read.
      */
-    private static function each_sql_statement_in_file( $path, $callback, $start = 0 ) {
+    private static function each_sql_statement_in_file( $path, $callback, $start = 0, $delim = ';' ) {
         $handle = @fopen( $path, 'rb' );
         if ( ! $handle ) {
             return new \WP_Error( 'sql_unreadable', 'Could not read ' . basename( $path ) . '.', [ 'status' => 500 ] );
         }
-        $scan = self::sql_scanner();
+        // $delim: the statement delimiter in force at $start (see sql_scan()).
+        $scan = self::sql_scanner( $start > 0 ? $delim : ';' );
         if ( $start > 0 ) {
             // Carrying on from a statement boundary an earlier call recorded.
             fseek( $handle, (int) $start );
@@ -5395,9 +5505,9 @@ class Import {
         $count = 0;
         // The callback also gets the byte offset just past the statement,
         // where a later call can start again.
-        $emit  = function ( $statement, $end = 0 ) use ( $callback, &$count ) {
+        $emit  = function ( $statement, $end = 0, $delim = ';' ) use ( $callback, &$count ) {
             $count++;
-            return $callback( $statement, $end ) !== false;
+            return $callback( $statement, $end, $delim ) !== false;
         };
         while ( ! $scan['stopped'] && ! feof( $handle ) ) {
             $chunk = fread( $handle, 1048576 );
@@ -5418,8 +5528,8 @@ class Import {
         ];
     }
 
-    private static function sql_scanner() {
-        return [ 'buf' => '', 'cur' => '', 'state' => 'normal', 'stopped' => false, 'ended_cleanly' => false, 'fed' => 0, 'pos' => 0 ];
+    private static function sql_scanner( $delim = ';' ) {
+        return [ 'buf' => '', 'cur' => '', 'state' => 'normal', 'stopped' => false, 'ended_cleanly' => false, 'fed' => 0, 'pos' => 0, 'delim' => (string) $delim !== '' ? (string) $delim : ';' ];
     }
 
     /**
@@ -5443,7 +5553,7 @@ class Import {
         $flush = function () use ( &$cur, &$scan, $emit ) {
             $statement = trim( $cur );
             $cur       = '';
-            if ( $statement !== '' && ! $emit( $statement, $scan['pos'] ) ) {
+            if ( $statement !== '' && ! $emit( $statement, $scan['pos'], $scan['delim'] ) ) {
                 $scan['stopped'] = true;
             }
         };
@@ -5458,10 +5568,36 @@ class Import {
 
             switch ( $state ) {
                 case 'normal':
-                    $run = strcspn( $s, "-#/'\"`;", $i );
+                    // A client DELIMITER line at the start of a statement
+                    // (mysqldump writes one around each trigger and routine,
+                    // whose bodies hold ";"): from here on that ends one.
+                    if ( ( $ch === 'D' || $ch === 'd' ) && strlen( $cur ) < 4096 && strncasecmp( substr( $s, $i, 9 ), 'DELIMITER', min( 9, $len - $i ) ) === 0 && trim( self::strip_leading_comments( $cur ) ) === '' ) {
+                        if ( $len - $i < 10 && ! $final ) {
+                            break 2; // too little left to tell
+                        }
+                        $nl = strpos( $s, "\n", $i );
+                        if ( $nl === false && ! $final ) {
+                            break 2; // the rest of the line is in the next piece
+                        }
+                        $line = $nl === false ? substr( $s, $i ) : substr( $s, $i, $nl - $i );
+                        if ( preg_match( '/^DELIMITER[ \t]+(\S+)[ \t]*\r?$/i', $line, $dm ) ) {
+                            $scan['delim'] = $dm[1];
+                            $i             = $nl === false ? $len : $nl + 1;
+                            $cur           = '';
+                            $scan['pos']   = $base + $i;
+                            break;
+                        }
+                    }
+                    $delim = $scan['delim'];
+                    $run   = strcspn( $s, "-#/'\"`\n" . $delim[0], $i );
                     if ( $run > 0 ) {
                         $cur .= substr( $s, $i, $run );
                         $i   += $run;
+                        break;
+                    }
+                    if ( $ch === "\n" ) {
+                        $cur .= $ch;
+                        $i++;
                         break;
                     }
                     if ( $ch === '-' && $nxt === '-' && ( $i + 2 >= $len || ctype_space( $s[ $i + 2 ] ) ) ) {
@@ -5485,13 +5621,19 @@ class Import {
                     if ( $ch === "'" ) { $state = 'squote';   $cur .= $ch; $i++; break; }
                     if ( $ch === '"' ) { $state = 'dquote';   $cur .= $ch; $i++; break; }
                     if ( $ch === '`' ) { $state = 'backtick'; $cur .= $ch; $i++; break; }
-                    if ( $ch === ';' ) {
-                        $i++;
-                        $scan['pos'] = $base + $i;
-                        $flush();
-                        break;
+                    if ( $ch === $delim[0] ) {
+                        $dl = strlen( $delim );
+                        if ( $dl > 2 && ! $final && $i + $dl > $len ) {
+                            break 2; // the rest of the delimiter is in the next piece
+                        }
+                        if ( $dl === 1 || substr_compare( $s, $delim, $i, $dl ) === 0 ) {
+                            $i          += $dl;
+                            $scan['pos'] = $base + $i;
+                            $flush();
+                            break;
+                        }
                     }
-                    $cur .= $ch; // a lone "-" or "/"
+                    $cur .= $ch; // a lone "-" or "/", or a ";" inside a body
                     $i++;
                     break;
 
