@@ -115,6 +115,55 @@
     });
   };
 
+  /**
+   * "Which database?" for a backup zip whose database isn't clear: several
+   * dumps and no clear winner, or only ones deep in its folders (db.ask
+   * "pick"), or none at all (db.ask "none"). Lists every dump found with
+   * what a quick look at it showed, the best guess picked. Resolves with
+   * the dump's path in the zip, "none" for the files only, or null when
+   * cancelled. Nothing has changed on the site yet.
+   */
+  D.chooseDatabase = function (box, db, zipName) {
+    return new Promise(function (resolve) {
+      function done(v) { D.mount(box); resolve(v); }
+      if (db.ask === 'none') {
+        D.mount(box, D.decideCard({ title: ['No ', 'database.'],
+          text: 'This zip has no database Disembark can use: there’s no .sql or .sql.gz file in ' + zipName + '. Restore the files only (this site keeps its own database), or cancel?',
+          go: h('button', { class: 'dsk-btn primary', type: 'button', onclick: function () { done('none'); } }, D.icon('ship'), 'Restore the files only'),
+          cancel: function () { done(null); } }));
+        return;
+      }
+      var list = db.candidates || [], pick = 'none';
+      list.forEach(function (c) { if (c.guess) pick = c.file; });
+      var row = function (value, title, lines, plain) {
+        var input = h('input', { type: 'radio', name: 'dsk-db-pick', value: value, style: { marginTop: '3px' } });
+        input.checked = value === pick;
+        input.addEventListener('change', function () { pick = value; });
+        return h('label', { style: { display: 'flex', gap: '10px', alignItems: 'flex-start', padding: '9px 0', borderTop: '1px solid var(--line)', cursor: 'pointer' } }, input,
+          h('span', { style: { minWidth: 0 } }, h('strong', { style: plain ? null : { fontFamily: 'var(--mono)', fontSize: '12.5px', overflowWrap: 'anywhere' } }, title),
+            lines.map(function (l) { return h('small', { class: 'muted', style: { display: 'block', marginTop: '2px' } }, l); })));
+      };
+      var rows = list.map(function (c) {
+        var seen = [D.fmt.size(c.size || 0), c.where];
+        if (!c.usable) seen.push('Not usable: ' + (c.note || 'it doesn’t read as a database dump'));
+        else {
+          if (c.prefix) seen.push('tables ' + c.prefix + '*');
+          seen.push(c.options ? 'options table ' + c.options : (c.whole ? 'no options table' : 'no options table in the first ' + D.fmt.size(c.looked || 0)));
+          if (c.home) seen.push(c.home);
+        }
+        return row(c.file, c.file + (c.guess ? '  · best guess' : ''), [seen.join(' · ')]);
+      });
+      rows.push(row('none', 'No database: restore the files only', ['This site keeps its own database.'], true));
+      var deep = list.every(function (c) { return c.spot === 'deep'; });
+      D.mount(box, D.decideCard({ title: ['Which ', 'database?'],
+        text: deep ? zipName + ' has no database dump at its root, only ' + (list.length === 1 ? 'this one' : 'these') + ' inside the site’s files. Restore ' + (list.length === 1 ? 'it' : 'one of them') + ', or the files only?'
+          : zipName + ' holds ' + D.fmt.plural(list.length, 'database dump') + ' and it isn’t clear which is the site’s. Pick the one to restore.',
+        body: h('div', null, rows),
+        go: h('button', { class: 'dsk-btn primary', type: 'button', onclick: function () { done(pick); } }, D.icon('ship'), 'Continue'),
+        cancel: function () { done(null); } }));
+    });
+  };
+
   D.runMove = function (view, opts) {
     var importId = opts.resume ? opts.resume.id : D.randomHex(24), rollbackId = '', codeMentions = null, quietOn = false, quietSource = '';
     // Request ids follow the import id and the step's place in the move, so
@@ -1055,9 +1104,23 @@
         step('read'); progress('');
         var info = await api.post('import/staged-info', t());
         if (info.refused) throw new Error(info.refused);
+        // A zip whose database isn't clear (or has none) asks before anything changes.
+        var dbi = info.database || {};
+        if (kind === 'restore' && dbi.ask) {
+          var dbPick = 'none';
+          if (!Object.prototype.hasOwnProperty.call(replay, ridAt(seq + 1))) {
+            progress('Choose the database\u2026');
+            dbPick = await D.chooseDatabase(chooser, dbi, srcLabel);
+            if (dbPick === null) { cancelled = true; throw Cancelled(); }
+            progress('');
+          }
+          info = await api.post('import/staged-info', t({ database: dbPick }));
+          if (info.refused) throw new Error(info.refused);
+          dbi = info.database || {};
+        }
         var srcPrefix = (info.source && info.source.db_prefix) || '';
         var srcHome = String(opts.sourceUrl || siteHome || (info.source && info.source.home_url) || '').replace(/\/$/, '');
-        rlog(D.fmt.plural(info.files || 0, 'file') + ' staged' + (info.sql_file ? ', database found.' : ', no database.'));
+        rlog(D.fmt.plural(info.files || 0, 'file') + ' staged' + (info.sql_file ? ', database ' + (kind === 'restore' && dbi.why ? info.sql_file + ' (' + dbi.why + ').' : 'found.') : dbi.files_only ? ', no database: the files only, as you chose.' : ', no database.'));
         stepEls.read.meta.textContent = D.fmt.plural(info.files || 0, 'file');
         if (info.multisite && info.multisite.length) rlog('The source is a multisite network. This site keeps its own wp-config.php, so add: ' + info.multisite.join(' '), 'err');
 
@@ -1090,7 +1153,7 @@
             }
             quietOn = true; quietSource = srcHome;
             rlog('Quiet mode on: emails held, scheduled jobs paused, checkout closed, payment and marketing APIs blocked.', 'ok');
-          } else rlog('Same address as the source, so quiet mode isn\u2019t needed.', 'dim');
+          } else rlog(srcHome ? 'Same address as the source, so quiet mode isn\u2019t needed.' : info.sql_file ? 'The backup doesn\u2019t say its address, so quiet mode waits for its database.' : 'No database comes in, so quiet mode isn\u2019t needed.', 'dim');
         }
 
         step('files');
@@ -1116,6 +1179,16 @@
             : await api.post('import/import-staged-sql', sqBody);
           progress('');
           rlog(D.fmt.num(sq.statements_executed || 0) + ' statements executed.');
+          // The old address, when only the imported database tells it.
+          if (!srcHome && sq.source_home && !(sq.errors && sq.errors.length)) {
+            srcHome = String(sq.source_home).replace(/\/$/, '');
+            rlog('The database is ' + D.host(srcHome) + '\u2019s.', 'dim');
+            if (opts.quiet && !target && !quietOn && D.address(srcHome) !== D.address(destHome)) {
+              await api.post('quiet-mode', t({ action: 'on', source: srcHome }));
+              quietOn = true; quietSource = srcHome;
+              rlog('Quiet mode on: emails held, scheduled jobs paused, checkout closed, payment and marketing APIs blocked.', 'ok');
+            }
+          }
           stepEls.db.meta.textContent = D.fmt.num(sq.statements_executed || 0) + ' statements';
           Object.keys(sq.converted || {}).forEach(function (c) { rlog('This database server doesn\u2019t support ' + c.split(' \u2192 ')[0] + ', so ' + D.fmt.plural(sq.converted[c], 'table') + ' use ' + c.split(' \u2192 ')[1] + ' instead.', 'dim'); });
           if (sq.definers_removed) rlog('Removed the source server\u2019s DEFINER account from ' + D.fmt.plural(sq.definers_removed, 'view, trigger or routine', 'views, triggers or routines') + '.', 'dim');
