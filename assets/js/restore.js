@@ -1317,6 +1317,7 @@
             throw new Error('Rollback reported ' + D.fmt.plural(r.errors.length, 'error') + '. It can be run again from the CLI.');
           }
           rlog('Rolled back.', 'ok');
+          (r.warnings || []).forEach(function (w) { rlog(w, 'dim'); });
           if (r.quiet_mode_lifted) rlog('Quiet mode lifted with it.', 'dim');
           setTitle('Rolled', 'back.');
           live.className = 'dsk-live ok'; capsText.textContent = KIND + ' undone';
@@ -1344,6 +1345,8 @@
    * and o.onCount(n, bytes) hears how many there are.
    */
   var BUOYS = ['#c8553d', '#d9a441', '#2b8a7e', '#3f78a8'];
+  /** Under a restore point from before 3.0 that holds other sites' tables (left_alone). */
+  D.OLD_POINT_NOTE = 'Made before 3.0: only this site’s tables are restored.';
   D.restorePoints = function (o) {
     o = o || {};
     var body = h('div'), count = h('span', { class: 'dsk-tag r', hidden: true });
@@ -1371,7 +1374,8 @@
             h('b', null, p.label || 'Restore point'),
             i === 0 ? h('span', { class: 'dsk-tag ok', style: { marginLeft: '8px' } }, 'latest') : null,
             p.rolled_back_at ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' } }, 'rolled back ' + D.fmt.ago(p.rolled_back_at)) : null,
-            h('div', { class: 'when' }, D.fmt.date(p.created_at) + ' · ' + D.fmt.size(p.size) + ' · ' + (p.files ? 'files and database' : 'database only'))),
+            h('div', { class: 'when' }, D.fmt.date(p.created_at) + ' · ' + D.fmt.size(p.size) + ' · ' + (p.files ? 'files and database' : 'database only')),
+            p.left_alone ? h('div', { class: 'when' }, D.OLD_POINT_NOTE) : null),
           h('div', { class: 'acts' },
             h('button', { class: 'dsk-btn sm', type: 'button', onclick: function (e) { rollback(p, e.currentTarget); } }, D.icon('restore'), 'Roll back'),
             h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function (e) { remove(p, e.currentTarget); } }, 'Delete')));
@@ -1387,7 +1391,7 @@
         try {
           var r = await D.paced(D.api, 'import/rollback', { import_id: p.id });
           if (r.errors && r.errors.length) throw new Error(D.fmt.plural(r.errors.length, 'error') + ': ' + r.errors.slice(0, 2).join(' · '));
-          D.toast('Rolled back to ' + D.fmt.date(p.created_at) + '.');
+          D.toast('Rolled back to ' + D.fmt.date(p.created_at) + '.' + (r.warnings && r.warnings.length ? ' ' + r.warnings.join(' ') : ''));
           if (D.store.state.database.length) D.loadDatabase(true).catch(function () {});
           load();
         } catch (e) { D.toast('Rollback failed: ' + D.errorText(e), 'error'); }
