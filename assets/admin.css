@@ -910,3 +910,19 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
 .dsk .dsk-zipname { display: flex; min-width: 0; font-size: 13px; white-space: nowrap; }
 .dsk .dsk-zipname .h { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .dsk .dsk-zipname .t { flex: none; }
+
+/* Voyage progress: spinner, message, percent, clock and a bar */
+.dsk .dsk-voy-line { padding: 0 24px 18px; margin-top: -2px; background: var(--surface); font: 12px/1.4 var(--mono); color: var(--ink-3); text-align: left; min-height: 0; }
+.dsk-voy-line[hidden] { display: none; }
+.dsk-voy-line .row { display: flex; align-items: center; gap: 10px; max-width: 760px; margin: 0 auto 8px; }
+.dsk-voy-line .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
+.dsk-voy-line .pct { color: var(--ink); font-weight: 600; }
+.dsk-voy-line .clock { color: var(--ink-3); min-width: 52px; text-align: right; }
+.dsk-voy-line .dsk-spin { width: 13px; height: 13px; border-width: 2px; color: var(--accent); }
+.dsk-voy-line .dsk-progress { max-width: 760px; margin: 0 auto; height: 6px; }
+.dsk-voy-line .dsk-progress i { background: var(--accent); }
+.dsk-voy-line.paused .dsk-spin { animation: none; border-right-color: currentColor; color: var(--warn); border-radius: 3px; width: 10px; height: 10px; }
+.dsk-voy-line.paused .dsk-progress i { animation-play-state: paused; background: var(--warn); }
+.dsk-voy:has(.dsk-voy-line.busy) .boat-slot { animation: dsk-bob 2.4s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+@media (prefers-reduced-motion: reduce) { .dsk-voy .boat-slot { animation: none !important; } }
+@media (max-width: 600px) { .dsk .dsk-voy-line { padding: 0 16px 16px; } .dsk-voy-line .t { white-space: normal; } }

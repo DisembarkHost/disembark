@@ -145,11 +145,21 @@
     var stepEls = {}, current = null, curStop = -1;
     STEPS.forEach(function (s) { var se = stopEls[stopOf[s.key]]; stepEls[s.key] = { el: se.li, meta: se.small }; });
     var strip = h('ol', { class: 'dsk-strip', 'aria-label': 'Voyage' }, stopEls.map(function (se) { return se.li; }));
-    var line = h('div', { class: 'dsk-voy-line', 'aria-live': 'polite' });
+    // Under the stops: a spinner, what's happening, a bar (filled when the
+    // message says "N of M", sliding otherwise), the percent and a running
+    // clock, so a long step still visibly moves.
+    var lineText = h('span', { class: 't', 'aria-live': 'polite' }), linePct = h('span', { class: 'pct' }), lineClock = h('span', { class: 'clock', title: 'Time since the move started' });
+    var lineBar = D.progress(); lineBar.set(null);
+    var line = h('div', { class: 'dsk-voy-line' }, h('div', { class: 'row' }, h('span', { class: 'dsk-spin', 'aria-hidden': 'true' }), lineText, linePct, lineClock), lineBar);
+    var began = Date.now(), clockTimer = 0;
+    function tickClock() {
+      var s = Math.max(0, Math.round((Date.now() - began) / 1000)), m = Math.floor(s / 60), hr = Math.floor(m / 60);
+      lineClock.textContent = hr ? hr + 'h ' + (m % 60) + 'm' : m ? m + 'm ' + ('0' + (s % 60)).slice(-2) + 's' : s + 's';
+    }
 
     // Who's where: the source on the left, the destination on the right.
     var here = D.host(D.config.homeUrl);
-    var srcLabel = opts.mode === 'file' ? (opts.file ? opts.file.name : 'backup.zip') : D.host(opts.site);
+    var srcLabel = opts.mode === 'file' ? D.midTrim(opts.file ? opts.file.name : 'backup.zip', 40) : D.host(opts.site);
     var dstLabel = D.host(opts.targetHome);
     var scene = opts.scene || {
       left: { kind: opts.mode === 'file' ? 'zip' : 'site', label: srcLabel },
@@ -407,7 +417,24 @@
       setStop(curStop, 'failed');
       stepEls[current].meta.textContent = why;
     }
-    function progress(text) { line.textContent = text || ''; }
+    function progress(text) {
+      lineText.textContent = text || (line.classList.contains('busy') ? 'Working\u2026' : '');
+      var m = /([\d][\d,]*)\s+of\s+([\d][\d,]*)/.exec(text || ''), n = m ? +m[1].replace(/,/g, '') : 0, of = m ? +m[2].replace(/,/g, '') : 0;
+      if (of > 0) { var pc = Math.min(100, n / of * 100); lineBar.set(pc); linePct.textContent = Math.floor(pc) + '%'; }
+      else { lineBar.set(null); linePct.textContent = ''; }
+    }
+    // Running, paused or ended follows the header's live dot.
+    function lineState() {
+      var c = live.className, busy = c === 'dsk-live', paused = / wait/.test(c) && !/finished/.test(capsText.textContent);
+      line.classList.toggle('busy', busy);
+      line.classList.toggle('paused', paused && !busy);
+      line.hidden = !busy && !paused;
+      clearInterval(clockTimer);
+      if (busy || paused) { tickClock(); clockTimer = setInterval(tickClock, 1000); }
+      if (busy && !lineText.textContent) lineText.textContent = 'Working\u2026';
+    }
+    new MutationObserver(lineState).observe(live, { attributes: true, attributeFilter: ['class'] });
+    lineState();
     var t = function (body) { return Object.assign({ import_id: importId }, body || {}); };
 
     // Every step carries a request_id. A site that says it's resumable
