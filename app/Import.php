@@ -1551,6 +1551,9 @@ class Import {
         @unlink( $state_file );
         @unlink( $journal_file );
 
+        // This site's own address, read before the swap brings the source's.
+        $here = [ 'home' => untrailingslashit( (string) get_option( 'home' ) ), 'siteurl' => untrailingslashit( (string) get_option( 'siteurl' ) ) ];
+
         // Only a clean import replaces this site's tables. Otherwise the copies
         // go and the live tables stay exactly as they were.
         if ( empty( $run['errors'] ) ) {
@@ -1596,6 +1599,9 @@ class Import {
             $rp = $this->remap_table_prefix( $old_prefix, $new_prefix );
             $result['prefix_keys_changed'] = (int) ( $rp['keys_changed'] ?? 0 );
             self::write_protected( $this->import_path . '/prefix-remapped.php', (string) wp_json_encode( [ 'from' => $old_prefix, 'to' => $new_prefix, 'keys_changed' => $result['prefix_keys_changed'] ] ) );
+        }
+        if ( ! $target && empty( $result['errors'] ) && ( $swapped || ! empty( $swap['direct'] ) ) && $here['home'] !== '' ) {
+            $this->hold_address( $here['home'], $here['siteurl'] );
         }
         if ( $target ) {
             $result['target']         = $target->info();
@@ -2446,6 +2452,10 @@ class Import {
         }
         $result['paths'] = self::path_pairs( $source );
         $result['moved'] = $moved;
+        // The options now hold this site's address: it needn't be held.
+        if ( ! $target ) {
+            self::release_address();
+        }
         $file_pairs = $from !== $to ? self::replacement_pairs( $from, $to, true ) : [];
         foreach ( $moved as $f => $t ) {
             $file_pairs += self::replacement_pairs( $f, $t );
@@ -6453,6 +6463,65 @@ class Import {
         return 'Undid ' . count( $undone ) . ' later ' . ( count( $undone ) === 1 ? 'move' : 'moves' ) . ' first: ' . implode( ', ', $labels ) . ( count( $undone ) > 5 ? ', …' : '' ) . '.';
     }
 
+    /** The option that holds this site's address mid-move (see hold_address()). */
+    const HOLD_OPTION = 'disembark_move_address';
+
+    /**
+     * Between swapping in the source's database and rewriting its addresses,
+     * the options say the source's address, so wp-admin and the login send
+     * everyone there. A move that stops in that window (a fatal error, a
+     * closed tab) could then be resumed from nowhere: the dashboard isn't
+     * reachable here, and WP-CLI doesn't take over a dashboard move. So the
+     * address this site had is kept in the swapped-in options and served
+     * (see keep_address()) until the rewrite puts it in the options for
+     * good. A rollback brings back the old options table, and it with it.
+     */
+    private function hold_address( $home, $siteurl ) {
+        update_option( self::HOLD_OPTION, [ 'home' => (string) $home, 'siteurl' => (string) ( $siteurl ?: $home ), 'import' => (string) $this->import_id, 'at' => time() ], true );
+        wp_cache_delete( 'alloptions', 'options' );
+    }
+
+    /** The address is in the options now: stop holding it. */
+    public static function release_address() {
+        if ( get_option( self::HOLD_OPTION ) !== false ) {
+            delete_option( self::HOLD_OPTION );
+        }
+    }
+
+    /** Serves the held address (see hold_address()), from when Disembark loads. */
+    public static function keep_address() {
+        $hold = get_option( self::HOLD_OPTION );
+        if ( ! is_array( $hold ) || empty( $hold['home'] ) || ! preg_match( '#^https?://#i', (string) $hold['home'] ) ) {
+            return;
+        }
+        add_filter( 'pre_option_home', function () use ( $hold ) { return (string) $hold['home']; } );
+        add_filter( 'pre_option_siteurl', function () use ( $hold ) { return (string) ( $hold['siteurl'] ?: $hold['home'] ); } );
+        // WordPress sets the content and plugin address (WP_CONTENT_URL) from
+        // the siteurl option before any plugin loads, so those still say the
+        // source's: the dashboard would load its scripts from there (another
+        // version, or nothing). Its base is swapped for this site's.
+        global $wpdb;
+        $raw  = untrailingslashit( (string) $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", 'siteurl' ) ) );
+        $here = untrailingslashit( (string) ( $hold['siteurl'] ?: $hold['home'] ) );
+        if ( $raw === '' || $raw === $here ) {
+            return;
+        }
+        $swap = function ( $url ) use ( $raw, $here ) {
+            return is_string( $url ) && strpos( $url, $raw ) === 0 ? $here . substr( $url, strlen( $raw ) ) : $url;
+        };
+        add_filter( 'content_url', $swap );
+        add_filter( 'plugins_url', $swap );
+        add_filter( 'theme_root_uri', $swap );
+        add_filter( 'upload_dir', function ( $dirs ) use ( $swap ) {
+            foreach ( [ 'url', 'baseurl' ] as $key ) {
+                if ( isset( $dirs[ $key ] ) ) {
+                    $dirs[ $key ] = $swap( $dirs[ $key ] );
+                }
+            }
+            return $dirs;
+        } );
+    }
+
     /** Marks the .maintenance file a rollback writes (see maintenance_on()). */
     const MAINTENANCE_MARK = 'disembark-rollback';
 
@@ -6676,6 +6745,7 @@ class Import {
     }
 
     public function finalize() {
+        self::release_address();
         $target = $this->target();
         // Remember the source's files now on this site, for a catch-up pull.
         if ( ! $target ) {

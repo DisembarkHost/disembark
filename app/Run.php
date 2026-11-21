@@ -12,6 +12,10 @@ class Run {
     public function __construct() {
         require_once ABSPATH . 'wp-admin/includes/file.php';
         
+        // A move that stopped between swapping in the source's database and
+        // rewriting its addresses keeps this site's address meanwhile.
+        Import::keep_address();
+
         $this->plugin_url  = plugin_dir_url( dirname( __FILE__ ) );
         $this->plugin_path = dirname( plugin_dir_path( __FILE__ ) );
 
