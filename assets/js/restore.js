@@ -1423,13 +1423,44 @@
     }
     async function rollback(p, btn) {
       var choice = hasFiles(p) && !p.files_spent && !p.creates_site, files = true;
-      var laterBox = h('div');
+      var laterBox = h('div'), sumBox = h('div'), preview = null;
+      // What it changes, from the site (read only): files each move placed
+      // that a rollback removes, the ones it puts back, and the totals.
+      D.api.post('restore-points/preview', { import_id: p.id }).then(function (r) { preview = r; showLater(); }).catch(function () { preview = false; showLater(); });
+      function size(b) { return (preview && preview.partial ? 'at least ' : '') + D.fmt.size(b || 0); }
+      function stepOf(q) { return preview && (preview.steps || []).find(function (st) { return st.id === q.id; }); }
+      function stepText(q) {
+        var st = stepOf(q);
+        if (!st) return '';
+        if (!files || !st.files) return st.creates_site && files ? 'removes the subsite or tenant it created' : (files && st.spent && (st.removes || st.puts_back || hasFiles(q)) ? 'database only (its files were put back before)' : 'database only');
+        var parts = [];
+        if (st.removes) parts.push('removes ' + D.fmt.plural(st.removes, 'file') + ' (' + size(st.removes_bytes) + ')');
+        if (st.puts_back) parts.push('puts back ' + D.fmt.plural(st.puts_back, 'file'));
+        return parts.length ? parts.join(', ') : 'database only';
+      }
+      function summary() {
+        if (preview === null) return D.note('', [h('span', { class: 'dsk-spin' }), ' Working out what changes…']);
+        if (!preview) return null;
+        var db = preview.database || {}, lines = [];
+        lines.push(h('div', null, h('strong', null, 'Database: '), db.partial ? 'the ' + D.fmt.plural(db.tables, 'table') + ' the change touched go back.' : 'back to ' + D.fmt.date(db.created_at) + ' (' + D.fmt.plural(db.tables, 'table') + ').'));
+        if (files) {
+          if (preview.removes) lines.push(h('div', null, h('strong', null, 'Removes: '), D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') the moves placed' + (preview.uploads ? ', ' + D.fmt.num(preview.uploads) + ' of them in uploads (' + size(preview.uploads_bytes) + ')' : '') + '.'));
+          if (preview.puts_back) lines.push(h('div', null, h('strong', null, 'Puts back: '), D.fmt.plural(preview.puts_back, 'file') + ' the moves replaced or removed.'));
+          if (!preview.removes && !preview.puts_back) lines.push(h('div', null, h('strong', null, 'Files: '), 'none to change.'));
+        } else {
+          lines.push(h('div', null, h('strong', null, 'Files: '), 'stay as they are' + (preview.removes ? ', including the ' + D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') the moves placed' : '') + '.'));
+        }
+        return D.note('', lines);
+      }
       function showLater() {
         var later = laterThan(p, files);
+        D.mount(sumBox, summary());
         D.mount(laterBox, later.length ? h('div', { class: 'dsk-stack', style: { gap: '4px' } },
           h('p', null, 'First it undoes ', h('strong', null, D.fmt.plural(later.length, 'later move')), ', newest first:'),
           h('ul', { style: { margin: '0 0 0 18px', padding: 0 } }, later.slice(0, 8).map(function (q) {
-            return h('li', null, (q.label || 'Restore point') + ' ', h('span', { class: 'muted' }, '(' + D.fmt.date(q.created_at) + ')'));
+            var t = stepText(q);
+            return h('li', { style: { marginBottom: '4px' } }, (q.label || 'Restore point') + ' ', h('span', { class: 'muted' }, '(' + D.fmt.date(q.created_at) + ')'),
+              t ? h('small', { class: 'muted', style: { display: 'block' } }, t) : null);
           }), later.length > 8 ? h('li', { class: 'muted' }, 'and ' + D.fmt.plural(later.length - 8, 'more')) : null)) : null);
       }
       var opt = function (value, title, text) {
@@ -1448,6 +1479,7 @@
           : h('p', { class: 'muted' }, p.creates_site ? 'The subsite or tenant this move created goes completely: its tables, folders and files.'
             : hasFiles(p) && p.files_spent ? 'Only the database goes back: an earlier rollback already put this point’s files back (a rollback moves them into place, so it can only happen once).'
             : 'The database is replaced with the snapshot.'),
+        sumBox,
         laterBox,
         h('p', { class: 'muted' }, 'Anything changed since is lost.')),
         { title: 'Roll back?', confirmLabel: 'Roll back', danger: true });

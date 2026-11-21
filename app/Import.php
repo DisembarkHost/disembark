@@ -6259,6 +6259,83 @@ class Import {
         return $last;
     }
 
+    /**
+     * What rolling back to this restore point with files would change, read
+     * only: each step (the later points undone first, newest first, then
+     * this one) with the files it removes (the ones its move placed that are
+     * still here, not ones it replaced) and puts back, and the totals. A
+     * database-only rollback changes no files, so the dashboard shows these
+     * as what stays. Sizes are read for up to a few seconds; past that the
+     * counts are still whole and 'partial' says the sizes are a floor.
+     */
+    public function rollback_preview() {
+        $meta = self::rollback_meta( $this->rollback_path );
+        if ( $meta === null ) {
+            return new \WP_Error( 'no_rollback', 'No rollback data found for this import ID.', [ 'status' => 404 ] );
+        }
+        if ( $elsewhere = self::point_elsewhere( $meta ) ) {
+            return new \WP_Error( 'other_site_point', $elsewhere, [ 'status' => 409 ] );
+        }
+        $steps    = self::later_points( $meta, true );
+        $steps[]  = [ 'id' => $this->import_id, 'label' => (string) ( $meta['label'] ?? '' ), 'created_at' => (int) ( $meta['created_at'] ?? 0 ) ];
+        $root     = rtrim( wp_normalize_path( dirname( WP_CONTENT_DIR ) ), '/' );
+        $uploads  = ltrim( substr( wp_normalize_path( (string) wp_upload_dir( null, false )['basedir'] ), strlen( $root ) ), '/' ) . '/';
+        $deadline = microtime( true ) + 6;
+        $partial  = false;
+        // Each file's end state, step by step newest first: the oldest step
+        // that touches a file decides (put back as it was, or removed).
+        $final    = [];
+        foreach ( $steps as $i => $step ) {
+            $m    = $step['id'] === $this->import_id ? $meta : (array) self::rollback_meta( Storage::base_dir() . '/_import_' . $step['id'] . '/rollback' );
+            $with = ! self::files_spent( $m );
+            $row  = [ 'files' => $with, 'spent' => ! $with, 'removes' => 0, 'removes_bytes' => 0, 'uploads' => 0, 'uploads_bytes' => 0, 'puts_back' => 0, 'tables' => count( (array) ( $m['saved_tables'] ?? $m['tables'] ?? [] ) ), 'partial' => ! empty( $m['partial'] ), 'creates_site' => ! empty( $m['target']['created'] ) ];
+            if ( $with ) {
+                $saved            = array_flip( array_map( 'strval', (array) ( $m['backed_up_files'] ?? [] ) ) );
+                $row['puts_back'] = count( $saved );
+                foreach ( $saved as $f => $unused ) {
+                    $final[ $f ] = false;
+                }
+                foreach ( (array) ( $m['deployed_files'] ?? [] ) as $f ) {
+                    $f = (string) $f;
+                    if ( isset( $saved[ $f ] ) ) {
+                        continue;
+                    }
+                    if ( ! $partial && microtime( true ) >= $deadline ) {
+                        $partial = true;
+                    }
+                    $size = 0;
+                    if ( ! $partial ) {
+                        if ( ! is_file( $root . '/' . $f ) && ! isset( $final[ $f ] ) ) {
+                            continue;
+                        }
+                        $size = (int) @filesize( $root . '/' . $f );
+                    }
+                    $row['removes']++;
+                    $row['removes_bytes'] += $size;
+                    if ( strpos( $f, $uploads ) === 0 ) {
+                        $row['uploads']++;
+                        $row['uploads_bytes'] += $size;
+                    }
+                    $final[ $f ] = $size;
+                }
+            }
+            $steps[ $i ] += $row;
+        }
+        $gone  = array_filter( $final, function ( $v ) { return $v !== false; } );
+        $back  = array_filter( $final, function ( $v ) { return $v === false; } );
+        $up    = array_filter( $gone, function ( $f ) use ( $uploads ) { return strpos( $f, $uploads ) === 0; }, ARRAY_FILTER_USE_KEY );
+        return [
+            'steps'         => $steps,
+            'removes'       => count( $gone ),
+            'removes_bytes' => array_sum( $gone ),
+            'uploads'       => count( $up ),
+            'uploads_bytes' => array_sum( $up ),
+            'puts_back'     => count( $back ),
+            'partial'       => $partial,
+            'database'      => [ 'created_at' => (int) ( $meta['created_at'] ?? 0 ), 'tables' => count( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? [] ) ), 'partial' => ! empty( $meta['partial'] ) ],
+        ];
+    }
+
     /** The later restore points a rollback undid first, in words. */
     private static function undone_words( $undone ) {
         $labels = array_map( function ( $u ) { return '"' . $u['label'] . '"'; }, array_slice( $undone, 0, 5 ) );

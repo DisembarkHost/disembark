@@ -615,6 +615,11 @@ class Run {
             'callback' => [ $this, 'restore_points' ],
             'permission_callback' => '__return_true',
         ]);
+        register_rest_route('disembark/v1', '/restore-points/preview', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'restore_point_preview' ],
+            'permission_callback' => '__return_true',
+        ]);
         register_rest_route('disembark/v1', '/restore-points/delete', [
             'methods'  => 'POST',
             'callback' => [ $this, 'delete_restore_point' ],
@@ -1465,6 +1470,18 @@ class Run {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
         return Import::restore_points();
+    }
+
+    /** What rolling back to a restore point would change (see Import::rollback_preview()). */
+    function restore_point_preview( $request ) {
+        if ( ! User::allowed( $request ) ) {
+            return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
+        }
+        $import_id = (string) ( $request['import_id'] ?? '' );
+        if ( ! preg_match( '/^[a-f0-9]{8,64}$/', $import_id ) ) {
+            return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
+        }
+        return ( new Import( $import_id ) )->rollback_preview();
     }
 
     function delete_restore_point( $request ) {
