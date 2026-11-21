@@ -624,6 +624,11 @@ class Import {
             'deployed_files' => [],
             'backed_up_files' => [],
         ];
+        // On a network every site keeps its restore points in the main
+        // site's folder: each lists and rolls back only its own.
+        if ( is_multisite() ) {
+            $meta['blog'] = get_current_blog_id();
+        }
         // Only the tables a change touches (Browse's search and replace):
         // a rollback puts those back and drops nothing.
         if ( $partial ) {
@@ -4748,7 +4753,7 @@ class Import {
         $points = [];
         foreach ( (array) glob( Storage::base_dir() . '/_import_*', GLOB_ONLYDIR ) as $dir ) {
             $meta = self::rollback_meta( $dir . '/rollback' );
-            if ( $meta === null ) {
+            if ( $meta === null || ! self::point_is_here( $meta ) ) {
                 continue;
             }
             $meta_file = is_file( $dir . '/rollback/meta.php' ) ? $dir . '/rollback/meta.php' : $dir . '/rollback/meta.json';
@@ -4775,6 +4780,29 @@ class Import {
         }
         usort( $points, function ( $a, $b ) { return $b['created_at'] - $a['created_at']; } );
         return $points;
+    }
+
+    /**
+     * Whether a restore point belongs to the site this runs as. On a network
+     * every site keeps its points in the main site's folder; one made before
+     * the point recorded its site was the main site's (moves run there).
+     */
+    public static function point_is_here( $meta ) {
+        if ( ! is_multisite() ) {
+            return true;
+        }
+        $blog = (int) ( $meta['blog'] ?? 0 );
+        return ( $blog > 0 ? $blog : (int) get_main_site_id() ) === (int) get_current_blog_id();
+    }
+
+    /** Where to roll back a restore point another site of this network made, in words; null when it's this site's. */
+    public static function point_elsewhere( $meta ) {
+        if ( self::point_is_here( $meta ) ) {
+            return null;
+        }
+        $blog = (int) ( $meta['blog'] ?? 0 ) ?: (int) get_main_site_id();
+        $home = untrailingslashit( (string) get_home_url( $blog ) );
+        return 'This restore point belongs to ' . ( $home !== '' ? $home : 'site ' . $blog ) . ' on this network. Roll it back from that site\'s Disembark' . ( $home !== '' ? ' (or with --url=' . $home . ')' : '' ) . '.';
     }
 
     /**
@@ -4888,6 +4916,46 @@ class Import {
      * goes and what's done is skipped, so it can stop at any point (out of
      * time, a killed request) and simply run again.
      * ---------------------------------------------------------------- */
+
+    /**
+     * Before 3.0 each site of a network kept its moves under its own
+     * uploads (uploads/sites/<id>/disembark). They now live in the main
+     * site's folder, so its restore points move there, marked with the site
+     * they belong to. True when none are left.
+     */
+    public static function adopt_subsite_storage( $deadline ) {
+        if ( ! is_multisite() ) {
+            return true;
+        }
+        $base    = rtrim( wp_normalize_path( Storage::base_dir() ), '/' );
+        $uploads = dirname( $base );
+        $dirs    = array_merge( glob( $uploads . '/sites/*/disembark/_import_*', GLOB_ONLYDIR ) ?: [], glob( wp_normalize_path( WP_CONTENT_DIR ) . '/blogs.dir/*/files/disembark/_import_*', GLOB_ONLYDIR ) ?: [] );
+        foreach ( $dirs as $dir ) {
+            $dir = wp_normalize_path( $dir );
+            if ( microtime( true ) >= $deadline ) {
+                return false;
+            }
+            if ( is_link( $dir ) || strpos( $dir, $base . '/' ) === 0 || ! preg_match( '#/(?:sites|blogs\.dir)/(\d+)/(?:files/)?disembark/_import_([a-f0-9]+)$#', $dir, $m ) || ! self::has_restore_point( $dir ) ) {
+                continue;
+            }
+            $to = $base . '/_import_' . $m[2];
+            if ( file_exists( $to ) ) {
+                continue;
+            }
+            Storage::ensure_dir( $base );
+            if ( ! @rename( $dir, $to ) ) {
+                continue;
+            }
+            $meta = self::rollback_meta( $to . '/rollback' );
+            if ( is_array( $meta ) && empty( $meta['blog'] ) ) {
+                $meta['blog'] = (int) $m[1];
+                if ( self::write_protected( $to . '/rollback/meta.php', (string) json_encode( $meta, JSON_PRETTY_PRINT ) ) ) {
+                    @unlink( $to . '/rollback/meta.json' );
+                }
+            }
+        }
+        return true;
+    }
 
     /** Moves every move folder's legacy files (see above) until $deadline. True when none are left. */
     public static function protect_legacy_storage( $deadline ) {
@@ -5745,6 +5813,9 @@ class Import {
             $meta = self::rollback_meta( $this->rollback_path );
             if ( $meta === null ) {
                 return new \WP_Error( 'no_rollback', 'No rollback data found for this import ID.', [ 'status' => 404 ] );
+            }
+            if ( $elsewhere = self::point_elsewhere( $meta ) ) {
+                return new \WP_Error( 'other_site_point', $elsewhere . ' Nothing was changed.', [ 'status' => 409 ] );
             }
             // Validate the whole snapshot before anything is dropped: a
             // missing, truncated or unreadable snapshot must leave the

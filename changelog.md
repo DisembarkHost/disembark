@@ -28,6 +28,7 @@
 * **Bringing a site into a network trusts its code:** its plugins, themes and uploads join the install's shared folders, so its code runs with access to every site there. The Move panel and the readme now say so.
 
 ### Changed
+* **Each site of a network has its own restore points:** a network's sites now keep their moves in the main site's folder, and each site's Backups tab and `wp disembark restore-points` list only the points that site made. Rolling back another site's point from here stops before anything changes and says which site to run it from. Restore points a subsite kept under its own uploads before move to the main site's folder on the first load after updating.
 * **A new dashboard, without Vue or Vuetify:** Tools → Disembark is rebuilt as plain JavaScript with its own design and a new mark (a freighter in a coral disc). Nothing loads from a CDN any more (Vue, Vuetify, axios, Prism, Material icons and Google Fonts are gone); every script, style and font ships with the plugin. It has four tabs, with light and dark themes:
   * **Move:** every move is from here to there. Pick where the site comes from (this site, another site, a backup zip) and where it goes (this site, another site, a new or replaced subsite or tenant), and Move works out whether that's a pull, a push or a restore. It asks for the one thing it needs (a connect line or a zip) and shows the one warning that matters.
   * **Backups:** download a backup zip, the CLI command, restore points and earlier scans.

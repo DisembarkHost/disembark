@@ -1476,6 +1476,9 @@ class Command {
                 return $p;
             }
         }
+        if ( preg_match( '/^[a-f0-9]+$/', (string) $id ) && is_array( $meta = Import::rollback_meta( Storage::base_dir() . "/_import_{$id}/rollback" ) ) && ( $elsewhere = Import::point_elsewhere( $meta ) ) ) {
+            $this->fail( $elsewhere );
+        }
         $this->fail( "No rollback point with id {$id}. List them with: wp disembark restore-points" );
     }
 
