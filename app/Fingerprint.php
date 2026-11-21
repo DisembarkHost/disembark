@@ -105,9 +105,27 @@ class Fingerprint {
         if ( ! $keys ) {
             return [ 'unknown' => 'no primary key' ];
         }
-        $columns = (array) $wpdb->get_col( 'SHOW COLUMNS FROM ' . $ident );
-        if ( $wpdb->last_error || ! $columns ) {
+        $col_rows = (array) $wpdb->get_results( 'SHOW COLUMNS FROM ' . $ident, ARRAY_A );
+        if ( $wpdb->last_error || ! $col_rows ) {
             return [ 'unknown' => 'SQL error: ' . substr( (string) $wpdb->last_error, 0, 120 ) ];
+        }
+        $columns   = [];
+        $col_types = [];
+        foreach ( $col_rows as $col_row ) {
+            $field = (string) ( $col_row['Field'] ?? '' );
+            if ( $field !== '' ) {
+                $columns[]                         = $field;
+                $col_types[ strtolower( $field ) ] = (string) ( $col_row['Type'] ?? '' );
+            }
+        }
+        if ( ! $columns ) {
+            return [ 'unknown' => 'SQL error: no columns' ];
+        }
+        foreach ( $keys as $key_col ) {
+            $type = $col_types[ strtolower( (string) $key_col ) ] ?? '';
+            if ( $type !== '' && preg_match( '/^(?:binary|varbinary|(?:tiny|medium|long)?blob|bit)\b/i', trim( $type ) ) ) {
+                return [ 'unknown' => 'binary primary key' ];
+            }
         }
         if ( $before_slice ) {
             $cur['tries']++;

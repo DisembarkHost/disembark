@@ -204,6 +204,8 @@ class Verify {
                 $page['problem'] = 'Not found (404). If links 404 across the site, re-save Settings → Permalinks.';
             } elseif ( $code >= 400 && ! in_array( $code, [ 401, 403 ], true ) ) {
                 $page['problem'] = "Answers {$code}";
+            } elseif ( $code >= 300 && $code < 400 ) {
+                $page['problem'] = "Too many redirects ({$code})";
             }
             if ( $old_home !== '' && $body !== '' ) {
                 $mentions = self::count_mentions( $body, $old_home );

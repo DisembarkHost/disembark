@@ -113,7 +113,10 @@ class Pace {
         if ( ! is_file( $file ) ) {
             return null;
         }
-        $size = filesize( $file );
+        $size = @filesize( $file );
+        if ( $size === false || $size <= 0 ) {
+            return null;
+        }
         $h    = @fopen( $file, 'rb' );
         if ( ! $h ) {
             return null;

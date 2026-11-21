@@ -27,10 +27,19 @@ class Pull {
     public function __construct( $import_id = '' ) {
         $this->import         = new Import( $import_id );
         $this->import_id      = $this->import->get_import_id();
-        $base                 = wp_upload_dir()['basedir'] . '/disembark/_import_' . $this->import_id;
+        $base                 = Storage::base_dir() . '/_import_' . $this->import_id;
         $this->staging_public = $base . '/staging/public';
         $this->state_file     = $base . '/pull.json';
         $this->secret_file    = $base . '/pull-secret.php';
+    }
+
+    /** Writes JSON-encoded $data behind the exit line, leaving any existing file intact if encoding fails. */
+    private static function write_protected_json( $file, $data ) {
+        $encoded = wp_json_encode( $data );
+        if ( ! is_string( $encoded ) ) {
+            return false;
+        }
+        return Import::write_protected( $file, $encoded );
     }
 
     public function get_import_id() {
@@ -53,11 +62,14 @@ class Pull {
         Storage::ensure_dir( dirname( $this->state_file ) );
         $secret = array_intersect_key( (array) $state, array_flip( self::SECRETS ) );
         if ( $secret ) {
-            Import::write_protected( $this->secret_file, (string) wp_json_encode( $secret ) );
+            self::write_protected_json( $this->secret_file, $secret );
         } else {
             @unlink( $this->secret_file );
         }
-        file_put_contents( $this->state_file, wp_json_encode( array_diff_key( (array) $state, $secret ) ) );
+        $encoded = wp_json_encode( array_diff_key( (array) $state, $secret ) );
+        if ( is_string( $encoded ) ) {
+            file_put_contents( $this->state_file, $encoded );
+        }
     }
 
     /**
@@ -245,28 +257,62 @@ class Pull {
         return $host === 'localhost' || (bool) preg_match( '/\.(?:localhost|local|test|internal|lan|home\.arpa)$/', $host );
     }
 
+    /** Whether a 4-byte IPv4 address is private, loopback, link-local, shared (CGNAT), reserved or multicast. */
+    private static function internal_ipv4_bytes( $bin ) {
+        $o = array_values( unpack( 'C4', $bin ) );
+        return $o[0] === 0                                                // 0.0.0.0/8
+            || $o[0] === 10                                               // 10.0.0.0/8
+            || ( $o[0] === 100 && $o[1] >= 64 && $o[1] <= 127 )           // 100.64.0.0/10 (CGNAT)
+            || $o[0] === 127                                              // 127.0.0.0/8 (loopback)
+            || ( $o[0] === 169 && $o[1] === 254 )                         // 169.254.0.0/16 (link-local)
+            || ( $o[0] === 172 && $o[1] >= 16 && $o[1] <= 31 )            // 172.16.0.0/12
+            || ( $o[0] === 192 && $o[1] === 0 && $o[2] === 0 )            // 192.0.0.0/24
+            || ( $o[0] === 192 && $o[1] === 0 && $o[2] === 2 )            // 192.0.2.0/24 (TEST-NET-1)
+            || ( $o[0] === 192 && $o[1] === 168 )                         // 192.168.0.0/16
+            || ( $o[0] === 198 && ( $o[1] === 18 || $o[1] === 19 ) )      // 198.18.0.0/15 (benchmarking)
+            || ( $o[0] === 198 && $o[1] === 51 && $o[2] === 100 )         // 198.51.100.0/24 (TEST-NET-2)
+            || ( $o[0] === 203 && $o[1] === 0 && $o[2] === 113 )          // 203.0.113.0/24 (TEST-NET-3)
+            || $o[0] >= 224;                                              // 224.0.0.0/3 (multicast + reserved + broadcast)
+    }
+
     /** Whether $ip is private, loopback, link-local, shared (CGNAT), reserved or multicast. */
     private static function internal_ip( $ip ) {
-        $ip = strtolower( (string) $ip );
-        if ( preg_match( '/^::ffff:(\d+\.\d+\.\d+\.\d+)$/', $ip, $m ) ) {
-            $ip = $m[1];
-        }
-        if ( filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) === false ) {
+        $bin = @inet_pton( trim( (string) $ip ) );
+        if ( $bin === false ) {
             return true;
         }
-        if ( filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 ) ) {
-            $long = ip2long( $ip );
-            foreach ( [ '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.168.0.0/16', '198.18.0.0/15', '224.0.0.0/3' ] as $cidr ) {
-                list( $net, $bits ) = explode( '/', $cidr );
-                $mask = -1 << ( 32 - (int) $bits );
-                if ( ( $long & $mask ) === ( ip2long( $net ) & $mask ) ) {
-                    return true;
-                }
-            }
-            return false;
+        if ( strlen( $bin ) === 4 ) {
+            return self::internal_ipv4_bytes( $bin );
         }
-        // IPv6: loopback, unspecified, unique local, link-local, multicast.
-        return $ip === '::1' || $ip === '::' || (bool) preg_match( '/^(?:f[cd]|fe[89ab]|ff)/', $ip );
+        if ( strlen( $bin ) !== 16 ) {
+            return true;
+        }
+        $b = array_values( unpack( 'C16', $bin ) );
+        // Unspecified (::) and loopback (::1).
+        if ( $bin === str_repeat( "\x00", 16 ) || $bin === str_repeat( "\x00", 15 ) . "\x01" ) {
+            return true;
+        }
+        // Unique local (fc00::/7), link-local (fe80::/10), site-local (fec0::/10), multicast (ff00::/8).
+        if ( ( $b[0] & 0xfe ) === 0xfc || ( $b[0] === 0xfe && ( $b[1] & 0xc0 ) === 0x80 ) || ( $b[0] === 0xfe && ( $b[1] & 0xc0 ) === 0xc0 ) || $b[0] === 0xff ) {
+            return true;
+        }
+        // Discard-only (100::/64) and documentation (2001:db8::/32).
+        if ( substr( $bin, 0, 8 ) === "\x01\x00\x00\x00\x00\x00\x00\x00" || substr( $bin, 0, 4 ) === "\x20\x01\x0d\xb8" ) {
+            return true;
+        }
+        // Embedded IPv4: IPv4-mapped (::ffff:0:0/96), IPv4-compatible (::/96), NAT64 (64:ff9b::/96).
+        $prefix12 = substr( $bin, 0, 12 );
+        if ( $prefix12 === "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff"
+            || $prefix12 === str_repeat( "\x00", 12 )
+            || $prefix12 === "\x00\x64\xff\x9b\x00\x00\x00\x00\x00\x00\x00\x00"
+        ) {
+            return self::internal_ipv4_bytes( substr( $bin, 12, 4 ) );
+        }
+        // 6to4 (2002::/16): embedded IPv4 sits in bytes 2..5.
+        if ( $b[0] === 0x20 && $b[1] === 0x02 ) {
+            return self::internal_ipv4_bytes( substr( $bin, 2, 4 ) );
+        }
+        return false;
     }
 
     /**
@@ -549,13 +595,18 @@ class Pull {
         }
 
         // Probe pretty route, then plain-permalink form, with the token in
-        // the body (see get_with_body()). Only if neither answers, the old
-        // way: a GET with the token in the query string, for a source behind
-        // something that drops the method override.
-        $style = null;
+        // the body (see get_with_body()). Only for a style that explicitly
+        // answered 404 rest_no_route (meaning something in between stripped
+        // X-HTTP-Method-Override) do we retry with GET and the token in the
+        // query string.
+        $style       = null;
+        $allow_query = [];
         foreach ( [ 'body', 'query' ] as $how ) {
             foreach ( [ 'pretty', 'rest_route' ] as $candidate ) {
-                $url  = $source_url . ( $candidate === 'rest_route' ? '/?rest_route=/disembark/v1/database' : '/wp-json/disembark/v1/database' );
+                if ( $how === 'query' && empty( $allow_query[ $candidate ] ) ) {
+                    continue;
+                }
+                $url = $source_url . ( $candidate === 'rest_route' ? '/?rest_route=/disembark/v1/database' : '/wp-json/disembark/v1/database' );
                 for ( $try = 0; $try < 3; $try++ ) {
                     $resp = $how === 'body'
                         ? $this->http( 'POST', $url, [ 'timeout' => 60, 'headers' => [ 'Content-Type' => 'application/json', 'X-HTTP-Method-Override' => 'GET' ], 'body' => wp_json_encode( [ 'token' => $source_token ] ) ] )
@@ -566,11 +617,19 @@ class Pull {
                     }
                     sleep( $try + 1 );
                 }
-                if ( ! is_wp_error( $resp ) && wp_remote_retrieve_response_code( $resp ) === 200 ) {
-                    $tables = json_decode( wp_remote_retrieve_body( $resp ) );
-                    if ( ! empty( $tables ) && is_array( $tables ) ) {
-                        $style = $candidate;
-                        break 2;
+                if ( ! is_wp_error( $resp ) ) {
+                    $code = (int) wp_remote_retrieve_response_code( $resp );
+                    if ( $code === 200 ) {
+                        $tables = json_decode( wp_remote_retrieve_body( $resp ) );
+                        if ( ! empty( $tables ) && is_array( $tables ) ) {
+                            $style = $candidate;
+                            break 2;
+                        }
+                    } elseif ( $how === 'body' && $code === 404 ) {
+                        $error = json_decode( (string) wp_remote_retrieve_body( $resp ), true );
+                        if ( is_array( $error ) && ( $error['code'] ?? '' ) === 'rest_no_route' ) {
+                            $allow_query[ $candidate ] = true;
+                        }
                     }
                 }
             }
@@ -944,7 +1003,7 @@ class Pull {
         $rollback = dirname( $this->state_file ) . '/rollback';
         if ( is_dir( $rollback ) ) {
             $previous = is_file( self::pull_file( $source ) ) ? (string) file_get_contents( self::pull_file( $source ) ) : null;
-            Import::write_protected( $rollback . '/pull-memory.php', (string) wp_json_encode( [ 'file' => self::pull_file( $source ), 'previous' => $previous ] ) );
+            self::write_protected_json( $rollback . '/pull-memory.php', [ 'file' => self::pull_file( $source ), 'previous' => $previous ] );
         }
         $memory = [ 'source' => untrailingslashit( $source ), 'at' => time(), 'files' => $files ];
         // What "What to bring" left behind, so the next catch-up can say
@@ -979,10 +1038,11 @@ class Pull {
         $data  = is_file( $state ) ? json_decode( (string) file_get_contents( $state ), true ) : null;
         if ( is_array( $data ) && ( $secret = array_intersect_key( $data, array_flip( self::SECRETS ) ) ) ) {
             $kept = json_decode( (string) Import::read_protected( $dir . '/pull-secret.php' ), true );
-            $ok   = Import::write_protected( $dir . '/pull-secret.php', (string) wp_json_encode( array_merge( $secret, is_array( $kept ) ? $kept : [] ) ) );
+            $ok   = self::write_protected_json( $dir . '/pull-secret.php', array_merge( $secret, is_array( $kept ) ? $kept : [] ) );
             if ( $ok ) {
-                $tmp = $state . '.tmp';
-                $ok  = @file_put_contents( $tmp, wp_json_encode( array_diff_key( $data, $secret ) ) ) !== false && @rename( $tmp, $state );
+                $tmp  = $state . '.tmp';
+                $body = wp_json_encode( array_diff_key( $data, $secret ) );
+                $ok   = is_string( $body ) && @file_put_contents( $tmp, $body ) !== false && @rename( $tmp, $state );
                 if ( ! $ok ) {
                     @unlink( $tmp );
                 }
@@ -1191,7 +1251,7 @@ class Pull {
             flock( $lock, LOCK_EX );
         }
         $ranges = Pace::ranges_add( $this->fetched_ranges(), $start, $end );
-        Import::write_protected( $dir . '/fetched.php', (string) wp_json_encode( $ranges ) );
+        self::write_protected_json( $dir . '/fetched.php', $ranges );
         if ( $lock ) {
             flock( $lock, LOCK_UN );
             fclose( $lock );
@@ -1323,7 +1383,9 @@ class Pull {
         $key        = md5( $name );
         $part       = "{$work}/{$key}.part";
         $state_file = "{$work}/{$key}.php";
-        $got        = (int) ( json_decode( (string) Import::read_protected( $state_file ), true )['got'] ?? 0 );
+        $got        = max( 0, (int) ( json_decode( (string) Import::read_protected( $state_file ), true )['got'] ?? 0 ) );
+        clearstatcache( true, $part );
+        $got        = is_file( $part ) ? min( $got, (int) @filesize( $part ) ) : 0;
         $h          = @fopen( $part, 'c+b' );
         if ( ! $h ) {
             return new \WP_Error( 'write_failed', 'Could not write to staging (is the disk full?).', [ 'status' => 500 ] );
@@ -1350,7 +1412,7 @@ class Pull {
             }
             fflush( $h );
             $got += $n;
-            Import::write_protected( $state_file, (string) wp_json_encode( [ 'got' => $got ] ) );
+            self::write_protected_json( $state_file, [ 'got' => $got ] );
             $eof = $n < $chunk || ( $size > 0 && $got >= $size );
         } while ( ! $eof && microtime( true ) < $deadline );
         fclose( $h );
@@ -1364,8 +1426,9 @@ class Pull {
             return new \WP_Error( 'write_failed', 'Could not write to staging (is the disk full?).', [ 'status' => 500 ] );
         }
         if ( Import::staged_name( $name ) !== $name ) {
+            $tmp = $dest . '.tmp';
             $in  = @fopen( $part, 'rb' );
-            $out = $in ? @fopen( $dest . '.tmp', 'wb' ) : false;
+            $out = $in ? @fopen( $tmp, 'wb' ) : false;
             $ok  = $in && $out && fwrite( $out, Import::PHP_EXIT ) !== false && stream_copy_to_stream( $in, $out ) !== false;
             if ( $in ) {
                 fclose( $in );
@@ -1373,8 +1436,12 @@ class Pull {
             if ( $out ) {
                 $ok = fclose( $out ) && $ok;
             }
-            $ok = $ok && @rename( $dest . '.tmp', $dest );
-            @unlink( $part );
+            $ok = $ok && @rename( $tmp, $dest );
+            if ( $ok ) {
+                @unlink( $part );
+            } else {
+                @unlink( $tmp );
+            }
         } else {
             $ok = @rename( $part, $dest );
         }
@@ -1484,10 +1551,10 @@ class Pull {
             $st['fp'] = $fingerprints && ! $this->import->target() ? $this->plan_init( $pre, $st['tables'], $schema_only, $skip_unchanged ) : null;
             wp_mkdir_p( $parts_dir );
             @file_put_contents( $part_file, Import::PHP_EXIT );
-            Import::write_protected( $state_file, (string) wp_json_encode( $st ) );
+            self::write_protected_json( $state_file, $st );
         }
         $save = function () use ( &$st, $state_file ) {
-            Import::write_protected( $state_file, (string) wp_json_encode( $st ) );
+            self::write_protected_json( $state_file, $st );
         };
         if ( ! empty( $st['fp'] ) && $st['fp']['phase'] !== 'done' ) {
             $step = $this->plan_step( $st, $deadline, $save );
@@ -1622,7 +1689,7 @@ class Pull {
     }
 
     private function save_plan( $plan ) {
-        Import::write_protected( $this->plan_file(), (string) wp_json_encode( $plan ) );
+        self::write_protected_json( $this->plan_file(), $plan );
     }
 
     /** What the client is told about the plan. */
@@ -1703,31 +1770,80 @@ class Pull {
      * true when done, false when out of time, or WP_Error to try again.
      */
     private function source_fingerprints( $tables, array &$cur, array &$src, array &$why, $deadline, $save ) {
+        $tables = array_values( $tables );
         do {
-            $tries        = (int) ( $cur['tries'] ?? 0 );
+            $t = (int) ( $cur['t'] ?? 0 );
+            if ( $t >= count( $tables ) ) {
+                return true;
+            }
+            $tries = (int) ( $cur['tries'] ?? 0 );
+            $slice = (int) ( $cur['slice'] ?? Fingerprint::SLICE );
+            // Mirror Fingerprint::run()'s halving here too: if the source
+            // keeps dying before answering, its own halving never runs.
+            if ( $tries >= 2 ) {
+                if ( $slice <= Fingerprint::MIN_SLICE ) {
+                    $why[ $tables[ $t ] ] = 'fingerprinting it didn\'t finish in time';
+                    $cur = [
+                        't'      => $t + 1,
+                        'key'    => null,
+                        'rows'   => 0,
+                        's1'     => '0',
+                        's2'     => '0',
+                        'struct' => '',
+                        'slice'  => Fingerprint::SLICE,
+                        'tries'  => 0,
+                        'b'      => (int) ( $cur['b'] ?? Pace::MAX_BUDGET ),
+                        'fails'  => (int) ( $cur['fails'] ?? 0 ),
+                    ];
+                    $save();
+                    if ( $cur['t'] >= count( $tables ) ) {
+                        return true;
+                    }
+                    continue;
+                }
+                $cur['slice'] = max( Fingerprint::MIN_SLICE, (int) ( $slice / 2 ) );
+                $cur['tries'] = 0;
+                $tries        = 0;
+            }
             // The source's own host may stop it sooner than this one stops
             // us: after a failed request it gets half the time ('b' stays here).
             $budget       = (int) min( max( 2, floor( Pace::left( $deadline ) ) - 1 ), (int) ( $cur['b'] ?? Pace::MAX_BUDGET ) );
             if ( $tries > 0 ) {
                 $budget = max( 2, (int) floor( $budget / 2 ) );
             }
-            $sent         = array_diff_key( $cur, [ 'b' => 1 ] );
+            $sent         = array_diff_key( $cur, [ 'b' => 1, 'fails' => 1 ] );
             $cur['tries'] = $tries + 1;
             $cur['b']     = $budget;
             $save();
-            $resp = $this->source_request( '/fingerprint', [ 'tables' => array_values( $tables ), 'cur' => $sent ?: (object) [], 'budget' => $budget ], 'POST', max( 10, (int) ceil( Pace::left( $deadline ) ) + 5 ) );
+            $resp = $this->source_request( '/fingerprint', [ 'tables' => $tables, 'cur' => $sent ?: (object) [], 'budget' => $budget ], 'POST', max( 10, (int) ceil( Pace::left( $deadline ) ) + 5 ) );
             if ( is_wp_error( $resp ) ) {
-                $status = (int) ( $resp->get_error_data()['status'] ?? 0 );
-                if ( in_array( $status, [ 429, 502, 503, 504 ], true ) || self::dropped( $resp ) ) {
+                $data          = $resp->get_error_data();
+                $source_status = is_array( $data ) ? (int) ( $data['source_status'] ?? 0 ) : 0;
+                $dropped       = $resp->get_error_code() === 'source_unreachable' || self::dropped( $resp );
+                $transient     = ( $source_status === 0 && $dropped ) || in_array( $source_status, [ 429, 502, 503, 504 ], true );
+                $fails         = (int) ( $cur['fails'] ?? 0 ) + 1;
+                if ( $transient && $fails < 15 ) {
+                    $cur['fails'] = $fails;
+                    $save();
                     return self::paced_error( $resp );
                 }
                 // Never fails the move: whatever is left is copied.
-                foreach ( array_slice( array_values( $tables ), (int) ( $cur['t'] ?? 0 ) ) as $table ) {
+                foreach ( array_slice( $tables, $t ) as $table ) {
                     $why[ $table ] = 'the source couldn\'t fingerprint it (' . substr( $resp->get_error_message(), 0, 100 ) . ')';
                 }
+                $cur['t'] = count( $tables );
+                $save();
                 return true;
             }
             $resp = json_decode( (string) wp_json_encode( $resp ), true );
+            if ( ! is_array( $resp ) || ( ! array_key_exists( 'results', $resp ) && ! array_key_exists( 'done', $resp ) ) ) {
+                foreach ( array_slice( $tables, $t ) as $table ) {
+                    $why[ $table ] = 'the source returned an unexpected fingerprint response';
+                }
+                $cur['t'] = count( $tables );
+                $save();
+                return true;
+            }
             foreach ( (array) ( $resp['results'] ?? [] ) as $table => $r ) {
                 if ( isset( $r['fp'] ) ) {
                     $src[ $table ] = (string) $r['fp'];
@@ -1735,7 +1851,8 @@ class Pull {
                     $why[ $table ] = (string) ( $r['unknown'] ?? 'unknown' );
                 }
             }
-            $cur      = (array) ( $resp['cur'] ?? [] ) + [ 'b' => $budget ];
+            $cur          = (array) ( $resp['cur'] ?? [] ) + [ 'b' => $budget ];
+            $cur['fails'] = 0;
             $save();
             if ( ! empty( $resp['done'] ) ) {
                 return true;
@@ -1895,7 +2012,7 @@ class Pull {
             $st = [ 'phase' => ! empty( $plan['skipped'] ) && ! empty( $state['source_token'] ) ? 'recheck' : 'cleanup', 'cur' => [], 'src' => [], 'why' => [], 'changed' => [], 'dcur' => [], 'dst' => [], 'dwhy' => [], 'x' => null ];
         }
         $save = function () use ( &$st, $state_file ) {
-            Import::write_protected( $state_file, (string) wp_json_encode( $st ) );
+            self::write_protected_json( $state_file, $st );
         };
         $more = function ( $what, $extra = [] ) use ( &$st, $save ) {
             $save();
@@ -2016,7 +2133,7 @@ class Pull {
             foreach ( $plan['large'] as $t ) {
                 $tables[ $t ] = [ 'src' => $src[ $t ] ?? null, 'dst' => $st['dst'][ $plan['map'][ $t ] ] ?? null, 'as' => $plan['map'][ $t ] ];
             }
-            Import::write_protected( $dir . '/fingerprints.php', (string) wp_json_encode( [ 'tables' => $tables, 'all' => $plan['all'], 'at' => time() ] ) );
+            self::write_protected_json( $dir . '/fingerprints.php', [ 'tables' => $tables, 'all' => $plan['all'], 'at' => time() ] );
             @unlink( $state_file );
             $skipped = array_values( array_diff( (array) $plan['skipped'], $st['changed'] ) );
             return [

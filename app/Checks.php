@@ -208,18 +208,25 @@ class Checks {
 
     private static function table_names( $tables, $source_prefix, $prefix, $add ) {
         global $wpdb;
-        $too_long = [];
-        $names    = [];
+        $too_long    = [];
+        $with_shadow = false;
+        $names       = [];
         foreach ( $tables as $table ) {
             $table = (string) $table;
             $new   = ( $source_prefix !== '' && strpos( $table, $source_prefix ) === 0 ) ? $prefix . substr( $table, strlen( $source_prefix ) ) : $table;
-            if ( strlen( $new ) > 64 ) {
+            if ( strlen( Import::SHADOW_PREFIX . $new ) > 64 ) {
                 $too_long[] = $new;
+                if ( strlen( $new ) <= 64 ) {
+                    $with_shadow = true;
+                }
             }
             $names[] = $new;
         }
         if ( $too_long ) {
-            $add( 'block', 'table_names', 'Table names would be too long', 'With this site\'s table prefix (' . $prefix . '), ' . implode( ', ', array_slice( $too_long, 0, 5 ) ) . ' would be over the 64 characters MySQL allows.' );
+            $detail = 'With this site\'s table prefix (' . $prefix . ')'
+                . ( $with_shadow ? ' and the temporary shadow prefix (' . Import::SHADOW_PREFIX . ') used during the swap' : '' )
+                . ', ' . implode( ', ', array_slice( $too_long, 0, 5 ) ) . ' would be over the 64 characters MySQL allows.';
+            $add( 'block', 'table_names', 'Table names would be too long', $detail );
         }
         $lower = (string) $wpdb->get_var( "SELECT @@lower_case_table_names" );
         if ( $lower !== '' && $lower !== '0' ) {

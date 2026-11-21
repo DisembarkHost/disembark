@@ -46,7 +46,7 @@ class Templates {
             return array_values( array_unique( array_filter( array_map( function ( $v ) { return trim( (string) $v, " /\t\n" ); }, (array) $list ) ) ) );
         };
         $entry = [
-            'name'        => substr( $name, 0, 80 ),
+            'name'        => function_exists( 'mb_substr' ) ? mb_substr( $name, 0, 80, 'UTF-8' ) : substr( $name, 0, 80 ),
             'suggestions' => $clean( $template['suggestions'] ?? [] ),
             'paths'       => $clean( $template['paths'] ?? [] ),
             'rows'        => $clean( $template['rows'] ?? [] ),
@@ -68,10 +68,19 @@ class Templates {
 
     private static function write( $list ) {
         Storage::ensure_dir( Storage::base_dir() );
-        $tmp = self::file() . '.tmp';
-        if ( @file_put_contents( $tmp, "<?php exit; ?>\n" . wp_json_encode( array_values( $list ) ) ) === false ) {
+        $json = wp_json_encode( array_values( $list ) );
+        if ( ! is_string( $json ) ) {
             return false;
         }
-        return @rename( $tmp, self::file() );
+        $tmp = self::file() . '.tmp';
+        if ( @file_put_contents( $tmp, "<?php exit; ?>\n" . $json ) === false ) {
+            @unlink( $tmp );
+            return false;
+        }
+        if ( ! @rename( $tmp, self::file() ) ) {
+            @unlink( $tmp );
+            return false;
+        }
+        return true;
     }
 }
