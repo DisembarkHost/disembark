@@ -1389,30 +1389,44 @@
         h('span', { class: 'r' }, count)),
       body);
     var points = [];
+    function item(p, i) {
+      return h('li', null,
+        h('span', { class: 'by', html: D.H.buoyIcon(BUOYS[i % BUOYS.length]) }),
+        h('div', null,
+          h('b', null, p.label || 'Restore point'),
+          i === 0 ? h('span', { class: 'dsk-tag ok', style: { marginLeft: '8px' } }, 'latest') : null,
+          p.rolled_back_at ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' } }, (hasFiles(p) && !p.files_spent ? 'database rolled back ' : 'rolled back ') + D.fmt.ago(p.rolled_back_at)) : null,
+          hasFiles(p) && p.files_spent ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' }, title: 'A rollback moved this point’s saved files back into place, so it can put back the database only.' }, 'files put back') : null,
+          h('div', { class: 'when' }, D.fmt.date(p.created_at) + ' · ' + D.fmt.size(p.size) + ' · ' + (!hasFiles(p) ? 'database only' : p.files_spent ? 'database (its files were put back)' : 'files and database')),
+          p.left_alone ? h('div', { class: 'when' }, D.OLD_POINT_NOTE) : null),
+        h('div', { class: 'acts' },
+          h('button', { class: 'dsk-btn sm', type: 'button', onclick: function (e) { rollback(p, e.currentTarget); } }, D.icon('restore'), 'Roll back'),
+          h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function (e) { remove(p, e.currentTarget); } }, 'Delete')));
+    }
     async function load() {
-      D.mount(body, h('div', { class: 'dsk-tl-empty' }, h('span', { class: 'dsk-spin' }), ' Loading…'));
-      try { points = await D.api.get('restore-points'); }
+      // The list stays on screen while it refreshes (after a rollback or a
+      // delete); only the first load shows a spinner.
+      if (!body.querySelector('.dsk-tl')) D.mount(body, h('div', { class: 'dsk-tl-empty' }, h('span', { class: 'dsk-spin' }), ' Loading…'));
+      var fresh;
+      try { fresh = await D.api.get('restore-points'); }
       catch (e) { D.mount(body, h('div', { class: 'dsk-tl-empty' }, D.note('error', 'Could not list restore points: ' + D.errorText(e)))); return; }
+      points = Array.isArray(fresh) ? fresh : [];
       var bytes = points.reduce(function (n, p) { return n + (p.size || 0); }, 0);
       count.hidden = !points.length;
       count.textContent = points.length + ' kept · ' + D.fmt.size(bytes);
       if (o.onCount) o.onCount(points.length, bytes, points[0]);
       if (!points.length) { D.mount(body, h('div', { class: 'dsk-tl-empty' }, 'None yet. One is saved automatically before anything changes this site.')); return; }
       var limit = showAll ? points.length : 5;
-      D.mount(body, h('ol', { class: 'dsk-tl' }, points.slice(0, limit).map(function (p, i) {
-        return h('li', null,
-          h('span', { class: 'by', html: D.H.buoyIcon(BUOYS[i % BUOYS.length]) }),
-          h('div', null,
-            h('b', null, p.label || 'Restore point'),
-            i === 0 ? h('span', { class: 'dsk-tag ok', style: { marginLeft: '8px' } }, 'latest') : null,
-            p.rolled_back_at ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' } }, (hasFiles(p) && !p.files_spent ? 'database rolled back ' : 'rolled back ') + D.fmt.ago(p.rolled_back_at)) : null,
-            hasFiles(p) && p.files_spent ? h('span', { class: 'dsk-tag', style: { marginLeft: '8px' }, title: 'A rollback moved this point\u2019s saved files back into place, so it can put back the database only.' }, 'files put back') : null,
-            h('div', { class: 'when' }, D.fmt.date(p.created_at) + ' · ' + D.fmt.size(p.size) + ' · ' + (!hasFiles(p) ? 'database only' : p.files_spent ? 'database (its files were put back)' : 'files and database')),
-            p.left_alone ? h('div', { class: 'when' }, D.OLD_POINT_NOTE) : null),
-          h('div', { class: 'acts' },
-            h('button', { class: 'dsk-btn sm', type: 'button', onclick: function (e) { rollback(p, e.currentTarget); } }, D.icon('restore'), 'Roll back'),
-            h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function (e) { remove(p, e.currentTarget); } }, 'Delete')));
-      })), points.length > limit ? h('div', { class: 'dsk-tl-more' }, h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function () { showAll = true; load(); } }, 'Show all ' + points.length)) : null);
+      var list = h('ol', { class: 'dsk-tl' }, points.slice(0, limit).map(item));
+      var more = points.length > limit ? h('div', { class: 'dsk-tl-more' }, h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function () {
+        // The rest join the list below the ones showing; nothing reloads.
+        showAll = true;
+        var first = list.children.length;
+        points.slice(first).forEach(function (p, j) { list.appendChild(item(p, first + j)); });
+        more.remove();
+        if (list.children[first]) list.children[first].querySelector('button').focus({ preventScroll: true });
+      } }, 'Show all ' + points.length)) : null;
+      D.mount(body, list, more);
     }
     function hasFiles(p) { return !!(p.files || p.deployed); }
     /** The restore points made after p that rolling back to it undoes first, newest first (matches Import::later_points()). */
