@@ -869,3 +869,26 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
 .dsk-bk-steps .dsk-step .meta:empty { display: none; }
 .dsk-bk-steps .dsk-progress { max-width: 100%; }
 .dsk-bk-cli .dsk-cmd pre { word-break: normal; overflow-wrap: anywhere; }
+
+/* Selects: WordPress's forms.css colours select text blue on hover and
+   focus, which vanishes on the dark theme. */
+.dsk select:hover, .dsk select:focus, .dsk .dsk-select:hover, .dsk .dsk-select:focus { color: var(--ink); }
+.dsk select option { background: var(--surface); color: var(--ink); }
+
+/* Autocomplete picker (D.combo) */
+.dsk-combo { position: relative; display: flex; align-items: center; min-width: 0; }
+.dsk-combo > .dsk-icon, .dsk-combo > svg { position: absolute; left: 12px; width: 15px; height: 15px; color: var(--ink-3); pointer-events: none; }
+.dsk .dsk-combo .dsk-input { padding: 0 34px 0 36px; text-overflow: ellipsis; cursor: pointer; }
+.dsk .dsk-combo .dsk-input:focus { cursor: text; }
+.dsk-combo-caret { position: absolute; right: 13px; width: 8px; height: 8px; border-right: 1.5px solid var(--ink-3); border-bottom: 1.5px solid var(--ink-3); transform: translateY(-2px) rotate(45deg); pointer-events: none; }
+.dsk-combo-list { position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 40; margin: 0; padding: 6px; list-style: none; max-height: 320px; overflow: auto;
+  background: var(--surface); border: 1px solid var(--line-2); border-radius: 12px; box-shadow: var(--shadow); }
+.dsk-combo-list[hidden] { display: none; }
+.dsk-combo-opt { display: flex; flex-direction: column; gap: 1px; margin: 0; padding: 8px 10px 8px 30px; border-radius: 8px; cursor: pointer; position: relative; }
+.dsk-combo-opt .l { color: var(--ink); font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsk-combo-opt .sub { color: var(--ink-3); font-family: var(--mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsk-combo-opt.on { background: var(--surface-2); }
+.dsk-combo-opt[aria-selected="true"]::before { content: ""; position: absolute; left: 12px; top: 13px; width: 5px; height: 9px; border-right: 2px solid var(--accent); border-bottom: 2px solid var(--accent); transform: rotate(45deg); }
+.dsk-combo-none { padding: 10px; color: var(--ink-3); font-size: 13.5px; }
+.dsk .dsk-bk-scope .dsk-combo { flex: 0 1 380px; }
+.dsk .dsk-into .dsk-combo { max-width: 460px; }
