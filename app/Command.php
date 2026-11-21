@@ -437,6 +437,10 @@ class Command {
             if ( ! empty( $sq['tables_left_out'] ) ) {
                 $this->say( '      Left out ' . self::plural( (int) $sq['tables_left_out'], 'table' ) . ' without the source\'s prefix (' . $src_prefix . '), so nothing else here is touched.' );
             }
+            if ( ! empty( $sq['left_out_words'] ) ) {
+                $summary['left_out'] = $sq['left_out'] ?? [];
+                $this->say( '      ! ' . $sq['left_out_words'] );
+            }
             $brought = $pull->super_admins_brought();
             if ( $brought ) {
                 $summary['super_admins'] = $brought;
@@ -878,6 +882,10 @@ class Command {
             if ( ! empty( $sq['tables_left_out'] ) ) {
                 $summary['tables_left_out'] = (int) $sq['tables_left_out'];
                 $this->say( '      Left out ' . self::plural( (int) $sq['tables_left_out'], 'table' ) . ' without the source\'s prefix (' . $src_prefix . '), so nothing else here is touched.' );
+            }
+            if ( ! empty( $sq['left_out_words'] ) ) {
+                $summary['left_out'] = $sq['left_out'] ?? [];
+                $this->say( '      ! ' . $sq['left_out_words'] );
             }
             if ( isset( $sq['users'] ) && ( $sq['users']['created'] || $sq['users']['matched'] ) ) {
                 $summary['users'] = $sq['users'];

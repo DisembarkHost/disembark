@@ -221,6 +221,7 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
 .dsk-log .err { color: #ffab95; }
 .dsk-log .dim { color: var(--term-dim); }
 .dsk-log .ok { color: #7fdcc8; }
+.dsk-log .warn { color: #f2c97d; }
 
 /* Progress */
 .dsk-progress { height: 8px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
@@ -569,7 +570,7 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
 .dsk-movelog summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); padding: 6px 2px; }
 .dsk-movelog summary::-webkit-details-marker { display: none; }
 .dsk-movelog .dsk-log { margin-top: 8px; max-height: 260px; }
-.dsk-movelog .dsk-log .err { color: #f0846e; } .dsk-movelog .dsk-log .ok { color: #7ed3c4; } .dsk-movelog .dsk-log .dim { color: var(--term-dim); }
+.dsk-movelog .dsk-log .err { color: #f0846e; } .dsk-movelog .dsk-log .ok { color: #7ed3c4; } .dsk-movelog .dsk-log .dim { color: var(--term-dim); } .dsk-movelog .dsk-log .warn { color: #f2c97d; }
 
 /* Arrived */
 .dsk-after { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; margin-top: 16px; }

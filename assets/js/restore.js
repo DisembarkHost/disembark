@@ -1217,6 +1217,7 @@
           }
           if (sq.tables_swapped) rlog('Swapped in ' + D.fmt.plural(sq.tables_swapped, 'imported table') + '.', 'dim');
           if (sq.tables_left_out) rlog('Left out ' + D.fmt.plural(sq.tables_left_out, 'table') + ' without the source\u2019s prefix, so nothing else here is touched.', 'dim');
+          if (sq.left_out_words) rlog(sq.left_out_words, 'warn');
           if (superBrought.length) rlog('Brought ' + D.fmt.plural(superBrought.length, 'super admin') + ' as administrators: ' + superBrought.join(', ') + '.', 'ok');
           // Into the network's main site: the network kept its users, and the incoming ones joined them.
           if (sq.users && !target) ctx.keptUsers = true;

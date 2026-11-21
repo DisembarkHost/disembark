@@ -1292,6 +1292,7 @@ class Import {
 
         $foreign  = $saved ? (int) $saved['foreign'] : 0;
         $refused  = $saved ? (int) $saved['refused'] : 0;
+        $left     = $saved ? (array) ( $saved['left'] ?? [] ) : [];
         $run      = $this->begin_statements();
         $count    = $saved ? (int) $saved['count'] : 0;
         $swap     = $saved ? $saved['swap'] : self::swap_start();
@@ -1354,7 +1355,7 @@ class Import {
             }
             return true;
         };
-        $read     = self::each_sql_statement_in_file( $path, function ( $statement, $end, $delim = ';' ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, &$imported, &$stop_at, &$stop_delim, &$pending, $exec, $flush, $max, $old_prefix, $new_prefix, $skip_rows, $target, $paced, $deadline, $replay_to, $journal, $shared_main, $in_users ) {
+        $read     = self::each_sql_statement_in_file( $path, function ( $statement, $end, $delim = ';' ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, &$left, &$imported, &$stop_at, &$stop_delim, &$pending, $exec, $flush, $max, $old_prefix, $new_prefix, $skip_rows, $target, $paced, $deadline, $replay_to, $journal, $shared_main, $in_users ) {
             $dry = $end <= $replay_to;
             if ( ++$count % 500 === 0 && ! $dry && $this->cancelled() ) {
                 $run['errors'][] = 'Cancelled.';
@@ -1396,6 +1397,7 @@ class Import {
                     $foreign++;
                 } elseif ( $verdict === 'refused' ) {
                     $refused++;
+                    self::note_left_out( $left, $statement );
                 }
                 // 'skip': mysqldump's own session bookkeeping, left out quietly.
                 if ( $verdict !== 'ok' ) {
@@ -1425,6 +1427,7 @@ class Import {
                     $tname = self::statement_table( $t );
                     if ( $tname !== null && strpos( $tname, $new_prefix ) !== 0 ) {
                         $refused++;
+                        self::note_left_out( $left, $t );
                         continue;
                     }
                     $safe[] = $t;
@@ -1521,6 +1524,7 @@ class Import {
                 'warnings' => $run['warnings'] ?? [],
                 'foreign'  => $foreign,
                 'refused'  => $refused,
+                'left'     => $left,
                 'swap'     => $swap,
                 'compat'   => array_intersect_key( $compat, array_flip( [ 'converted', 'definers_removed', 'map' ] ) ),
                 'expected' => $expected,
@@ -1581,6 +1585,10 @@ class Import {
             $result['target']         = $target->info();
             $result['tables_left_out'] = $foreign;
             $result['statements_refused'] = $refused;
+            $result['left_out']           = self::left_out_counts( $left );
+            if ( $words = self::left_out_words( $left, $target->kind ) ) {
+                $result['left_out_words'] = $words;
+            }
             if ( $refused ) {
                 $result['warnings'][] = "Left out {$refused} statements that would have changed something other than the incoming site's own tables.";
                 error_log( "Disembark: import {$this->import_id} into {$target->kind} {$target->id} left out {$refused} statements outside the source's tables." );
@@ -3226,6 +3234,60 @@ class Import {
     /** The incoming users of a whole-site move into a network's main site wait under {base}{this}users (see import_staged_sql()). */
     const INCOMING_USERS = 'dskin_';
 
+    /**
+     * Records what a statement left out of a subsite or tenant import made:
+     * views, triggers and routines by name (a dump may define one twice),
+     * anything else counted. A dump's own session and transaction lines and
+     * the drops that go with a create aren't worth telling.
+     */
+    private static function note_left_out( array &$left, $statement ) {
+        $flat = trim( (string) preg_replace( '/\s+/', ' ', (string) preg_replace( '/\/\*M?!\d*|\*\//', ' ', substr( self::strip_leading_comments( (string) $statement ), 0, 600 ) ) ) );
+        if ( $flat === '' || preg_match( '/^(?:DROP|SET|COMMIT|ROLLBACK|BEGIN|START\s+TRANSACTION|(?:UN)?LOCK\s+TABLES?|USE|DELIMITER)\b|^\\\\-/i', $flat ) ) {
+            return;
+        }
+        if ( preg_match( '/^CREATE\b.*?\b(VIEW|TRIGGER|PROCEDURE|FUNCTION|EVENT)\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`((?:[^`]|``)+)`|([A-Za-z0-9_$]+))/i', $flat, $m ) ) {
+            $kind = strtolower( $m[1] );
+            $kind = $kind === 'view' || $kind === 'trigger' ? $kind : 'routine';
+            $name = strtolower( ( $m[2] ?? '' ) !== '' ? $m[2] : ( $m[3] ?? '' ) );
+            $left[ $kind ][ $name ] = 1;
+            return;
+        }
+        $left['other'] = (int) ( $left['other'] ?? 0 ) + 1;
+    }
+
+    /** What a subsite or tenant import left out, counted: [ view => n, trigger => n, routine => n, other => n ]. */
+    private static function left_out_counts( $left ) {
+        $out = [];
+        foreach ( [ 'view', 'trigger', 'routine' ] as $k ) {
+            if ( ! empty( $left[ $k ] ) && is_array( $left[ $k ] ) ) {
+                $out[ $k ] = count( $left[ $k ] );
+            }
+        }
+        if ( ! empty( $left['other'] ) ) {
+            $out['other'] = (int) $left['other'];
+        }
+        return $out;
+    }
+
+    /** What a subsite or tenant import left out, in words, or ''. */
+    private static function left_out_words( $left, $kind ) {
+        $left  = self::left_out_counts( $left );
+        $names = [ 'view' => [ 'view', 'views' ], 'trigger' => [ 'trigger', 'triggers' ], 'routine' => [ 'stored routine or event', 'stored routines or events' ], 'other' => [ 'other statement', 'other statements' ] ];
+        $parts = [];
+        foreach ( $names as $k => $n ) {
+            $c = (int) ( $left[ $k ] ?? 0 );
+            if ( $c > 0 ) {
+                $parts[] = $c . ' ' . ( $c === 1 ? $n[0] : $n[1] );
+            }
+        }
+        if ( ! $parts ) {
+            return '';
+        }
+        $list = count( $parts ) > 1 ? implode( ', ', array_slice( $parts, 0, -1 ) ) . ' and ' . end( $parts ) : $parts[0];
+        $one  = $kind === 'multisite' ? 'subsite' : 'tenant';
+        return "Left out {$list} from the incoming database: a {$one} takes only the site's own tables and rows, so nothing reaches the rest of this install.";
+    }
+
     /** The table or view a DML/DDL statement names, or null. */
     private static function statement_table( $statement ) {
         $clean = self::strip_leading_comments( (string) $statement );
@@ -3458,6 +3520,11 @@ class Import {
                 return self::dump_session_restore( $sql ) ? 'skip' : 'refused';
             }
             if ( preg_match( '/^ALTER\s+TABLE\s+`((?:[^`]|``)+)`\s+(?:DISABLE|ENABLE)\s+KEYS\s*$/i', $sql ) ) {
+                return 'skip';
+            }
+            // mariadb-dump's first line (/*M!999999\- enable the sandbox
+            // mode */) is a note for the mariadb client, not a statement.
+            if ( preg_match( '/^\\\\-\s/', $sql ) ) {
                 return 'skip';
             }
             return 'refused';
