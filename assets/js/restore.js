@@ -197,9 +197,9 @@
     // Under the stops: a spinner, what's happening, a bar (filled when the
     // message says "N of M", sliding otherwise), the percent and a running
     // clock, so a long step still visibly moves.
-    var lineText = h('span', { class: 't', 'aria-live': 'polite' }), linePct = h('span', { class: 'pct' }), lineClock = h('span', { class: 'clock', title: 'Time since the move started' });
+    var lineText = h('span', { class: 't', 'aria-live': 'polite' }), lineClock = h('span', { class: 'clock', title: 'Time since the move started' });
     var lineBar = D.progress(); lineBar.set(null);
-    var line = h('div', { class: 'dsk-voy-line' }, h('div', { class: 'row' }, h('span', { class: 'dsk-spin', 'aria-hidden': 'true' }), lineText, linePct, lineClock), lineBar);
+    var line = h('div', { class: 'dsk-voy-line' }, h('div', { class: 'row' }, h('span', { class: 'dsk-spin', 'aria-hidden': 'true' }), lineText, lineClock), lineBar);
     var began = Date.now(), clockTimer = 0;
     function tickClock() {
       var s = Math.max(0, Math.round((Date.now() - began) / 1000)), m = Math.floor(s / 60), hr = Math.floor(m / 60);
@@ -469,8 +469,7 @@
     function progress(text) {
       lineText.textContent = text || (line.classList.contains('busy') ? 'Working\u2026' : '');
       var m = /([\d][\d,]*)\s+of\s+([\d][\d,]*)/.exec(text || ''), n = m ? +m[1].replace(/,/g, '') : 0, of = m ? +m[2].replace(/,/g, '') : 0;
-      if (of > 0) { var pc = Math.min(100, n / of * 100); lineBar.set(pc); linePct.textContent = Math.floor(pc) + '%'; }
-      else { lineBar.set(null); linePct.textContent = ''; }
+      lineBar.set(of > 0 ? Math.min(100, n / of * 100) : null);
     }
     // Running, paused or ended follows the header's live dot.
     function lineState() {
