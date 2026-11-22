@@ -250,7 +250,7 @@ class Command {
         $this->say( '[1/9] Checking this site' );
         // In a subsite's or tenant's context, the pull would replace the
         // install's shared files: refused before anything is copied.
-        if ( $refused = Import::here_refusal() ) {
+        if ( $refused = Import::sqlite_refusal() ?: Import::here_refusal() ) {
             $this->fail( $refused->get_error_message(), 'preflight' );
         }
         if ( ! $resuming ) {
@@ -699,7 +699,7 @@ class Command {
         if ( ! empty( $assoc_args['files-only'] ) && isset( $assoc_args['database'] ) ) {
             $this->fail( '--database and --files-only don\'t go together: pick one.' );
         }
-        if ( $refused = Import::here_refusal() ) {
+        if ( $refused = Import::sqlite_refusal() ?: Import::here_refusal() ) {
             $this->fail( $refused->get_error_message(), 'preflight' );
         }
         $import_id = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
