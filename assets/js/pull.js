@@ -61,7 +61,7 @@
         (m.started ? 'Started ' + D.fmt.ago(m.started) + ', last active ' : 'Last active ') + D.fmt.ago(m.touched) + '. ' + where,
         m.rollback_point && m.idle_days >= 7 ? ' It has waited ' + D.fmt.plural(m.idle_days, 'day') + ': it stays until you resume it, discard it or roll it back.' : '',
         m.rollback_point && m.left_alone ? ' ' + (D.OLD_POINT_NOTE || '') : '',
-        m.active ? h('div', { style: { marginTop: '8px' } }, h('strong', null, 'Still running: '), 'it was active ' + D.fmt.ago(m.touched) + '. Resume and Discard wait until it stops.') : null,
+        m.active ? h('div', { style: { marginTop: '8px' } }, h('strong', null, 'Still running: '), 'it was active ' + (m.active_ago >= 0 ? D.fmt.plural(Math.round(m.active_ago), 'second') + ' ago' : D.fmt.ago(m.touched)) + '. Resume and Discard wait until it stops.') : null,
         h('div', { class: 'dsk-row', style: { marginTop: '10px' } },
           cli ? h('code', null, 'wp disembark pull --resume=' + m.id)
             : h('button', { class: 'dsk-btn primary sm', type: 'button', disabled: !!m.active, onclick: function (e) { resume(m, e.currentTarget); } }, D.icon('play'), 'Resume'),
