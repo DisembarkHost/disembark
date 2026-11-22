@@ -77,7 +77,7 @@
     D.store.on(['diskSize', 'lastScan'], renderStorage);
     renderStorage();
     loadPoints();
-    var withPoints = D.toggle('Also delete restore points', false, function () {});
+    var withPoints = D.toggle('Also delete this site’s restore points', false, function () {});
 
     /* Appearance */
     // Made once; syncing only moves the pressed state, so focus stays put.
@@ -223,15 +223,19 @@
 
     async function cleanup(e) {
       var btn = e.currentTarget, all = withPoints.input.checked;
-      var ok = await D.confirm(all ? 'This removes every scan, export and zip, and every restore point. Restores already done can no longer be rolled back.' : 'This removes every scan, export and zip. Restore points stay.', { title: 'Clean up working files?', confirmLabel: 'Clean up', danger: all });
-      if (!ok) return;
+      // A move this page is driving keeps its staging folder and restore point.
+      if (D.movesRunning > 0) { D.toast('A move is running in this tab. Clean up once it finishes.', 'error'); return; }
+      var ok = await D.confirm(all ? 'This removes every scan, export and zip, and this site’s restore points. Moves already done here can no longer be rolled back. A move still running keeps its files.' : 'This removes every scan, export and zip. Restore points stay, and a move still running keeps its files.', { title: 'Clean up working files?', confirmLabel: 'Clean up', danger: all });
+      if (!ok || D.movesRunning > 0) return;
       await D.busy(btn, async function () {
         try {
-          await D.api.post('cleanup', all ? { include_restore_points: 1 } : {});
+          var r = await D.api.post('cleanup', all ? { include_restore_points: 1 } : {});
           D.store.set({ scanned: false, files: [], index: null, excluded: new Set(), backupToken: '' });
           await D.loadStatus();
           loadPoints();
-          D.toast('Working files cleaned up.');
+          // The site leaves a move it saw active alone (skipped_active: a list, or how many).
+          var sk = r && r.skipped_active, n = Array.isArray(sk) ? sk.length : (+sk || 0);
+          D.toast('Working files cleaned up.' + (n ? ' ' + D.fmt.plural(n, 'move') + ' still running ' + (n === 1 ? 'was' : 'were') + ' left alone.' : ''));
         } catch (err) { D.toast('Cleanup failed: ' + D.errorText(err), 'error'); }
       });
     }
