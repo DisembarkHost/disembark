@@ -986,6 +986,13 @@ class Run {
      * refused.
      */
     private function browse_file( $params, $path ) {
+        // Browse lists plain paths: a "." or ".." segment only ever climbs
+        // somewhere the list didn't show.
+        foreach ( explode( '/', str_replace( '\\', '/', (string) $path ) ) as $seg ) {
+            if ( $seg === '.' || $seg === '..' ) {
+                return new \WP_Error( 'invalid_path', 'Invalid file path.', [ 'status' => 400 ] );
+            }
+        }
         $scope = Scope::from_request( (array) $params );
         if ( is_wp_error( $scope ) ) {
             return $scope;
@@ -996,6 +1003,20 @@ class Run {
         $real = $scope->file_in( (string) $path );
         if ( $scope->file_out( $real ) === null ) {
             return new \WP_Error( 'other_site_file', 'That file belongs to another site of this install.', [ 'status' => 403 ] );
+        }
+        // And the file it really is, after any link: still this site's.
+        foreach ( array_unique( [ realpath( dirname( WP_CONTENT_DIR ) ), realpath( ABSPATH ) ] ) as $root ) {
+            $abs = $root ? realpath( $root . '/' . ltrim( $real, '/' ) ) : false;
+            if ( ! $abs ) {
+                continue;
+            }
+            $root = rtrim( wp_normalize_path( $root ), '/' );
+            $abs  = wp_normalize_path( $abs );
+            $rel  = strpos( $abs, $root . '/' ) === 0 ? substr( $abs, strlen( $root ) + 1 ) : null;
+            if ( $rel === null || $scope->file_out( $rel ) === null ) {
+                return new \WP_Error( 'other_site_file', 'That file belongs to another site of this install.', [ 'status' => 403 ] );
+            }
+            break;
         }
         return $real;
     }
