@@ -46,6 +46,11 @@
       });
       Object.keys(kids).forEach(function (k) { kids[k].sort(function (a, b) { return (b.dir - a.dir) || (b.bytes - a.bytes); }); });
       var sugg = c.suggestions || [], prefix = String(c.prefix || '').toLowerCase();
+      // Tables WordPress can't run without: brought across empty they leave
+      // a site with no settings or no one to log in as. Their rows always come.
+      var bare = prefix.replace(/[^a-z0-9_]/g, '');
+      var coreRe = new RegExp('^' + bare + '(?:(?:\\d+_)?options|users|usermeta|site|sitemeta|blogs)$');
+      function isCore(name) { return !!bare && coreRe.test(String(name).toLowerCase()); }
       var tableBytes = {};
       (c.tables || []).forEach(function (t) { tableBytes[t.name] = t.size; });
 
@@ -91,6 +96,7 @@
         sugg.forEach(function (s) { if (on.has(s.id)) (s.tables || []).forEach(function (t) { all.add(t); }); });
         rows.forEach(function (t) { all.add(t); });
         keepRows.forEach(function (t) { all.delete(t); });
+        all.forEach(function (t) { if (isCore(t)) all.delete(t); });
         return Array.from(all);
       }
       /** What leaves this path behind: { by: suggestion | null, path } or null. */
@@ -211,6 +217,7 @@
         D.mount(tables, (c.tables || []).map(function (t) {
           var empty = skip.has(t.name);
           var flip = function () {
+            if (!empty && isCore(t.name)) { D.toast(t.name + ' always comes with its rows: WordPress can’t run without them.', 'error'); return; }
             if (empty) { if (rows.has(t.name)) rows.delete(t.name); else keepRows.add(t.name); }
             else { if (keepRows.has(t.name)) keepRows.delete(t.name); else rows.add(t.name); }
             render();
