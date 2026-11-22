@@ -4399,7 +4399,7 @@ class Import {
         // PHP's backtracking room and reads as "invalid data" though every
         // byte is the database's own. The statement passed Disembark's own
         // checks already, so it goes to the database as it is.
-        if ( $result === false && strpos( (string) $wpdb->last_error, 'contains invalid data' ) !== false ) {
+        if ( $result === false && self::invalid_data_error( (string) $wpdb->last_error ) ) {
             $result = self::raw_query( $statement );
         }
         if ( $result === false && preg_match( '/^CREATE\s+TABLE\s+`((?:[^`]|``)+)`/i', $statement, $cm ) && preg_match( '/already exists/i', (string) $wpdb->last_error ) ) {
@@ -4438,13 +4438,37 @@ class Import {
         if ( ! ( $dbh instanceof \mysqli ) ) {
             return false;
         }
-        $ok = @mysqli_query( $dbh, $sql );
+        // PHP 8.1 makes mysqli throw on an error by default.
+        try {
+            $ok = @mysqli_query( $dbh, $sql );
+        } catch ( \Throwable $e ) {
+            $wpdb->last_error = $e->getMessage();
+            return false;
+        }
         if ( $ok === false ) {
             $wpdb->last_error = (string) mysqli_error( $dbh );
             return false;
         }
+        if ( $ok instanceof \mysqli_result ) {
+            mysqli_free_result( $ok );
+        }
         $wpdb->last_error = '';
         return (int) mysqli_affected_rows( $dbh );
+    }
+
+    /**
+     * Whether $error is wpdb's refusal of a query it couldn't check, in
+     * English or in the site's language (WordPress translates it).
+     */
+    private static function invalid_data_error( $error ) {
+        if ( $error === '' ) {
+            return false;
+        }
+        $english = 'WordPress database error: Could not perform query because it contains invalid data.';
+        if ( strpos( $error, 'contains invalid data' ) !== false || $error === $english ) {
+            return true;
+        }
+        return function_exists( '__' ) && $error === __( $english );
     }
 
     private function end_statements( $run ) {
