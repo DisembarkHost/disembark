@@ -4849,7 +4849,11 @@ class Import {
 
                 foreach ( $rows as $row ) {
                     $update = [];
-                    foreach ( $row as $column => $value ) {
+                    // The held address is this site's already (see
+                    // hold_address()); rewritten, a move into a subfolder of
+                    // the source would serve the subfolder twice.
+                    $held = isset( $row['option_name'] ) && $row['option_name'] === self::HOLD_OPTION;
+                    foreach ( $held ? [] : $row as $column => $value ) {
                         if ( ! is_string( $value ) || $value === '' ) {
                             continue;
                         }
@@ -6797,8 +6801,12 @@ class Import {
         if ( $raw === '' || $raw === $here ) {
             return;
         }
-        $swap = function ( $url ) use ( $raw, $here ) {
-            return is_string( $url ) && strpos( $url, $raw ) === 0 ? $here . substr( $url, strlen( $raw ) ) : $url;
+        // Either scheme (WordPress gives the address the request's), and
+        // only a whole host and path: the source's address up to a slash or
+        // the end.
+        $bare = preg_quote( (string) preg_replace( '#^https?://#i', '', $raw ), '#' );
+        $swap = function ( $url ) use ( $bare, $here ) {
+            return is_string( $url ) ? (string) preg_replace( '#^https?://' . $bare . '(?=/|$)#i', $here, $url, 1 ) : $url;
         };
         add_filter( 'content_url', $swap );
         add_filter( 'plugins_url', $swap );
