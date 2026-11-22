@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## **v3.0.0** - November 21, 2026
 
 ### Security
 * **A failed swap can't leave a table missing:** the import put each imported table in place by dropping the live one and then renaming the copy, so a rename that failed (a database that can't rename tables, a lock) left the site without that table. The live table and the copy now trade places in one atomic rename, and the old one goes only after that worked; a failure leaves the live table exactly as it was.
@@ -27,6 +27,16 @@
 * **The host's firewall secrets stay with the host:** Kinsta's Patchstack options (`patchstack_*`, and `webarx_*` from before Patchstack's rename, the site's Patchstack API token among them) travelled with every pull, push and restore, so each copy carried the source's token. Like the host's mu-plugins and tables, they now stay with the server: a move keeps the destination's own and leaves the source's behind, into a subsite or tenant too. The list lives in one place (`Import::HOST_OPTIONS`).
 * **A move into a network's main site rewrites only that site:** the address rewrite after a whole-site move covered every table under the network's base prefix, which on a network is every subsite's tables and the network's users and sites too, and the checks after the move counted the old address there as leftovers. Both now cover the main site's own tables and the ones the move imported.
 * **Bringing a site into a network trusts its code:** its plugins, themes and uploads join the install's shared folders, so its code runs with access to every site there. The Move panel and the readme now say so.
+* **Fewer ways past the dump checks:** the checks that keep an incoming database to this site's own tables and away from the database server now also see through a statement wrapped in an executable comment (`/*! … */`, or MariaDB's `/*M! … */`), a table name without backticks or with a database in front of it, `RENAME TABLE` or a `DROP` or `LOCK` naming several tables at once, a trigger or routine whose body is a single statement without `BEGIN`, and a `CREATE TABLE` that names its storage engine before its columns. They also refuse `PREPARE`/`EXECUTE`, `INSTALL COMPONENT`, and a dump that switches `sql_mode` to `NO_BACKSLASH_ESCAPES` or `ANSI_QUOTES` or the connection to a character set other than utf8, utf8mb4, latin1, ascii or binary, since each changes how the rest of the dump is read. A `;` inside an executable comment no longer ends a statement early, and a dump that ends inside one counts as cut off.
+* **Files still being written can't be read from the web:** restore-point dumps, a pull's saved source token, notification webhooks and a move's other protected files were written first under a temporary name that the web server sent out as plain text, and a write the host cut off left that copy behind. The temporary copies are now protected the same way as the finished files.
+* **Rolling back a new subsite leaves the other subsites' uploads alone:** when a move into a network was the one that created the shared `uploads/sites` (or `blogs.dir`) folder, rolling it back deleted that whole folder, including the uploads of subsites made since. A rollback now removes only the new site's own folder, and removes the shared folder only when nothing else is in it. A new WP Freighter tenant's own folder is removed with it on an install that shares only some files, too.
+* **Customers who couldn't be added aren't left under someone else's account:** when an incoming site's users join a network, content by a user who couldn't be added (or one the source had deleted) gets no author. In WooCommerce's customer lookup, where each user ID may appear only once, two such customers both set to 0 made the update fail, and they kept user IDs that belong to other people on the network. A column that allows it is now left empty instead of 0.
+* **More hardening:**
+  * Pulls treat more addresses as internal: IPv4 addresses written inside IPv6 ones, IPv6 site-local and documentation ranges, the IPv4 test ranges, and any address that doesn't parse.
+  * `wp disembark pull` now stops when the checks before a move refuse it (it carried on), and `--into` no longer gets it past the refusal in a subsite's or tenant's own context.
+  * A request packed to get past a firewall can't change the values in its own address, such as the table an export writes.
+  * A pasted connect line must be an `http` or `https` address.
+  * Names in the harbor scene (a backup zip's file name, a site's address) are escaped.
 
 ### Changed
 * **Each site of a network has its own restore points:** a network's sites now keep their moves in the main site's folder, and each site's Backups tab and `wp disembark restore-points` list only the points that site made. Rolling back another site's point from here stops before anything changes and says which site to run it from. Restore points a subsite kept under its own uploads before move to the main site's folder on the first load after updating.
@@ -38,6 +48,11 @@
 
   A move runs as a voyage: a harbor scene where the boat sails as each step finishes, any question it needs answered (which site, where it goes, what to bring) right under it, and an arrival with what to do next beside the checks. The REST API is unchanged, so the CLI works as before, and older links (`#pull`, `#restore`, `#files`) open the tab that holds them now.
 * **Notices from other plugins stay out of the way:** WordPress moves every admin notice (update nags, "rate us" and usage-tracking prompts, license warnings) under the first heading on the page, which was the middle of the dashboard. Tools → Disembark now gathers them into a **notices** button in the header that opens a tray; their buttons and dismiss links still work there, and the bell turns red when one of them is an error.
+* **A site brought into a subsite or tenant leaves out files that aren't its to place:** these stay behind:
+  * PHP files under its uploads;
+  * loose files at the top of wp-content (drop-ins such as `db.php`, `object-cache.php` or `sunrise.php`);
+  * Disembark's own folder;
+  * on a dedicated tenant, the source's WP Freighter mu-plugin and Disembark's quiet-mode file.
 
 ### Added
 * **Deleting Disembark cleans up after it:** its settings, the site token, the cached update check and its scheduled clean-up go, on every site of a network. Backups and restore points in uploads/disembark stay (delete the folder by hand when they aren't needed), and quiet mode stays on until it's turned off.
@@ -155,6 +170,28 @@
 * **Browse → Database:** editing a row saves only the fields you changed (an untouched `NULL` stays `NULL`), and adding a row leaves empty fields out so auto-increment keys and column defaults apply. Deleting a row asks first.
 * **Search & replace pages in key order:** the engine (used by restores too) now reads rows in primary-key order, so a large table can't skip or repeat rows between pages.
 * **Settings:** the connection token is masked until you choose to show it, and cleanup keeps restore points unless you ask for them to go too.
+
+### Fixed
+* **Backups and pulls no longer miss the end of a folder:** the file scan works in batches, and when a batch ran out partway through the last folder in its queue, it marked the scan finished. That folder's remaining files were left out of the backup or pull without a word.
+* **A table exported again isn't doubled:** a database export (Browse → Database, a backup zip built in the browser, the Disembark CLI) added to whatever an earlier try at the same table or part had written, so a retried request held its rows twice. Each export now starts its file afresh, and an export of a table that doesn't exist fails instead of writing an empty file.
+* **`--files-only` restores only the files:** `wp disembark restore <zip> --files-only` on a Disembark backup still imported its database, because Disembark's own dump was picked before the choice was read.
+* **A move into a subsite or tenant clears that site's Elementor CSS:** it cleared the main site's generated CSS and records instead, and left the new site's out of date.
+* **phpMyAdmin and Adminer exports with foreign keys import:** they add their foreign keys at the end of the export. The import ran them against its temporary copy of each table, where their names clashed with the live table's, and the import stopped. They now wait until the copies are swapped in. A `DELIMITER` line with spaces in front of it is read too.
+* **Moves in the dashboard:**
+  * Once a move finished, the Move tab and links to Pull, Push and Restore did nothing until you clicked Back to Move. Now they open the form again, the arrival offers **Start another move** (unless the move logged you out), and Restore points shows the new point.
+  * A resumed catch-up carries on as a catch-up (it copied every table again).
+  * A resumed pull into a network's or WP Freighter install's main site keeps its place in the steps it replays.
+  * **Cancel** works while the move asks **Which site?**, **Where should it go?** or **Which database?** (it waited on the question).
+  * **Undo** on the arrival shows that it's rolling back.
+  * Push switches to `?rest_route=` when the destination's `/wp-json/` answers with a 404 page, not only a 200 one.
+* **Backup zips in the browser:** **Cancel** during "Finishing the zip" no longer downloads the zip anyway. The progress window also no longer has a close button: closing it hid the window while the zip kept building.
+* **Catch-ups get past a source that can't fingerprint a table:** when the source kept failing while fingerprinting a large table, the catch-up asked again with the same slice size. It now asks for smaller slices, and after repeated failures it copies the tables it couldn't compare, with the reason in the log. A table whose primary key is binary is always copied.
+* **Checks after a move catch redirect loops:** a page that was still redirecting within the site after three hops passed the checks; it's now reported as too many redirects.
+* **WP-CLI:**
+  * `wp disembark rollback` that reports errors now exits non-zero, with `"ok": false` in its JSON, instead of a warning and a success line.
+  * `wp disembark restore` on a network's main site says the network kept its users, instead of telling you to log in with the backup's credentials. It names the users who joined (and any renamed or left without an author), the tables it left out or removed, and the shared plugins it kept, in the JSON too. After a blocking check it says to run the restore again rather than resume.
+  * A resumed `wp disembark pull` no longer reads the steps it replays in seconds as a sign of a fast host and raises its batch sizes.
+  * `wp disembark search-replace` prints an undo command only when it saved a restore point.
 
 ## **v2.9.0** - November 17, 2026
 

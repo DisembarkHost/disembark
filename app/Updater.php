@@ -18,7 +18,7 @@ class Updater {
             add_filter( 'http_request_host_is_external', [ __CLASS__, 'dev_mode_external' ], 10, 3 );
         }
         $this->plugin_slug   = 'disembark';
-        $this->version       = '2.9.0';
+        $this->version       = '3.0.0';
         $this->cache_key     = 'disembark_updater';
         $this->cache_allowed = true;
         
