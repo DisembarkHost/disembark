@@ -5954,6 +5954,12 @@ class Import {
         // options: the roles are stored under "{prefix}user_roles".
         $options = $new_prefix . 'options';
         if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $options ) ) ) === $options ) {
+            // The source's roles win over a leftover row under this site's
+            // prefix that came along (option_name is unique, so the rename
+            // would otherwise fail and leave the leftover in charge).
+            if ( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM `{$options}` WHERE option_name = %s", $old_prefix . 'user_roles' ) ) ) {
+                $wpdb->delete( $options, [ 'option_name' => $new_prefix . 'user_roles' ] );
+            }
             $res = $wpdb->update(
                 $options,
                 [ 'option_name' => $new_prefix . 'user_roles' ],
