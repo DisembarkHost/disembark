@@ -68,12 +68,11 @@ class Run {
             return;
         }
         $base = Storage::base_dir();
-        // A network's sites kept their own folders before 3.0: their
-        // restore points move into the main site's (version 4).
-        if ( is_multisite() && ! Import::adopt_subsite_storage( microtime( true ) + 5 ) ) {
-            return;
+        if ( is_multisite() ) {
+            Storage::ensure_dir( $base );
         }
         if ( is_dir( $base ) ) {
+            // One request at a time, adopting a network's folders too.
             $lock = @fopen( $base . '/upgrade.lock', 'c' );
             if ( ! $lock || ! flock( $lock, LOCK_EX | LOCK_NB ) ) {
                 if ( $lock ) {
@@ -81,7 +80,10 @@ class Run {
                 }
                 return;
             }
-            $done = Import::protect_legacy_storage( microtime( true ) + 5 );
+            // A network's sites kept their own folders before 3.0: their
+            // restore points move into the main site's (version 4).
+            $done = ! is_multisite() || Import::adopt_subsite_storage( microtime( true ) + 5 );
+            $done = $done && Import::protect_legacy_storage( microtime( true ) + 5 );
             flock( $lock, LOCK_UN );
             fclose( $lock );
             if ( ! $done ) {

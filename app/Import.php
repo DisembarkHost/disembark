@@ -5343,7 +5343,9 @@ class Import {
         }
         $base    = rtrim( wp_normalize_path( Storage::base_dir() ), '/' );
         $uploads = dirname( $base );
-        $dirs    = array_merge( glob( $uploads . '/sites/*/disembark/_import_*', GLOB_ONLYDIR ) ?: [], glob( wp_normalize_path( WP_CONTENT_DIR ) . '/blogs.dir/*/files/disembark/_import_*', GLOB_ONLYDIR ) ?: [] );
+        $content = wp_normalize_path( WP_CONTENT_DIR );
+        $dirs    = array_merge( glob( $uploads . '/sites/*/disembark/_import_*', GLOB_ONLYDIR ) ?: [], glob( $content . '/blogs.dir/*/files/disembark/_import_*', GLOB_ONLYDIR ) ?: [] );
+        $failed  = [];
         foreach ( $dirs as $dir ) {
             $dir = wp_normalize_path( $dir );
             if ( microtime( true ) >= $deadline ) {
@@ -5352,22 +5354,46 @@ class Import {
             if ( is_link( $dir ) || strpos( $dir, $base . '/' ) === 0 || ! preg_match( '#/(?:sites|blogs\.dir)/(\d+)/(?:files/)?disembark/_import_([a-f0-9]+)$#', $dir, $m ) || ! self::has_restore_point( $dir ) ) {
                 continue;
             }
+            // Nothing reached through a link on the way (a site's folder or
+            // its disembark folder pointing somewhere else): the real path
+            // is the found one, below the real uploads or content folder.
+            $root = strpos( $dir, $uploads . '/' ) === 0 ? $uploads : $content;
+            $real = realpath( $dir );
+            $top  = realpath( $root );
+            if ( $real === false || $top === false || wp_normalize_path( $real ) !== rtrim( wp_normalize_path( $top ), '/' ) . substr( $dir, strlen( $root ) ) ) {
+                continue;
+            }
             $to = $base . '/_import_' . $m[2];
             if ( file_exists( $to ) ) {
                 continue;
             }
-            Storage::ensure_dir( $base );
-            if ( ! @rename( $dir, $to ) ) {
-                continue;
-            }
-            $meta = self::rollback_meta( $to . '/rollback' );
+            // Marked with its site before it moves, so a crash between the
+            // two never leaves a subsite's point looking like the main site's.
+            $meta = self::rollback_meta( $dir . '/rollback' );
             if ( is_array( $meta ) && empty( $meta['blog'] ) ) {
                 $meta['blog'] = (int) $m[1];
-                if ( self::write_protected( $to . '/rollback/meta.php', (string) json_encode( $meta, JSON_PRETTY_PRINT ) ) ) {
-                    @unlink( $to . '/rollback/meta.json' );
+                if ( ! self::write_protected( $dir . '/rollback/meta.php', (string) json_encode( $meta, JSON_PRETTY_PRINT ) ) ) {
+                    $failed[] = $dir;
+                    continue;
                 }
+                @unlink( $dir . '/rollback/meta.json' );
+            }
+            Storage::ensure_dir( $base );
+            if ( ! @rename( $dir, $to ) ) {
+                $failed[] = $dir;
             }
         }
+        if ( $failed ) {
+            // Tried again on the next few loads, then given up on out loud
+            // rather than holding up the rest of the upgrade for good.
+            $tries = (int) get_site_option( 'disembark_adopt_tries', 0 ) + 1;
+            if ( $tries < 3 ) {
+                update_site_option( 'disembark_adopt_tries', $tries );
+                return false;
+            }
+            error_log( 'Disembark: could not move these older restore points into ' . $base . ' (they stay where they are and won\'t be listed): ' . implode( ', ', array_slice( $failed, 0, 10 ) ) );
+        }
+        delete_site_option( 'disembark_adopt_tries' );
         return true;
     }
 
