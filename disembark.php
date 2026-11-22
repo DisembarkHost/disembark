@@ -10,6 +10,8 @@
  * Plugin URI:        https://disembark.host
  * Description:       Back up, restore, or migrate your files and database in the dashboard or CLI.
  * Version:           3.0.0
+ * Requires at least: 5.6
+ * Requires PHP:      7.0
  * Author:            Austin Ginder
  * Author URI:        https://austinginder.com
  * License:           MIT
