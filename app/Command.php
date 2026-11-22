@@ -268,6 +268,9 @@ class Command {
         // once it has connected (that's when it's listed as unfinished).
         $this->steps_import = $import_id;
         $this->resume_hint  = $resuming ? $import_id : '';
+        // Until it connects, a new pull that fails leaves nothing behind
+        // (its step records included): see fail().
+        $this->unconnected  = $resuming ? '' : $import_id;
         $pre         = $this->check( $this->step( function () use ( $import ) { return $import->preflight(); } ), 'preflight' );
         $dest_prefix = (string) ( $pre['db_prefix'] ?? '' );
         $dest_home   = untrailingslashit( (string) ( $pre['home_url'] ?? home_url() ) );
@@ -311,6 +314,7 @@ class Command {
                 . ' Its sites: ' . implode( '; ', array_slice( $sites, 0, 50 ) ) . ( count( $sites ) > 50 ? '; …' : '' ), 'connect' );
         }
         $this->resume_hint = $import_id;
+        $this->unconnected = '';
         $src_home = untrailingslashit( (string) ( $c['source_home'] ?? '' ) );
         $this->say( '      Connected to ' . ( $src_home ?: $source['url'] ) . ' (' . (int) ( $c['table_count'] ?? 0 ) . ' tables).' );
         $this->report_scope( $c, $summary, ! empty( $move_args['shared-tables'] ) );
@@ -1624,6 +1628,8 @@ class Command {
     private $steps_seq    = 0;
     /** Set while a pull can be resumed: failures say how. */
     private $resume_hint  = '';
+    /** A new pull's id until it has connected (see pull() and fail()), else ''. */
+    private $unconnected  = '';
     /** The running move, for the notice a failure sends (see Notify). */
     private $notify       = [];
 
@@ -2202,6 +2208,10 @@ class Command {
     }
 
     private function fail( $message, $step = '', $rollback_id = '' ) {
+        if ( $this->unconnected !== '' ) {
+            ( new Import( $this->unconnected ) )->cancel( 'cleanup' );
+            $this->unconnected = '';
+        }
         if ( $this->notify ) {
             Notify::send( $this->notify['import'], $message === 'Cancelled.' ? 'cancelled' : 'failed', [
                 'kind'        => $this->notify['kind'],
