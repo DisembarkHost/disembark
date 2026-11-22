@@ -714,6 +714,13 @@ class Import {
         if ( is_multisite() ) {
             $meta['blog'] = get_current_blog_id();
         }
+        // Off a network, the table prefix says which site made it: a WP
+        // Freighter install in shared files mode keeps every tenant's
+        // points in one folder (see point_is_here()).
+        global $wpdb;
+        $meta['site_prefix'] = (string) $wpdb->prefix;
+        // Points made in the same second still chain in order (later_points()).
+        $meta['created_us'] = microtime( true );
         // Only the tables a change touches (Browse's search and replace):
         // a rollback puts those back and drops nothing.
         if ( $partial ) {
@@ -5136,9 +5143,14 @@ class Import {
                 // A restore point from before 3.0's scope fix that holds
                 // other sites' tables: a rollback leaves those alone.
                 'left_alone'     => ( new self( substr( basename( $dir ), strlen( '_import_' ) ) ) )->rollback_leaves( $meta ),
+                'order'          => self::point_order( $meta + [ 'created_at' => filemtime( $meta_file ) ] ),
             ];
         }
-        usort( $points, function ( $a, $b ) { return $b['created_at'] - $a['created_at']; } );
+        usort( $points, function ( $a, $b ) { return $b['order'] <=> $a['order']; } );
+        foreach ( $points as &$p ) {
+            unset( $p['order'] );
+        }
+        unset( $p );
         return $points;
     }
 
@@ -5199,24 +5211,76 @@ class Import {
     /**
      * Whether a restore point belongs to the site this runs as. On a network
      * every site keeps its points in the main site's folder; one made before
-     * the point recorded its site was the main site's (moves run there).
+     * the point recorded its site was the main site's (moves run there). On
+     * a WP Freighter install in shared files mode every tenant shares one
+     * folder too: a point belongs to the table prefix it was made under.
+     * One made before points recorded that is judged by its tables: a
+     * tenant's are all stacked_<id>_; anything else was the main site's.
+     * A plain site owns every point in its folder.
      */
     public static function point_is_here( $meta ) {
+        global $wpdb;
         if ( ! is_multisite() ) {
-            return true;
+            $owner = self::point_owner_prefix( $meta );
+            return $owner === null || strtolower( $owner ) === strtolower( (string) $wpdb->prefix );
         }
         $blog = (int) ( $meta['blog'] ?? 0 );
         return ( $blog > 0 ? $blog : (int) get_main_site_id() ) === (int) get_current_blog_id();
     }
 
-    /** Where to roll back a restore point another site of this network made, in words; null when it's this site's. */
+    /** On a WP Freighter install, the table prefix of the site that made a point; null anywhere else. */
+    private static function point_owner_prefix( $meta ) {
+        $primary = Scope::freighter_primary();
+        if ( $primary === '' ) {
+            return null;
+        }
+        $meta = (array) $meta;
+        if ( isset( $meta['site_prefix'] ) && is_string( $meta['site_prefix'] ) && $meta['site_prefix'] !== '' ) {
+            return $meta['site_prefix'];
+        }
+        $tables = array_map( 'strval', (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? [] ) );
+        $tenant = null;
+        foreach ( $tables as $t ) {
+            if ( ! preg_match( '/^(stacked_\d+_)/i', $t, $m ) ) {
+                return $primary;
+            }
+            if ( $tenant !== null && strtolower( $tenant ) !== strtolower( $m[1] ) ) {
+                return $primary;
+            }
+            $tenant = $m[1];
+        }
+        return $tenant !== null ? $tenant : $primary;
+    }
+
+    /** Where to roll back a restore point another site of this install made, in words; null when it's this site's. */
     public static function point_elsewhere( $meta ) {
         if ( self::point_is_here( $meta ) ) {
             return null;
         }
+        if ( ! is_multisite() ) {
+            $owner = (string) self::point_owner_prefix( $meta );
+            $id    = preg_match( '/^stacked_(\d+)_$/i', $owner, $m ) && strtolower( $owner ) !== strtolower( Scope::freighter_primary() ) ? $m[1] : 'main';
+            $where = $id === 'main' ? 'the main site' : 'tenant site ' . $id;
+            $install = Scope::install();
+            foreach ( (array) ( $install['sites'] ?? [] ) as $site ) {
+                if ( (string) $site['id'] === $id && trim( (string) ( $site['name'] ?? '' ) ) !== '' ) {
+                    $where .= ' (' . trim( (string) $site['name'] ) . ')';
+                }
+            }
+            return 'This restore point belongs to ' . $where . ' of this WP Freighter install. Roll it back from that site\'s Disembark' . ( $id === 'main' ? '' : ' (or with STACKED_SITE_ID=' . $id . ')' ) . '.';
+        }
         $blog = (int) ( $meta['blog'] ?? 0 ) ?: (int) get_main_site_id();
         $home = untrailingslashit( (string) get_home_url( $blog ) );
         return 'This restore point belongs to ' . ( $home !== '' ? $home : 'site ' . $blog ) . ' on this network. Roll it back from that site\'s Disembark' . ( $home !== '' ? ' (or with --url=' . $home . ')' : '' ) . '.';
+    }
+
+    /**
+     * Where a restore point falls in time, for ordering: microseconds when
+     * it recorded them, else its second.
+     */
+    public static function point_order( $meta ) {
+        $meta = (array) $meta;
+        return isset( $meta['created_us'] ) && is_numeric( $meta['created_us'] ) ? (float) $meta['created_us'] : (float) (int) ( $meta['created_at'] ?? 0 );
     }
 
     /**
@@ -6559,7 +6623,7 @@ class Import {
      * [ [ id, label, created_at ], … ].
      */
     public static function later_points( $meta, $files = true ) {
-        $since = (int) ( $meta['created_at'] ?? 0 );
+        $since = self::point_order( $meta );
         $self  = (string) ( $meta['import_id'] ?? '' );
         $later = [];
         foreach ( (array) glob( Storage::base_dir() . '/_import_*', GLOB_ONLYDIR ) as $dir ) {
@@ -6568,15 +6632,19 @@ class Import {
                 continue;
             }
             $m = self::rollback_meta( $dir . '/rollback' );
-            if ( ! is_array( $m ) || ! self::point_is_here( $m ) || (int) ( $m['created_at'] ?? 0 ) <= $since ) {
+            if ( ! is_array( $m ) || ! self::point_is_here( $m ) || self::point_order( $m ) <= $since ) {
                 continue;
             }
             $open = ( empty( $m['rolled_back_at'] ) && ! self::legacy_rolled_back( $m ) ) || ( $files && self::point_has_files( $m ) && ! self::files_spent( $m ) );
             if ( $open ) {
-                $later[] = [ 'id' => $id, 'label' => self::point_label( $m ), 'created_at' => (int) ( $m['created_at'] ?? 0 ) ];
+                $later[] = [ 'id' => $id, 'label' => self::point_label( $m ), 'created_at' => (int) ( $m['created_at'] ?? 0 ), 'order' => self::point_order( $m ) ];
             }
         }
-        usort( $later, function ( $a, $b ) { return $b['created_at'] - $a['created_at']; } );
+        usort( $later, function ( $a, $b ) { return $b['order'] <=> $a['order']; } );
+        foreach ( $later as &$l ) {
+            unset( $l['order'] );
+        }
+        unset( $l );
         return $later;
     }
 
