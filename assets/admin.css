@@ -895,6 +895,8 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
 .dsk-combo > .dsk-icon, .dsk-combo > svg { position: absolute; left: 12px; width: 15px; height: 15px; color: var(--ink-3); pointer-events: none; }
 .dsk .dsk-combo .dsk-input { padding: 0 34px 0 36px; text-overflow: ellipsis; cursor: pointer; }
 .dsk .dsk-combo .dsk-input:focus { cursor: text; }
+.dsk-combo.is-disabled { opacity: .6; }
+.dsk .dsk-combo.is-disabled .dsk-input { cursor: not-allowed; }
 .dsk-combo-caret { position: absolute; right: 13px; width: 8px; height: 8px; border-right: 1.5px solid var(--ink-3); border-bottom: 1.5px solid var(--ink-3); transform: translateY(-2px) rotate(45deg); pointer-events: none; }
 .dsk-combo-list { position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 40; margin: 0; padding: 6px; list-style: none; max-height: 320px; overflow: auto;
   background: var(--surface); border: 1px solid var(--line-2); border-radius: 12px; box-shadow: var(--shadow); }

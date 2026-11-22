@@ -58,8 +58,11 @@
     }
     D.store.on(['scanned', 'index', 'site'], render);
     D.store.on(['sessions', 'lastScan'], function () { if (!S.scanned && !busy) render(); renderScans(); });
-    D.store.on(['backupToken'], renderScans);
-    var busy = false;
+    D.store.on(['backupToken', 'site'], renderScans);
+    // While a scan runs (or an earlier one loads), the site it's for stays
+    // put: the result would otherwise land under another site.
+    var busy = false, siteSel = null;
+    function setBusy(on) { busy = on; if (siteSel) siteSel.setDisabled(on); }
     render();
     renderScans();
 
@@ -78,9 +81,9 @@
       if (!inst || !(inst.sites || []).length) return null;
       var kind = inst.kind === 'multisite' ? 'network' : 'WP Freighter install';
       var opts = [{ value: '', label: 'The whole ' + kind, sub: D.fmt.plural(inst.total || inst.sites.length, 'site') + ' · for a full server restore' }].concat(inst.sites.map(function (s) {
-        return { value: s.id, label: s.name || D.host(s.url), sub: D.host(s.url) + ' · ' + (s.id === 'main' ? 'main site' : (inst.kind === 'multisite' ? 'site ' : 'tenant ') + s.id) };
+        return { value: s.id, label: s.name || D.host(s.url), match: D.host(s.url), sub: D.host(s.url) + ' · ' + (s.id === 'main' ? 'main site' : (inst.kind === 'multisite' ? 'site ' : 'tenant ') + s.id) };
       }));
-      var sel = D.combo(opts, S.site || '', function (v) { D.setSite(v); }, { label: 'What to back up', placeholder: 'Search sites by name or address' });
+      var sel = siteSel = D.combo(opts, S.site || '', function (v) { if (!busy) D.setSite(v); }, { label: 'What to back up', placeholder: 'Search sites by name or address', disabled: busy });
       return h('div', { class: 'dsk-card dsk-bk-scope' },
         h('span', { class: 'caps' }, 'Back up'), sel,
         h('span', { class: 'muted' }, S.site ? 'This site alone, as a standalone site: its tables, its users, its uploads, and the plugins and themes it uses. Restore it into any single WordPress site.' : 'Every site of the ' + kind + ', exactly as it is here. ' + wholeNote()));
@@ -125,7 +128,7 @@
         bar.set(pct);
       }
       fresh();
-      busy = true;
+      setBusy(true);
       D.mount(view, h('div', { class: 'dsk-two' },
         dlCard([h('h2', null, 'Scanning ', h('em', { class: 'hl' }, D.host(S.site ? D.siteName(S.site).split(' ')[0] : D.config.homeUrl))), h('div', { class: 'dsk-bk-steps' }, list, bar)]),
         cliCard(false)));
@@ -138,18 +141,18 @@
           var meta = p.phase === 'scanning' ? D.fmt.num(p.done) + ' of ' + D.fmt.num(p.total) + ' folders' : D.fmt.num(p.done) + ' of ' + D.fmt.num(p.total) + ' parts';
           at(p.phase, meta, pct);
         });
-        busy = false;
+        setBusy(false);
         D.toast('Scan complete: ' + D.fmt.plural(S.files.length, 'file') + '.');
       } catch (e) {
-        busy = false;
-        D.toast('The scan did not finish: ' + D.errorText(e), 'error');
+        setBusy(false);
+        D.toast(e.siteChanged ? D.errorText(e) : 'The scan did not finish: ' + D.errorText(e), 'error');
         render();
       }
     }
 
     async function resume(session) {
       fresh();
-      busy = true;
+      setBusy(true);
       D.mount(view, h('div', { class: 'dsk-two' },
         dlCard([h('h2', null, 'Picking up ', h('em', { class: 'hl' }, 'a scan')), h('div', { class: 'dsk-row muted' }, h('span', { class: 'dsk-spin' }), 'Loading the scan from ' + when(session.timestamp) + '…')]),
         cliCard(false)));
@@ -157,11 +160,13 @@
       try {
         await D.loadDatabase(true);
         await D.resumeSession(session);
-        busy = false;
+        setBusy(false);
         D.toast('Scan loaded.');
       } catch (e) {
-        busy = false;
+        setBusy(false);
         D.toast('Could not load that scan: ' + D.errorText(e), 'error');
+        // The site says the scan covered another site (or is gone): the list again.
+        if (e.data && e.data.code === 'session_site_mismatch') D.loadStatus();
         render();
       }
     }
@@ -291,6 +296,12 @@
       if (!S.includeFiles && !S.includeDb) { D.toast('Include files, the database, or both.', 'error'); return; }
       var files = S.includeFiles ? S.files.filter(function (f) { return !D.isExcluded(f.name); }) : [];
       var tables = S.includeDb ? S.database.filter(function (t) { return S.included.has(t.table); }) : [];
+      // A zip that says it has the database but holds none would pass for a full backup.
+      if (S.includeDb && !tables.length) {
+        D.toast(S.database.length ? 'No tables are picked. Pick some under Database, or turn off its Include.' : 'The database tables didn’t load, so the zip would have no database. Scan again, or turn off the database’s Include.', 'error');
+        return;
+      }
+      if (S.includeFiles && !files.length) { D.toast('No files are picked. Bring some back under Files, or turn off its Include.', 'error'); return; }
       var MAX = 150 * 1024 * 1024, MAX_FILES = 1500, BIG = 40 * 1024 * 1024, batches = [], cur = [], curSize = 0;
       files.forEach(function (f) {
         var size = Number(f.size) || 0, big = size > BIG;
@@ -349,6 +360,8 @@
         if (close) close(null);
         await cleanupArchive();
         if (!cancelled) D.toast('The backup did not finish: ' + D.errorText(e), 'error'); else D.toast('Backup cancelled.');
+        // The site says this scan covered another site: it can't be used for this one, so scan again.
+        if (e && e.data && e.data.code === 'session_site_mismatch') { D.setSite(S.site); D.loadStatus(); }
       }
       async function cleanupArchive() {
         var base = archive.replace(/\.zip$/, '');
@@ -403,8 +416,20 @@
     }
 
     /* ------------------------------------------- Pick up an earlier scan */
+    // On a network's or WP Freighter install's main site, only scans of the
+    // site picked under Back up: another site's file list would download
+    // with this site's name. A scan from before 3.0.1 doesn't say which
+    // site it covered, so it's offered only on a single site. (A subsite's
+    // own dashboard scans only itself.)
+    function fits(s) {
+      var inst = D.config.install;
+      if (!inst || !(inst.sites || []).length) return true;
+      if (!('site' in s)) return false;
+      var a = String(s.site || ''), b = String(S.site || '');
+      return (a === 'all' ? '' : a) === b;
+    }
     function renderScans() {
-      var sessions = (S.sessions || []).slice(0, 5);
+      var sessions = (S.sessions || []).filter(fits).slice(0, 5);
       if (!sessions.length) { D.mount(scans); return; }
       D.mount(scans, h('section', { class: 'dsk-card dsk-sec' },
         h('div', { class: 'dsk-sec-h' }, h('div', null, h('h3', null, 'Pick up an earlier scan'), h('p', null, 'Skip the scan and download from one of these. Files may have changed since.'))),
@@ -414,7 +439,8 @@
           sessionInfo(s).then(function (i) { meta.textContent = i ? D.fmt.plural(i.files, 'file') + ' · ' + D.fmt.size(i.size) : D.fmt.ago(s.timestamp); });
           var go = function () { if (!busy) resume(s); };
           return h('li', { tabindex: '0', role: 'button', 'aria-label': 'Pick up the scan from ' + when(s.timestamp), onclick: go, onkeydown: function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } } },
-            D.icon('scan'), h('span', { class: 'd' }, when(s.timestamp), loaded ? h('span', { class: 'dsk-tag ok' }, 'in use') : null), meta, D.icon('chevron', 'chev'));
+            D.icon('scan'), h('span', { class: 'd' }, when(s.timestamp), loaded ? h('span', { class: 'dsk-tag ok' }, 'in use') : null,
+              s.filtered ? h('span', { class: 'dsk-tag', title: 'Scanned with folders left out (the CLI’s -x), so its file list isn’t the whole site.' }, 'some folders left out') : null), meta, D.icon('chevron', 'chev'));
         }))));
     }
   }

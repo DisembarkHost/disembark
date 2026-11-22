@@ -537,7 +537,10 @@
     function reset() { var c = current(); input.value = c ? c.label : ''; }
     function open(q) {
       q = (q || '').trim().toLowerCase();
-      shown = options.filter(function (x) { return !q || (x.label + ' ' + (x.sub || '')).toLowerCase().indexOf(q) !== -1; });
+      // The name and the address match; the grey line's other words (a
+      // site's number, "full server restore") don't. An option's match
+      // says what to search, else its label alone.
+      shown = options.filter(function (x) { return !q || (x.label + ' ' + (x.match || '')).toLowerCase().indexOf(q) !== -1; });
       active = shown.findIndex(function (x) { return x.value === value; });
       if (active < 0 && shown.length) active = 0;
       mount(list, shown.length ? shown.map(function (x, i) {
@@ -554,7 +557,8 @@
       if (li) { input.setAttribute('aria-activedescendant', li.id); li.scrollIntoView({ block: 'nearest' }); }
     }
     function pick(x) { close(); var changed = x.value !== value; value = x.value; reset(); if (changed) onChange(value); }
-    input.addEventListener('focus', function () { input.select(); open(''); });
+    var quiet = false;
+    input.addEventListener('focus', function () { if (quiet) { quiet = false; return; } input.select(); open(''); });
     input.addEventListener('click', function () { if (list.hidden) open(''); });
     input.addEventListener('input', function () { open(input.value); });
     input.addEventListener('blur', function () { close(); reset(); });
@@ -569,9 +573,14 @@
         if (!list.hidden) { e.preventDefault(); e.stopPropagation(); close(); reset(); }
       } else if (e.key === 'Tab') { close(); reset(); }
     });
-    el.addEventListener('click', function (e) { if (e.target !== input) input.focus(); });
+    el.addEventListener('click', function (e) { if (e.target !== input && !input.disabled) input.focus(); });
     reset();
     el.input = input;
+    /** Locks the choice while something that depends on it runs (a scan). */
+    el.setDisabled = function (on) { close(); input.disabled = !!on; el.classList.toggle('is-disabled', !!on); };
+    /** Focus without opening the list (focus coming back after a redraw). */
+    el.focusQuiet = function () { quiet = true; input.focus({ preventScroll: true }); quiet = false; };
+    if (o.disabled) el.setDisabled(true);
     return el;
   };
 
@@ -735,9 +744,21 @@
     } catch (e) { /* the dashboard still works without it */ }
   };
 
+  /**
+   * The site picked under Back up changed while a scan or table list for
+   * the one before was loading: its answer is dropped (it would be stored
+   * under the new site), and this says why.
+   */
+  function siteChanged() {
+    var e = new Error('The site to back up changed before the scan finished, so its result was dropped. Scan again.');
+    e.siteChanged = true;
+    return e;
+  }
   D.loadDatabase = async function (force) {
     if (D.store.state.database.length && !force) return D.store.state.database;
-    var tables = await D.api.get('database', D.store.state.site ? { site: D.store.state.site } : undefined);
+    var site = D.store.state.site;
+    var tables = await D.api.get('database', site ? { site: site } : undefined);
+    if (D.store.state.site !== site) throw siteChanged();
     if (!Array.isArray(tables)) throw new Error('Could not read the database tables.');
     tables.forEach(function (t) { t.size = Number(t.size) || 0; t.row_count = Number(t.row_count) || 0; });
     D.store.set({ database: tables, included: new Set(tables.map(function (t) { return t.table; })) });
@@ -769,7 +790,12 @@
   D.scanSite = async function (onProgress) {
     var token = '';
     var site = D.store.state.site;
-    var step = function (name, extra) { return D.api.post('regenerate-manifest', Object.assign({ backup_token: token, step: name }, site ? { site: site } : {}, extra || {})); };
+    var step = async function (name, extra) {
+      if (D.store.state.site !== site) throw siteChanged();
+      var r = await D.api.post('regenerate-manifest', Object.assign({ backup_token: token, step: name }, site ? { site: site } : {}, extra || {}));
+      if (D.store.state.site !== site) throw siteChanged();
+      return r;
+    };
     onProgress = onProgress || function () {};
     // The server mints the session id (an unguessable folder name).
     token = (await step('initiate')).backup_token;
@@ -787,6 +813,7 @@
     }
     var manifests = await step('finalize');
     var files = await loadManifests(Array.isArray(manifests) ? manifests : [], onProgress);
+    if (D.store.state.site !== site) throw siteChanged();
     setFiles(files, token);
     D.loadStatus();
     return files;
@@ -817,9 +844,11 @@
 
   /** Reloads the file list from an earlier scan session. */
   D.resumeSession = async function (session, onProgress) {
+    var site = D.store.state.site;
     var manifests = await D.api.get('manifest', { backup_token: session.token });
     if (!Array.isArray(manifests)) throw new Error('That scan is no longer available.');
     var files = await loadManifests(manifests, onProgress);
+    if (D.store.state.site !== site) throw siteChanged();
     setFiles(files, session.token);
     return files;
   };
