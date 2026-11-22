@@ -93,6 +93,7 @@
 * **Notifications:** **Notify me** on a running move (or `--notify=<email or URL>` in the CLI) sends an email, a Slack or Discord message, or JSON to any https:// webhook when the move finishes, stops or is cancelled: with how long it took, the checks' result, and how to undo or resume. Emails go out even from a copy in quiet mode (through PHP's mail(), around the held wp_mail()). New endpoint: `POST /import/notify`.
 
 ### Improved
+* **Old restore points on a network say what they can't undo:** a restore point made by an earlier version on a site of a multisite network holds the network's users table, but rolling it back puts back only that site's tables. The rollback preview and `wp disembark rollback` now say the network's user list stays as it is.
 * **One site of a network, by its own address:** the Disembark CLI pointed at a subsite's address (disembark backup https://network.com/shop) exported the whole network. A request that reaches one site of a network or WP Freighter install by its own address now exports that site, users included, and the CLI also takes --site=<id>.
 * **A whole network can't be restored into one site from any backup:** a zip or CLI backup that holds a network's own tables is refused before anything changes, even without the profile that usually says so, and an import stops before its swap if one turns up anyway.
 * **Text files too big to rewrite are named:** a text file under uploads that mentions the old address but is over 5 MB is listed after a move instead of skipped without a word.
