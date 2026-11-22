@@ -208,8 +208,8 @@ class Command {
      *     $ wp disembark pull https://freighter.example.com 9fXc... --site=8 --yes
      */
     public function pull( $args, $assoc_args ) {
-        $this->retry_limits( $assoc_args );
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
+        $this->retry_limits( $assoc_args );
         @set_time_limit( 0 );
 
         $resuming = ! empty( $assoc_args['resume'] );
@@ -688,8 +688,8 @@ class Command {
      *     $ wp disembark restore ~/backups/shop.zip --into=new --slug=shop --yes
      */
     public function restore( $args, $assoc_args ) {
-        $this->retry_limits( $assoc_args );
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
+        $this->retry_limits( $assoc_args );
         @set_time_limit( 0 );
         $zip = (string) ( $args[0] ?? '' );
         if ( $zip === '' || ! is_file( $zip ) ) {
@@ -1221,8 +1221,8 @@ class Command {
      * ---
      */
     public function rollback( $args, $assoc_args ) {
-        $this->retry_limits( $assoc_args );
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
+        $this->retry_limits( $assoc_args );
         $point      = $this->find_point( $args[0] );
         $files      = empty( $assoc_args['database-only'] );
         $through    = empty( $assoc_args['only'] );
@@ -1342,8 +1342,8 @@ class Command {
      * @subcommand search-replace
      */
     public function search_replace( $args, $assoc_args ) {
-        $this->retry_limits( $assoc_args );
         $this->json = ( $assoc_args['format'] ?? 'text' ) === 'json';
+        $this->retry_limits( $assoc_args );
         list( $from, $to ) = $args;
         if ( $from === '' ) {
             $this->fail( 'Enter the text to search for.' );
@@ -1862,9 +1862,10 @@ class Command {
             if ( ! isset( $assoc_args[ $flag ] ) ) {
                 continue;
             }
-            $v = trim( (string) $assoc_args[ $flag ] );
+            // A bare --max-retries arrives as true, which isn't a number.
+            $v = is_bool( $assoc_args[ $flag ] ) ? '' : trim( (string) $assoc_args[ $flag ] );
             if ( ! preg_match( '/^\d+$/', $v ) ) {
-                \WP_CLI::error( "--{$flag} takes a whole number (0 for no limit)." );
+                $this->fail( "--{$flag} takes a whole number (0 for no limit), as in --{$flag}=5." );
             }
             $this->$prop = $flag === 'max-retry-minutes' ? (int) $v * 60 : (int) $v;
         }
