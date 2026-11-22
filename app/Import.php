@@ -1840,11 +1840,21 @@ class Import {
         global $wpdb;
         $done = 0;
         foreach ( $swap['map'] as $table => $shadow ) {
-            $live = '`' . str_replace( '`', '``', $table ) . '`';
-            $wpdb->query( "DROP TABLE IF EXISTS {$live}" );
-            if ( $wpdb->query( "RENAME TABLE `{$shadow}` TO {$live}" ) === false ) {
+            $live   = '`' . str_replace( '`', '``', $table ) . '`';
+            $exists = strcasecmp( (string) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ), $table ) === 0;
+            // The live table moves aside and the copy takes its name in one
+            // statement (atomic on MySQL and MariaDB), and the old one goes
+            // only after that worked: a rename that fails leaves this site's
+            // table exactly as it was, never dropped with nothing in its place.
+            $old = '_dsko_' . substr( md5( $table . '|' . $shadow ), 0, 20 );
+            $sql = $exists ? "RENAME TABLE {$live} TO `{$old}`, `{$shadow}` TO {$live}" : "RENAME TABLE `{$shadow}` TO {$live}";
+            if ( $wpdb->query( $sql ) === false ) {
                 $run['errors'][] = "Could not put the imported {$table} in place: " . substr( $wpdb->last_error, 0, 200 );
+                $wpdb->query( "DROP TABLE IF EXISTS `{$shadow}`" ); // its copy goes; the live table stays
                 continue;
+            }
+            if ( $exists ) {
+                $wpdb->query( "DROP TABLE IF EXISTS `{$old}`" );
             }
             $done++;
         }
