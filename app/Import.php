@@ -1931,7 +1931,9 @@ class Import {
             // statement (atomic on MySQL and MariaDB), and the old one goes
             // only after that worked: a rename that fails leaves this site's
             // table exactly as it was, never dropped with nothing in its place.
-            $old = '_dsko_' . substr( md5( $table . '|' . $shadow ), 0, 20 );
+            // Under the copies' prefix, so the next import's swap_start()
+            // clears one a crash left between the rename and the drop.
+            $old = self::SHADOW_PREFIX . 'o' . ( $swap['tag'] ?? '' ) . '_' . substr( md5( $table . '|' . $shadow ), 0, 20 );
             $sql = $exists ? "RENAME TABLE {$live} TO `{$old}`, `{$shadow}` TO {$live}" : "RENAME TABLE `{$shadow}` TO {$live}";
             if ( $wpdb->query( $sql ) === false ) {
                 $run['errors'][] = "Could not put the imported {$table} in place: " . substr( $wpdb->last_error, 0, 200 );
@@ -1939,6 +1941,7 @@ class Import {
                 continue;
             }
             if ( $exists ) {
+                self::repoint_foreign_keys( $old, $table, $run );
                 $wpdb->query( "DROP TABLE IF EXISTS `{$old}`" );
             }
             $done++;
@@ -1962,6 +1965,34 @@ class Import {
         }
         wp_cache_flush();
         return $done;
+    }
+
+    /**
+     * InnoDB moves a foreign key with the table it points at: renaming the
+     * live table aside left every other table's key to it (a plugin table
+     * the import didn't bring, one a catch-up skipped) pointing at the old
+     * copy, about to be dropped. Those keys are pointed at the table now
+     * live under the name, as they were before the swap.
+     */
+    private static function repoint_foreign_keys( $old, $table, &$run ) {
+        global $wpdb;
+        $quiet = $wpdb->suppress_errors( true );
+        $refs  = (array) $wpdb->get_results( $wpdb->prepare( 'SELECT TABLE_NAME, CONSTRAINT_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME = %s', $old ), ARRAY_N );
+        foreach ( $refs as $ref ) {
+            list( $child, $name ) = [ (string) $ref[0], (string) $ref[1] ];
+            $create = (string) ( $wpdb->get_row( 'SHOW CREATE TABLE `' . str_replace( '`', '``', $child ) . '`', ARRAY_N )[1] ?? '' );
+            $quoted = '`' . str_replace( '`', '``', $name ) . '`';
+            if ( ! preg_match( '/CONSTRAINT\s+' . preg_quote( $quoted, '/' ) . '\s+(FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+)`' . preg_quote( str_replace( '`', '``', $old ), '/' ) . '`(\s*\([^)]*\)[^,\n]*)/i', $create, $m ) ) {
+                $run['warnings'][] = "The foreign key {$name} on {$child} points at a table that's gone; add it again by hand.";
+                continue;
+            }
+            $t   = '`' . str_replace( '`', '``', $child ) . '`';
+            $def = $m[1] . '`' . str_replace( '`', '``', $table ) . '`' . rtrim( $m[2] );
+            if ( $wpdb->query( "ALTER TABLE {$t} DROP FOREIGN KEY {$quoted}" ) === false || $wpdb->query( "ALTER TABLE {$t} ADD CONSTRAINT {$quoted} {$def}" ) === false ) {
+                $run['warnings'][] = "The foreign key {$name} on {$child} couldn't be pointed back at {$table}: " . substr( (string) $wpdb->last_error, 0, 160 );
+            }
+        }
+        $wpdb->suppress_errors( $quiet );
     }
 
     private static function swap_abandon( $swap ) {
