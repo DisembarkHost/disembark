@@ -6457,6 +6457,13 @@ class Import {
             }
             if ( $with_files ) {
                 $saved['files_put_back_at'] = time();
+            } elseif ( ! empty( $st['spent'] ) ) {
+                // Spent already (2.9 put its files back without saying so):
+                // it stays spent, so a later chain never "puts back" files
+                // that aren't there any more.
+                if ( empty( $saved['files_put_back_at'] ) ) {
+                    $saved['files_put_back_at'] = time();
+                }
             } elseif ( ! isset( $saved['files_put_back_at'] ) ) {
                 $saved['files_put_back_at'] = 0;
             }
