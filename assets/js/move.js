@@ -243,13 +243,24 @@
     var control;
     if (others.length <= 4) {
       others.forEach(function (s) { opts.push({ value: String(s.id), label: 'Replace ' + (s.name || D.host(s.url)) }); });
-      control = D.seg(opts, String(S.into), function (v) { S.into = v; render(); });
+      control = D.seg(opts, String(S.into), function (v) { S.into = v; redrawInto(); });
     } else {
       control = D.combo([{ value: 'new', label: 'A new ' + one, sub: 'Nothing here is replaced' }].concat(others.map(function (s) {
-        return { value: String(s.id), label: 'Replace ' + (s.name || D.host(s.url)), sub: D.host(s.url) + ' · ' + one + ' ' + s.id };
-      })), String(S.into), function (v) { S.into = v; render(); }, { label: 'Where it lands', placeholder: 'Search ' + one + 's by name or address' });
+        return { value: String(s.id), label: 'Replace ' + (s.name || D.host(s.url)), match: D.host(s.url), sub: D.host(s.url) + ' · ' + one + ' ' + s.id };
+      })), String(S.into), function (v) { S.into = v; redrawInto(); }, { label: 'Where it lands', placeholder: 'Search ' + one + 's by name or address' });
     }
     return h('div', { class: 'dsk-into' }, h('div', { class: 'dsk-field-h' }, h('span', { class: 'dsk-label' }, 'Where it lands on ' + here)), control);
+  }
+
+  // Choosing where it lands redraws the page (the scene and the words
+  // change with it): the control that had focus gets it back.
+  function redrawInto() {
+    var act = document.activeElement, was = act && act.closest && act.closest('.dsk-into');
+    render();
+    if (!was || !root) return;
+    var seg = root.querySelector('.dsk-into .dsk-seg button[aria-pressed="true"]'), combo = root.querySelector('.dsk-into .dsk-combo');
+    if (seg) seg.focus({ preventScroll: true });
+    else if (combo && combo.focusQuiet) combo.focusQuiet();
   }
 
   function panel() {

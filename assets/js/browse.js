@@ -35,7 +35,9 @@
   }
 
   function select() {
-    D.mount(segBox, D.seg(PANES.map(function (p) { return { value: p.id, label: p.label, icon: p.icon }; }), mode, function (v) { mode = v; select(); }));
+    // Made once, so the button pressed keeps focus; a route change only updates it.
+    if (!segBox.seg) { segBox.seg = D.seg(PANES.map(function (p) { return { value: p.id, label: p.label, icon: p.icon }; }), mode, function (v) { mode = v; select(); }); D.mount(segBox, segBox.seg); }
+    else segBox.seg.set(mode);
     spotBox.innerHTML = D.H.spot(mode === 'files' ? 'files' : 'db');
     PANES.forEach(function (p) { boxes[p.id].hidden = tools[p.id].hidden = p.id !== mode; });
     var d = def(mode);

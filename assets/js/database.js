@@ -58,13 +58,26 @@
       countEl.textContent = S.database.length ? D.fmt.plural(rows.length, 'table') + ' · ' + D.fmt.size(rows.reduce(function (n, t) { return n + t.size; }, 0)) + (st.selected.length ? ' · ' + st.selected.length + ' selected' : '') : '';
       if (!S.database.length) { D.mount(listEl, h('div', { class: 'dsk-pad muted' }, h('span', { class: 'dsk-spin' }), ' Loading tables…')); return; }
       if (!rows.length) { D.mount(listEl, h('div', { class: 'dsk-pad muted' }, 'No tables match.')); return; }
+      // The list is made anew: the table that had focus gets it back.
+      var act = document.activeElement, had = act && listEl.contains(act) && act.getAttribute('data-table');
       D.mount(listEl, h('ul', { class: 'dsk-list dsk-db-list' }, rows.map(function (t) {
         var sel = st.selected.indexOf(t.table) !== -1;
-        return h('li', { class: 'clickable' + (sel ? ' sel' : ''), tabindex: '0', onclick: function (e) { pick(t.table, e, rows); }, onkeydown: function (e) { if (e.key === 'Enter') pick(t.table, e, rows); } },
+        return h('li', { class: 'clickable' + (sel ? ' sel' : ''), tabindex: '0', 'data-table': t.table, 'aria-selected': String(sel), onclick: function (e) { pick(t.table, e, rows); }, onkeydown: function (e) {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(t.table, e, rows); }
+          else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            var sib = e.key === 'ArrowDown' ? e.currentTarget.nextElementSibling : e.currentTarget.previousElementSibling;
+            if (sib) sib.focus();
+          }
+        } },
           h('span', { class: 'dsk-check' + (sel ? ' on' : ''), title: 'Add to the selection', onclick: function (e) { e.stopPropagation(); pick(t.table, { metaKey: true, shiftKey: e.shiftKey }, rows); } }),
           h('span', { class: 'nm' }, t.table),
           h('span', { class: 'size' }, D.fmt.size(t.size)));
       })));
+      if (had) {
+        var back = Array.prototype.find.call(listEl.querySelectorAll('li[data-table]'), function (x) { return x.getAttribute('data-table') === had; });
+        if (back) back.focus({ preventScroll: true });
+      }
     }
     function pick(name, e, rows) {
       var names = rows.map(function (r) { return r.table; });

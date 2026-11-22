@@ -14,6 +14,18 @@
   var D = window.Disembark, h = D.h;
 
   function check(state) { return h('span', { class: 'dsk-check' + (state ? ' ' + state : '') }); }
+  /** The rows are redrawn on every change: the one that had focus (data-key) gets it back. */
+  function focusedKey(box) { var a = document.activeElement; return a && box.contains(a) ? a.getAttribute('data-key') : null; }
+  function refocus(box, key) {
+    if (key === null) return;
+    var x = Array.prototype.find.call(box.querySelectorAll('[data-key]'), function (e) { return e.getAttribute('data-key') === key; });
+    if (x) x.focus({ preventScroll: true });
+  }
+  /** Up and down between the rows of a list or tree. */
+  function stepFocus(e) {
+    var sib = e.key === 'ArrowDown' ? e.currentTarget.nextElementSibling : e.currentTarget.previousElementSibling;
+    if (sib && sib.hasAttribute('data-key')) { e.preventDefault(); sib.focus(); }
+  }
   function inside(path, parent) { return path === parent || path.indexOf(parent + '/') === 0; }
   function topmost(list) {
     var out = [];
@@ -141,7 +153,7 @@
       }
 
       function renderTree() {
-        var out = [];
+        var out = [], had = focusedKey(tree);
         (function walk(parent, depth) {
           (kids[parent] || []).forEach(function (n) {
             var cov = cover(n.path), partial = false;
@@ -149,8 +161,18 @@
               skipPaths().forEach(function (p) { if (p.indexOf(n.path + '/') === 0) partial = true; });
             }
             var name = n.path.slice(parent ? parent.length + 1 : 0), isOpen = open.has(n.path), hasKids = n.dir && kids[n.path];
+            var flip = function () { if (isOpen) open.delete(n.path); else open.add(n.path); renderTree(); };
             out.push(h('div', { class: 'dsk-tree-row' + (cov ? ' off' : '') + (isOpen ? ' open' : ''), style: { paddingLeft: (6 + depth * 18) + 'px' },
-              onclick: function () { if (hasKids) { if (isOpen) open.delete(n.path); else open.add(n.path); renderTree(); } } },
+              role: 'treeitem', tabindex: '0', 'data-key': n.path, 'aria-expanded': hasKids ? String(isOpen) : null,
+              'aria-label': name + (cov ? ', left behind' : partial ? ', partly brought over' : ', brought over'),
+              title: 'Space brings it or leaves it behind' + (hasKids ? '; Enter opens the folder' : ''),
+              onclick: function () { if (hasKids) flip(); },
+              onkeydown: function (e) {
+                if (e.key === ' ') { e.preventDefault(); toggleNode(n, cov); }
+                else if (e.key === 'Enter') { e.preventDefault(); if (hasKids) flip(); else toggleNode(n, cov); }
+                else if ((e.key === 'ArrowRight' && hasKids && !isOpen) || (e.key === 'ArrowLeft' && isOpen)) { e.preventDefault(); flip(); }
+                else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') stepFocus(e);
+              } },
               h('span', { class: 'tw' }, hasKids ? D.icon('chevron') : null),
               h('span', { title: cov ? 'Left behind' : 'Brought over', onclick: function (e) { e.stopPropagation(); toggleNode(n, cov); } }, check(cov ? '' : partial ? 'mixed' : 'on')),
               D.fileIcon({ dir: n.dir, name: name }),
@@ -160,6 +182,7 @@
           });
         })('', 0);
         D.mount(tree, out.length ? out : h('p', { class: 'muted', style: { padding: '10px 14px' } }, 'No files.'));
+        refocus(tree, had);
       }
       function toggleNode(n, cov) {
         if (!cov) {
@@ -184,19 +207,26 @@
       }
 
       function renderTables() {
-        var skip = new Set(skipRows());
+        var skip = new Set(skipRows()), had = focusedKey(tables);
         D.mount(tables, (c.tables || []).map(function (t) {
           var empty = skip.has(t.name);
+          var flip = function () {
+            if (empty) { if (rows.has(t.name)) rows.delete(t.name); else keepRows.add(t.name); }
+            else { if (keepRows.has(t.name)) keepRows.delete(t.name); else rows.add(t.name); }
+            render();
+          };
           return h('li', { class: 'clickable' + (empty ? ' off' : ''), title: empty ? 'The table comes across empty' : 'Brought over with its rows',
-            onclick: function () {
-              if (empty) { if (rows.has(t.name)) rows.delete(t.name); else keepRows.add(t.name); }
-              else { if (keepRows.has(t.name)) keepRows.delete(t.name); else rows.add(t.name); }
-              render();
+            role: 'checkbox', tabindex: '0', 'data-key': t.name, 'aria-checked': String(!empty), 'aria-label': t.name + (empty ? ', comes across empty' : ', with its rows'),
+            onclick: flip,
+            onkeydown: function (e) {
+              if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); flip(); }
+              else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') stepFocus(e);
             } },
             check(empty ? '' : 'on'), h('span', { class: 'grow mono' }, t.name),
             empty ? h('span', { class: 'dsk-badge' }, 'empty') : null,
             h('span', { class: 'size' }, D.fmt.size(t.size) + ' · ' + D.fmt.plural(t.rows, 'row')));
         }));
+        refocus(tables, had);
       }
 
       function renderSummary() {

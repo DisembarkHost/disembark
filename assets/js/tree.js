@@ -65,7 +65,7 @@
       var inherited = off && !excludedSelf;
       var r = h('div', {
         class: ['dsk-tree-row', isOpen && 'open', off && 'off', selected === node.path && 'sel', opts.mode === 'exclude' && anchor === node.path && 'anchor'],
-        role: 'treeitem', tabindex: '0', 'aria-expanded': node.dir ? String(isOpen) : null, 'aria-selected': opts.mode === 'browse' ? String(selected === node.path) : null,
+        role: 'treeitem', tabindex: '0', 'data-path': node.path, 'aria-expanded': node.dir ? String(isOpen) : null, 'aria-selected': opts.mode === 'browse' ? String(selected === node.path) : null,
         style: { paddingLeft: (6 + depth * 16) + 'px' }, title: node.path,
         onclick: function () { activate(node); },
         onkeydown: function (e) {
@@ -112,9 +112,17 @@
       if (!idx) { D.mount(el); return; }
       var rows = [];
       walk(idx.root.kids, 0, rows);
+      // The rows are made anew, so the one with focus (or its toggle) gets
+      // it back: keyboard users stay where they were.
+      var act = document.activeElement, fRow = act && el.contains(act) ? act.closest('.dsk-tree-row') : null;
+      var fPath = fRow ? fRow.getAttribute('data-path') : null, fTog = !!(act && act.classList && act.classList.contains('tog'));
       var scrollParent = el.parentElement, top = scrollParent ? scrollParent.scrollTop : 0;
       D.mount(el, rows);
       if (scrollParent) scrollParent.scrollTop = top;
+      if (fPath !== null) {
+        var back = Array.prototype.find.call(el.querySelectorAll('.dsk-tree-row'), function (x) { return x.getAttribute('data-path') === fPath; });
+        if (back) ((fTog && back.querySelector('.tog:not([disabled])')) || back).focus({ preventScroll: true });
+      }
     }
 
     var scope = opts.scope || D.scope();
