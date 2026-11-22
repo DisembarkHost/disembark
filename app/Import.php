@@ -6686,12 +6686,22 @@ class Import {
         // that touches a file decides (put back as it was, or removed).
         $final    = [];
         $from     = []; // which step's saved copy a file comes back as
+        $maint    = false;
         foreach ( $steps as $i => $step ) {
-            $m    = $step['id'] === $this->import_id ? $meta : (array) self::rollback_meta( Storage::base_dir() . '/_import_' . $step['id'] . '/rollback' );
-            $with = ! self::files_spent( $m );
-            $row  = [ 'files' => $with, 'spent' => ! $with, 'removes' => 0, 'removes_bytes' => 0, 'uploads' => 0, 'uploads_bytes' => 0, 'puts_back' => 0, 'tables' => count( (array) ( $m['saved_tables'] ?? $m['tables'] ?? [] ) ), 'partial' => ! empty( $m['partial'] ), 'creates_site' => ! empty( $m['target']['created'] ) ];
+            $point = $step['id'] === $this->import_id ? $this : new self( (string) $step['id'] );
+            $m     = $step['id'] === $this->import_id ? $meta : (array) self::rollback_meta( $point->rollback_path );
+            $owner = $point->rollback_owner( $m );
+            // Any whole-site step puts up the maintenance page (see maintenance_on()).
+            $maint = $maint || ( ( $owner['kind'] ?? '' ) === 'plain' && empty( $m['partial'] ) );
+            $with  = ! self::files_spent( $m );
+            $row   = [ 'files' => $with, 'spent' => ! $with, 'removes' => 0, 'removes_bytes' => 0, 'uploads' => 0, 'uploads_bytes' => 0, 'puts_back' => 0, 'tables' => max( 0, count( (array) ( $m['saved_tables'] ?? $m['tables'] ?? [] ) ) - count( self::rollback_left_tables( $owner, $m ) ) ), 'partial' => ! empty( $m['partial'] ), 'creates_site' => ! empty( $m['target']['created'] ) ];
             if ( $with ) {
-                $saved            = array_flip( array_map( 'strval', (array) ( $m['backed_up_files'] ?? [] ) ) );
+                // As the rollback does: nothing in another site's folder of
+                // the install, nothing outside the site (see rollback_run()).
+                $mine = function ( $f ) use ( $owner, $root ) {
+                    return self::is_safe_relative_path( $f ) && ! self::rollback_other_site_path( $owner, $root . '/' . $f );
+                };
+                $saved            = array_flip( array_filter( array_map( 'strval', (array) ( $m['backed_up_files'] ?? [] ) ), $mine ) );
                 $row['puts_back'] = count( $saved );
                 foreach ( $saved as $f => $unused ) {
                     $final[ $f ] = false;
@@ -6699,22 +6709,29 @@ class Import {
                 }
                 foreach ( (array) ( $m['deployed_files'] ?? [] ) as $f ) {
                     $f = (string) $f;
-                    if ( isset( $saved[ $f ] ) ) {
+                    if ( isset( $saved[ $f ] ) || ! $mine( $f ) ) {
                         continue;
                     }
                     if ( ! $partial && microtime( true ) >= $deadline ) {
                         $partial = true;
                     }
+                    // Past the deadline the count stays exact (one look
+                    // each), only the sizes stop.
                     $size = 0;
-                    if ( ! $partial ) {
-                        if ( is_file( $root . '/' . $f ) ) {
-                            $size = (int) @filesize( $root . '/' . $f );
-                        } elseif ( isset( $from[ $f ] ) ) {
-                            // Not here now: a newer step puts it back first.
-                            $size = (int) @filesize( ( new self( $from[ $f ] ) )->rollback_file( $f ) );
-                        } else {
-                            continue;
+                    if ( is_file( $root . '/' . $f ) ) {
+                        $size = $partial ? 0 : (int) @filesize( $root . '/' . $f );
+                    } elseif ( isset( $from[ $f ] ) ) {
+                        // Not here now: a newer step puts it back first. Its
+                        // saved copy carries the exit line in front.
+                        if ( ! $partial ) {
+                            $copy = ( new self( $from[ $f ] ) )->rollback_file( $f );
+                            $size = (int) @filesize( $copy );
+                            if ( substr( $copy, -strlen( self::STAGED_SUFFIX ) ) === self::STAGED_SUFFIX ) {
+                                $size = max( 0, $size - strlen( self::PHP_EXIT ) );
+                            }
                         }
+                    } else {
+                        continue;
                     }
                     $row['removes']++;
                     $row['removes_bytes'] += $size;
@@ -6738,9 +6755,10 @@ class Import {
             'uploads_bytes' => array_sum( $up ),
             'puts_back'     => count( $back ),
             'partial'       => $partial,
-            'database'      => [ 'created_at' => (int) ( $meta['created_at'] ?? 0 ), 'tables' => count( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? [] ) ), 'partial' => ! empty( $meta['partial'] ) ],
-            // Visitors see the maintenance page while it runs (see maintenance_on()).
-            'maintenance'   => ( $this->rollback_owner( $meta )['kind'] ?? '' ) === 'plain' && empty( $meta['partial'] ),
+            // This site's tables only: ones of other sites the point holds stay (see rollback_left_tables()).
+            'database'      => [ 'created_at' => (int) ( $meta['created_at'] ?? 0 ), 'tables' => max( 0, count( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? [] ) ) - $this->rollback_leaves( $meta ) ), 'partial' => ! empty( $meta['partial'] ) ],
+            // Visitors see the maintenance page while it runs, if any step does (see maintenance_on()).
+            'maintenance'   => $maint,
             'notes'         => $this->rollback_notes( $steps ),
         ];
     }
