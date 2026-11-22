@@ -1492,7 +1492,11 @@
       var db = preview.database || {}, lines = [];
       var steps = preview.steps || [], moves = steps.filter(function (st) { return st.files && (st.removes || st.puts_back); }).length > 1 ? 'the moves' : 'the move';
       var created = steps.filter(function (st) { return st.creates_site && !st.spent; }).length;
-      lines.push(h('div', null, h('strong', null, 'Database: '), db.partial ? 'the ' + D.fmt.plural(db.tables, 'table') + ' the change touched ' + (db.tables === 1 ? 'goes' : 'go') + ' back.' : 'back to ' + D.fmt.date(db.created_at) + ' (' + D.fmt.plural(db.tables, 'table') + ').'));
+      // A point taken before a move that made a new subsite or tenant saves
+      // no tables: the made site's go with it.
+      var own = steps.filter(function (st) { return st.id === p.id; })[0];
+      if (own && own.creates_site && !own.spent && !db.tables) lines.push(h('div', null, h('strong', null, 'Database: '), 'the tables of the subsite or tenant this move made go with it.'));
+      else lines.push(h('div', null, h('strong', null, 'Database: '), db.partial ? 'the ' + D.fmt.plural(db.tables, 'table') + ' the change touched ' + (db.tables === 1 ? 'goes' : 'go') + ' back.' : 'back to ' + D.fmt.date(db.created_at) + ' (' + D.fmt.plural(db.tables, 'table') + ').'));
       if (files) {
         if (preview.removes) lines.push(h('div', null, h('strong', null, 'Removes: '), D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') ' + moves + ' placed' + (preview.uploads ? ', ' + D.fmt.num(preview.uploads) + ' of them in uploads (' + size(preview.uploads_bytes) + ')' : '') + '.'));
         if (preview.puts_back) lines.push(h('div', null, h('strong', null, 'Puts back: '), D.fmt.plural(preview.puts_back, 'file') + ' ' + moves + ' replaced or removed.'));
