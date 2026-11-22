@@ -366,7 +366,9 @@ class Target {
         if ( ! Import::is_safe_relative_path( $rel ) ) {
             return null;
         }
-        $norm = preg_replace( '#/+#', '/', str_replace( '\\', '/', $rel ) );
+        // One slash between segments and no "." segments, so a name like
+        // wp-content/./db.php is judged as the file it is.
+        $norm = implode( '/', array_filter( explode( '/', str_replace( '\\', '/', $rel ) ), function ( $seg ) { return $seg !== '' && $seg !== '.'; } ) );
         if ( Import::in_storage( $norm ) ) {
             return null;
         }
@@ -381,7 +383,7 @@ class Target {
 
     private function map( $rel ) {
         $rel = ltrim( (string) $rel, '/' );
-        if ( strpos( $rel, 'wp-content/' ) !== 0 ) {
+        if ( stripos( $rel, 'wp-content/' ) !== 0 ) {
             return null;
         }
         $sub = substr( $rel, strlen( 'wp-content/' ) );
@@ -391,7 +393,10 @@ class Target {
             // object-cache.php, maintenance.php, db-error.php, etc.).
             return null;
         }
-        $top = (string) strtok( $sub, '/' );
+        // Folder names compared without case: on a case-insensitive disk
+        // Uploads/ is uploads/, and its rules (no PHP, Disembark's own
+        // folder left alone) hold however a backup spells it.
+        $top = strtolower( (string) strtok( $sub, '/' ) );
         if ( $top === 'uploads' ) {
             if ( preg_match( '#^uploads/disembark(?:/|$)#i', $sub ) ) {
                 return null;
