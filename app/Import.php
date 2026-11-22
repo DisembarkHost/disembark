@@ -1805,15 +1805,22 @@ class Import {
     private static function swap_start( $import_id = '' ) {
         global $wpdb;
         $tag  = substr( md5( uniqid( '', true ) ), 0, 4 );
-        $live = self::swap_register( $tag, (string) $import_id );
+        list( $live, $dead ) = self::swap_register( $tag, (string) $import_id );
         $ages = [];
         foreach ( (array) $wpdb->get_results( $wpdb->prepare( 'SELECT TABLE_NAME, UNIX_TIMESTAMP() - UNIX_TIMESTAMP(CREATE_TIME) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE %s', $wpdb->esc_like( self::SHADOW_PREFIX ) . '%' ), ARRAY_N ) as $row ) {
             $ages[ (string) $row[0] ] = $row[1] === null ? null : (int) $row[1];
         }
         foreach ( (array) $wpdb->get_results( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( self::SHADOW_PREFIX ) . '%' ), ARRAY_N ) as $row ) {
             $name = (string) $row[0];
-            if ( preg_match( '/^_dsk_o?([0-9a-f]{4})_/', $name, $m ) && isset( $live[ $m[1] ] ) ) {
-                continue;
+            if ( preg_match( '/^_dsk_o?([0-9a-f]{4})_/', $name, $m ) ) {
+                if ( isset( $live[ $m[1] ] ) ) {
+                    continue;
+                }
+                // A tag this install never recorded: another install sharing
+                // the database, mid-import. Left until it's six hours old.
+                if ( ! isset( $dead[ $m[1] ] ) && isset( $ages[ $name ] ) && $ages[ $name ] < 6 * HOUR_IN_SECONDS ) {
+                    continue;
+                }
             }
             // The table-rename check (Checks) cleans up its own; a fresh one is running.
             if ( strpos( $name, '_dsk_check_' ) === 0 && isset( $ages[ $name ] ) && $ages[ $name ] < HOUR_IN_SECONDS ) {
@@ -1831,6 +1838,7 @@ class Import {
      * still under way: one whose import is mid-way (its paced state was
      * written in the last day), or one that started in the last hour. This
      * import's earlier tries and finished or abandoned swaps drop out.
+     * Returns [ live tags, dropped tags ] (each tag => entry).
      */
     private static function swap_register( $tag, $import_id ) {
         $base = Storage::base_dir();
@@ -1842,14 +1850,18 @@ class Import {
         $file = $base . '/swaps.php';
         $all  = json_decode( (string) self::read_protected( $file ), true );
         $kept = [];
+        $dead = [];
         foreach ( is_array( $all ) ? $all : [] as $t => $e ) {
+            $t   = (string) $t;
             $imp = preg_replace( '/[^a-f0-9]/', '', (string) ( $e['import'] ?? '' ) );
-            if ( ! preg_match( '/^[0-9a-f]{4}$/', (string) $t ) || ( $import_id !== '' && $imp === $import_id ) ) {
+            if ( ! preg_match( '/^[0-9a-f]{4}$/', $t ) ) {
                 continue;
             }
             $state = $imp !== '' ? $base . '/_import_' . $imp . '/sql-state.php' : '';
-            if ( (int) ( $e['at'] ?? 0 ) > time() - HOUR_IN_SECONDS || ( $state !== '' && is_file( $state ) && (int) @filemtime( $state ) > time() - DAY_IN_SECONDS ) ) {
+            if ( ! ( $import_id !== '' && $imp === $import_id ) && ( (int) ( $e['at'] ?? 0 ) > time() - HOUR_IN_SECONDS || ( $state !== '' && is_file( $state ) && (int) @filemtime( $state ) > time() - DAY_IN_SECONDS ) ) ) {
                 $kept[ $t ] = [ 'import' => $imp, 'at' => (int) ( $e['at'] ?? 0 ) ];
+            } else {
+                $dead[ $t ] = true;
             }
         }
         $live = $kept;
@@ -1861,7 +1873,7 @@ class Import {
             flock( $lock, LOCK_UN );
             fclose( $lock );
         }
-        return $live;
+        return [ $live, $dead ];
     }
 
     /** A swap is over (done or abandoned): its tag leaves swaps.php. */
