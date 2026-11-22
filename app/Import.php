@@ -5444,11 +5444,11 @@ class Import {
                     $where .= ' (' . trim( (string) $site['name'] ) . ')';
                 }
             }
-            return 'This restore point belongs to ' . $where . ' of this WP Freighter install. Roll it back from that site\'s Disembark' . ( $id === 'main' ? '' : ' (or with STACKED_SITE_ID=' . $id . ')' ) . '.';
+            return 'This restore point belongs to ' . $where . ' of this WP Freighter install. Roll it back or delete it from that site\'s Disembark' . ( $id === 'main' ? '' : ' (or with STACKED_SITE_ID=' . $id . ')' ) . '.';
         }
         $blog = (int) ( $meta['blog'] ?? 0 ) ?: (int) get_main_site_id();
         $home = untrailingslashit( (string) get_home_url( $blog ) );
-        return 'This restore point belongs to ' . ( $home !== '' ? $home : 'site ' . $blog ) . ' on this network. Roll it back from that site\'s Disembark' . ( $home !== '' ? ' (or with --url=' . $home . ')' : '' ) . '.';
+        return 'This restore point belongs to ' . ( $home !== '' ? $home : 'site ' . $blog ) . ' on this network. Roll it back or delete it from that site\'s Disembark' . ( $home !== '' ? ' (or with --url=' . $home . ')' : '' ) . '.';
     }
 
     /**
