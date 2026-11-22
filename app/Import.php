@@ -6332,6 +6332,39 @@ class Import {
         return $r;
     }
 
+    /**
+     * A rollback of this one point alone, asked without later: true, while
+     * restore points made after it are still open: refused, because putting
+     * this point's database back under a later move's files mixes two
+     * states and leaves the later point looking open. Callers say later:
+     * true (undo those first, newest first) or only: true (this point
+     * alone, knowingly). A rollback already under way, or one asked again
+     * right after it finished, carries on. null when there's nothing to say.
+     */
+    public function later_refusal( $files = true ) {
+        if ( is_file( $this->import_path . '/rollback-state.php' ) ) {
+            return null;
+        }
+        $done = json_decode( (string) self::read_protected( $this->import_path . '/rollback-done.php' ), true );
+        if ( is_array( $done ) && (int) ( $done['at'] ?? 0 ) > time() - 600 ) {
+            return null;
+        }
+        $meta = self::rollback_meta( $this->rollback_path );
+        if ( ! is_array( $meta ) || self::point_elsewhere( $meta ) ) {
+            return null;
+        }
+        $later = self::later_points( $meta, $files );
+        if ( ! $later ) {
+            return null;
+        }
+        $n = count( $later );
+        return new \WP_Error(
+            'later_points_exist',
+            ( $n === 1 ? 'A restore point was' : $n . ' restore points were' ) . ' made after this one and ' . ( $n === 1 ? 'isn\'t' : 'aren\'t' ) . ' rolled back: "' . $later[0]['label'] . '"' . ( $n > 1 ? ' and ' . ( $n - 1 ) . ' more' : '' ) . '. Rolling back this one alone would leave ' . ( $n === 1 ? 'that change' : 'those changes' ) . ' half undone. Roll back with later: true to undo ' . ( $n === 1 ? 'it' : 'them' ) . ' first, newest first, or only: true for this point alone. Nothing was changed.',
+            [ 'status' => 409, 'later' => $later ]
+        );
+    }
+
     private function rollback_run( $budget = null, $opts = [] ) {
         global $wpdb;
         // With files unless asked for the database only.

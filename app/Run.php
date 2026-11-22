@@ -2118,10 +2118,16 @@ class Run {
         $import = new Import( $import_id );
         $import->set_request_token( User::request_token( $request ) );
         // files: false rolls back the database only. later: true undoes the
-        // restore points made after this one first, newest first.
+        // restore points made after this one first, newest first; only:
+        // true rolls back this one alone. With neither, a point that has
+        // later ones still open is refused (later_points_exist), so an
+        // older client can't put a database back under a later move.
         $opts = [ 'files' => ! isset( $params['files'] ) || ! empty( $params['files'] ) ];
         if ( ! empty( $params['later'] ) ) {
             return $import->rollback_through( self::paced( $params ), $opts );
+        }
+        if ( empty( $params['only'] ) && ( $refused = $import->later_refusal( $opts['files'] ) ) ) {
+            return $refused;
         }
         return $import->rollback( self::paced( $params ), $opts );
     }
