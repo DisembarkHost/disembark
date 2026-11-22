@@ -306,13 +306,26 @@
       if (!res.ok) throw new ApiError((await res.text()).slice(0, 200) || ('HTTP ' + res.status), res.status);
       return { blob: await res.blob(), type: res.headers.get('content-type') };
     }
-    if (!opts.url && !opts.retried && apiRoot.indexOf('rest_route=') === -1 && /text\/html/i.test(res.headers.get('content-type') || '')) {
+    // A page instead of JSON: try the ?rest_route= form once, and keep it
+    // only if that answers with JSON. A 5xx page is the site's error or
+    // WordPress's maintenance page (503), not a missing route: it stays.
+    var html = /text\/html/i.test(res.headers.get('content-type') || '');
+    if (!opts.url && !opts.retried && html && res.status < 500 && apiRoot.indexOf('rest_route=') === -1) {
+      var was = apiRoot;
       apiRoot = plainRoot();
-      return request(method, path, Object.assign({}, opts, { retried: true }));
+      try { return await request(method, path, Object.assign({}, opts, { retried: true })); }
+      catch (e) { if (e.page) apiRoot = was; throw e; }
+    }
+    if (opts.retried && html) {
+      var page = new ApiError('The site answered with a page instead of the Disembark API (HTTP ' + res.status + ').', res.status);
+      page.page = true;
+      throw page;
     }
     var text = await res.text(), data = text;
     try { data = text === '' ? null : JSON.parse(text); } catch (e) { /* plain text */ }
     if (!res.ok || (data && typeof data === 'object' && data.code && data.message && data.data && data.data.status >= 400)) {
+      // A page (the maintenance page, a host's error) reads as its text, not its markup.
+      if (typeof data === 'string' && html) data = data.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
       var msg = (data && data.message) ? data.message : (typeof data === 'string' && data ? data.slice(0, 200) : 'HTTP ' + res.status);
       var fail = new ApiError(msg, res.status, data);
       fail.retryAfter = parseInt(res.headers.get('Retry-After') || '', 10) || 0;
@@ -338,7 +351,8 @@
         var again = !e.status || [429, 500, 502, 503, 504].indexOf(e.status) !== -1;
         if (!again || ++fails > 6) throw e;
         if (e.status !== 429 && e.status !== 503) budget = Math.max(5, (budget || 20) / 2);
-        await new Promise(function (ok) { setTimeout(ok, 1000 * (e.retryAfter || 2 * fails)); });
+        // WordPress's maintenance page asks for 10 minutes (Retry-After: 600): wait 30 seconds at most.
+        await new Promise(function (ok) { setTimeout(ok, 1000 * Math.min(30, e.retryAfter || 2 * fails)); });
         r = { done: false };
       }
     } while (r && r.done === false);
