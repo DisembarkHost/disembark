@@ -5226,6 +5226,12 @@ class Import {
         if ( ! is_dir( $this->import_path ) ) {
             return new \WP_Error( 'not_found', 'That restore point no longer exists.', [ 'status' => 404 ] );
         }
+        // Another site of this network's point, as the list, the preview
+        // and the rollback treat it: that site deletes it.
+        $meta = self::rollback_meta( $this->rollback_path );
+        if ( is_array( $meta ) && ( $elsewhere = self::point_elsewhere( $meta ) ) ) {
+            return new \WP_Error( 'other_site_point', str_replace( 'Roll it back from', 'Delete it from', $elsewhere ) . ' Nothing was deleted.', [ 'status' => 409 ] );
+        }
         self::delete_directory_recursive( $this->import_path );
         return [ 'deleted' => true ];
     }
