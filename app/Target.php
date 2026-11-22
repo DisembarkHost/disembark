@@ -248,6 +248,7 @@ class Target {
         $saved = $wp_filter['wp_initialize_site'] ?? null;
         unset( $wp_filter['wp_initialize_site'] );
         $id = wp_insert_site( [ 'domain' => $domain, 'path' => $path, 'network_id' => $network->id ] );
+        Scope::forget();
         if ( $saved ) {
             $wp_filter['wp_initialize_site'] = $saved;
         }
@@ -305,6 +306,7 @@ class Target {
         }
         wp_cache_delete( 'alloptions', 'options' );
         wp_cache_delete( 'stacked_sites', 'options' );
+        Scope::forget();
         $this->domain  = $mapping ? $domain : '';
         $this->created = true;
         $this->locate( (string) $id );
@@ -907,6 +909,7 @@ class Target {
             }
             wp_cache_flush();
         }
+        Scope::forget();
     }
 
     private static function remove_dir( $dir ) {

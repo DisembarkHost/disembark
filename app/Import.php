@@ -496,7 +496,7 @@ class Import {
         if ( $target ) {
             return $target->tables();
         }
-        return Scope::install() ? self::own_tables() : (array) $wpdb->get_col( 'SHOW TABLES' );
+        return Scope::ids() ? self::own_tables() : (array) $wpdb->get_col( 'SHOW TABLES' );
     }
 
     /**
@@ -1352,7 +1352,7 @@ class Import {
         // the network keeps its users, its super admins and every subsite's
         // members.
         global $wpdb;
-        $shared_main = ! $target && Scope::install();
+        $shared_main = ! $target && Scope::ids();
         $in_users    = [];
         if ( $shared_main ) {
             $new_prefix = $wpdb->prefix;
@@ -1938,6 +1938,8 @@ class Import {
 
     /** Puts every copy in place of its live table. Returns how many. */
     private static function swap_finish( $swap, &$run ) {
+        // The install's sites may be the source's now (see Scope::install()).
+        Scope::forget();
         global $wpdb;
         $done = 0;
         foreach ( $swap['map'] as $table => $shadow ) {
@@ -2635,7 +2637,7 @@ class Import {
         global $wpdb;
         // On a network's main site the base prefix covers every subsite and
         // the network's users and sites too: its own tables only.
-        $shared = (bool) Scope::install();
+        $shared = (bool) Scope::ids();
         $tables = $shared ? self::own_tables() : (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $wpdb->base_prefix ) . '%' ) );
         $file   = $this->import_path . '/imported-tables.json';
         if ( is_file( $file ) ) {
@@ -4314,7 +4316,7 @@ class Import {
         // in the batch runs when one statement reaches outside it.
         global $wpdb;
         foreach ( $statements as $statement ) {
-            if ( $problem = self::reach_problem( $statement, (string) $wpdb->prefix, (bool) Scope::install(), '', '', true ) ) {
+            if ( $problem = self::reach_problem( $statement, (string) $wpdb->prefix, (bool) Scope::ids(), '', '', true ) ) {
                 return new \WP_Error( 'sql_refused', $problem, [ 'status' => 400 ] );
             }
         }

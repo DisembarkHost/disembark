@@ -79,7 +79,7 @@ class Scope {
         // STACKED_SITE_ID) and named no site exports that site, not the
         // whole install (the Disembark CLI pointed at a subsite's address).
         if ( trim( $value ) === '' ) {
-            $install = self::install();
+            $install = self::ids();
             if ( $install && (string) $install['current'] !== (string) $install['main'] ) {
                 $value = 'current';
             }
@@ -184,6 +184,45 @@ class Scope {
      */
     public static function install() {
         global $wpdb;
+        // Once per request per site: every batch of a backup or pull asks,
+        // and on a network this lists up to 500 sites with their names.
+        $key = ( is_multisite() ? 'b' . get_current_blog_id() : 'p' . $wpdb->prefix ) . '|' . self::$generation;
+        if ( ! array_key_exists( $key, self::$install_cache ) ) {
+            self::$install_cache = [ $key => self::install_uncached() ];
+        }
+        return self::$install_cache[ $key ];
+    }
+
+    /** @var array install()'s answer for this request. */
+    private static $install_cache = [];
+
+    /** @var int Bumped when a site is added or removed (forget()). */
+    private static $generation = 0;
+
+    /** Drops install()'s cached answer: a site was just added or removed. */
+    public static function forget() {
+        self::$generation++;
+        self::$install_cache = [];
+    }
+
+    /**
+     * The cheap part of install(): kind, this site's ID and the main site's,
+     * without listing the sites. null when it isn't a shared install.
+     */
+    public static function ids() {
+        global $wpdb;
+        if ( is_multisite() ) {
+            return [ 'kind' => 'multisite', 'current' => (string) get_current_blog_id(), 'main' => (string) get_main_site_id() ];
+        }
+        $primary = self::freighter_primary();
+        if ( $primary === '' ) {
+            return null;
+        }
+        return [ 'kind' => 'freighter', 'current' => preg_match( '/^stacked_(\d+)_$/', $wpdb->prefix, $m ) && $wpdb->prefix !== $primary ? $m[1] : 'main', 'main' => 'main' ];
+    }
+
+    private static function install_uncached() {
+        global $wpdb;
         if ( is_multisite() ) {
             $sites = [];
             foreach ( get_sites( [ 'number' => 500, 'orderby' => 'id' ] ) as $site ) {
@@ -235,15 +274,23 @@ class Scope {
         if ( $value === '' || strtolower( $value ) === 'all' ) {
             return null;
         }
-        $install = self::install();
-        if ( ! $install ) {
+        $ids = self::ids();
+        if ( ! $ids ) {
             return new \WP_Error( 'not_shared', 'This site isn\'t a multisite network or a WP Freighter install, so there is no single site to choose.', [ 'status' => 400 ] );
         }
         if ( strtolower( $value ) === 'current' ) {
-            $value = $install['current'];
+            $value = $ids['current'];
         } elseif ( strtolower( $value ) === 'main' ) {
-            $value = $install['main'];
+            $value = $ids['main'];
         }
+        // A network's site by its ID: no need to list them all.
+        if ( $ids['kind'] === 'multisite' && ctype_digit( $value ) ) {
+            if ( get_site( (int) $value ) ) {
+                return new self( 'multisite', (string) (int) $value );
+            }
+            return new \WP_Error( 'unknown_site', 'No site ' . $value . ' in this network.', [ 'status' => 404 ] );
+        }
+        $install = self::install();
         $found = null;
         foreach ( $install['sites'] as $site ) {
             if ( strtolower( $value ) === strtolower( $site['id'] ) ) {
