@@ -373,6 +373,11 @@
     Error: ApiError
   };
   D.errorText = function (e) { return (e && e.message) ? e.message : String(e); };
+  /** body with the site picked on a network's or WP Freighter install's main site (state.site), so the request reaches that site's tables or files. */
+  D.withSite = function (body) {
+    var site = D.store.state.site;
+    return site ? Object.assign({ site: site }, body) : body;
+  };
 
   /* ------------------------------------------------------------------- UI */
 

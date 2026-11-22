@@ -165,7 +165,7 @@
           var save = h('button', { class: 'dsk-btn primary sm', onclick: async function () {
             await D.busy(save, async function () {
               try {
-                await D.api.post('file/save', { file: node.path, content: ta.value });
+                await D.api.post('file/save', D.withSite({ file: node.path, content: ta.value }));
                 text = ta.value;
                 D.toast('Saved ' + node.name + '.');
                 renderCode(text);
@@ -235,7 +235,7 @@
         var name = await D.prompt({ title: 'Rename', label: 'New name for ' + node.path, value: node.name, confirmLabel: 'Rename' });
         if (!name || name === node.name) return;
         try {
-          await D.api.post('file/rename', { old_path: node.path, new_name: name });
+          await D.api.post('file/rename', D.withSite({ old_path: node.path, new_name: name }));
           var parent = node.path.slice(0, node.path.length - node.name.length);
           var next = parent + name;
           var files = S.files.map(function (f) {

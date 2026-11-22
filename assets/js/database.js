@@ -234,7 +234,7 @@
       var tabBar = h('div', { class: 'dsk-dbtabs', role: 'tablist' });
       var schema = null;
       function loadSchema() {
-        if (!schema) schema = D.api.get('database/schema', { table: t.table }).catch(function (e) { schema = null; throw e; });
+        if (!schema) schema = D.api.get('database/schema', D.withSite({ table: t.table })).catch(function (e) { schema = null; throw e; });
         return schema;
       }
       function renderTabs() {
@@ -256,22 +256,51 @@
       renderTabs(); renderTab();
     }
 
+    /*
+     * On a subsite, /database lists the network's user tables under the
+     * site's own prefix, showing only its members. They're shared with
+     * every site, so they're read only here (the server refuses a write
+     * with shared_table): say so up front, and remember any table a write
+     * was refused for.
+     */
+    var readOnly = {};
+    function sharedTable(t) {
+      if (readOnly[t.table]) return readOnly[t.table];
+      var inst = D.config.install;
+      if (!inst || inst.kind !== 'multisite' || String(inst.current) === String(inst.main)) return '';
+      var opts = S.database.map(function (x) { return x.table; }).filter(function (n) { return /options$/.test(n); }).sort(function (a, b) { return a.length - b.length; })[0];
+      if (!opts) return '';
+      var pre = opts.slice(0, -'options'.length);
+      return t.table === pre + 'users' || t.table === pre + 'usermeta'
+        ? t.table + ' is the network’s user table, shared with every site (this shows the members of this site only): change it from the main site.' : '';
+    }
+    /** A write refused because the table is the network's: true once it's marked read only and said. */
+    function refusedShared(e, t, body, loadSchema) {
+      if (!(e && e.status === 403 && e.data && e.data.code === 'shared_table')) return false;
+      readOnly[t.table] = D.errorText(e);
+      D.toast(readOnly[t.table], 'error');
+      rowsTab(t, body, loadSchema);
+      return true;
+    }
+
     /* Rows */
     function rowsTab(t, body, loadSchema) {
       var st2 = { page: 1, limit: 100, orderby: null, order: 'ASC', total: 0, rows: [], cols: [] };
       var tableWrap = h('div', { class: 'dsk-table-wrap', style: { flex: 1, minHeight: 0 } });
       var pager = h('div', { class: 'dsk-pager' });
+      var ro = sharedTable(t);
       var toolbar = h('div', { class: 'dsk-row', style: { padding: '10px 14px' } },
-        h('button', { class: 'dsk-btn sm', onclick: function () { editRow(null); } }, D.icon('plus'), 'Add row'),
+        ro ? null : h('button', { class: 'dsk-btn sm', onclick: function () { editRow(null); } }, D.icon('plus'), 'Add row'),
         h('button', { class: 'dsk-btn ghost sm', onclick: function () { load(); } }, D.icon('refresh'), 'Reload'),
-        h('span', { class: 'muted', style: { marginLeft: 'auto', fontSize: '12.5px' } }, 'Click a row to edit it.'));
+        ro ? h('span', { class: 'muted dsk-db-ro', style: { marginLeft: 'auto', fontSize: '12.5px', display: 'inline-flex', gap: '6px', alignItems: 'center' } }, D.icon('info'), 'Read only. ' + ro)
+          : h('span', { class: 'muted', style: { marginLeft: 'auto', fontSize: '12.5px' } }, 'Click a row to edit it.'));
       D.mount(body, toolbar, tableWrap, pager);
       load();
 
       async function load() {
         D.mount(tableWrap, h('div', { class: 'dsk-empty' }, h('span', { class: 'dsk-spin' })));
         try {
-          var r = await D.api.get('database/rows', { table: t.table, page: st2.page, limit: st2.limit, orderby: st2.orderby, order: st2.order });
+          var r = await D.api.get('database/rows', D.withSite({ table: t.table, page: st2.page, limit: st2.limit, orderby: st2.orderby, order: st2.order }));
           st2.rows = r.rows || []; st2.total = Number(r.total) || 0;
           if (st2.rows.length) st2.cols = Object.keys(st2.rows[0]);
           else if (!st2.cols.length) { try { var sc = await loadSchema(); st2.cols = (sc.structure || []).map(function (c) { return c.Field; }); } catch (e) { /* ignore */ } }
@@ -280,7 +309,7 @@
       }
       function draw() {
         if (!st2.rows.length) {
-          D.mount(tableWrap, h('div', { class: 'dsk-empty' }, h('div', null, h('h3', null, 'This table is empty'), h('p', null, 'Add a row to get started.'))));
+          D.mount(tableWrap, h('div', { class: 'dsk-empty' }, h('div', null, h('h3', null, 'This table is empty'), ro ? null : h('p', null, 'Add a row to get started.'))));
         } else {
           D.mount(tableWrap, h('table', { class: 'dsk-table' },
             h('thead', null, h('tr', null, st2.cols.map(function (c) {
@@ -290,7 +319,7 @@
               } }, c, st2.orderby === c ? h('span', { class: 'arrow' }, st2.order === 'ASC' ? '↑' : '↓') : null);
             }))),
             h('tbody', null, st2.rows.map(function (row) {
-              return h('tr', { tabindex: '0', onclick: function () { editRow(row); }, onkeydown: function (e) { if (e.key === 'Enter') editRow(row); } }, st2.cols.map(function (c) {
+              return h('tr', ro ? null : { tabindex: '0', onclick: function () { editRow(row); }, onkeydown: function (e) { if (e.key === 'Enter') editRow(row); } }, st2.cols.map(function (c) {
                 var v = row[c];
                 return v === null ? h('td', { class: 'null' }, 'NULL') : h('td', { title: String(v).slice(0, 500) }, String(v).slice(0, 200));
               }));
@@ -338,18 +367,18 @@
           });
           if (!Object.keys(data).length) { if (creating) { D.toast('Fill in at least one field.', 'error'); return false; } return true; }
           try {
-            if (creating) await D.api.post('database/row/create', { table: t.table, data: data });
-            else await D.api.post('database/row', { table: t.table, data: data, where: where() });
+            if (creating) await D.api.post('database/row/create', D.withSite({ table: t.table, data: data }));
+            else await D.api.post('database/row', D.withSite({ table: t.table, data: data, where: where() }));
             D.toast(creating ? 'Row added.' : 'Row saved.');
             load();
             return true;
-          } catch (e) { D.toast(D.errorText(e), 'error'); return false; }
+          } catch (e) { if (refusedShared(e, t, body, loadSchema)) return true; D.toast(D.errorText(e), 'error'); return false; }
         } }];
         if (!creating) actions.unshift({ label: 'Delete row', kind: 'danger', left: true, onClick: async function () {
           var ok = await D.confirm('Delete this row from ' + t.table + '? This can’t be undone.', { title: 'Delete row?', confirmLabel: 'Delete', danger: true });
           if (!ok) return false;
-          try { await D.api.post('database/row/delete', { table: t.table, where: where() }); D.toast('Row deleted.'); load(); return true; }
-          catch (e) { D.toast(D.errorText(e), 'error'); return false; }
+          try { await D.api.post('database/row/delete', D.withSite({ table: t.table, where: where() })); D.toast('Row deleted.'); load(); return true; }
+          catch (e) { if (refusedShared(e, t, body, loadSchema)) return true; D.toast(D.errorText(e), 'error'); return false; }
         } });
         D.modal({ title: creating ? 'Add a row' : 'Edit row', wide: true, body: form, actions: actions });
       }
