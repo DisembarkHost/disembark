@@ -2151,9 +2151,15 @@ class Run {
      * Deletes backup working files. With a backup_token, only that session's
      * folder goes (the CLI passes its own at the end of every backup, so a
      * parallel backup or pull keeps its files). Without one, every backup
-     * session goes. Restore folders (_import_*: staged restores and their
-     * rollback points) are kept unless include_restore_points is set, so a
-     * backup taken after a restore can't silently remove the way back.
+     * session goes; the catch-up memory (pulls/) stays, as the daily
+     * clean-up keeps it. Restore folders (_import_*: staged restores and
+     * their rollback points) are kept unless include_restore_points is set,
+     * so a backup taken after a restore can't silently remove the way back;
+     * even then only this site's own points go (another site of a network
+     * or a shared WP Freighter folder keeps its), and never a move still in
+     * progress: one not finished (its pull state, a rollback's state or its
+     * staging folder is there) or worked on in the last two minutes. Answers JSON: { removed, skipped_active: [ids],
+     * kept_other_sites }.
      */
     function cleanup( $request ) {
         if ( ! User::allowed( $request ) ) {
@@ -2162,19 +2168,46 @@ class Run {
         $base    = Storage::base_dir();
         $session = Storage::sanitize_session( $request['backup_token'] ?? '' );
         $targets = [];
+        $active  = [];
+        $others  = 0;
         if ( $session !== '' ) {
             $targets[] = "{$base}/{$session}";
         } else {
             $include_restore_points = ! empty( $request['include_restore_points'] );
             foreach ( (array) glob( "{$base}/*", GLOB_ONLYDIR ) as $dir ) {
-                if ( strpos( basename( $dir ), '_import_' ) === 0 && ! $include_restore_points ) {
+                $name = basename( $dir );
+                if ( $name === 'pulls' ) {
                     continue;
+                }
+                if ( strpos( $name, '_import_' ) === 0 ) {
+                    if ( ! $include_restore_points ) {
+                        continue;
+                    }
+                    $id   = substr( $name, strlen( '_import_' ) );
+                    $meta = Import::rollback_meta( $dir . '/rollback' );
+                    if ( is_array( $meta ) && ! Import::point_is_here( $meta ) ) {
+                        $others++;
+                        continue;
+                    }
+                    $state = is_file( $dir . '/pull.json' ) ? json_decode( (string) file_get_contents( $dir . '/pull.json' ), true ) : null;
+                    if ( is_array( $state ) && isset( $state['owner'] ) && (string) $state['owner'] !== Pull::owner() ) {
+                        $others++;
+                        continue;
+                    }
+                    $touched = (int) @filemtime( $dir );
+                    foreach ( (array) glob( $dir . '/*', GLOB_NOSORT ) as $f ) {
+                        $touched = max( $touched, (int) @filemtime( $f ) );
+                    }
+                    if ( is_array( $state ) || is_file( $dir . '/rollback-state.php' ) || is_dir( $dir . '/staging' ) || $touched > time() - 2 * MINUTE_IN_SECONDS ) {
+                        $active[] = $id;
+                        continue;
+                    }
                 }
                 $targets[] = $dir;
             }
         }
 
-        header( 'Content-Type: text/plain' );
+        $removed = 0;
         foreach ( $targets as $dir ) {
             if ( ! is_dir( $dir ) || is_link( $dir ) ) {
                 continue;
@@ -2187,12 +2220,12 @@ class Run {
                 if ( $item->isDir() && ! $item->isLink() ) {
                     @rmdir( $item->getPathname() );
                 } else {
-                    echo "Removing {$item->getPathname()}\n";
                     @unlink( $item->getPathname() );
                 }
             }
             @rmdir( $dir );
+            $removed++;
         }
-        exit;
+        return [ 'removed' => $removed, 'skipped_active' => $active, 'kept_other_sites' => $others ];
     }
 }
