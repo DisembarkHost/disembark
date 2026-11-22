@@ -937,3 +937,10 @@ body.tools_page_disembark .disembark-wrap > :is(.notice, div.updated, div.error,
 .dsk-voy:has(.dsk-voy-line.busy) .boat-slot { animation: dsk-bob 2.4s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
 @media (prefers-reduced-motion: reduce) { .dsk-voy .boat-slot { animation: none !important; } }
 @media (max-width: 600px) { .dsk .dsk-voy-line { padding: 0 16px 16px; } .dsk-voy-line .t { white-space: normal; } }
+
+/* The tab bar on the narrowest phones: four tabs and their icons need about
+   370px, so below 400px the words stand alone and nothing scrolls sideways. */
+@media (max-width: 400px) {
+  .dsk-tabs a { min-width: 0; padding: 0 4px; font-size: 13px; }
+  .dsk-tabs a svg.i { display: none; }
+}
