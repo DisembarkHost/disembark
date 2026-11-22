@@ -494,9 +494,12 @@ class Command {
                 ];
                 $this->say( '      ' . ( $from !== $dest_home ? "{$src_home} → {$dest_home} (every http, https and www spelling): " : 'Same address: ' ) . number_format( (int) ( $sr['cells_changed'] ?? 0 ) ) . ' cells, ' . (int) ( $sr['files_rewritten'] ?? 0 ) . ' files under uploads.' );
                 if ( ! empty( $sr['files_too_big_total'] ) ) {
+                    $summary['urls']['files_too_big'] = (array) ( $sr['files_too_big'] ?? [] );
                     $this->say( '      ! ' . self::plural( (int) $sr['files_too_big_total'], 'file' ) . ' under uploads ' . ( (int) $sr['files_too_big_total'] === 1 ? 'mentions' : 'mention' ) . " {$src_home} but " . ( (int) $sr['files_too_big_total'] === 1 ? 'is' : 'are' ) . ' over 5 MB, so left as is: ' . implode( ', ', array_slice( (array) ( $sr['files_too_big'] ?? [] ), 0, 8 ) ) . ( (int) $sr['files_too_big_total'] > 8 ? ', …' : '' ) );
                 }
                 if ( ! empty( $sr['files_mentioning_total'] ) ) {
+                    // Under urls as restore has it; code_mentions stays for 3.0 readers.
+                    $summary['urls']['files_mentioning_source'] = (array) ( $sr['files_mentioning_source'] ?? [] );
                     $summary['code_mentions'] = $sr['files_mentioning_source'] ?? [];
                     $this->say( '      ' . (int) $sr['files_mentioning_total'] . " theme or plugin files still mention {$src_home} (left as is):" );
                     foreach ( (array) ( $sr['files_mentioning_source'] ?? [] ) as $file ) {
