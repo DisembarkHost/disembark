@@ -62,6 +62,28 @@ class Backup {
         return $scope ? $scope->root : dirname( WP_CONTENT_DIR );
     }
 
+    /**
+     * What a scan session was made for, kept beside its file lists
+     * (_session.json): the site of an install it lists ('' for the whole
+     * install) and whether folders were left out of it (filtered). null for
+     * a session an older build made, which recorded neither.
+     */
+    public static function session_meta( $token ) {
+        $token = Storage::sanitize_session( $token );
+        if ( $token === '' ) {
+            return null;
+        }
+        $meta = json_decode( (string) @file_get_contents( Storage::base_dir() . "/{$token}/_session.json" ), true );
+        return is_array( $meta ) ? $meta : null;
+    }
+
+    /** Records what this session is for (see session_meta()); $changes merge into what's there. */
+    public function save_session_meta( $changes ) {
+        Storage::ensure_dir( $this->backup_path );
+        $meta = self::session_meta( $this->token ) ?: [];
+        file_put_contents( "{$this->backup_path}/_session.json", wp_json_encode( array_merge( $meta, (array) $changes ) ) );
+    }
+
     public function initiate_scan_state() {
         $state_file = "{$this->backup_path}/_scan_state.json";
         

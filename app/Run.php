@@ -689,11 +689,20 @@ class Run {
                     $token = basename( $dir );
                     // Only list sessions that have a manifest (completed scans)
                     if ( file_exists( $dir . '/manifest.json' ) ) {
-                        $sessions[] = [
+                        $session = [
                             'token'     => $token,
                             'timestamp' => filemtime( $dir . '/manifest.json' ), // Use manifest time
                             'count'     => count( glob( $dir . '/files-*.json' ) ) // Count chunks
                         ];
+                        // What it was scanned for: the site ('' for the
+                        // whole install) and whether folders were left out.
+                        // Left out for a session an older build made.
+                        $meta = Backup::session_meta( $token );
+                        if ( is_array( $meta ) && array_key_exists( 'site', $meta ) ) {
+                            $session['site']     = (string) $meta['site'];
+                            $session['filtered'] = ! empty( $meta['filtered'] );
+                        }
+                        $sessions[] = $session;
                     }
                 }
                 // Sort by newest first
@@ -1021,6 +1030,42 @@ class Run {
         return $real;
     }
 
+    /**
+     * The scope of a request made within a scan session (backup_token): the
+     * site the session was scanned for. Named no site, it gets that site's
+     * scope; named another site (or reached another site by its address),
+     * it's refused with session_site_mismatch, since the session's file
+     * lists name that site's files. A session an older build made, which
+     * recorded no site, scopes as the request says. $params: the request's
+     * parameters as an array, for routes that read their own body.
+     */
+    private static function session_scope( $request, $params = null ) {
+        $get   = function ( $key ) use ( $request, $params ) {
+            return is_array( $params ) ? ( $params[ $key ] ?? null ) : ( $request ? $request->get_param( $key ) : null );
+        };
+        $token = Storage::sanitize_session( (string) ( $get( 'backup_token' ) ?? '' ) );
+        $meta  = $token !== '' ? Backup::session_meta( $token ) : null;
+        $known = is_array( $meta ) && array_key_exists( 'site', $meta );
+        if ( $known && trim( (string) ( $get( 'site' ) ?? '' ) ) === '' && (string) $meta['site'] !== '' ) {
+            if ( is_array( $params ) ) {
+                $params['site'] = (string) $meta['site'];
+            } else {
+                $request->set_param( 'site', (string) $meta['site'] );
+            }
+        }
+        $scope = Scope::from_request( is_array( $params ) ? $params : $request );
+        if ( is_wp_error( $scope ) || ! $known ) {
+            return $scope;
+        }
+        $now = $scope ? (string) $scope->id : '';
+        if ( $now !== (string) $meta['site'] ) {
+            Scope::activate( null );
+            $was = (string) $meta['site'] === '' ? 'the whole install' : 'site ' . $meta['site'];
+            return new \WP_Error( 'session_site_mismatch', 'Scan session ' . $token . ' was made for ' . $was . ', and this request is for ' . ( $now === '' ? 'the whole install' : 'site ' . $now ) . '. Scan again for that site, or leave out the site to use the session\'s.', [ 'status' => 400, 'session_site' => (string) $meta['site'] ] );
+        }
+        return $scope;
+    }
+
     function save_file( $request ) {
         // 1. Security Check
         $params = $request->get_json_params();
@@ -1158,13 +1203,13 @@ class Run {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
-        $scope = Scope::from_request( $request );
+        $step  = $request['step'] ?? 'initiate';
+        $scope = $step === 'initiate' ? Scope::from_request( $request ) : self::session_scope( $request );
         if ( is_wp_error( $scope ) ) {
             return $scope;
         }
         $backup_token     = $request['backup_token'];
         $backup_manager   = new Backup( $backup_token );
-        $step             = $request['step'] ?? 'initiate';
         $chunk_size_mb    = 150;
         $default_excludes = [
             Storage::relative_base_dir(),
@@ -1181,10 +1226,16 @@ class Run {
                 // Without a backup_token, a new session is minted here and
                 // returned (the dashboard); the CLI still names its own.
                 $backup_manager->initiate_scan_state();
+                // Which site it lists, so a later request with this session
+                // gets that site's files and tables (see session_scope()).
+                $backup_manager->save_session_meta( [ 'site' => $scope ? (string) $scope->id : '', 'filtered' => false ] );
                 return [ 'status' => 'ready', 'backup_token' => $backup_manager->session() ];
             case 'scan':
                 $exclude_files_string = $request['exclude_files'] ?? '';
                 $user_exclude_paths = !empty($exclude_files_string) ? explode( "\n", $exclude_files_string ) : [];
+                if ( array_filter( array_map( 'trim', $user_exclude_paths ) ) && ! empty( ( Backup::session_meta( (string) $backup_token ) ?: [] ) ) ) {
+                    $backup_manager->save_session_meta( [ 'filtered' => true ] );
+                }
                 // Merge default and user-defined exclusions
                 $exclude_paths = array_unique( array_merge( $default_excludes, $user_exclude_paths ) );
                 $include_checksums = isset( $request['include_checksums'] ) ? $request['include_checksums'] : false;
@@ -1206,7 +1257,7 @@ class Run {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
-        $scope = Scope::from_request( $request );
+        $scope = self::session_scope( $request );
         if ( is_wp_error( $scope ) ) {
             return $scope;
         }
@@ -1242,7 +1293,7 @@ class Run {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
-        $scope = Scope::from_request( $request );
+        $scope = self::session_scope( $request );
         if ( is_wp_error( $scope ) ) {
             return $scope;
         }
@@ -1262,7 +1313,7 @@ class Run {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
-        $scope = Scope::from_request( $request );
+        $scope = self::session_scope( $request );
         if ( is_wp_error( $scope ) ) {
             return $scope;
         }
@@ -1355,9 +1406,13 @@ class Run {
         // its files as the export does (its uploads as wp-content/uploads),
         // so the real file is looked up the same way. Disembark's own
         // exports (database dumps, zips) are named as they are.
-        $scope = Scope::from_request( $params );
+        $scope = self::session_scope( null, $params );
         if ( is_wp_error( $scope ) ) {
             header("HTTP/1.1 400 Bad Request");
+            if ( $scope->get_error_code() === 'session_site_mismatch' ) {
+                header( 'Content-Type: application/json' );
+                die( wp_json_encode( [ 'code' => 'session_site_mismatch', 'message' => $scope->get_error_message(), 'data' => [ 'status' => 400 ] ] ) );
+            }
             die('400 Bad Request: ' . esc_html( $scope->get_error_message() ));
         }
         if ( $scope && ! Import::in_storage( ltrim( (string) $file_path, '/' ) ) ) {
