@@ -94,6 +94,16 @@ class Run {
 
     /** Schedules the daily clean-up once per site. */
     public static function schedule_purge() {
+        // On a network everything Disembark keeps is in the main site's
+        // folder (see Storage::base_dir()), so the clean-up runs there only:
+        // network-activated, it would otherwise land in every subsite's cron
+        // that gets a visit. One an earlier build scheduled on a subsite goes.
+        if ( is_multisite() && ! is_main_site() ) {
+            if ( wp_next_scheduled( self::PURGE_HOOK ) ) {
+                wp_clear_scheduled_hook( self::PURGE_HOOK );
+            }
+            return;
+        }
         if ( ! wp_next_scheduled( self::PURGE_HOOK ) ) {
             wp_schedule_event( time() + HOUR_IN_SECONDS, 'daily', self::PURGE_HOOK );
         }
