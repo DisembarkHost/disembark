@@ -1246,6 +1246,20 @@ class Run {
             die('400 Bad Request: File parameter is missing.');
         }
 
+        // One site of a network or WP Freighter install (--site, or a
+        // request that reached it by its own address): the file list named
+        // its files as the export does (its uploads as wp-content/uploads),
+        // so the real file is looked up the same way. Disembark's own
+        // exports (database dumps, zips) are named as they are.
+        $scope = Scope::from_request( $params );
+        if ( is_wp_error( $scope ) ) {
+            header("HTTP/1.1 400 Bad Request");
+            die('400 Bad Request: ' . esc_html( $scope->get_error_message() ));
+        }
+        if ( $scope && ! Import::in_storage( ltrim( (string) $file_path, '/' ) ) ) {
+            $file_path = $scope->file_in( $file_path );
+        }
+
         $base_dir = realpath( dirname( WP_CONTENT_DIR ) );
         $core_dir = realpath( ABSPATH );
         
