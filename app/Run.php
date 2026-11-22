@@ -752,11 +752,12 @@ class Run {
         $data  = $params['data'] ?? [];       // The new values
         $where = $params['where'] ?? [];      // The primary keys to identify the row
 
-        // Validate Table Name
-        $valid_tables = $wpdb->get_col( "SHOW TABLES" );
-        if ( ! in_array( $table, $valid_tables, true ) ) {
-            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        // Validate Table Name (one site's, by the name /database listed)
+        $found = $this->browse_table( $request, $table, true );
+        if ( is_wp_error( $found ) ) {
+            return $found;
         }
+        $table = $found['table'];
 
         if ( empty( $data ) || empty( $where ) ) {
             return new \WP_Error( 'missing_data', 'Missing data or primary key identification.', [ 'status' => 400 ] );
@@ -783,11 +784,12 @@ class Run {
         $table = $params['table'] ?? '';
         $data  = $params['data'] ?? []; 
 
-        // Validate Table Name
-        $valid_tables = $wpdb->get_col( "SHOW TABLES" );
-        if ( ! in_array( $table, $valid_tables, true ) ) {
-            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        // Validate Table Name (one site's, by the name /database listed)
+        $found = $this->browse_table( $request, $table, true );
+        if ( is_wp_error( $found ) ) {
+            return $found;
         }
+        $table = $found['table'];
 
         if ( empty( $data ) ) {
             return new \WP_Error( 'missing_data', 'Missing data.', [ 'status' => 400 ] );
@@ -835,11 +837,12 @@ class Run {
         $table = $params['table'] ?? '';
         $where = $params['where'] ?? [];
 
-        // Validate Table Name
-        $valid_tables = $wpdb->get_col( "SHOW TABLES" );
-        if ( ! in_array( $table, $valid_tables, true ) ) {
-            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        // Validate Table Name (one site's, by the name /database listed)
+        $found = $this->browse_table( $request, $table, true );
+        if ( is_wp_error( $found ) ) {
+            return $found;
         }
+        $table = $found['table'];
 
         if ( empty( $where ) ) {
             return new \WP_Error( 'missing_data', 'Missing primary key identification.', [ 'status' => 400 ] );
@@ -853,6 +856,39 @@ class Run {
         }
 
         return [ 'success' => true, 'rows_affected' => $result ];
+    }
+
+    /**
+     * The real table behind a name Browse → Database shows. On one site of
+     * a network or WP Freighter install (a subsite's or tenant's own
+     * address, or a picked site), /database lists its tables by the names
+     * it exports them under: the network's user tables as the subsite's
+     * own, filtered to its members. Those are read through that filter and
+     * can't be changed from here; the site's own tables can. [ table,
+     * where ] or WP_Error.
+     */
+    private function browse_table( $request, $table, $write = false ) {
+        global $wpdb;
+        $table = (string) $table;
+        $scope = Scope::from_request( $request );
+        if ( is_wp_error( $scope ) ) {
+            return $scope;
+        }
+        if ( $scope ) {
+            $real = $scope->real( $table );
+            if ( $real === null ) {
+                return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+            }
+            $where = $scope->where( $table );
+            if ( $write && ( $real !== $table || $where !== '' ) ) {
+                return new \WP_Error( 'shared_table', "{$table} is the network's {$real}, shared with every site: change it from the main site.", [ 'status' => 403 ] );
+            }
+            return [ 'table' => $real, 'where' => $where ];
+        }
+        if ( ! in_array( $table, (array) $wpdb->get_col( 'SHOW TABLES' ), true ) ) {
+            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        }
+        return [ 'table' => $table, 'where' => '' ];
     }
 
     public function get_table_rows( $request ) {
@@ -870,14 +906,16 @@ class Run {
         $orderby = isset($request['orderby']) ? $request['orderby'] : null;
         $order   = isset($request['order']) && strtoupper($request['order']) === 'DESC' ? 'DESC' : 'ASC';
 
-        // 1. Validate Table Name
-        $valid_tables = $wpdb->get_col( "SHOW TABLES" );
-        if ( ! in_array( $table, $valid_tables, true ) ) {
-            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        // 1. Validate Table Name (one site's, by the name /database listed)
+        $found = $this->browse_table( $request, $table );
+        if ( is_wp_error( $found ) ) {
+            return $found;
         }
+        $table = $found['table'];
+        $where = $found['where'] !== '' ? ' WHERE ' . $found['where'] : '';
 
         // 2. Build Query
-        $sql = "SELECT * FROM " . Backup::ident( $table );
+        $sql = "SELECT * FROM " . Backup::ident( $table ) . $where;
 
         // 3. Handle Sorting securely
         if ( $orderby ) {
@@ -895,7 +933,7 @@ class Run {
         $rows = $wpdb->get_results( $sql, ARRAY_A );
         
         // Get total rows for pagination
-        $total = $wpdb->get_var( "SELECT COUNT(*) FROM " . Backup::ident( $table ) );
+        $total = $wpdb->get_var( "SELECT COUNT(*) FROM " . Backup::ident( $table ) . $where );
 
         return [
             'rows' => $rows,
@@ -911,11 +949,12 @@ class Run {
         global $wpdb;
         $table = $request['table'];
 
-        // Security: Validate table existence
-        $valid_tables = $wpdb->get_col( "SHOW TABLES" );
-        if ( ! in_array( $table, $valid_tables, true ) ) {
-            return new \WP_Error( 'invalid_table', 'Invalid table name.', [ 'status' => 400 ] );
+        // Security: Validate table existence (one site's, by the name /database listed)
+        $found = $this->browse_table( $request, $table );
+        if ( is_wp_error( $found ) ) {
+            return $found;
         }
+        $table = $found['table'];
 
         // Get Table Structure
         $structure = $wpdb->get_results( "DESCRIBE " . Backup::ident( $table ) );
@@ -927,6 +966,29 @@ class Run {
             'structure' => $structure,
             'status'    => $status
         ];
+    }
+
+    /**
+     * The real file behind a path Browse → Files shows. On one site of a
+     * network or WP Freighter install the file list names its files as the
+     * export does (a tenant's content/<id>/themes as wp-content/themes, see
+     * regenerate_manifest()), so an edit goes to that site's file, never
+     * the main site's of the same name. A file that isn't this site's is
+     * refused.
+     */
+    private function browse_file( $params, $path ) {
+        $scope = Scope::from_request( (array) $params );
+        if ( is_wp_error( $scope ) ) {
+            return $scope;
+        }
+        if ( ! $scope ) {
+            return (string) $path;
+        }
+        $real = $scope->file_in( (string) $path );
+        if ( $scope->file_out( $real ) === null ) {
+            return new \WP_Error( 'other_site_file', 'That file belongs to another site of this install.', [ 'status' => 403 ] );
+        }
+        return $real;
     }
 
     function save_file( $request ) {
@@ -951,6 +1013,10 @@ class Run {
 
         if ( empty( $file_path ) ) {
             return new \WP_Error( 'missing_params', 'File path is required.', [ 'status' => 400 ] );
+        }
+        $file_path = $this->browse_file( $params, $file_path );
+        if ( is_wp_error( $file_path ) ) {
+            return $file_path;
         }
 
         // 2. Path Resolution (Same security logic as stream_file)
@@ -1012,6 +1078,11 @@ class Run {
         // Security: Prevent directory traversal
         if ( $new_name === '.' || strpos( $new_name, '/' ) !== false || strpos( $new_name, '\\' ) !== false || strpos( $new_name, '..' ) !== false ) {
             return new \WP_Error( 'invalid_name', 'Invalid file name.', [ 'status' => 400 ] );
+        }
+
+        $old_path_relative = $this->browse_file( $params, $old_path_relative );
+        if ( is_wp_error( $old_path_relative ) ) {
+            return $old_path_relative;
         }
 
         // Same wp-config.php protection as save_file, in both directions.
