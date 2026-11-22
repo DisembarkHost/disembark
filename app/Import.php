@@ -1388,7 +1388,7 @@ class Import {
         $netcore  = $saved ? (array) ( $saved['netcore'] ?? [] ) : [];
         $run      = $this->begin_statements();
         $count    = $saved ? (int) $saved['count'] : 0;
-        $swap     = $saved ? $saved['swap'] : self::swap_start();
+        $swap     = $saved ? $saved['swap'] : self::swap_start( $this->import_id );
         $compat   = self::db_compat();
         if ( $saved ) {
             $compat = array_merge( $compat, array_intersect_key( (array) $saved['compat'], array_flip( [ 'converted', 'definers_removed', 'map' ] ) ) );
@@ -1666,6 +1666,7 @@ class Import {
             self::swap_abandon( $swap );
             $swapped = 0;
         }
+        self::swap_unregister( (string) ( $swap['tag'] ?? '' ) );
         // The address rewrite after the move covers these and this site's own.
         $this->prepare_import_dir();
         // $merge: a second import in the same move (a catch-up copying again
@@ -1777,7 +1778,8 @@ class Import {
      * Import into copies, then swap
      *
      * Each table of the dump is created and filled under a temporary name
-     * (_dsk_<table>) while the live table keeps serving the site. Only when
+     * (_dsk_<tag>_<table>, the tag naming this import's swap) while the live
+     * table keeps serving the site. Only when
      * every statement has run does each copy replace its live table (DROP,
      * then RENAME: milliseconds). An import that fails, runs out of disk or
      * is cancelled drops the copies and leaves the database untouched.
@@ -1793,14 +1795,95 @@ class Import {
 
     const SHADOW_PREFIX = '_dsk_';
 
-    /** A fresh swap, with copies left by an earlier attempt dropped first. */
-    private static function swap_start() {
+    /**
+     * A fresh swap, with copies left by earlier attempts dropped first:
+     * this import's own earlier tries, crashed moves, and copies older
+     * builds left without a tag. Another move's copies, while it's still
+     * importing (moves into different subsites or tenants can run at
+     * once, and installs can share a database), are left alone.
+     */
+    private static function swap_start( $import_id = '' ) {
         global $wpdb;
-        foreach ( (array) $wpdb->get_results( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( self::SHADOW_PREFIX ) . '%' ), ARRAY_N ) as $row ) {
-            $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
-            $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $row[0] ) . '`' );
+        $tag  = substr( md5( uniqid( '', true ) ), 0, 4 );
+        $live = self::swap_register( $tag, (string) $import_id );
+        $ages = [];
+        foreach ( (array) $wpdb->get_results( $wpdb->prepare( 'SELECT TABLE_NAME, UNIX_TIMESTAMP() - UNIX_TIMESTAMP(CREATE_TIME) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE %s', $wpdb->esc_like( self::SHADOW_PREFIX ) . '%' ), ARRAY_N ) as $row ) {
+            $ages[ (string) $row[0] ] = $row[1] === null ? null : (int) $row[1];
         }
-        return [ 'map' => [], 'direct' => [], 'views' => [], 'deferred' => [], 'keys' => [], 'tag' => substr( md5( uniqid( '', true ) ), 0, 4 ) ];
+        foreach ( (array) $wpdb->get_results( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( self::SHADOW_PREFIX ) . '%' ), ARRAY_N ) as $row ) {
+            $name = (string) $row[0];
+            if ( preg_match( '/^_dsk_o?([0-9a-f]{4})_/', $name, $m ) && isset( $live[ $m[1] ] ) ) {
+                continue;
+            }
+            // The table-rename check (Checks) cleans up its own; a fresh one is running.
+            if ( strpos( $name, '_dsk_check_' ) === 0 && isset( $ages[ $name ] ) && $ages[ $name ] < HOUR_IN_SECONDS ) {
+                continue;
+            }
+            $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
+            $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $name ) . '`' );
+        }
+        return [ 'map' => [], 'direct' => [], 'views' => [], 'deferred' => [], 'keys' => [], 'tag' => $tag ];
+    }
+
+    /**
+     * Records a swap that's starting, in the storage folder's swaps.php
+     * (tag => [ import, at ]), and answers the tags of other moves' swaps
+     * still under way: one whose import is mid-way (its paced state was
+     * written in the last day), or one that started in the last hour. This
+     * import's earlier tries and finished or abandoned swaps drop out.
+     */
+    private static function swap_register( $tag, $import_id ) {
+        $base = Storage::base_dir();
+        Storage::ensure_dir( $base );
+        $lock = @fopen( $base . '/swaps.lock', 'c' );
+        if ( $lock ) {
+            flock( $lock, LOCK_EX );
+        }
+        $file = $base . '/swaps.php';
+        $all  = json_decode( (string) self::read_protected( $file ), true );
+        $kept = [];
+        foreach ( is_array( $all ) ? $all : [] as $t => $e ) {
+            $imp = preg_replace( '/[^a-f0-9]/', '', (string) ( $e['import'] ?? '' ) );
+            if ( ! preg_match( '/^[0-9a-f]{4}$/', (string) $t ) || ( $import_id !== '' && $imp === $import_id ) ) {
+                continue;
+            }
+            $state = $imp !== '' ? $base . '/_import_' . $imp . '/sql-state.php' : '';
+            if ( (int) ( $e['at'] ?? 0 ) > time() - HOUR_IN_SECONDS || ( $state !== '' && is_file( $state ) && (int) @filemtime( $state ) > time() - DAY_IN_SECONDS ) ) {
+                $kept[ $t ] = [ 'import' => $imp, 'at' => (int) ( $e['at'] ?? 0 ) ];
+            }
+        }
+        $live = $kept;
+        if ( $tag !== '' ) {
+            $kept[ $tag ] = [ 'import' => $import_id, 'at' => time() ];
+        }
+        self::write_protected( $file, (string) wp_json_encode( (object) $kept ) );
+        if ( $lock ) {
+            flock( $lock, LOCK_UN );
+            fclose( $lock );
+        }
+        return $live;
+    }
+
+    /** A swap is over (done or abandoned): its tag leaves swaps.php. */
+    private static function swap_unregister( $tag ) {
+        $base = Storage::base_dir();
+        $file = $base . '/swaps.php';
+        if ( ! is_file( $file ) ) {
+            return;
+        }
+        $lock = @fopen( $base . '/swaps.lock', 'c' );
+        if ( $lock ) {
+            flock( $lock, LOCK_EX );
+        }
+        $all = json_decode( (string) self::read_protected( $file ), true );
+        if ( is_array( $all ) && isset( $all[ $tag ] ) ) {
+            unset( $all[ $tag ] );
+            self::write_protected( $file, (string) wp_json_encode( (object) $all ) );
+        }
+        if ( $lock ) {
+            flock( $lock, LOCK_UN );
+            fclose( $lock );
+        }
     }
 
     /** A temporary, unique name for a copy's foreign key. */
@@ -1828,9 +1911,9 @@ class Import {
         return [ $statement, $keys ];
     }
 
-    private static function shadow_name( $table ) {
-        $name = self::SHADOW_PREFIX . $table;
-        return strlen( $name ) <= 64 ? $name : self::SHADOW_PREFIX . substr( md5( $table ), 0, 24 );
+    private static function shadow_name( $table, $tag ) {
+        $name = self::SHADOW_PREFIX . $tag . '_' . $table;
+        return strlen( $name ) <= 64 ? $name : self::SHADOW_PREFIX . $tag . '_' . substr( md5( $table ), 0, 24 );
     }
 
     /**
@@ -1905,7 +1988,7 @@ class Import {
                     $out[] = $statement;
                     continue;
                 }
-                $shadow                = self::shadow_name( $table );
+                $shadow                = self::shadow_name( $table, (string) $swap['tag'] );
                 $swap['map'][ $table ] = $shadow;
                 unset( $swap['direct'][ $table ] );
                 if ( $keys ) {
