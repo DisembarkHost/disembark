@@ -562,6 +562,15 @@ class Import {
             // Asked again after it finished (a lost answer): the same answer.
             $meta = self::rollback_meta( $this->rollback_path );
             if ( $meta !== null && ! empty( $meta['sql_files'] ) ) {
+                // The restore point is saved but the new subsite or tenant
+                // wasn't made (that failed, or the request stopped): made
+                // now, or the error again; never "done" without it.
+                if ( $target && ! $target->ready() && $only === null ) {
+                    $made = $this->make_target( $target, $meta );
+                    if ( is_wp_error( $made ) ) {
+                        return $made;
+                    }
+                }
                 return [ 'done' => true, 'rollback_id' => $this->import_id, 'tables' => count( (array) $meta['tables'] ), 'target' => $target ? $target->info() : null ];
             }
             if ( $only !== null ) {
@@ -738,10 +747,7 @@ class Import {
         // A new subsite or tenant is made now, once the rollback point can
         // take it away again.
         if ( $target ) {
-            $made = $target->create( $this->staged_source() );
-            $target->save( $this->import_path );
-            $meta['target'] = [ 'kind' => $target->kind, 'id' => $target->id, 'prefix' => $target->prefix, 'created' => $target->created ];
-            $this->save_rollback_meta( $meta );
+            $made = $this->make_target( $target, $meta );
             if ( is_wp_error( $made ) ) {
                 return $made;
             }
@@ -752,6 +758,25 @@ class Import {
             'tables'      => count( $all_tables ),
             'target'      => $target ? $target->info() : null,
         ];
+    }
+
+    /**
+     * Makes the new subsite or tenant a move goes into and records it in
+     * the target and the restore point (so a rollback takes it away).
+     * WP_Error when it can't be made.
+     */
+    private function make_target( $target, $meta ) {
+        $made = $target->create( $this->staged_source(), $this->import_path );
+        $target->save( $this->import_path );
+        $meta['target'] = [ 'kind' => $target->kind, 'id' => $target->id, 'prefix' => $target->prefix, 'created' => $target->created ];
+        $this->save_rollback_meta( $meta );
+        if ( is_wp_error( $made ) ) {
+            return $made;
+        }
+        if ( ! $target->ready() ) {
+            return new \WP_Error( 'target_not_ready', 'The new subsite or tenant couldn\'t be made, so nothing was copied into it. Roll back or discard this move and try again.', [ 'status' => 500 ] );
+        }
+        return true;
     }
 
     /**
@@ -1335,6 +1360,9 @@ class Import {
         // is left out).
         $target = $this->target();
         if ( $target ) {
+            if ( ! $target->ready() ) {
+                return new \WP_Error( 'target_not_ready', 'The subsite or tenant this move goes into wasn\'t made, so its database wasn\'t imported. Roll back or discard this move and try again.', [ 'status' => 409 ] );
+            }
             if ( $old_prefix === '' || $target->prefix === '' ) {
                 return new \WP_Error( 'no_prefix', 'This backup doesn\'t record its table prefix, so it can\'t go into a subsite or tenant.', [ 'status' => 400 ] );
             }
@@ -3022,6 +3050,10 @@ class Import {
     public function deploy_files( $files, $keep_host_files = true, $budget = null ) {
         if ( $refused = $this->refused() ) {
             return $refused;
+        }
+        $t = $this->target();
+        if ( $t && ! $t->ready() ) {
+            return new \WP_Error( 'target_not_ready', 'The subsite or tenant this move goes into wasn\'t made, so no files were placed. Roll back or discard this move and try again.', [ 'status' => 409 ] );
         }
         if ( $budget !== null && count( $files ) === 1 && $files[0] === '*' ) {
             return $this->deploy_files_paced( $keep_host_files, $budget );

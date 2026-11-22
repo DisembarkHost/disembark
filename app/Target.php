@@ -45,6 +45,10 @@ class Target {
     public $created_dirs = [];
     public $uploads = '';  // the site's uploads folder, relative to the web root
     public $content = '';  // its own content folder (dedicated Freighter tenants), or ''
+    public $pending = [];  // a new site being made: what it will be, saved first (see create())
+
+    /** @var string Where create() saves $pending; never saved itself. */
+    private $import_path = '';
 
     /* ------------------------------------------------------------------
      * Choosing and saving
@@ -74,7 +78,60 @@ class Target {
 
     public function save( $import_path ) {
         Storage::ensure_dir( $import_path );
-        file_put_contents( self::file( $import_path ), wp_json_encode( get_object_vars( $this ) ) );
+        $vars = get_object_vars( $this );
+        unset( $vars['import_path'] );
+        file_put_contents( self::file( $import_path ), wp_json_encode( $vars ) );
+    }
+
+    /** Saves $pending before the new site is made (see create()). */
+    private function save_pending( $pending ) {
+        $this->pending = $pending;
+        if ( $this->import_path !== '' ) {
+            $this->save( $this->import_path );
+        }
+    }
+
+    /**
+     * A new site an earlier try made and then stopped before saving it
+     * (see create()): found by the address or ID it was given, and only
+     * when it was made after that try began. True when adopted.
+     */
+    private function adopt_pending() {
+        $p  = (array) $this->pending;
+        $at = (int) ( $p['at'] ?? 0 );
+        if ( $this->kind === 'multisite' && ! empty( $p['domain'] ) && isset( $p['path'] ) ) {
+            $site = get_site_by_path( (string) $p['domain'], (string) $p['path'] );
+            if ( ! $site || (string) $site->domain !== (string) $p['domain'] || (string) $site->path !== (string) $p['path'] || strtotime( (string) $site->registered . ' UTC' ) < $at - 5 ) {
+                return false;
+            }
+            $this->slug    = (string) ( $p['slug'] ?? $this->slug );
+            $this->created = true;
+            $this->locate( (string) $site->blog_id );
+            $scheme        = (string) wp_parse_url( get_home_url( get_main_site_id() ), PHP_URL_SCHEME );
+            $this->home    = untrailingslashit( ( $scheme !== '' ? $scheme : 'https' ) . '://' . $p['domain'] . $p['path'] );
+            $this->make_dir( $this->uploads );
+            return true;
+        }
+        if ( $this->kind === 'freighter' && ! empty( $p['id'] ) ) {
+            $primary = Scope::freighter_primary();
+            foreach ( (array) Scope::freighter_option( $primary, 'stacked_sites' ) as $site ) {
+                if ( (string) ( $site['stacked_site_id'] ?? '' ) === (string) $p['id'] && (int) ( $site['created_at'] ?? 0 ) >= $at - 5 ) {
+                    $this->domain  = (string) ( $site['domain'] ?? '' );
+                    $this->created = true;
+                    $this->locate( (string) $p['id'] );
+                    if ( $this->content !== '' ) {
+                        $this->make_dir( $this->content );
+                        foreach ( [ 'plugins', 'themes', 'uploads' ] as $sub ) {
+                            $this->make_dir( $this->content . '/' . $sub );
+                        }
+                    } elseif ( $this->files === 'hybrid' ) {
+                        $this->make_dir( $this->uploads );
+                    }
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -196,11 +253,31 @@ class Target {
      * Creating a new site (after the rollback point)
      * ---------------------------------------------------------------- */
 
-    /** $source: the staged disembark-source.json (for a name and a slug). */
-    public function create( $source ) {
+    /**
+     * Whether the site the move lands in is known: an existing one, or a new
+     * one already made. A move never places files or tables for a target
+     * that isn't (its folders and prefix would be empty).
+     */
+    public function ready() {
+        return ( $this->into !== 'new' || $this->created ) && $this->id !== '' && $this->prefix !== '' && $this->uploads !== '';
+    }
+
+    /**
+     * $source: the staged disembark-source.json (for a name and a slug).
+     * $import_path: where to save what's about to be made before it's made,
+     * so a request that dies between making the site and saving the target
+     * leaves a site the next try adopts rather than an orphan, and a second
+     * one.
+     */
+    public function create( $source, $import_path = '' ) {
         if ( $this->into !== 'new' || $this->created ) {
             return true;
         }
+        if ( $this->pending && $this->adopt_pending() ) {
+            $this->pending = [];
+            return true;
+        }
+        $this->import_path = (string) $import_path;
         $source = (array) $source;
         $from   = (string) ( $source['home_url'] ?? '' );
         $name   = (string) ( ( (array) ( $source['scope'] ?? [] ) )['name'] ?? '' );
@@ -245,6 +322,7 @@ class Target {
         // The import brings every table, so WordPress (and plugins hooked to
         // a new site) mustn't install the default ones first.
         global $wp_filter;
+        $this->save_pending( [ 'domain' => $domain, 'path' => $path, 'slug' => $slug, 'at' => time() ] );
         $saved = $wp_filter['wp_initialize_site'] ?? null;
         unset( $wp_filter['wp_initialize_site'] );
         $id = wp_insert_site( [ 'domain' => $domain, 'path' => $path, 'network_id' => $network->id ] );
@@ -253,8 +331,10 @@ class Target {
             $wp_filter['wp_initialize_site'] = $saved;
         }
         if ( is_wp_error( $id ) ) {
+            $this->save_pending( [] );
             return $id;
         }
+        $this->pending = [];
         $this->slug    = $slug;
         $this->created = true;
         $this->locate( (string) $id );
@@ -297,6 +377,7 @@ class Target {
                 $domain = '';
             }
         }
+        $this->save_pending( [ 'id' => $id, 'at' => time() ] );
         $sites[] = [ 'stacked_site_id' => $id, 'created_at' => time(), 'name' => sanitize_text_field( $name ), 'domain' => $mapping ? $domain : '' ];
         // The install's first tenant: there is no registry row to update yet.
         if ( Scope::freighter_option( $primary, 'stacked_sites' ) === null ) {
@@ -307,6 +388,7 @@ class Target {
         wp_cache_delete( 'alloptions', 'options' );
         wp_cache_delete( 'stacked_sites', 'options' );
         Scope::forget();
+        $this->pending = [];
         $this->domain  = $mapping ? $domain : '';
         $this->created = true;
         $this->locate( (string) $id );
@@ -365,7 +447,7 @@ class Target {
      * the whole install.
      */
     public function dest( $rel ) {
-        if ( ! Import::is_safe_relative_path( $rel ) ) {
+        if ( ! $this->ready() || ! Import::is_safe_relative_path( $rel ) ) {
             return null;
         }
         // One slash between segments and no "." segments, so a name like
