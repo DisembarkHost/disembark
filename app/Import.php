@@ -6420,7 +6420,12 @@ class Import {
                     if ( ! is_dir( dirname( $dest ) ) ) {
                         mkdir( dirname( $dest ), 0755, true );
                     }
-                    self::take_staged( $backup_src, $dest );
+                    // One that can't go back (a folder or a file in the way
+                    // that can't be replaced) keeps its saved copy, and is
+                    // named in the warnings.
+                    if ( ! self::take_staged( $backup_src, $dest ) ) {
+                        $st['not_back'][] = $relative_path;
+                    }
                 }
                 continue;
             }
@@ -6530,7 +6535,11 @@ class Import {
             // What a restore point from an earlier build holds of other
             // sites (see rollback_owner()), which stays as it is now.
             'left_alone'       => [ 'tables' => count( $left_tables ), 'files' => $left_files, 'names' => array_slice( $left_tables, 0, 50 ) ],
-            'warnings'         => array_merge( self::rollback_left_words( $owner, count( $left_tables ), $left_files ), ! empty( $st['spent'] ) && empty( $st['with_files'] ) && $asked_files ? [ 'Only the database went back: an earlier rollback already put this restore point\'s files back.' ] : [] ),
+            'warnings'         => array_merge(
+                self::rollback_left_words( $owner, count( $left_tables ), $left_files ),
+                ! empty( $st['spent'] ) && empty( $st['with_files'] ) && $asked_files ? [ 'Only the database went back: an earlier rollback already put this restore point\'s files back.' ] : [],
+                ! empty( $st['not_back'] ) ? [ count( $st['not_back'] ) . ' saved ' . ( count( $st['not_back'] ) === 1 ? 'file' : 'files' ) . ' couldn\'t be put back, and stay in the restore point\'s folder (' . $this->rollback_path . '/files): ' . implode( ', ', array_slice( (array) $st['not_back'], 0, 10 ) ) . ( count( $st['not_back'] ) > 10 ? ', …' : '' ) ] : []
+            ),
             'files'            => $with_files,
             'errors'           => $errors,
         ];
@@ -7111,7 +7120,7 @@ class Import {
     /** The working files of paced steps (see Pace), once a move is done or cancelled. */
     private function remove_pace_files() {
         $this->merge_deploy_journal();
-        foreach ( [ 'sql-state.php', 'sql-journal.php', 'deploy-list.php', 'deploy-journal.php', 'replace-state.php', 'replace-journal.php', 'extract-state.php', 'fetched.php', 'fetched.lock', 'database-state.php', 'pace.php', 'db-plan.php', 'db-peek.php', 'settle-state.php', 'fingerprints.php', 'rollback/snapshot-state.php', 'rollback/snapshot-add-state.php' ] as $name ) {
+        foreach ( [ 'sql-state.php', 'sql-journal.php', 'deploy-list.php', 'deploy-journal.php', 'replace-state.php', 'replace-journal.php', 'extract-state.php', 'fetched.php', 'fetched.lock', 'database-state.php', 'pace.php', 'db-plan.php', 'db-peek.php', 'settle-state.php', 'fingerprints.php', 'prefix-remapped.php', 'db-network.php', 'rollback/snapshot-state.php', 'rollback/snapshot-add-state.php' ] as $name ) {
             @unlink( $this->import_path . '/' . $name );
         }
         foreach ( array_merge( glob( $this->rollback_path . '/*.db.part.php' ) ?: [], glob( $this->rollback_path . '/*.db.php.part' ) ?: [] ) as $part ) {
