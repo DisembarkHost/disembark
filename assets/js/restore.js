@@ -1243,6 +1243,7 @@
             rlog(D.fmt.num(sr.cells_changed || 0) + ' cells updated.');
             stepEls.urls.meta.textContent = D.fmt.num(sr.cells_changed || 0) + ' cells' + (sr.files_rewritten ? ' · ' + D.fmt.plural(sr.files_rewritten, 'file') : '');
             if (sr.files_rewritten) rlog('Rewrote the old address in ' + D.fmt.plural(sr.files_rewritten, 'file') + ' under uploads (' + (sr.files_rewritten_list || []).slice(0, 3).join(', ') + (sr.files_rewritten > 3 ? ', \u2026' : '') + ').');
+            if (sr.files_too_big_total) rlog(D.fmt.plural(sr.files_too_big_total, 'file') + ' under uploads ' + (sr.files_too_big_total === 1 ? 'mentions' : 'mention') + ' the old address but ' + (sr.files_too_big_total === 1 ? 'is' : 'are') + ' over 5 MB, so ' + (sr.files_too_big_total === 1 ? 'it was' : 'they were') + ' left as ' + (sr.files_too_big_total === 1 ? 'it is' : 'they are') + ': ' + (sr.files_too_big || []).slice(0, 5).join(', ') + (sr.files_too_big_total > 5 ? ', \u2026' : '') + '.', 'warn');
             if (sr.elementor_css_cleared) rlog('Cleared Elementor\u2019s generated CSS so it rebuilds with the new address.');
             if (sr.files_mentioning_total) {
               codeMentions = { total: sr.files_mentioning_total, list: sr.files_mentioning_source || [], from: srcHome };

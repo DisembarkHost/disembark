@@ -4858,6 +4858,36 @@ class Import {
         return ( $start > 0 ? '…' : '' ) . $slice . ( $start + 160 < strlen( $value ) ? '…' : '' );
     }
 
+    /** Whether the file at $path holds any of $needles, read 1 MB at a time (a match across two pieces counts). */
+    private static function file_mentions( $path, $needles ) {
+        $needles = array_values( array_filter( array_map( 'strval', (array) $needles ), 'strlen' ) );
+        if ( ! $needles ) {
+            return false;
+        }
+        $keep = max( array_map( 'strlen', $needles ) ) - 1;
+        $h    = @fopen( $path, 'rb' );
+        if ( ! $h ) {
+            return false;
+        }
+        $tail = '';
+        while ( ! feof( $h ) ) {
+            $piece = fread( $h, 1048576 );
+            if ( $piece === false || $piece === '' ) {
+                break;
+            }
+            $buf = $tail . $piece;
+            foreach ( $needles as $n ) {
+                if ( strpos( $buf, $n ) !== false ) {
+                    fclose( $h );
+                    return true;
+                }
+            }
+            $tail = $keep > 0 ? substr( $buf, -$keep ) : '';
+        }
+        fclose( $h );
+        return false;
+    }
+
     /**
      * After a restore's database rewrite: rewrites the old address in text
      * files the restore brought in under the uploads folder (page-builder CSS
@@ -4868,7 +4898,7 @@ class Import {
      * whatever was there before.
      */
     public function rewrite_files( $pairs, $target = null ) {
-        $report = [ 'files_rewritten' => 0, 'files_rewritten_list' => [], 'files_mentioning_source' => [], 'files_mentioning_total' => 0, 'elementor_css_cleared' => false ];
+        $report = [ 'files_rewritten' => 0, 'files_rewritten_list' => [], 'files_mentioning_source' => [], 'files_mentioning_total' => 0, 'files_too_big' => [], 'files_too_big_total' => 0, 'elementor_css_cleared' => false ];
         // Deploying moves files out of staging, so the list of what this
         // import put in place comes from its rollback metadata.
         $meta = self::rollback_meta( $this->rollback_path );
@@ -4900,7 +4930,18 @@ class Import {
             }
             $path = $web_root . '/' . $rel;
             $size = is_file( $path ) ? filesize( $path ) : 0;
-            if ( ! $size || $size > ( $rewrite ? 5 : 1 ) * 1024 * 1024 ) {
+            if ( ! $size ) {
+                continue;
+            }
+            if ( $size > ( $rewrite ? 5 : 1 ) * 1024 * 1024 ) {
+                // Too big to rewrite in one piece: named when it mentions the
+                // old address (read a piece at a time), so it isn't missed.
+                if ( $rewrite && $size <= 512 * 1024 * 1024 && self::file_mentions( $path, array_keys( $pairs ) ) ) {
+                    $report['files_too_big_total']++;
+                    if ( count( $report['files_too_big'] ) < 25 ) {
+                        $report['files_too_big'][] = $rel;
+                    }
+                }
                 continue;
             }
             $contents = file_get_contents( $path );
