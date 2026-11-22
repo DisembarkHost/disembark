@@ -18,6 +18,8 @@ Tools → Disembark has four tabs:
 
 **Bringing a site into a network or WP Freighter install trusts it like a super admin.** Its plugins, themes and uploads join the install's shared folders, so its code runs with access to every site there. Only bring in sites you'd trust with the whole install.
 
+**Disembark on one site of an install can reach the whole install.** On a network only super admins use it. On a WP Freighter install, a tenant's administrators and its connect line back up that tenant by default, but can ask for another site or all of them, as they could already read any file or table through Browse. Give a tenant's admin login or connect line only to someone you'd trust with the whole install.
+
 **Quiet mode** keeps a staging or dev copy of a live store from reaching real customers. Emails are held, scheduled jobs paused, checkout closed, and payment and marketing APIs blocked.
 
 Everything ships with the plugin: no outside scripts, fonts or accounts. It's free and MIT licensed.
