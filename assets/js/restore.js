@@ -1454,8 +1454,16 @@
           { title: words.title, confirmLabel: words.confirmLabel, danger: true });
         return plain ? { files: true } : null;
       }
+      // The preview lists the steps for Database and files, which include
+      // later moves whose database was already rolled back (their files are
+      // still out). With Database only those steps don't run, so take each
+      // step's rolled-back state from the restore points list when it loads.
+      var listed = {};
+      // (A push's destination answers POST only: there, the preview alone.)
+      if (typeof api.get === 'function') try { (await api.get('restore-points') || []).forEach(function (q) { if (q && q.id) listed[q.id] = q; }); } catch (e) { /* an older site: the preview alone */ }
       points = pv.steps.map(function (st) {
-        return { id: st.id, label: st.label, created_at: st.created_at, files: (st.spent || st.removes || st.puts_back) ? 1 : 0, files_spent: !!st.spent, creates_site: !!st.creates_site };
+        var q = listed[st.id] || {};
+        return { id: st.id, label: st.label, created_at: st.created_at, files: (st.spent || st.removes || st.puts_back) ? 1 : 0, files_spent: !!st.spent, creates_site: !!st.creates_site, rolled_back_at: q.rolled_back_at || 0, rolled_back_legacy: !!q.rolled_back_legacy };
       });
       p = points.filter(function (q) { return q.id === p.id; })[0] || p;
       pending = Promise.resolve(pv);
