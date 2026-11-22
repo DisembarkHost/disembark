@@ -1239,6 +1239,10 @@ class Command {
                 $this->say( '  - ' . wp_date( 'Y-m-d H:i', $l['created_at'] ) . "  {$l['label']}" );
             }
         }
+        $steps = array_merge( $later, [ [ 'id' => $point['id'], 'label' => $point['label'] ] ] );
+        foreach ( ( new Import( $point['id'] ) )->rollback_notes( $steps ) as $note ) {
+            \WP_CLI::warning( $note );
+        }
         $this->confirm( $assoc_args, 'Roll ' . home_url() . " back to \"{$point['label']}\"" . ( $later ? ', undoing ' . self::plural( count( $later ), 'later move' ) . ' first' : '' ) . '? Anything changed since is lost.' );
         @set_time_limit( 0 );
         $this->say( 'Rolling back…' );

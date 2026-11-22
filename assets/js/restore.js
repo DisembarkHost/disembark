@@ -1466,6 +1466,7 @@
         } else {
           lines.push(h('div', null, h('strong', null, 'Files: '), 'stay as they are' + (preview.removes ? ', including the ' + D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') the moves placed' : '') + '.'));
         }
+        (preview.notes || []).forEach(function (n) { lines.push(h('div', null, h('strong', null, 'Users: '), n)); });
         if (preview.maintenance) lines.push(h('div', null, h('strong', null, 'While it runs: '), 'visitors see WordPress\u2019s \u201cBriefly unavailable for scheduled maintenance\u201d page, so nothing loads the site half put back.'));
         return D.note('', lines);
       }

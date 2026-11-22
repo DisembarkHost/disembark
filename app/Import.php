@@ -6623,7 +6623,41 @@ class Import {
             'database'      => [ 'created_at' => (int) ( $meta['created_at'] ?? 0 ), 'tables' => count( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? [] ) ), 'partial' => ! empty( $meta['partial'] ) ],
             // Visitors see the maintenance page while it runs (see maintenance_on()).
             'maintenance'   => ( $this->rollback_owner( $meta )['kind'] ?? '' ) === 'plain' && empty( $meta['partial'] ),
+            'notes'         => $this->rollback_notes( $steps ),
         ];
+    }
+
+    /**
+     * What a rollback through these steps can't put back, in words: a
+     * restore point an earlier build made on a site of a network holds the
+     * network's users table, but its rollback restores only this site's
+     * tables (see rollback_owner()), so the network's user list stays as it
+     * is now, with any users that move added or changed.
+     */
+    public function rollback_notes( $steps ) {
+        if ( ! is_multisite() ) {
+            return [];
+        }
+        global $wpdb;
+        $base = strtolower( $wpdb->base_prefix . 'users' );
+        $old  = [];
+        foreach ( $steps as $step ) {
+            $point = $step['id'] === $this->import_id ? $this : new self( $step['id'] );
+            $meta  = (array) self::rollback_meta( $point->rollback_path );
+            $held  = array_map( 'strtolower', array_map( 'strval', array_merge( (array) ( $meta['tables'] ?? [] ), (array) ( $meta['saved_tables'] ?? [] ) ) ) );
+            $made_before_3 = ! is_file( $point->import_path . '/imported-tables.json' ) && ! is_file( $point->import_path . '/sql-state.php' ) && ! is_file( $point->rollback_path . '/users-merge.php' );
+            if ( ! $made_before_3 || ! empty( $meta['target'] ) || ! empty( $meta['partial'] ) || ! in_array( $base, $held, true ) ) {
+                continue;
+            }
+            $owner = $point->rollback_owner( $meta );
+            if ( $owner['kind'] === 'install' && empty( $owner['users'] ) ) {
+                $old[] = '"' . ( $step['label'] ?? self::point_label( $meta ) ) . '"';
+            }
+        }
+        if ( ! $old ) {
+            return [];
+        }
+        return [ ( count( $old ) === 1 ? 'The restore point ' . $old[0] . ' was' : 'The restore points ' . implode( ', ', array_slice( $old, 0, 3 ) ) . ( count( $old ) > 3 ? ', …' : '' ) . ' were' ) . ' made by an earlier version of Disembark. Rolling back puts back this site\'s tables but not the network\'s user list: users added or changed since stay as they are now.' ];
     }
 
     /** The later restore points a rollback undid first, in words. */
