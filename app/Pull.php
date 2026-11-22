@@ -612,6 +612,26 @@ class Pull {
         if ( ! preg_match( '#^https?://#', $source_url ) ) {
             $source_url = 'https://' . $source_url;
         }
+        // A resume passes no token: the one this move connected with, kept
+        // in pull-secret.php, when it's the same source.
+        if ( (string) $source_token === '' ) {
+            $kept = $this->state();
+            if ( ! empty( $kept['source_token'] ) && rtrim( (string) ( $kept['source_url'] ?? '' ), '/' ) === $source_url ) {
+                $source_token = (string) $kept['source_token'];
+            }
+        }
+        $r = $this->connect_run( $source_url, $source_token, $move, $catch_up, $site, $shared_rows );
+        // A connect that failed after it saved the connection (the source's
+        // preflight, the site it named, a busy source) leaves nothing
+        // behind: no move listed as unfinished that can't be resumed, and
+        // not the source's token on disk for a week.
+        if ( is_wp_error( $r ) && is_file( $this->state_file ) && ! Import::has_restore_point( dirname( $this->state_file ) ) ) {
+            $this->import->cancel( 'cleanup' );
+        }
+        return $r;
+    }
+
+    private function connect_run( $source_url, $source_token, $move, $catch_up, $site, $shared_rows ) {
 
         // Probe pretty route, then plain-permalink form, with the token in
         // the body (see get_with_body()). Only for a style that explicitly
@@ -675,6 +695,8 @@ class Pull {
             'move'         => is_array( $move ) ? $move : [],
             'catch_up'     => (bool) $catch_up,
             'shared_rows'  => (bool) $shared_rows,
+            // Which site of this install started it (see unfinished()).
+            'owner'        => self::owner(),
         ] );
 
         // Source metadata (v2.8 sources expose /import/preflight).
@@ -1142,17 +1164,28 @@ class Pull {
         foreach ( (array) glob( Storage::base_dir() . '/_import_*', GLOB_ONLYDIR ) as $dir ) {
             $id         = substr( basename( $dir ), strlen( '_import_' ) );
             $state_file = $dir . '/pull.json';
-            $has_point  = Import::has_restore_point( $dir );
-            $touched    = max( (int) @filemtime( $dir ), (int) @filemtime( $dir . '/steps' ), (int) @filemtime( $state_file ) );
             if ( ! is_file( $state_file ) ) {
+                continue;
+            }
+            $has_point  = Import::has_restore_point( $dir );
+            // The newest change to the move's own files, its steps and its
+            // staging folder: a step that's running writes one of them.
+            $touched    = max( (int) @filemtime( $dir ), (int) @filemtime( $dir . '/steps' ), (int) @filemtime( $dir . '/staging' ), (int) @filemtime( $dir . '/staging/public' ) );
+            foreach ( (array) glob( $dir . '/*', GLOB_NOSORT ) as $f ) {
+                $touched = max( $touched, (int) @filemtime( $f ) );
+            }
+            $state = json_decode( (string) file_get_contents( $state_file ), true );
+            $state = is_array( $state ) ? $state : [];
+            // Another site's move (a network's subsite, a WP Freighter
+            // tenant sharing this folder): that site lists it.
+            if ( isset( $state['owner'] ) && (string) $state['owner'] !== self::owner() ) {
                 continue;
             }
             if ( ! $has_point && $touched < time() - WEEK_IN_SECONDS ) {
                 ( new Import( $id ) )->cancel( 'cleanup' );
                 continue;
             }
-            $state = json_decode( (string) file_get_contents( $state_file ), true );
-            $state = is_array( $state ) ? $state : [];
+            $ago   = max( 0, time() - $touched );
             $out[] = [
                 'id'             => $id,
                 'source'         => (string) ( $state['source_home'] ?? '' ) ?: (string) ( $state['source_url'] ?? '' ),
@@ -1169,11 +1202,22 @@ class Pull {
                 'left_alone'     => $has_point ? ( new Import( $id ) )->rollback_leaves() : 0,
                 // Past its restore point, it's kept until it's resumed,
                 // discarded or rolled back, however long that takes.
-                'idle_days'      => (int) floor( max( 0, time() - $touched ) / DAY_IN_SECONDS ),
+                'idle_days'      => (int) floor( $ago / DAY_IN_SECONDS ),
+                // Worked on in the last two minutes: something (another tab,
+                // a terminal, a push from the source) may still be running
+                // it, so Resume, Discard and Roll back wait or ask.
+                'active'         => $ago < 120,
+                'active_ago'     => $ago,
             ];
         }
         usort( $out, function ( $a, $b ) { return $b['touched'] - $a['touched']; } );
         return $out;
+    }
+
+    /** This site within its install, for telling moves apart in a shared folder: "blog:<id>" on a network, the table prefix elsewhere. */
+    public static function owner() {
+        global $wpdb;
+        return is_multisite() ? 'blog:' . get_current_blog_id() : 'prefix:' . (string) $wpdb->prefix;
     }
 
     private function staging_dir() {

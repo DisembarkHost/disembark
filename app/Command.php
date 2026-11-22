@@ -218,6 +218,9 @@ class Command {
             if ( ( $move['move']['client'] ?? '' ) !== 'cli' ) {
                 $this->fail( 'That move was started in the dashboard. Resume it from Tools → Disembark → Pull, or discard it with: wp disembark discard ' . $move['id'] );
             }
+            if ( ! empty( $move['active'] ) ) {
+                $this->fail( 'That move was working ' . (int) $move['active_ago'] . ' seconds ago, so something may still be running it. If it has stopped, try again in two minutes.' );
+            }
             $import_id  = $move['id'];
             // The same options as the first run, so its steps line up.
             // Flags about how this run reports or checks may change on a resume.
@@ -2131,9 +2134,13 @@ class Command {
                 'started' => $m['started'] ? wp_date( 'Y-m-d H:i', $m['started'] ) : '',
                 'stopped' => $where,
                 'resume'  => $cli ? "wp disembark pull --resume={$m['id']}" : 'dashboard: Tools → Disembark → Pull',
+                'active'  => ! empty( $m['active'] ) ? 'yes, ' . (int) $m['active_ago'] . 's ago' : '',
             ];
         }, $list );
-        \WP_CLI\Utils\format_items( 'table', $rows, [ 'id', 'source', 'started', 'stopped', 'resume' ] );
+        \WP_CLI\Utils\format_items( 'table', $rows, [ 'id', 'source', 'started', 'stopped', 'resume', 'active' ] );
+        if ( array_filter( array_column( $list, 'active' ) ) ) {
+            \WP_CLI::log( 'A move marked active was working in the last two minutes: something may still be running it. Resume or discard it only once it has stopped.' );
+        }
     }
 
     /**
@@ -2160,11 +2167,20 @@ class Command {
     public function discard( $args, $assoc_args ) {
         $this->retry_limits( $assoc_args );
         $move = $this->find_unfinished( (string) ( $args[0] ?? '' ) );
-        $this->confirm( $assoc_args, $move['rollback_point'] ? 'Roll this site back to before the move, then delete what it copied and its rollback point?' : 'Delete what this move copied so far? Nothing on this site has changed.' );
+        if ( ! empty( $move['active'] ) ) {
+            \WP_CLI::warning( 'This move was working ' . (int) $move['active_ago'] . ' seconds ago: something may still be running it (another terminal, the dashboard, or a push from the source).' );
+        }
+        // Restore points made after this move's are undone first, newest
+        // first, so the site really goes back to before it.
+        $later = [];
+        if ( $move['rollback_point'] ) {
+            $later = Import::later_points( (array) Import::rollback_meta( Storage::base_dir() . "/_import_{$move['id']}/rollback" ) );
+        }
+        $this->confirm( $assoc_args, $move['rollback_point'] ? 'Roll this site back to before the move' . ( $later ? ' (undoing ' . self::plural( count( $later ), 'later restore point' ) . ' first: ' . implode( ', ', array_map( function ( $l ) { return '"' . $l['label'] . '"'; }, $later ) ) . ')' : '' ) . ', then delete what it copied and its rollback point?' : 'Delete what this move copied so far? Nothing on this site has changed.' );
         $import      = new Import( $move['id'] );
         $rolled_back = false;
         if ( $move['rollback_point'] ) {
-            $r = $this->budgeted( function () { return 'Rolling back'; }, function ( $budget ) use ( $import ) { return $import->rollback( $budget ); } );
+            $r = $this->budgeted( function () { return 'Rolling back'; }, function ( $budget ) use ( $import ) { return $import->rollback_through( $budget ); } );
             if ( is_wp_error( $r ) || ! empty( $r['errors'] ) ) {
                 \WP_CLI::error( 'The rollback reported errors; the rollback point is kept. Try: wp disembark rollback ' . $move['id'] );
             }
