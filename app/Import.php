@@ -6833,10 +6833,27 @@ class Import {
         if ( is_file( $file ) && strpos( (string) @file_get_contents( $file ), self::MAINTENANCE_MARK ) === false ) {
             return false;
         }
+        // Let in only Disembark's import routes: in the address's path under
+        // the REST prefix, or as ?rest_route= (plain permalinks), never a
+        // query string that merely mentions them.
+        $prefix = function_exists( 'rest_get_url_prefix' ) ? trim( (string) rest_get_url_prefix(), '/' ) : 'wp-json';
+        $route  = var_export( '#/' . preg_quote( $prefix, '#' ) . '/disembark/v1/import/#', true );
         $code = "<?php\n"
             . '// ' . self::MAINTENANCE_MARK . ' ' . preg_replace( '/[^a-f0-9]/', '', (string) $this->import_id ) . ": Disembark is putting this site back to a restore point. Delete this file if it's still here after the rollback.\n"
-            . "\$upgrading = ( ( defined( 'WP_CLI' ) && WP_CLI ) || preg_match( '#/disembark/v1/import/#', rawurldecode( (string) ( \$_SERVER['REQUEST_URI'] ?? '' ) ) ) ) ? 0 : " . time() . ";\n";
-        return @file_put_contents( $file, $code, LOCK_EX ) !== false;
+            . "\$disembark_path  = explode( '?', rawurldecode( (string) ( \$_SERVER['REQUEST_URI'] ?? '' ) ), 2 )[0];\n"
+            . "\$disembark_route = isset( \$_GET['rest_route'] ) && is_string( \$_GET['rest_route'] ) ? '/' . ltrim( \$_GET['rest_route'], '/' ) : '';\n"
+            . "\$upgrading = ( ( defined( 'WP_CLI' ) && WP_CLI ) || preg_match( {$route}, \$disembark_path ) || strpos( \$disembark_route, '/disembark/v1/import/' ) === 0 ) ? 0 : " . time() . ";\n";
+        // Written whole and then moved into place, so a request never reads
+        // half a file, and dropped from OPcache so the new time counts.
+        $tmp = $file . '.' . substr( md5( uniqid( '', true ) ), 0, 8 ) . '.tmp';
+        if ( @file_put_contents( $tmp, $code ) === false || ! @rename( $tmp, $file ) ) {
+            @unlink( $tmp );
+            return false;
+        }
+        if ( function_exists( 'opcache_invalidate' ) ) {
+            @opcache_invalidate( $file, true );
+        }
+        return true;
     }
 
     /** Takes down the maintenance page a rollback put up (never anyone else's). */
@@ -6844,6 +6861,9 @@ class Import {
         $file = ABSPATH . '.maintenance';
         if ( is_file( $file ) && strpos( (string) @file_get_contents( $file ), self::MAINTENANCE_MARK ) !== false ) {
             @unlink( $file );
+            if ( function_exists( 'opcache_invalidate' ) ) {
+                @opcache_invalidate( $file, true );
+            }
         }
     }
 
