@@ -451,7 +451,9 @@ class Command {
                 $this->say( '      Left out ' . self::plural( (int) $sq['tables_left_out'], 'table' ) . ' without the source\'s prefix (' . $src_prefix . '), so nothing else here is touched.' );
             }
             if ( ! empty( $sq['left_out_words'] ) ) {
-                $summary['left_out'] = $sq['left_out'] ?? [];
+                // The SQL the import left out (views, triggers, routines),
+                // apart from left_out (what to bring), which it used to replace.
+                $summary['sql_left_out'] = $sq['left_out'] ?? [];
                 $this->say( '      ! ' . $sq['left_out_words'] );
             }
             $brought = $pull->super_admins_brought();
@@ -913,7 +915,9 @@ class Command {
                 $this->say( '      Left out ' . self::plural( (int) $sq['tables_left_out'], 'table' ) . ' without the source\'s prefix (' . $src_prefix . '), so nothing else here is touched.' );
             }
             if ( ! empty( $sq['left_out_words'] ) ) {
-                $summary['left_out'] = $sq['left_out'] ?? [];
+                // The SQL the import left out (views, triggers, routines),
+                // apart from left_out (what to bring), which it used to replace.
+                $summary['sql_left_out'] = $sq['left_out'] ?? [];
                 $this->say( '      ! ' . $sq['left_out_words'] );
             }
             if ( isset( $sq['users'] ) && ( $sq['users']['created'] || $sq['users']['matched'] ) ) {
