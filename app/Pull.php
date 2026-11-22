@@ -1008,7 +1008,7 @@ class Pull {
     public static function last_pulls() {
         $out = [];
         foreach ( (array) glob( self::pulls_dir() . '/*.php' ) as $file ) {
-            if ( basename( $file ) === 'index.php' ) {
+            if ( basename( $file ) === 'index.php' || basename( $file ) === 'changed.php' ) {
                 continue;
             }
             $raw  = (string) file_get_contents( $file );
@@ -1020,17 +1020,41 @@ class Pull {
         }
         usort( $out, function ( $a, $b ) { return $b['at'] - $a['at']; } );
         // Only the newest can catch up: an older one's files were replaced
-        // by the pulls since (see newest_pull()).
+        // by the pulls since (see newest_pull()), and not even the newest
+        // once something else changed the site's files after it.
+        $changed = self::files_changed_at();
         foreach ( $out as $i => $p ) {
-            $out[ $i ]['current'] = $i === 0;
+            $out[ $i ]['current'] = $i === 0 && $p['at'] > $changed;
         }
         return $out;
     }
 
-    /** Whether $memory is this site's newest pull, so its files are still the ones here. */
+    /**
+     * Whether $memory is this site's newest pull, so its files are still the
+     * ones here: no pull from elsewhere since, and nothing else that changed
+     * this site's files or tables since (files_changed()).
+     */
     private static function newest_pull( $memory ) {
         $newest = self::last_pulls()[0] ?? null;
-        return $newest && Quiet::address( (string) $newest['source'] ) === Quiet::address( (string) ( $memory['source'] ?? '' ) ) && (int) $newest['at'] === (int) ( $memory['at'] ?? 0 );
+        return $newest && ! empty( $newest['current'] ) && Quiet::address( (string) $newest['source'] ) === Quiet::address( (string) ( $memory['source'] ?? '' ) ) && (int) $newest['at'] === (int) ( $memory['at'] ?? 0 );
+    }
+
+    /**
+     * Notes that this site's files or database changed some other way than
+     * by a pull (a backup zip or a push restored here, a move into a
+     * subsite or tenant that placed shared files): the last pull's memory
+     * no longer says what's here, so no catch-up trusts it.
+     */
+    public static function files_changed() {
+        Storage::ensure_dir( self::pulls_dir() );
+        @file_put_contents( self::pulls_dir() . '/changed.php', "<?php exit; ?>\n" . time() );
+    }
+
+    /** When files_changed() last ran, or 0. */
+    private static function files_changed_at() {
+        $raw = (string) @file_get_contents( self::pulls_dir() . '/changed.php' );
+        $nl  = strpos( $raw, "\n" );
+        return $nl === false ? 0 : (int) substr( $raw, $nl + 1 );
     }
 
     /**
@@ -1129,8 +1153,13 @@ class Pull {
         return $ok;
     }
 
-    /** Called by a rollback: puts back what this site remembered before the move. */
-    public static function restore_memory( $rollback_path ) {
+    /**
+     * Called by a rollback: puts back what this site remembered before the
+     * move. A database-only rollback leaves the move's files in place, so
+     * the memory of them stays, without its table fingerprints (the tables
+     * went back).
+     */
+    public static function restore_memory( $rollback_path, $with_files = true ) {
         $saved = $rollback_path . '/pull-memory.php';
         if ( ! is_file( $saved ) ) {
             $saved = $rollback_path . '/pull-memory.json'; // an older build's
@@ -1144,6 +1173,20 @@ class Pull {
         }
         $file   = (string) ( $memory['file'] ?? '' );
         if ( $file === '' || strpos( wp_normalize_path( $file ), wp_normalize_path( self::pulls_dir() ) . '/' ) !== 0 ) {
+            return;
+        }
+        if ( ! $with_files ) {
+            $raw  = (string) @file_get_contents( $file );
+            $nl   = strpos( $raw, "\n" );
+            $data = $nl === false ? null : json_decode( substr( $raw, $nl + 1 ), true );
+            if ( is_array( $data ) && ( isset( $data['tables'] ) || isset( $data['all_tables'] ) ) ) {
+                unset( $data['tables'], $data['all_tables'] );
+                $body = wp_json_encode( $data );
+                if ( is_string( $body ) ) {
+                    @file_put_contents( $file . '.tmp', "<?php exit; ?>\n" . $body ) !== false && @rename( $file . '.tmp', $file );
+                }
+            }
+            @unlink( $saved );
             return;
         }
         if ( $memory['previous'] === null ) {

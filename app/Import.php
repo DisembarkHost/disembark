@@ -6574,8 +6574,9 @@ class Import {
             if ( empty( $errors ) ) {
                 Target::undo_merge( $this->rollback_path . '/users-merge.php' );
             }
-            // A catch-up pull's memory goes back to what it was before this move.
-            Pull::restore_memory( $this->rollback_path );
+            // A catch-up pull's memory goes back to what it was before this
+            // move (database only: its files stay, so the memory of them does).
+            Pull::restore_memory( $this->rollback_path, (bool) $st['files'] );
             $st['phase'] = 'files';
             $st['i']     = 0;
             $save();
@@ -7350,8 +7351,11 @@ class Import {
         self::release_address();
         $target = $this->target();
         // Remember the source's files now on this site, for a catch-up pull.
-        if ( ! $target ) {
-            ( new Pull( $this->import_id ) )->remember_files();
+        // Any other move (a backup zip or a push restored here, a move into
+        // a subsite or tenant, which can place shared files) means the last
+        // pull's memory no longer says what's here.
+        if ( $target || ! ( new Pull( $this->import_id ) )->remember_files() ) {
+            Pull::files_changed();
         }
 
         // Read before staging (which holds the source's details) goes.
