@@ -1340,13 +1340,13 @@
         try {
           var r = await D.paced(opts.api, 'import/rollback', { import_id: rollbackId }, function (x) { progress('Rolling back\u2026 ' + (x.phase === 'files' ? D.fmt.num(x.files_done || 0) + ' of ' + D.fmt.plural(x.files_total || 0, 'file') : 'the database')); });
           progress('');
+          if (r.quiet_mode_lifted) { rlog('Quiet mode lifted with it.', 'dim'); if (opts.local && D.quietOff) D.quietOff(); }
           if (r.errors && r.errors.length) {
             r.errors.slice(0, 5).forEach(function (e) { rlog('  ' + e, 'err'); });
             throw new Error('Rollback reported ' + D.fmt.plural(r.errors.length, 'error') + '. It can be run again from the CLI.');
           }
           rlog('Rolled back.', 'ok');
           (r.warnings || []).forEach(function (w) { rlog(w, 'dim'); });
-          if (r.quiet_mode_lifted) { rlog('Quiet mode lifted with it.', 'dim'); if (opts.local && D.quietOff) D.quietOff(); }
           setTitle('Rolled', 'back.');
           live.className = 'dsk-live ok'; capsText.textContent = KIND + ' undone';
           lineState();
@@ -1365,11 +1365,18 @@
           live.className = prevLive;
           capsText.textContent = prevCaps;
           lineState();
+          if (opts.local && D.quietLifted(e)) { rlog('Quiet mode lifted with it.', 'dim'); D.quietOff(); }
           rlog('ERROR: ' + D.errorText(e), 'err');
           D.toast('Rollback failed: ' + D.errorText(e), 'error');
         }
       });
     }
+  };
+
+  /** Whether a failed rollback (an error answer) still lifted quiet mode on its way: a chain's earlier step can. */
+  D.quietLifted = function (e) {
+    var d = e && e.data && typeof e.data === 'object' ? e.data : null;
+    return !!(D.quietOff && d && (d.quiet_mode_lifted || (d.data && d.data.quiet_mode_lifted)));
   };
 
   /**
@@ -1390,6 +1397,13 @@
         h('span', { class: 'r' }, count)),
       body);
     var points = [];
+    // One rollback or delete at a time: while one runs, every other row's
+    // buttons wait (the list behind it is about to change).
+    var running = false;
+    function lock(on) {
+      running = on;
+      Array.prototype.forEach.call(body.querySelectorAll('.acts button'), function (b) { if (!b.classList.contains('is-busy')) b.disabled = on; });
+    }
     function item(p, i) {
       return h('li', null,
         h('span', { class: 'by', html: D.H.buoyIcon(BUOYS[i % BUOYS.length]) }),
@@ -1402,8 +1416,8 @@
           h('div', { class: 'when' }, D.fmt.date(p.created_at) + ' · ' + D.fmt.size(p.size) + ' · ' + (!hasFiles(p) ? 'database only' : p.files_spent ? 'database (its files were put back)' : 'files and database')),
           p.left_alone ? h('div', { class: 'when' }, D.OLD_POINT_NOTE) : null),
         h('div', { class: 'acts' },
-          h('button', { class: 'dsk-btn sm', type: 'button', onclick: function (e) { rollback(p, e.currentTarget); } }, D.icon('restore'), 'Roll back'),
-          h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function (e) { remove(p, e.currentTarget); } }, 'Delete')));
+          h('button', { class: 'dsk-btn sm', type: 'button', disabled: running, onclick: function (e) { rollback(p, e.currentTarget); } }, D.icon('restore'), 'Roll back'),
+          h('button', { class: 'dsk-btn ghost sm', type: 'button', disabled: running, onclick: function (e) { remove(p, e.currentTarget); } }, 'Delete')));
     }
     async function load() {
       // The list stays on screen while it refreshes (after a rollback or a
@@ -1437,8 +1451,11 @@
         return q.id !== p.id && q.created_at > p.created_at && ((!q.rolled_back_at && !q.rolled_back_legacy) || (files && hasFiles(q) && !q.files_spent));
       }).sort(function (a, b) { return b.created_at - a.created_at; });
     }
+    /** The steps a rollback to p runs that still hold their files: the choice of Database only matters for any of them. */
+    function unspentFiles(p) { return [p].concat(laterThan(p, true)).some(function (q) { return hasFiles(q) && !q.files_spent && !(q.id === p.id && p.creates_site); }); }
     async function rollback(p, btn) {
-      var choice = hasFiles(p) && !p.files_spent && !p.creates_site, files = true;
+      if (running) return;
+      var choice = unspentFiles(p), files = true;
       var laterBox = h('div'), sumBox = h('div'), preview = null;
       // What it changes, from the site (read only): files each move placed
       // that a rollback removes, the ones it puts back, and the totals.
@@ -1448,7 +1465,9 @@
       function stepText(q) {
         var st = stepOf(q);
         if (!st) return '';
-        if (!files || !st.files) return st.creates_site && files ? 'removes the subsite or tenant it created' : (files && st.spent && (st.removes || st.puts_back || hasFiles(q)) ? 'database only (its files were put back before)' : 'database only');
+        // A subsite or tenant a move created goes whole, files and all, with Database only too.
+        if (st.creates_site && !st.spent) return 'removes the subsite or tenant it created, files and all';
+        if (!files || !st.files) return files && st.spent && (st.removes || st.puts_back || hasFiles(q)) ? 'database only (its files were put back before)' : 'database only';
         var parts = [];
         if (st.removes) parts.push('removes ' + D.fmt.plural(st.removes, 'file') + ' (' + size(st.removes_bytes) + ')');
         if (st.puts_back) parts.push('puts back ' + D.fmt.plural(st.puts_back, 'file'));
@@ -1458,13 +1477,20 @@
         if (preview === null) return D.note('', [h('span', { class: 'dsk-spin' }), ' Working out what changes…']);
         if (!preview) return null;
         var db = preview.database || {}, lines = [];
-        lines.push(h('div', null, h('strong', null, 'Database: '), db.partial ? 'the ' + D.fmt.plural(db.tables, 'table') + ' the change touched go back.' : 'back to ' + D.fmt.date(db.created_at) + ' (' + D.fmt.plural(db.tables, 'table') + ').'));
+        var steps = preview.steps || [], moves = steps.filter(function (st) { return st.files && (st.removes || st.puts_back); }).length > 1 ? 'the moves' : 'the move';
+        var created = steps.filter(function (st) { return st.creates_site && !st.spent; }).length;
+        lines.push(h('div', null, h('strong', null, 'Database: '), db.partial ? 'the ' + D.fmt.plural(db.tables, 'table') + ' the change touched ' + (db.tables === 1 ? 'goes' : 'go') + ' back.' : 'back to ' + D.fmt.date(db.created_at) + ' (' + D.fmt.plural(db.tables, 'table') + ').'));
         if (files) {
-          if (preview.removes) lines.push(h('div', null, h('strong', null, 'Removes: '), D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') the moves placed' + (preview.uploads ? ', ' + D.fmt.num(preview.uploads) + ' of them in uploads (' + size(preview.uploads_bytes) + ')' : '') + '.'));
-          if (preview.puts_back) lines.push(h('div', null, h('strong', null, 'Puts back: '), D.fmt.plural(preview.puts_back, 'file') + ' the moves replaced or removed.'));
+          if (preview.removes) lines.push(h('div', null, h('strong', null, 'Removes: '), D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') ' + moves + ' placed' + (preview.uploads ? ', ' + D.fmt.num(preview.uploads) + ' of them in uploads (' + size(preview.uploads_bytes) + ')' : '') + '.'));
+          if (preview.puts_back) lines.push(h('div', null, h('strong', null, 'Puts back: '), D.fmt.plural(preview.puts_back, 'file') + ' ' + moves + ' replaced or removed.'));
           if (!preview.removes && !preview.puts_back) lines.push(h('div', null, h('strong', null, 'Files: '), 'none to change.'));
         } else {
-          lines.push(h('div', null, h('strong', null, 'Files: '), 'stay as they are' + (preview.removes ? ', including the ' + D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') the moves placed' : '') + '.'));
+          // The files a created site's step placed go with that site; only
+          // the other steps' placed files stay.
+          var staying = created ? steps.some(function (st) { return st.removes && !(st.creates_site && !st.spent); }) : !!preview.removes;
+          lines.push(h('div', null, h('strong', null, 'Files: '), 'stay as they are' + (created ? ', except the ' + (created > 1 ? created + ' subsites or tenants' : 'subsite or tenant') + ' below' + (staying ? ', including files ' + moves + ' placed' : '')
+            : staying ? ', including the ' + D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') ' + moves + ' placed' : '') + '.'));
+          if (created) lines.push(h('div', null, h('strong', null, 'Removes: '), (created > 1 ? 'the ' + created + ' subsites or tenants these moves created, each' : 'the subsite or tenant a move created,') + ' with its tables, folders and files. A site a move created always goes whole.'));
         }
         (preview.notes || []).forEach(function (n) { lines.push(h('div', null, h('strong', null, 'Users: '), n)); });
         if (preview.maintenance) lines.push(h('div', null, h('strong', null, 'While it runs: '), 'visitors see WordPress\u2019s \u201cBriefly unavailable for scheduled maintenance\u201d page, so nothing loads the site half put back.'));
@@ -1491,6 +1517,7 @@
       showLater();
       var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
         h('p', null, 'Put this site back to how it was on ', h('strong', null, D.fmt.date(p.created_at)), '?'),
+        choice && p.creates_site ? h('p', { class: 'muted' }, 'The subsite or tenant this move created goes completely either way: its tables, folders and files.') : null,
         choice ? h('div', null,
           opt('all', 'Database and files', 'The database goes back to the snapshot, the files the move replaced come back and the ones it added go.'),
           opt('db', 'Database only', 'The files stay as they are now, and the restore point keeps its saved files for a later rollback. An older database with newer plugin files usually works, though a plugin may ask to update its database.'))
@@ -1501,8 +1528,9 @@
         laterBox,
         h('p', { class: 'muted' }, 'Anything changed since is lost.')),
         { title: 'Roll back?', confirmLabel: 'Roll back', danger: true });
-      if (!ok) return;
+      if (!ok || running) return;
       var label = btn.lastChild, was = label && label.nodeType === 3 ? label.textContent : null;
+      lock(true);
       await D.busy(btn, async function () {
         try {
           var r = await D.paced(D.api, 'import/rollback', { import_id: p.id, files: files, later: true }, function (x) {
@@ -1512,21 +1540,33 @@
           if (r.quiet_mode_lifted && D.quietOff) D.quietOff();
           if (r.errors && r.errors.length) throw new Error(D.fmt.plural(r.errors.length, 'error') + ': ' + r.errors.slice(0, 2).join(' · '));
           D.toast('Rolled back to ' + D.fmt.date(p.created_at) + (r.files === false ? ' (database only)' : '') + '.' + (r.warnings && r.warnings.length ? ' ' + r.warnings.join(' ') : ''));
-          // User accounts went back with a whole-site move's database: log in again.
-          var moves = [p].concat(r.undone || []).some(function (q) { return /^Before (restore|pull|push|catch-up)/i.test(q.label || ''); });
+          // User accounts went back with a whole-site move's database: log
+          // in again. A move is a point labelled as one, or one that placed
+          // files (an unlabelled point from before 3.0, or a custom label),
+          // the same test as wp disembark rollback.
+          var moves = [p].concat(r.undone || []).some(function (q) {
+            var full = points.filter(function (x) { return x.id === q.id; })[0] || q;
+            return /^Before (restore|pull|push|catch-up)/i.test(q.label || full.label || '') || (full.deployed || 0) > 0;
+          });
           if (moves && !r.logins_kept) { setTimeout(function () { location.href = D.config.loginUrl; }, 2500); return; }
           if (D.store.state.database.length) D.loadDatabase(true).catch(function () {});
           load();
-        } catch (e) { D.toast('Rollback failed: ' + D.errorText(e), 'error'); load(); }
-        finally { if (was !== null) label.textContent = was; }
+        } catch (e) {
+          if (D.quietLifted(e)) D.quietOff();
+          D.toast('Rollback failed: ' + D.errorText(e), 'error'); load();
+        }
+        finally { if (was !== null) label.textContent = was; lock(false); }
       });
     }
     async function remove(p, btn) {
+      if (running) return;
       var ok = await D.confirm('Delete the restore point from ' + D.fmt.date(p.created_at) + '? You won’t be able to roll back to it.', { title: 'Delete restore point?', confirmLabel: 'Delete', danger: true });
-      if (!ok) return;
+      if (!ok || running) return;
+      lock(true);
       await D.busy(btn, async function () {
         try { await D.api.post('restore-points/delete', { import_id: p.id }); D.toast('Restore point deleted.'); load(); D.loadStatus(); }
         catch (e) { D.toast('Could not delete it: ' + D.errorText(e), 'error'); }
+        finally { lock(false); }
       });
     }
     card.reload = load;
