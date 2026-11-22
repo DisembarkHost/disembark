@@ -5947,7 +5947,11 @@ class Import {
             $imported = array_flip( $this->imported_tables() );
             foreach ( (array) $wpdb->get_col( 'SHOW TABLES' ) as $t ) {
                 $t = (string) $t;
-                if ( ( strpos( strtolower( $t ), $owner['prefix'] ) === 0 || isset( $imported[ $t ] ) ) && self::rollback_owns( $owner, $t ) ) {
+                // A table this move imported that wasn't here at the restore
+                // point (those are kept, below) can only be the move's, even
+                // when it looks like another site's or another WordPress's
+                // (a removed subsite's leftovers wp_186_options and so on).
+                if ( isset( $imported[ $t ] ) || ( strpos( strtolower( $t ), $owner['prefix'] ) === 0 && self::rollback_owns( $owner, $t ) ) ) {
                     $owned[ $t ] = true;
                 }
             }

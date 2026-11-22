@@ -124,6 +124,38 @@ class Scope {
         return $primary;
     }
 
+    /**
+     * Where site $id of a network with ms-files rewriting keeps its uploads
+     * (see setup_multisite()): its own upload_path setting, else
+     * uploads/sites/<id>, else blogs.dir/<id>/files, the first that exists.
+     * A site with none has no uploads: its folder is named all the same, so
+     * nothing of the main site's is taken for it. Returns wp_upload_dir()'s
+     * basedir and baseurl, plus files_url, the site's old ms-files address.
+     */
+    private function legacy_uploads( $id, $upload_path, $fallback ) {
+        $content    = wp_normalize_path( WP_CONTENT_DIR );
+        $abs        = rtrim( wp_normalize_path( ABSPATH ), '/' );
+        $main_url   = untrailingslashit( (string) get_site_url( get_main_site_id( $this->network ) ) );
+        $candidates = [];
+        if ( $upload_path !== '' ) {
+            $dir = wp_normalize_path( path_is_absolute( $upload_path ) ? $upload_path : $abs . '/' . $upload_path );
+            $candidates[] = [ $dir, $main_url . '/' . ltrim( substr( $dir, strlen( $abs ) ), '/' ) ];
+        }
+        $candidates[] = [ $content . '/uploads/sites/' . $id, untrailingslashit( content_url( 'uploads/sites/' . $id ) ) ];
+        $candidates[] = [ $content . '/blogs.dir/' . $id . '/files', untrailingslashit( content_url( 'blogs.dir/' . $id . '/files' ) ) ];
+        $pick = null;
+        foreach ( $candidates as $c ) {
+            if ( is_dir( $c[0] ) ) {
+                $pick = $c;
+                break;
+            }
+        }
+        if ( $pick === null ) {
+            $pick = $candidates[ $upload_path !== '' ? 1 : 0 ];
+        }
+        return [ 'basedir' => rtrim( $pick[0], '/' ), 'baseurl' => $pick[1], 'files_url' => $this->home !== '' ? $this->home . '/files' : '' ];
+    }
+
     /** A site name as plain text: WordPress keeps blogname HTML-escaped ("Crane &amp; Turtle"). */
     public static function plain( $name ) {
         return html_entity_decode( (string) $name, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
@@ -261,6 +293,26 @@ class Scope {
         $this->network = $site ? (int) $site->network_id : 1;
         $main          = get_main_site_id( $this->network );
         $this->blog_ids = array_flip( array_map( 'intval', get_sites( [ 'fields' => 'ids', 'number' => 0 ] ) ) );
+        // Sites removed from the network often leave their tables behind
+        // (wp_115_posts, or only a plugin's wp_115_podpress_stats, with no
+        // row in wp_blogs). They are another site's too, never network-wide
+        // tables. A numbered prefix counts as a removed site when it has its
+        // own options table, or when it's below the next site ID and at
+        // least two tables share it, so a plugin's lone table that merely
+        // starts with a number (wp_404_to_301) doesn't.
+        $next   = (int) $wpdb->get_var( $wpdb->prepare( 'SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s', $wpdb->blogs ) );
+        $next   = max( $next, (int) $wpdb->get_var( "SELECT MAX(blog_id) FROM {$wpdb->blogs}" ) + 1 );
+        $groups = [];
+        foreach ( (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $this->base ) . '%' ) ) as $t ) {
+            if ( preg_match( '/^' . preg_quote( $this->base, '/' ) . '(\d+)_(.+)$/', (string) $t, $m ) && ! isset( $this->blog_ids[ (int) $m[1] ] ) ) {
+                $groups[ (int) $m[1] ][] = $m[2];
+            }
+        }
+        foreach ( $groups as $n => $rests ) {
+            if ( in_array( 'options', $rests, true ) || ( $n < $next && count( $rests ) >= 2 ) ) {
+                $this->blog_ids[ $n ] = -1; // a removed site's leftovers
+            }
+        }
         $this->aliases  = $this->mapped_domains( $id );
 
         switch_to_blog( $id );
@@ -270,7 +322,15 @@ class Scope {
         $this->active   = (array) get_option( 'active_plugins', [] );
         $this->theme    = [ (string) get_option( 'stylesheet' ), (string) get_option( 'template' ) ];
         $own            = wp_upload_dir( null, false );
+        $own_path       = trim( (string) get_option( 'upload_path' ) );
         restore_current_blog();
+        // A network that still has ms-files rewriting on (the old blogs.dir
+        // layout) can't say where a site it switched to keeps its uploads:
+        // wp_upload_dir() answers the main site's folder for every site. The
+        // site's own folder is found on disk instead.
+        if ( (int) $id !== (int) $main && get_site_option( 'ms_files_rewriting' ) ) {
+            $own = $this->legacy_uploads( (int) $id, $own_path, $own );
+        }
         switch_to_blog( $main );
         $this->main_home = untrailingslashit( (string) get_option( 'home' ) );
         $main_siteurl    = untrailingslashit( (string) get_option( 'siteurl' ) );
@@ -288,6 +348,10 @@ class Scope {
             $this->url_moves         = [ [ $own_dir, $target ] ];
             if ( ! empty( $own['baseurl'] ) ) {
                 $this->url_pairs[ untrailingslashit( $own['baseurl'] ) ] = $target;
+            }
+            // ms-files addresses (site/files/2016/10/x.png) served from it.
+            if ( ! empty( $own['files_url'] ) ) {
+                $this->url_pairs[ untrailingslashit( $own['files_url'] ) ] = $target;
             }
         } else {
             $this->drop[] = $target . '/sites';
@@ -356,7 +420,17 @@ class Scope {
 
     /** Plugins switched on for the subsite's whole network. */
     private function network_plugins() {
-        return array_keys( (array) get_network_option( $this->network, 'active_sitewide_plugins', [] ) );
+        $active = array_keys( (array) get_network_option( $this->network, 'active_sitewide_plugins', [] ) );
+        if ( ! function_exists( 'get_plugins' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+        // A plugin that says it only works network-activated (Network: true,
+        // such as a network directory or a network admin tool) has nothing
+        // to do on a standalone site: it stays behind, inactive.
+        $all = get_plugins();
+        return array_values( array_filter( $active, function ( $file ) use ( $all ) {
+            return empty( $all[ $file ]['Network'] );
+        } ) );
     }
 
     /**
