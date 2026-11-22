@@ -255,6 +255,12 @@ class Import {
                     $kind = 'freighter';
                 }
             }
+            // No profile to go by (another tool's zip, a Disembark CLI backup
+            // without one): the dump itself says whether it's a whole network.
+            if ( $kind === '' && ( ! is_array( $source ) || empty( $source['scope'] ) ) && $this->staged_dump_is_network() ) {
+                $zip  = true;
+                $kind = 'multisite';
+            }
         }
         if ( $kind !== 'multisite' && $kind !== 'freighter' ) {
             return null;
@@ -268,6 +274,52 @@ class Import {
             ? 'Back up one site of it instead (Backups → Download a backup zip, then pick the site), or pull the site you want from the ' . ( $kind === 'multisite' ? 'network' : 'install' ) . ' with --site=<id>.'
             : 'Bring its sites one at a time: choose one site (in WP-CLI, --site=<id>).';
         return new \WP_Error( 'whole_install', ( $zip ? 'This backup holds a whole ' : 'The source is a whole ' ) . $what . $count . '. Moving a whole ' . $what . ' as one isn\'t supported yet (it\'s planned): ' . $why . '. ' . $how . ' Nothing here was changed.', [ 'status' => 409 ] );
+    }
+
+    /**
+     * Whether the staged database dump creates a multisite network's own
+     * tables (blogs and sitemeta under one prefix): a whole network. Read a
+     * line at a time (gzip too) and remembered per dump, since every step
+     * asks (see refused()).
+     */
+    private function staged_dump_is_network() {
+        if ( ! is_dir( $this->staging_path ) ) {
+            return false;
+        }
+        $db = $this->database_info();
+        if ( empty( $db['file'] ) ) {
+            return false;
+        }
+        $path = self::staged_file( $this->staging_path, (string) $db['file'] );
+        if ( ! is_file( $path ) ) {
+            return false;
+        }
+        $key   = $db['file'] . ':' . (int) filesize( $path );
+        $cache = json_decode( (string) self::read_protected( $this->import_path . '/db-network.php' ), true );
+        if ( is_array( $cache ) && ( $cache['key'] ?? '' ) === $key ) {
+            return ! empty( $cache['network'] );
+        }
+        $network = false;
+        $seen    = [];
+        $h       = function_exists( 'gzopen' ) ? @gzopen( $path, 'rb' ) : @fopen( $path, 'rb' );
+        while ( $h && ( $line = ( function_exists( 'gzopen' ) ? gzgets( $h, 8192 ) : fgets( $h, 8192 ) ) ) !== false ) {
+            if ( stripos( $line, 'CREATE TABLE' ) === false ) {
+                continue;
+            }
+            if ( preg_match( '/CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`?([A-Za-z0-9_$]*?)(blogs|sitemeta)`?\s*\(/i', $line, $m ) ) {
+                $seen[ strtolower( $m[1] ) ][ strtolower( $m[2] ) ] = true;
+                if ( count( $seen[ strtolower( $m[1] ) ] ) === 2 ) {
+                    $network = true;
+                    break;
+                }
+            }
+        }
+        if ( $h ) {
+            function_exists( 'gzopen' ) ? gzclose( $h ) : fclose( $h );
+        }
+        $this->prepare_import_dir();
+        self::write_protected( $this->import_path . '/db-network.php', (string) wp_json_encode( [ 'key' => $key, 'network' => $network ] ) );
+        return $network;
     }
 
     /**
@@ -1298,6 +1350,7 @@ class Import {
         $foreign  = $saved ? (int) $saved['foreign'] : 0;
         $refused  = $saved ? (int) $saved['refused'] : 0;
         $left     = $saved ? (array) ( $saved['left'] ?? [] ) : [];
+        $netcore  = $saved ? (array) ( $saved['netcore'] ?? [] ) : [];
         $run      = $this->begin_statements();
         $count    = $saved ? (int) $saved['count'] : 0;
         $swap     = $saved ? $saved['swap'] : self::swap_start();
@@ -1360,7 +1413,7 @@ class Import {
             }
             return true;
         };
-        $read     = self::each_sql_statement_in_file( $path, function ( $statement, $end, $delim = ';' ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, &$left, &$imported, &$stop_at, &$stop_delim, &$pending, $exec, $flush, $max, $old_prefix, $new_prefix, $skip_rows, $target, $paced, $deadline, $replay_to, $journal, $shared_main, $in_users ) {
+        $read     = self::each_sql_statement_in_file( $path, function ( $statement, $end, $delim = ';' ) use ( &$run, &$count, &$swap, &$compat, &$expected, &$foreign, &$refused, &$left, &$netcore, &$imported, &$stop_at, &$stop_delim, &$pending, $exec, $flush, $max, $old_prefix, $new_prefix, $skip_rows, $target, $paced, $deadline, $replay_to, $journal, $shared_main, $in_users ) {
             $dry = $end <= $replay_to;
             if ( ++$count % 500 === 0 && ! $dry && $this->cancelled() ) {
                 $run['errors'][] = 'Cancelled.';
@@ -1387,6 +1440,18 @@ class Import {
             }
             if ( $skip_rows && preg_match( '/^\s*INSERT\s+INTO\s+`([^`]+)`/i', $statement, $m ) && isset( $skip_rows[ strtolower( $m[1] ) ] ) ) {
                 return true;
+            }
+            // A dump of a whole multisite network (its blogs and sitemeta
+            // tables under one prefix) isn't something one site can take,
+            // whatever said where it came from: a zip or a CLI backup without
+            // its profile reaches here. Stopped before the swap, so this
+            // site's tables are as they were (see whole_install_refusal()).
+            if ( preg_match( '/^\s*(?:\/\*!\d+\s*)?CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`?([A-Za-z0-9_$]*?)(blogs|sitemeta)`?\s*\(/i', self::strip_leading_comments( substr( $statement, 0, 2000 ) ), $nm ) ) {
+                $netcore[ strtolower( $nm[1] ) ][ strtolower( $nm[2] ) ] = true;
+                if ( count( $netcore[ strtolower( $nm[1] ) ] ) === 2 ) {
+                    $run['errors'][] = 'This backup holds a whole multisite network (it has the network\'s ' . $nm[1] . 'blogs and ' . $nm[1] . 'sitemeta tables). Moving a whole network as one isn\'t supported yet (it\'s planned): its sites\' addresses and the network\'s wp-config.php settings wouldn\'t come across. Back up one site of it instead (Backups → pick the site, or the Disembark CLI with --site=<id>), or pull the site you want with --site=<id>. This site\'s database was not changed.';
+                    return false;
+                }
             }
             // Into a subsite or tenant, only statements that create, fill or
             // drop one of the source's own tables run (see target_statement()).
@@ -1530,6 +1595,7 @@ class Import {
                 'foreign'  => $foreign,
                 'refused'  => $refused,
                 'left'     => $left,
+                'netcore'  => $netcore,
                 'swap'     => $swap,
                 'compat'   => array_intersect_key( $compat, array_flip( [ 'converted', 'definers_removed', 'map' ] ) ),
                 'expected' => $expected,
