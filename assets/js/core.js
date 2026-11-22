@@ -396,7 +396,9 @@
   D.modal = function (o) {
     return new Promise(function (resolve) {
       var dlg = h('dialog', { class: 'dsk-modal' + (o.wide ? ' wide' : '') });
-      var done = function (v) { if (dlg.open) dlg.close(); dlg.remove(); resolve(v); };
+      // o.busy(): while it says true (a change running inside), the dialog
+      // can't be closed, so its result isn't lost with it.
+      var done = function (v) { if (o.busy && o.busy()) return; if (dlg.open) dlg.close(); dlg.remove(); resolve(v); };
       var footer = h('footer');
       (o.actions || [{ label: 'Close', value: null }]).forEach(function (a) {
         var b = h('button', { type: 'button', class: 'dsk-btn ' + (a.kind || '') + (a.left ? ' left' : '') }, a.icon ? D.icon(a.icon) : null, a.label);

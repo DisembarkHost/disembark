@@ -125,8 +125,15 @@
       [from, to].forEach(function (i) { i.addEventListener('input', function () { result.replaceChildren(); }); i.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); preview(); } }); });
       function scope() { return onlySelected && onlySelected.input.checked ? selected : []; }
       function allTables() { return !scope().length && everyTable.input.checked ? 1 : 0; }
+      // While a replace (or its undo) runs, the dialog stays open: closing it
+      // would hide the result, a partial failure included.
+      var working = 0, dlgEl = null;
+      function hold(on) {
+        working += on ? 1 : -1;
+        if (dlgEl) Array.prototype.forEach.call(dlgEl.querySelectorAll('header .dsk-btn, footer .dsk-btn'), function (b) { b.disabled = working > 0; });
+      }
       D.modal({
-        title: 'Search and replace', wide: true,
+        title: 'Search and replace', wide: true, busy: function () { return working > 0; }, onOpen: function (dlg) { dlgEl = dlg; },
         body: h('div', { class: 'dsk-stack', style: { gap: '12px' } },
           h('p', null, 'Rewrites text across the database, safely inside serialized PHP values and JSON (the same engine a restore uses). Preview first; a restore point is saved before anything changes.'),
           h('div', { class: 'dsk-grid two', style: { gap: '12px' } },
@@ -168,6 +175,7 @@
         if (!ok) return;
         await D.busy(btn, async function () {
           var id = D.randomHex(24), saved = false;
+          hold(true);
           try {
             // The tables the preview found, and only those: their restore
             // point, then the replace, each a piece at a time.
@@ -177,12 +185,14 @@
             var done = await D.paced(D.api, 'search-replace', { import_id: id, from: from.value, to: to.value, tables: tables });
             var undo = h('button', { class: 'dsk-btn', onclick: async function () {
               await D.busy(undo, async function () {
+                hold(true);
                 try {
                   var rb = await D.paced(D.api, 'import/rollback', { import_id: id });
                   if (rb.errors && rb.errors.length) throw new Error(rb.errors[0]);
                   result.replaceChildren(D.note('ok', 'Undone. The database is back to how it was before the replace.'));
                   D.loadDatabase(true).catch(function () {});
-                } catch (e) { D.toast('Undo failed: ' + D.errorText(e), 'error'); }
+                } catch (e) { result.appendChild(D.note('error', 'Undo failed: ' + D.errorText(e) + ' Try again, or roll back from Backups → Restore points.')); }
+                finally { hold(false); }
               });
             } }, D.icon('restore'), 'Undo');
             result.replaceChildren(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
@@ -193,7 +203,7 @@
             result.replaceChildren(D.note('error', saved
               ? ['The replace stopped partway: ' + D.errorText(e) + ' Some cells may have changed. Roll back from ', pointsLink(), '.']
               : 'Nothing was replaced: ' + D.errorText(e)));
-          }
+          } finally { hold(false); }
         });
       }
     }
