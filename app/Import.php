@@ -6676,7 +6676,8 @@ class Import {
             }
             // A catch-up pull's memory goes back to what it was before this
             // move (database only: its files stay, so the memory of them does).
-            Pull::restore_memory( $this->rollback_path, (bool) $st['files'] );
+            // $st['files'] is the snapshot's dump parts, not the files choice.
+            Pull::restore_memory( $this->rollback_path, ! array_key_exists( 'with_files', $st ) || ! empty( $st['with_files'] ) );
             $st['phase'] = 'files';
             $st['i']     = 0;
             $save();

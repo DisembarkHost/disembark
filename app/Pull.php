@@ -1186,7 +1186,8 @@ class Pull {
                     @file_put_contents( $file . '.tmp', "<?php exit; ?>\n" . $body ) !== false && @rename( $file . '.tmp', $file );
                 }
             }
-            @unlink( $saved );
+            // Kept: a later rollback of this point with its files takes the
+            // move's files away, and then the memory from before it goes back.
             return;
         }
         if ( $memory['previous'] === null ) {
