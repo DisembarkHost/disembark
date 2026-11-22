@@ -320,12 +320,21 @@ class Import {
         }
         $network = false;
         $seen    = [];
-        $h       = function_exists( 'gzopen' ) ? @gzopen( $path, 'rb' ) : @fopen( $path, 'rb' );
-        while ( $h && ( $line = ( function_exists( 'gzopen' ) ? gzgets( $h, 8192 ) : fgets( $h, 8192 ) ) ) !== false ) {
-            if ( stripos( $line, 'CREATE TABLE' ) === false ) {
+        // Through open_dump(), which steps past a .sql.gz.php's exit line
+        // before it unpacks; gzopen() would read that file as plain bytes.
+        $open = self::open_dump( $path );
+        $h    = is_wp_error( $open ) ? false : $open[0];
+        // Only a statement's own start counts, not a row that quotes one: a
+        // match needs the start of a line, and a long line read in pieces
+        // only counts its first piece.
+        $at_start = true;
+        while ( $h && ( $line = fgets( $h, 8192 ) ) !== false ) {
+            $starts   = $at_start;
+            $at_start = substr( $line, -1 ) === "\n";
+            if ( ! $starts || stripos( $line, 'CREATE TABLE' ) === false ) {
                 continue;
             }
-            if ( preg_match( '/CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`?([A-Za-z0-9_$]*?)(blogs|sitemeta)`?\s*\(/i', $line, $m ) ) {
+            if ( preg_match( '/^\s*CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`?([A-Za-z0-9_$]*?)(blogs|sitemeta)`?\s*\(/i', $line, $m ) ) {
                 $seen[ strtolower( $m[1] ) ][ strtolower( $m[2] ) ] = true;
                 if ( count( $seen[ strtolower( $m[1] ) ] ) === 2 ) {
                     $network = true;
@@ -334,7 +343,7 @@ class Import {
             }
         }
         if ( $h ) {
-            function_exists( 'gzopen' ) ? gzclose( $h ) : fclose( $h );
+            fclose( $h );
         }
         $this->prepare_import_dir();
         self::write_protected( $this->import_path . '/db-network.php', (string) wp_json_encode( [ 'key' => $key, 'network' => $network ] ) );
