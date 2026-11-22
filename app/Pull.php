@@ -897,6 +897,12 @@ class Pull {
         // from the source now are removed here (deploy_files, with a backup
         // for rollback).
         $last = ! empty( $state['catch_up'] ) ? self::last_pull( self::memory_source( $state ) ) : null;
+        // Only while this site still holds that pull's files: a pull from
+        // another source since (another subsite of the same network, say)
+        // replaced them, so everything comes across again.
+        if ( $last && ! self::newest_pull( $last ) ) {
+            $last = null;
+        }
         if ( $last ) {
             $before  = (array) $last['files'];
             $changed = [];
@@ -991,7 +997,18 @@ class Pull {
             }
         }
         usort( $out, function ( $a, $b ) { return $b['at'] - $a['at']; } );
+        // Only the newest can catch up: an older one's files were replaced
+        // by the pulls since (see newest_pull()).
+        foreach ( $out as $i => $p ) {
+            $out[ $i ]['current'] = $i === 0;
+        }
         return $out;
+    }
+
+    /** Whether $memory is this site's newest pull, so its files are still the ones here. */
+    private static function newest_pull( $memory ) {
+        $newest = self::last_pulls()[0] ?? null;
+        return $newest && Quiet::address( (string) $newest['source'] ) === Quiet::address( (string) ( $memory['source'] ?? '' ) ) && (int) $newest['at'] === (int) ( $memory['at'] ?? 0 );
     }
 
     /**
@@ -1030,7 +1047,11 @@ class Pull {
         // dashboard offers a catch-up when that connect line is pasted again.
         $via = untrailingslashit( (string) ( $state['source_url'] ?? '' ) );
         if ( $via !== '' && Quiet::address( $via ) !== Quiet::address( $source ) && ! empty( $state['site'] ) ) {
-            $memory['via']  = $via;
+            $memory['via'] = $via;
+        }
+        // Which site, the main one too, so the dashboard can tell a main
+        // site's pull from a subsite's through the same connect line.
+        if ( ! empty( $state['site'] ) ) {
             $memory['site'] = (string) $state['site'];
         }
         // What "What to bring" left behind, so the next catch-up can say
@@ -1770,7 +1791,7 @@ class Pull {
         }
         $then = [];
         $last = ! empty( $state['catch_up'] ) ? self::last_pull( self::memory_source( $state ) ) : null;
-        if ( $last && ! empty( $last['tables'] ) ) {
+        if ( $last && ! empty( $last['tables'] ) && self::newest_pull( $last ) ) {
             $then = [ 'tables' => (array) $last['tables'], 'all' => (array) ( $last['all_tables'] ?? [] ) ];
         }
         return [
