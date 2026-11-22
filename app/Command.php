@@ -1559,7 +1559,7 @@ class Command {
         $points = Import::restore_points();
         if ( $id === 'latest' ) {
             foreach ( $points as $p ) {
-                if ( empty( $p['rolled_back_at'] ) ) {
+                if ( empty( $p['rolled_back_at'] ) && empty( $p['rolled_back_legacy'] ) ) {
                     return $p;
                 }
             }
