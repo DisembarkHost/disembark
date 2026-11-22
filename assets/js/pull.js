@@ -102,8 +102,9 @@
           }
           await D.api.post('import/cancel', { import_id: m.id, action: 'cleanup', delete_restore_point: rolledBack });
           D.toast(m.rollback_point ? 'Rolled back and cleaned up.' : 'Discarded.');
-          // User accounts went back with a whole-site move's database: log in again.
-          if (r && !r.logins_kept) { setTimeout(function () { location.href = D.config.loginUrl; }, 1200); return; }
+          // Log in again only when the rollback took this login's accounts
+          // away (D.rollbackNeedsLogin: the same test as the restore points list).
+          if (await D.rollbackNeedsLogin(r, [{ id: m.id, label: (m.move && m.move.label) || 'Before pull from ' + D.host(m.source) }])) { setTimeout(function () { location.href = D.config.loginUrl; }, 1200); return; }
         } catch (e) {
           if (D.quietLifted(e)) D.quietOff();
           D.toast(D.laterPointsText(e) || D.errorText(e), 'error');

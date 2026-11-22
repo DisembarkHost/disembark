@@ -1566,6 +1566,32 @@
     if (busy) return null;
     return D.rollbackConfirm(api, Object.assign({ id: id, home: home }, words || {}), null, pv || null);
   };
+  /**
+   * Whether this browser has to log in again after rollback r, which undid
+   * the points steps (plus r.undone). User accounts go back with a whole-site
+   * move's database: a move is a point labelled as one, or one that placed
+   * files (an unlabelled point from before 3.0, or a custom label), the same
+   * test as wp disembark rollback. Even then, when the accounts that came
+   * back are the ones this page was opened with (a move that stopped before
+   * its database went in, or one this login predates), the login still
+   * holds: WordPress is asked before sending anyone to the login page.
+   * points is the restore points list, for labels and placed files.
+   */
+  D.rollbackNeedsLogin = async function (r, steps, points) {
+    if (!r || r.logins_kept) return false;
+    points = points || [];
+    var moves = (steps || []).concat(r.undone || []).some(function (q) {
+      var full = points.filter(function (x) { return x.id === q.id; })[0] || q;
+      return /^Before (restore|pull|push|catch-up)/i.test(q.label || full.label || '') || (full.deployed || 0) > 0;
+    });
+    if (!moves) return false;
+    try {
+      var url = String(D.config.apiRoot || '').replace('disembark/v1/', 'wp/v2/users/me');
+      var res = await fetch(url + (url.indexOf('?') === -1 ? '?' : '&') + '_fields=id', { headers: { 'X-WP-Nonce': D.config.nonce }, credentials: 'same-origin', cache: 'no-store' });
+      var me = res.ok && /json/i.test(res.headers.get('content-type') || '') ? await res.json() : null;
+      return !(me && me.id);
+    } catch (e) { return true; }
+  };
   /** What a rollback refused because later restore points exist (later_points_exist) says to do instead. */
   D.laterPointsText = function (e) {
     return e && e.data && e.data.code === 'later_points_exist'
@@ -1653,15 +1679,7 @@
           if (r.quiet_mode_lifted && D.quietOff) D.quietOff();
           if (r.errors && r.errors.length) throw new Error(D.fmt.plural(r.errors.length, 'error') + ': ' + r.errors.slice(0, 2).join(' · '));
           D.toast('Rolled back to ' + D.fmt.date(p.created_at) + (r.files === false ? ' (database only)' : '') + '.' + (r.warnings && r.warnings.length ? ' ' + r.warnings.join(' ') : ''));
-          // User accounts went back with a whole-site move's database: log
-          // in again. A move is a point labelled as one, or one that placed
-          // files (an unlabelled point from before 3.0, or a custom label),
-          // the same test as wp disembark rollback.
-          var moves = [p].concat(r.undone || []).some(function (q) {
-            var full = points.filter(function (x) { return x.id === q.id; })[0] || q;
-            return /^Before (restore|pull|push|catch-up)/i.test(q.label || full.label || '') || (full.deployed || 0) > 0;
-          });
-          if (moves && !r.logins_kept) { setTimeout(function () { location.href = D.config.loginUrl; }, 2500); return; }
+          if (await D.rollbackNeedsLogin(r, [p], points)) { setTimeout(function () { location.href = D.config.loginUrl; }, 2500); return; }
           if (D.store.state.database.length) D.loadDatabase(true).catch(function () {});
           load();
         } catch (e) {
