@@ -1392,6 +1392,13 @@ class Import {
         // Where an earlier call of a paced import stopped (see Pace).
         $paced        = $budget !== null;
         $deadline     = $paced ? Pace::deadline( $budget ) : 0;
+        // The import is done and swapped in, and the incoming users are
+        // being merged into the network's (see merge_users_step()): that
+        // carries on, never the import again.
+        $merge_job = json_decode( (string) self::read_protected( $this->import_path . '/users-merge-job.php' ), true );
+        if ( is_array( $merge_job ) && ( $merge_job['file'] ?? '' ) === $sql_file ) {
+            return $this->merge_users_step( $merge_job, $deadline );
+        }
         $state_file   = $this->import_path . '/sql-state.php';
         $journal_file = $this->import_path . '/sql-journal.php';
         $saved        = $paced ? json_decode( (string) Import::read_protected( $state_file ), true ) : null;
@@ -1745,8 +1752,8 @@ class Import {
                 $result['warnings'][] = "Left out {$refused} statements that would have changed something other than the incoming site's own tables.";
                 error_log( "Disembark: import {$this->import_id} into {$target->kind} {$target->id} left out {$refused} statements outside the source's tables." );
             }
-            if ( empty( $result['errors'] ) ) {
-                $result['users'] = $target->merge_users( $old_prefix, null, $this->rollback_path . '/users-merge.php' );
+            if ( empty( $result['errors'] ) && $target->kind === 'multisite' ) {
+                $merge_users = [ 'incoming' => null ];
             }
         } elseif ( $shared_main ) {
             $result['tables_other_sites'] = $foreign;
@@ -1754,7 +1761,7 @@ class Import {
                 $result['warnings'][] = "Left out {$foreign} tables that belong to other sites of this install.";
             }
             if ( $in_users && empty( $result['errors'] ) ) {
-                $result['users'] = Target::network_main()->merge_users( $old_prefix, array_values( $in_users ), $this->rollback_path . '/users-merge.php' );
+                $merge_users = [ 'incoming' => array_values( $in_users ) ];
             }
         }
         if ( empty( $result['errors'] ) && $rows !== null ) {
@@ -1770,6 +1777,47 @@ class Import {
                 self::write_protected( $this->import_path . '/source-home.php', $result['source_home'] );
             }
         }
+        // Last, the incoming users into the network's: a step of its own
+        // that can take several calls (see merge_users_step()).
+        if ( isset( $merge_users ) ) {
+            $job = [ 'file' => $sql_file, 'old_prefix' => $old_prefix, 'incoming' => $merge_users['incoming'], 'bytes' => self::dump_bytes( $path ), 'result' => $result ];
+            self::write_protected( $this->import_path . '/users-merge-job.php', (string) wp_json_encode( $job ) );
+            return $this->merge_users_step( $job, $deadline );
+        }
+        return $result;
+    }
+
+    /**
+     * Merges the incoming users into the network's after the import swapped
+     * the tables in, as far as $deadline allows (0: all of it). Until it's
+     * done, each call answers { done: false, phase: "users", users_done,
+     * users_total } and the import step is asked again; the import's own
+     * answer, saved in users-merge-job.php, comes back with the merge's
+     * report when it's done. A killed call carries on from the merge's
+     * last checkpoint (see Target::merge_users()).
+     */
+    private function merge_users_step( $job, $deadline ) {
+        $target = empty( $job['incoming'] ) ? $this->target() : Target::network_main();
+        $result = (array) ( $job['result'] ?? [] );
+        if ( ! $target ) {
+            @unlink( $this->import_path . '/users-merge-job.php' );
+            return $result;
+        }
+        $report = $target->merge_users( (string) ( $job['old_prefix'] ?? '' ), $job['incoming'] ?: null, $this->rollback_path . '/users-merge.php', $deadline, $this->import_path . '/users-merge-cursor.php' );
+        if ( isset( $report['done'] ) && $report['done'] === false ) {
+            return [
+                'done'                => false,
+                'phase'               => 'users',
+                'users_done'          => (int) $report['users_done'],
+                'users_total'         => (int) $report['users_total'],
+                'bytes_done'          => (int) ( $job['bytes'] ?? 0 ),
+                'bytes_total'         => (int) ( $job['bytes'] ?? 0 ),
+                'statements_executed' => (int) ( $result['statements_executed'] ?? 0 ),
+                'errors'              => [],
+            ];
+        }
+        @unlink( $this->import_path . '/users-merge-job.php' );
+        $result['users'] = $report;
         return $result;
     }
 
@@ -7371,7 +7419,7 @@ class Import {
     /** The working files of paced steps (see Pace), once a move is done or cancelled. */
     private function remove_pace_files() {
         $this->merge_deploy_journal();
-        foreach ( [ 'sql-state.php', 'sql-journal.php', 'deploy-list.php', 'deploy-journal.php', 'replace-state.php', 'replace-journal.php', 'extract-state.php', 'fetched.php', 'fetched.lock', 'database-state.php', 'pace.php', 'db-plan.php', 'db-peek.php', 'settle-state.php', 'fingerprints.php', 'prefix-remapped.php', 'db-network.php', 'rollback/snapshot-state.php', 'rollback/snapshot-add-state.php' ] as $name ) {
+        foreach ( [ 'sql-state.php', 'sql-journal.php', 'deploy-list.php', 'deploy-journal.php', 'replace-state.php', 'replace-journal.php', 'extract-state.php', 'fetched.php', 'fetched.lock', 'database-state.php', 'pace.php', 'db-plan.php', 'db-peek.php', 'settle-state.php', 'fingerprints.php', 'prefix-remapped.php', 'db-network.php', 'users-merge-job.php', 'users-merge-cursor.php', 'rollback/snapshot-state.php', 'rollback/snapshot-add-state.php' ] as $name ) {
             @unlink( $this->import_path . '/' . $name );
         }
         foreach ( array_merge( glob( $this->rollback_path . '/*.db.part.php' ) ?: [], glob( $this->rollback_path . '/*.db.php.part' ) ?: [] ) as $part ) {

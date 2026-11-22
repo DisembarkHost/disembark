@@ -430,7 +430,7 @@ class Command {
         if ( ! empty( $info['sql_file'] ) ) {
             $this->say( '[6/9] Importing the database' );
             $sql_file = $info['sql_file'];
-            $sq = $this->check( $this->budgeted( function ( $r ) { return 'Imported ' . (int) floor( 100 * $r['bytes_done'] / max( 1, $r['bytes_total'] ) ) . '%'; }, function ( $budget ) use ( $import, $sql_file, $src_prefix, $dest_prefix ) { return $import->import_staged_sql( $sql_file, $src_prefix, $dest_prefix, $budget ); } ), 'database', $import_id );
+            $sq = $this->check( $this->budgeted( function ( $r ) { return ( $r['phase'] ?? '' ) === 'users' ? 'Merging users: ' . (int) $r['users_done'] . ' of ' . (int) $r['users_total'] : 'Imported ' . (int) floor( 100 * $r['bytes_done'] / max( 1, $r['bytes_total'] ) ) . '%'; }, function ( $budget ) use ( $import, $sql_file, $src_prefix, $dest_prefix ) { return $import->import_staged_sql( $sql_file, $src_prefix, $dest_prefix, $budget ); } ), 'database', $import_id );
             $summary['statements'] = (int) $sq['statements_executed'];
             foreach ( (array) ( $sq['converted'] ?? [] ) as $conversion => $tables ) {
                 $summary['converted'][ $conversion ] = (int) $tables;
@@ -891,7 +891,7 @@ class Command {
             $this->say( '[6/9] Importing the database' );
             $sql_file = (string) $info['sql_file'];
             $t0 = microtime( true );
-            $sq = $this->check( $this->budgeted( function ( $r ) { return 'Imported ' . (int) floor( 100 * $r['bytes_done'] / max( 1, $r['bytes_total'] ) ) . '%'; }, function ( $budget ) use ( $import, $sql_file, $src_prefix, $dest_prefix ) { return $import->import_staged_sql( $sql_file, $src_prefix, $dest_prefix, $budget ); } ), 'database', $import_id );
+            $sq = $this->check( $this->budgeted( function ( $r ) { return ( $r['phase'] ?? '' ) === 'users' ? 'Merging users: ' . (int) $r['users_done'] . ' of ' . (int) $r['users_total'] : 'Imported ' . (int) floor( 100 * $r['bytes_done'] / max( 1, $r['bytes_total'] ) ) . '%'; }, function ( $budget ) use ( $import, $sql_file, $src_prefix, $dest_prefix ) { return $import->import_staged_sql( $sql_file, $src_prefix, $dest_prefix, $budget ); } ), 'database', $import_id );
             $summary['statements'] = (int) $sq['statements_executed'];
             $summary['database_seconds'] = (int) round( microtime( true ) - $t0 );
             foreach ( (array) ( $sq['converted'] ?? [] ) as $conversion => $tables ) {
