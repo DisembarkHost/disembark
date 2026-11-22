@@ -515,9 +515,28 @@ class Pull {
      */
     private function stream_from_source( $url, $timeout = 600 ) {
         $state = $this->state();
-        $base  = $state['source_url'] ?? '';
         $host  = is_string( $url ) ? strtolower( (string) parse_url( $url, PHP_URL_HOST ) ) : '';
-        if ( $host === '' || $host !== strtolower( (string) parse_url( $base, PHP_URL_HOST ) ) ) {
+        // The source's own address, or (one site of a network or WP
+        // Freighter install) the install's main one: its export files sit
+        // in the main site's folder and are linked from that address, which
+        // for a subdomain or mapped subsite is another host.
+        // Of those on the file's host, the one whose path the file's starts
+        // with, the longest (a subfolder subsite under the install's path).
+        $base     = '';
+        $url_path = rawurldecode( (string) parse_url( (string) $url, PHP_URL_PATH ) );
+        foreach ( [ $state['source_url'] ?? '', $state['install']['home'] ?? '', $state['scope']['install_home'] ?? '' ] as $candidate ) {
+            if ( $host === '' || ! is_string( $candidate ) || $candidate === '' || $host !== strtolower( (string) parse_url( $candidate, PHP_URL_HOST ) ) ) {
+                continue;
+            }
+            $cp      = rtrim( (string) parse_url( $candidate, PHP_URL_PATH ), '/' );
+            $matches = $cp === '' || strpos( $url_path, $cp . '/' ) === 0;
+            $bp      = rtrim( (string) parse_url( $base, PHP_URL_PATH ), '/' );
+            $base_ok = $base !== '' && ( $bp === '' || strpos( $url_path, $bp . '/' ) === 0 );
+            if ( $base === '' || ( $matches && ( ! $base_ok || strlen( $cp ) > strlen( $bp ) ) ) ) {
+                $base = $candidate;
+            }
+        }
+        if ( $base === '' ) {
             return new \WP_Error( 'invalid_url', 'Refusing to stream a file from another host.', [ 'status' => 502 ] );
         }
         // /stream-file takes a path relative to the source's root folder.
