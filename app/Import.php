@@ -1935,7 +1935,11 @@ class Import {
         $done = 0;
         foreach ( $swap['map'] as $table => $shadow ) {
             $live   = '`' . str_replace( '`', '``', $table ) . '`';
-            $exists = strcasecmp( (string) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ), $table ) === 0;
+            $found  = (array) $wpdb->get_row( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( $table ) ), ARRAY_N );
+            $exists = strcasecmp( (string) ( $found[0] ?? '' ), $table ) === 0;
+            // A view under the table's name moves aside the same way, and
+            // only DROP VIEW removes it.
+            $kind = strtoupper( (string) ( $found[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
             // The live table moves aside and the copy takes its name in one
             // statement (atomic on MySQL and MariaDB), and the old one goes
             // only after that worked: a rename that fails leaves this site's
@@ -1950,8 +1954,10 @@ class Import {
                 continue;
             }
             if ( $exists ) {
-                self::repoint_foreign_keys( $old, $table, $run );
-                $wpdb->query( "DROP TABLE IF EXISTS `{$old}`" );
+                if ( $kind === 'TABLE' ) {
+                    self::repoint_foreign_keys( $old, $table, $run );
+                }
+                $wpdb->query( "DROP {$kind} IF EXISTS `{$old}`" );
             }
             $done++;
         }
