@@ -1,5 +1,59 @@
 # Changelog
 
+## **v3.0.1** - November 22, 2026
+
+### Security
+* **A backup can't put PHP under uploads by changing a folder's case:** a move into a dedicated WP Freighter tenant judged a backup's folders case by case, so `Uploads/` slipped past the no-PHP rule and `Mu-Plugins/` past the protected files. Folder names are now compared without regard to case, and `./` segments are dropped.
+* **Browse on a subsite or tenant stays on that site:** on a dedicated WP Freighter tenant, saving or renaming a theme or plugin file in Browse changed the main site's copy of that file. Browse now saves and renames at the site's own path, refuses a path with `.` or `..` in it, and checks where a link really points before writing through it. Its tables are read by the names it lists, and on a subsite the network's user tables are read only.
+* **The rollback's maintenance page lets in only Disembark:** the page that keeps visitors out while a site is put back let in any address that mentioned Disembark's import route, anywhere in it. It now lets in only the import routes at the site's own address (or `?rest_route=` on plain permalinks), is written whole before it replaces the old one, and is dropped from OPcache when it changes.
+
+### Fixed
+* **Foreign keys survive the table swap:** 3.0.0's atomic swap renamed the live table aside before dropping it, and InnoDB moved other tables' foreign keys along with it, so a key from a table the move didn't touch ended up pointing at the dropped copy. Those keys are now pointed back at the live table, with their rules kept, before the old copy goes. Each move's copies carry its own tag, so a new import clears a crashed move's leftovers but never another move's copies still in use, and a view under a table's name is moved aside and dropped as a view.
+* **A source with its own `upload_path` keeps the restore point:** Disembark kept a move's state and restore points under the uploads folder, which the swap's new options table could move. After a pull from such a source, `restore-points` said there were none and the rollback couldn't be found. The working folder now follows WordPress's constants, never the option, and folders kept under a custom `upload_path` by earlier versions move over once.
+* **Restore points belong to their site on WP Freighter:** in shared files mode, every tenant shared one folder of restore points, so rolling back the main site first undid a tenant's newer move. Each point now records the site it was made for, and each site lists, rolls back and deletes only its own. Deleting a point from one subsite of a network refuses another subsite's too.
+* **Subsite and tenant backups hold that site's large files:** files over 10 MB in a backup of one site of an install came from the main site's file of the same name. `/stream-file` now looks them up the way the site's file list named them. A scan session records the site it was made for, and later requests in that session get that site's files and tables or are refused (`session_site_mismatch`) instead of mixing two sites.
+* **Rollbacks undo later moves first, and the page stays closed:** rolling back one restore point while later ones were open could put a database back under a later move. That's now refused (`later_points_exist`) unless the request asks to undo the later points too (`later`) or knowingly only that one (`only`). A rollback through several points keeps the maintenance page up from the first step to the last, and reports quiet mode lifted if a later step fails.
+* **Restore points 2.9 already used stay used:** rolling back a point that 2.9 had already rolled back marked its files as not put back, so a later chain could remove current files at its old paths, and `wp disembark rollback latest` could pick it. Both now pass over it.
+* **Catch-up pulls know when the files changed:** a catch-up trusted what the last pull brought even after a backup zip, a push, a move into a subsite or another source's pull had replaced those files, and reported success with the wrong files in place. It now only trusts that memory when nothing else changed the files since. A database-only rollback keeps the memory of the files it leaves in place.
+* **A failed new subsite or tenant can't carry on as "done":** when making the new site failed, asking again answered "done" with no site, and the move went on with no folder for its uploads. Asking again now makes the site or gives the error again, nothing is placed for a site that wasn't made, and a site made by a request that died is taken up by the next try.
+* **Big user lists merge in steps:** merging tens of thousands of users (a store's customers) into a network ran in one request and could hit the host's time limit, then merge again on retry. It's now its own paced step with checkpoints, and a step that was killed carries on without adding anyone or any setting twice.
+* **Whole-network backups are caught when compressed:** the check that refuses a whole network's backup into one site read a `.sql.gz.php` dump as raw bytes and missed it. It now reads past the exit line, and counts only a `CREATE TABLE` at the start of a line, so a single site whose posts quote one isn't refused.
+* **Pulls that fail early leave nothing behind:** a pull whose connection failed (a wrong token, an unreachable source, a refused `--site` or `--into`) left an unfinished move that couldn't be resumed and the source's token on disk. It's now cleaned up, and resuming a move reuses the token it connected with. Unfinished moves say when they're still running elsewhere, and list only this site's own.
+* **Clean up keeps what it should:** "Clean up working files" deleted the catch-up memory, and with "Also delete restore points" deleted every site's points network-wide and any move in progress. It now keeps the memory, deletes only this site's own points, and leaves moves from the last couple of minutes alone, saying which.
+* **Mid-move addresses on either scheme:** the address held while a move runs only matched the source's own scheme and had no host boundary, and the address rewrite could rewrite it again, doubling a subfolder. Both are fixed.
+* **Smaller fixes:**
+  * Pulls from a subdomain or mapped subsite can stream files linked from the network's main address.
+  * Adopting a network's older restore points runs under the upgrade lock, marks each with its site first, skips one reached through a link, and retries before giving up out loud.
+  * The large-row fallback works on sites in any language.
+  * A move into a site on SQLite is refused before anything is unpacked or copied, in WP-CLI, the CLI and the dashboard.
+  * The source's user roles replace a leftover roles row under this site's prefix.
+  * A rollback names any saved file it couldn't put back, and drops what a name is now (table or view) before putting the point's version back.
+  * The rollback preview counts only files that are really there, sizes them correctly, and leaves out other sites' files and tables.
+  * Restore points made in the same second chain in order.
+  * Uninstall no longer errors on a network site whose tables are gone, and clears the failed update check.
+  * `wp disembark pull` and `restore --format=json` keep `left_out` and report SQL the import left out as `sql_left_out`; `pull` lists large files and code mentions under `urls`, as `restore` does. A bad `--max-retries` value fails as JSON when JSON was asked for.
+
+### Dashboard
+* **Rollbacks ask first:** a move's Undo, Roll back and Roll back and discard ran at once, without the later points. They now ask with the same preview as the restore points list and undo any later move first. Database only is offered whenever any step still holds its files, and the dialog says a subsite or tenant a move created is removed whole either way. While one rollback or delete runs, the other restore points wait.
+* **Cancel tells the truth:** cancelling while the restore point was being saved left a new subsite and its point behind and said nothing had changed. It now rolls back what the move made, and asks again in the right words if the point lands while the question is open. Cancel stops a zip upload at once.
+* **Backups can't mix sites:** changing the site during a scan gave a zip named for one site holding another's files and no database. The picker now waits for the scan, a scan for another site is dropped, earlier scans are offered only for the site picked, and a zip set to hold the database is refused when no tables would be in it.
+* **What to bring keeps WordPress running:** unticking `options`, `users` or `usermeta` brought them across empty and broke the site. They now always come with their rows.
+* **Smaller fixes:**
+  * The login page after a rollback only when your login is really gone, including for unlabelled restore points from before 3.0.
+  * Move offers a catch-up only for the source of this site's newest pull.
+  * WordPress's maintenance page no longer switches the dashboard to `?rest_route=` addresses for the rest of the visit, and a paced step waits at most 30 seconds when asked to retry later.
+  * Settings and Backups show current quiet mode and restore points each time they open.
+  * On a SQLite site, Move says up front that nothing can move in and pushing out works.
+  * The search and replace dialog stays open while a replace runs, so its result isn't lost.
+  * Keyboard focus stays put in the file trees, the table list and the switches, and What to bring can be used from the keyboard. The theme menu closes on Escape or a right-click elsewhere.
+  * The tab bar fits phones narrower than 400px. Restoring into a network's main site no longer says you'll need to log in again.
+
+### Changed
+* The plugin header names the WordPress (5.6) and PHP (7.0) versions it needs.
+* `wp disembark rollback --database-only` says when a subsite or tenant a move made goes whole anyway.
+* A request on a network's main site no longer lists every site just to learn which one it reached.
+* The readme explains how far Disembark on one site of a network or WP Freighter install can reach, and who that trusts.
+
 ## **v3.0.0** - November 21, 2026
 
 ### Security
