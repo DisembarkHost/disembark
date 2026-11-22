@@ -174,8 +174,11 @@
     });
   };
 
+  /** How many moves this page is driving right now (Settings' cleanup waits for them). */
+  D.movesRunning = 0;
   D.runMove = function (view, opts) {
-    var importId = opts.resume ? opts.resume.id : D.randomHex(24), rollbackId = '', codeMentions = null, quietOn = false, quietSource = '';
+    D.movesRunning++;
+    var importId = opts.resume ? opts.resume.id : D.randomHex(24), rollbackId = '', snapSent = false, codeMentions = null, quietOn = false, quietSource = '';
     // Request ids follow the import id and the step's place in the move, so
     // the same move asks for the same ids. Resuming replays the steps the
     // server already finished (opts.resume.steps) and carries on from the
@@ -317,12 +320,19 @@
     function Cancelled() { var e = new Error('Cancelled.'); e.cancelled = true; return e; }
     async function askCancel() {
       if (cancelled) return;
-      var after = !!rollbackId;
-      var ok = await D.confirm(after
-        ? h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, D.host(opts.targetHome) + ' is partly changed by now.'), h('p', { class: 'muted' }, 'Cancelling stops the move and rolls it back to the restore point, then deletes the copied files and the restore point.'))
-        : h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, 'Nothing on ' + D.host(opts.targetHome) + ' has changed yet.'), h('p', { class: 'muted' }, 'Cancelling stops the move and deletes what was copied so far.')),
-        { title: after ? 'Cancel and roll back?' : 'Cancel this move?', confirmLabel: after ? 'Cancel and roll back' : 'Cancel the move', cancelLabel: 'Keep going', danger: true });
-      if (!ok || cancelled) return;
+      // Once the restore point is asked for, the site may change (a new
+      // subsite is made with it). If that happens while the question is
+      // open, it's asked again in the right words.
+      var after, ok;
+      for (var ask = 0; ask < 3; ask++) {
+        after = !!rollbackId || snapSent;
+        ok = await D.confirm(after
+          ? h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, D.host(opts.targetHome) + (rollbackId ? ' is partly changed by now.' : ' may be changing already: its restore point is being saved.')), h('p', { class: 'muted' }, 'Cancelling stops the move and rolls it back to the restore point, then deletes the copied files and the restore point.'))
+          : h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, 'Nothing on ' + D.host(opts.targetHome) + ' has changed yet.'), h('p', { class: 'muted' }, 'Cancelling stops the move and deletes what was copied so far.')),
+          { title: after ? 'Cancel and roll back?' : 'Cancel this move?', confirmLabel: after ? 'Cancel and roll back' : 'Cancel the move', cancelLabel: 'Keep going', danger: true });
+        if (!ok || cancelled) return;
+        if (after === (!!rollbackId || snapSent)) break;
+      }
       cancelled = true;
       cancelBtn.disabled = true;
       rlog('Cancelling after the current step\u2026', 'dim');
@@ -335,19 +345,32 @@
       setTitle('Cancelling', '');
       capsText.textContent = 'Cancelling';
       var rolledBack = false;
-      if (rollbackId) {
+      // Cancelled while the restore point was being saved: the answer may
+      // never have reached this page, so ask the site whether there is one.
+      var pointId = rollbackId || (snapSent ? importId : '');
+      if (pointId) {
         rlog('Rolling back to the snapshot\u2026');
         try {
-          var r = await D.paced(opts.api, 'import/rollback', { import_id: rollbackId }, function (x) { progress('Rolling back\u2026 ' + (x.phase === 'files' ? D.fmt.num(x.files_done || 0) + ' of ' + D.fmt.plural(x.files_total || 0, 'file') : 'the database')); });
+          var r = await D.paced(opts.api, 'import/rollback', { import_id: pointId }, function (x) { progress('Rolling back\u2026 ' + (x.phase === 'files' ? D.fmt.num(x.files_done || 0) + ' of ' + D.fmt.plural(x.files_total || 0, 'file') : 'the database')); });
           progress('');
+          rollbackId = pointId;
           rolledBack = !(r.errors && r.errors.length);
           (r.errors || []).slice(0, 5).forEach(function (e) { rlog('  ' + e, 'err'); });
           if (r.quiet_mode_lifted) { rlog('Quiet mode lifted with it.', 'dim'); if (opts.local && D.quietOff) D.quietOff(); }
-        } catch (e) { rlog('ERROR: ' + D.errorText(e), 'err'); }
+        } catch (e) {
+          if (!rollbackId && e.status === 404 && e.data && e.data.code === 'no_rollback') rlog('No restore point was saved, so nothing here changed.', 'dim');
+          else {
+            rollbackId = pointId;
+            if (opts.local && D.quietLifted(e)) { rlog('Quiet mode lifted with it.', 'dim'); D.quietOff(); }
+            rlog('ERROR: ' + (D.laterPointsText(e) || D.errorText(e)), 'err');
+          }
+        }
       }
       var kept = !!rollbackId && !rolledBack;
       try {
-        await opts.api.post('import/cancel', t({ action: 'cleanup', delete_restore_point: rolledBack }));
+        var cl = await opts.api.post('import/cancel', t({ action: 'cleanup', delete_restore_point: rolledBack }));
+        // The site still holds a restore point this page didn't hear about: never say nothing changed.
+        if (cl && cl.restore_point_kept && !rolledBack) { rollbackId = rollbackId || importId; kept = true; }
         rlog('Cleaned up the copied files' + (rolledBack ? ' and the rollback point.' : '.'), 'ok');
       } catch (e) {
         if (e.status === 404) rlog('This Disembark can\u2019t clean up on cancel; the copied files stay in uploads/disembark until you delete them (Settings \u2192 clean up).', 'dim');
@@ -571,9 +594,14 @@
         if (cancelled) throw Cancelled();
         return r;
       },
-      upload: function (endpoint, form) {
+      upload: async function (endpoint, form) {
+        if (cancelled) throw Cancelled();
         form.append('request_id', D.randomHex(24));
-        return retrying(function () { return opts.api.upload(endpoint, form); });
+        try {
+          var r = await retrying(function () { return opts.api.upload(endpoint, form); });
+        } catch (e) { if (cancelled) throw Cancelled(); throw e; }
+        if (cancelled) throw Cancelled();
+        return r;
       }
     };
 
@@ -1025,6 +1053,7 @@
         return;
       }
       for (var i = 0; i < total; i++) {
+        if (cancelled) throw Cancelled();
         var part = new FormData();
         part.append('import_id', importId); part.append('file_path', 'restore.zip');
         part.append('chunk_index', i); part.append('total_chunks', total);
@@ -1147,6 +1176,7 @@
         // Named for the site that came over (see srcLabel above).
         var snapLabel = String(opts.label || ''), siteHost = kind === 'pull' && opts.site ? D.host(opts.site) : '';
         if (siteHost && siteHost !== srcLabel) snapLabel = snapLabel.replace(siteHost, srcLabel);
+        snapSent = true;
         var snap = pacing ? await budgeted('import/snapshot', t({ label: snapLabel }), function (r) { paced('Saving a rollback point\u2026 ' + D.fmt.num(r.tables_done || 0) + ' of ' + D.fmt.plural(r.tables_total || 0, 'table')); })
           : await api.post('import/snapshot', t({ label: snapLabel }));
         progress('');
@@ -1310,12 +1340,13 @@
         sendNotice('failed', { error: msg, step: current ? (STEPS.filter(function (s) { return s.key === current; })[0] || {}).label : '' });
         rlog('ERROR: ' + msg, 'err');
         setTitle('It', 'stopped.');
-        sub.textContent = rollbackId ? D.host(opts.targetHome) + ' may be partly changed. Roll back below to put it as it was.' : 'Nothing on ' + D.host(opts.targetHome) + ' changed.';
+        var unsure = !rollbackId && snapSent;
+        sub.textContent = rollbackId ? D.host(opts.targetHome) + ' may be partly changed. Roll back below to put it as it was.' : unsure ? 'It stopped while saving the restore point. If one was saved, it’s under Backups → Restore points.' : 'Nothing on ' + D.host(opts.targetHome) + ' changed.';
         live.className = 'dsk-live stop'; capsText.textContent = KIND + ' stopped';
         progress('');
         cancelAnimationFrame(boat.raf);
         failStop('stopped');
-        setHead([rollbackId ? D.host(opts.targetHome) + ' may be partly changed. Roll back to put it as it was.' : 'Nothing on ' + D.host(opts.targetHome) + ' changed.'], 'Stopped', 'warn');
+        setHead([rollbackId ? D.host(opts.targetHome) + ' may be partly changed. Roll back to put it as it was.' : unsure ? 'It stopped while saving the restore point.' : 'Nothing on ' + D.host(opts.targetHome) + ' changed.'], 'Stopped', 'warn');
         D.mount(chooser);
         D.mount(outcome, h('div', { class: 'dsk-stack', style: { marginTop: '16px' } },
           D.note('error', [h('strong', null, 'It stopped. '), msg]),
@@ -1327,9 +1358,15 @@
             : h('div', null, h('button', { class: 'dsk-btn', type: 'button', onclick: opts.back }, D.icon('ship'), 'Back to Move'))));
         if (opts.onFinish) opts.onFinish();
       }
-    })();
+    })().finally(function () { D.movesRunning = Math.max(0, (D.movesRunning || 1) - 1); });
 
     async function rollback(btn, into) {
+      // The same question as Backups → Restore points, and the same
+      // rollback: any move made since this one is undone first.
+      var pick;
+      try { pick = await D.askRollback(opts.api, rollbackId, ctx.target ? ctx.target.home : opts.targetHome, btn); }
+      catch (e) { D.toast('Can’t roll back: ' + D.errorText(e), 'error'); return; }
+      if (!pick) return;
       await D.busy(btn, async function () {
         var prevLive = live.className, prevCaps = capsText.textContent;
         live.className = 'dsk-live';
@@ -1338,9 +1375,10 @@
         rlog('Rolling back to the snapshot…');
         progress('Rolling back to the snapshot\u2026');
         try {
-          var r = await D.paced(opts.api, 'import/rollback', { import_id: rollbackId }, function (x) { progress('Rolling back\u2026 ' + (x.phase === 'files' ? D.fmt.num(x.files_done || 0) + ' of ' + D.fmt.plural(x.files_total || 0, 'file') : 'the database')); });
+          var r = await D.paced(opts.api, 'import/rollback', { import_id: rollbackId, files: pick.files, later: true }, function (x) { progress(x.steps ? 'Undoing ' + x.step + ' of ' + x.steps + (x.label ? ': ' + x.label : '') + '\u2026' : 'Rolling back\u2026 ' + (x.phase === 'files' ? D.fmt.num(x.files_done || 0) + ' of ' + D.fmt.plural(x.files_total || 0, 'file') : 'the database')); });
           progress('');
           if (r.quiet_mode_lifted) { rlog('Quiet mode lifted with it.', 'dim'); if (opts.local && D.quietOff) D.quietOff(); }
+          if (r.undone && r.undone.length) rlog('Undid ' + D.fmt.plural(r.undone.length, 'later move') + ' first.', 'dim');
           if (r.errors && r.errors.length) {
             r.errors.slice(0, 5).forEach(function (e) { rlog('  ' + e, 'err'); });
             throw new Error('Rollback reported ' + D.fmt.plural(r.errors.length, 'error') + '. It can be run again from the CLI.');
@@ -1350,15 +1388,16 @@
           setTitle('Rolled', 'back.');
           live.className = 'dsk-live ok'; capsText.textContent = KIND + ' undone';
           lineState();
-          sub.textContent = D.host(opts.targetHome) + ' is back to how it was before the move.';
+          var dbOnly = pick.files === false || r.files === false;
+          sub.textContent = dbOnly ? 'The database of ' + D.host(opts.targetHome) + ' is back to how it was before the move. Its files stay as they are.' : D.host(opts.targetHome) + ' is back to how it was before the move.';
           headK.textContent = 'Undone.';
-          setHead(['The crates went back to ', { b: srcLabel }, '. Nothing from the move is left on ', { b: D.host(opts.targetHome) }, '.'], 'Rolled back', 'ok');
+          setHead(dbOnly ? ['The database went back to how it was. The files the move placed stay on ', { b: D.host(opts.targetHome) }, '.'] : ['The crates went back to ', { b: srcLabel }, '. Nothing from the move is left on ', { b: D.host(opts.targetHome) }, '.'], 'Rolled back', 'ok');
           cancelAnimationFrame(boat.raf);
           boat.t = null; boat.cargo = 0; boat.dock = 'left'; boat.arrived = false; drawScene();
           stopEls.forEach(function (se, i) { setStop(i, 'todo'); se.small.textContent = '\u00a0'; });
           strip.style.setProperty('--p', 0);
           D.mount(outcome, h('div', { class: 'dsk-stack', style: { marginTop: '16px' } },
-            D.note('ok', [h('strong', null, 'Rolled back. '), D.host(opts.targetHome) + ' is back to how it was before.']),
+            D.note('ok', [h('strong', null, 'Rolled back. '), dbOnly ? 'The database of ' + D.host(opts.targetHome) + ' is back to how it was before; its files stay as they are.' : D.host(opts.targetHome) + ' is back to how it was before.']),
             h('div', null, h('button', { class: 'dsk-btn', type: 'button', onclick: opts.back }, D.icon(opts.icon || 'ship'), opts.againLabel || 'Start another move'))));
         } catch (e) {
           progress('');
@@ -1366,8 +1405,8 @@
           capsText.textContent = prevCaps;
           lineState();
           if (opts.local && D.quietLifted(e)) { rlog('Quiet mode lifted with it.', 'dim'); D.quietOff(); }
-          rlog('ERROR: ' + D.errorText(e), 'err');
-          D.toast('Rollback failed: ' + D.errorText(e), 'error');
+          rlog('ERROR: ' + (D.laterPointsText(e) || D.errorText(e)), 'err');
+          D.toast('Rollback failed: ' + (D.laterPointsText(e) || D.errorText(e)), 'error');
         }
       });
     }
@@ -1377,6 +1416,148 @@
   D.quietLifted = function (e) {
     var d = e && e.data && typeof e.data === 'object' ? e.data : null;
     return !!(D.quietOff && d && (d.quiet_mode_lifted || (d.data && d.data.quiet_mode_lifted)));
+  };
+
+  function hasFiles(p) { return !!(p.files || p.deployed); }
+  /** The restore points made after p that rolling back to it undoes first, newest first (matches Import::later_points()). */
+  function laterThan(points, p, files) {
+    return points.filter(function (q) {
+      return q.id !== p.id && q.created_at > p.created_at && ((!q.rolled_back_at && !q.rolled_back_legacy) || (files && hasFiles(q) && !q.files_spent));
+    }).sort(function (a, b) { return b.created_at - a.created_at; });
+  }
+  /** The steps a rollback to p runs that still hold their files: the choice of Database only matters for any of them. */
+  function unspentFiles(points, p) { return [p].concat(laterThan(points, p, true)).some(function (q) { return hasFiles(q) && !q.files_spent && !(q.id === p.id && p.creates_site); }); }
+
+  /**
+   * Asks before a rollback to restore point p, saying what it changes: the
+   * later moves it undoes first, the files it removes and puts back, and,
+   * when a step still holds its files, a choice of Database only. points is
+   * the restore points list. Without it (a move's own Undo or Roll back,
+   * maybe on another site), the steps come from the site's preview, which
+   * can be passed in already fetched. Resolves { files } to go ahead, or
+   * null. A point that's gone rejects with the site's 404.
+   */
+  D.rollbackConfirm = async function (api, p, points, preview) {
+    var where = p.home ? D.host(p.home) : 'this site';
+    var words = { title: p.title || 'Roll back?', confirmLabel: p.confirmLabel || 'Roll back', after: p.after || '' };
+    var pending = preview !== undefined ? Promise.resolve(preview) : api.post('restore-points/preview', { import_id: p.id });
+    if (!points) {
+      var pv = null;
+      try { pv = await pending; } catch (e) {
+        if (e && e.status === 404 && e.data && e.data.code === 'no_rollback') throw e;
+      }
+      if (!pv || !Array.isArray(pv.steps)) {
+        // An older Disembark without the preview: the plain question.
+        var plain = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
+          h('p', null, 'Put ' + where + ' back to the restore point taken before this move?'),
+          h('p', { class: 'muted' }, 'Any move made there since is undone first, newest first. Anything changed since is lost.' + (words.after ? ' ' + words.after : ''))),
+          { title: words.title, confirmLabel: words.confirmLabel, danger: true });
+        return plain ? { files: true } : null;
+      }
+      points = pv.steps.map(function (st) {
+        return { id: st.id, label: st.label, created_at: st.created_at, files: (st.spent || st.removes || st.puts_back) ? 1 : 0, files_spent: !!st.spent, creates_site: !!st.creates_site };
+      });
+      p = points.filter(function (q) { return q.id === p.id; })[0] || p;
+      pending = Promise.resolve(pv);
+    }
+    var choice = unspentFiles(points, p), files = true;
+    var laterBox = h('div'), sumBox = h('div'), preview = null;
+    // What it changes, from the site (read only): files each move placed
+    // that a rollback removes, the ones it puts back, and the totals.
+    pending.then(function (r) { preview = r || false; showLater(); }).catch(function () { preview = false; showLater(); });
+    function size(b) { return (preview && preview.partial ? 'at least ' : '') + D.fmt.size(b || 0); }
+    function stepOf(q) { return preview && (preview.steps || []).find(function (st) { return st.id === q.id; }); }
+    function stepText(q) {
+      var st = stepOf(q);
+      if (!st) return '';
+      // A subsite or tenant a move created goes whole, files and all, with Database only too.
+      if (st.creates_site && !st.spent) return 'removes the subsite or tenant it created, files and all';
+      if (!files || !st.files) return files && st.spent && (st.removes || st.puts_back || hasFiles(q)) ? 'database only (its files were put back before)' : 'database only';
+      var parts = [];
+      if (st.removes) parts.push('removes ' + D.fmt.plural(st.removes, 'file') + ' (' + size(st.removes_bytes) + ')');
+      if (st.puts_back) parts.push('puts back ' + D.fmt.plural(st.puts_back, 'file'));
+      return parts.length ? parts.join(', ') : 'database only';
+    }
+    function summary() {
+      if (preview === null) return D.note('', [h('span', { class: 'dsk-spin' }), ' Working out what changes…']);
+      if (!preview) return null;
+      var db = preview.database || {}, lines = [];
+      var steps = preview.steps || [], moves = steps.filter(function (st) { return st.files && (st.removes || st.puts_back); }).length > 1 ? 'the moves' : 'the move';
+      var created = steps.filter(function (st) { return st.creates_site && !st.spent; }).length;
+      lines.push(h('div', null, h('strong', null, 'Database: '), db.partial ? 'the ' + D.fmt.plural(db.tables, 'table') + ' the change touched ' + (db.tables === 1 ? 'goes' : 'go') + ' back.' : 'back to ' + D.fmt.date(db.created_at) + ' (' + D.fmt.plural(db.tables, 'table') + ').'));
+      if (files) {
+        if (preview.removes) lines.push(h('div', null, h('strong', null, 'Removes: '), D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') ' + moves + ' placed' + (preview.uploads ? ', ' + D.fmt.num(preview.uploads) + ' of them in uploads (' + size(preview.uploads_bytes) + ')' : '') + '.'));
+        if (preview.puts_back) lines.push(h('div', null, h('strong', null, 'Puts back: '), D.fmt.plural(preview.puts_back, 'file') + ' ' + moves + ' replaced or removed.'));
+        if (!preview.removes && !preview.puts_back) lines.push(h('div', null, h('strong', null, 'Files: '), 'none to change.'));
+      } else {
+        // The files a created site's step placed go with that site; only
+        // the other steps' placed files stay.
+        var staying = created ? steps.some(function (st) { return st.removes && !(st.creates_site && !st.spent); }) : !!preview.removes;
+        lines.push(h('div', null, h('strong', null, 'Files: '), 'stay as they are' + (created ? ', except the ' + (created > 1 ? created + ' subsites or tenants' : 'subsite or tenant') + ' below' + (staying ? ', including files ' + moves + ' placed' : '')
+          : staying ? ', including the ' + D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') ' + moves + ' placed' : '') + '.'));
+        if (created) lines.push(h('div', null, h('strong', null, 'Removes: '), (created > 1 ? 'the ' + created + ' subsites or tenants these moves created, each' : 'the subsite or tenant a move created,') + ' with its tables, folders and files. A site a move created always goes whole.'));
+      }
+      (preview.notes || []).forEach(function (n) { lines.push(h('div', null, h('strong', null, 'Users: '), n)); });
+      if (preview.maintenance) lines.push(h('div', null, h('strong', null, 'While it runs: '), 'visitors see WordPress\u2019s \u201cBriefly unavailable for scheduled maintenance\u201d page, so nothing loads the site half put back.'));
+      return D.note('', lines);
+    }
+    function showLater() {
+      var later = laterThan(points, p, files);
+      D.mount(sumBox, summary());
+      D.mount(laterBox, later.length ? h('div', { class: 'dsk-stack', style: { gap: '4px' } },
+        h('p', null, 'First it undoes ', h('strong', null, D.fmt.plural(later.length, 'later move')), ', newest first:'),
+        h('ul', { style: { margin: '0 0 0 18px', padding: 0 } }, later.slice(0, 8).map(function (q) {
+          var t = stepText(q);
+          return h('li', { style: { marginBottom: '4px' } }, (q.label || 'Restore point') + ' ', h('span', { class: 'muted' }, '(' + D.fmt.date(q.created_at) + ')'),
+            t ? h('small', { class: 'muted', style: { display: 'block' } }, t) : null);
+        }), later.length > 8 ? h('li', { class: 'muted' }, 'and ' + D.fmt.plural(later.length - 8, 'more')) : null)) : null);
+    }
+    var opt = function (value, title, text) {
+      var input = h('input', { type: 'radio', name: 'dsk-rb-files', value: value, style: { marginTop: '3px' } });
+      input.checked = (value === 'all') === files;
+      input.addEventListener('change', function () { files = value === 'all'; showLater(); });
+      return h('label', { style: { display: 'flex', gap: '10px', alignItems: 'flex-start', padding: '9px 0', borderTop: '1px solid var(--line)', cursor: 'pointer' } }, input,
+        h('span', null, h('strong', null, title), h('small', { class: 'muted', style: { display: 'block', marginTop: '2px' } }, text)));
+    };
+    showLater();
+    var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
+      h('p', null, 'Put ' + where + ' back to how it was on ', h('strong', null, D.fmt.date(p.created_at)), '?'),
+      choice && p.creates_site ? h('p', { class: 'muted' }, 'The subsite or tenant this move created goes completely either way: its tables, folders and files.') : null,
+      choice ? h('div', null,
+        opt('all', 'Database and files', 'The database goes back to the snapshot, the files the move replaced come back and the ones it added go.'),
+        opt('db', 'Database only', 'The files stay as they are now, and the restore point keeps its saved files for a later rollback. An older database with newer plugin files usually works, though a plugin may ask to update its database.'))
+        : h('p', { class: 'muted' }, p.creates_site ? 'The subsite or tenant this move created goes completely: its tables, folders and files.'
+          : hasFiles(p) && p.files_spent ? 'Only the database goes back: an earlier rollback already put this point’s files back (a rollback moves them into place, so it can only happen once).'
+          : 'The database is replaced with the snapshot.'),
+      sumBox,
+      laterBox,
+      h('p', { class: 'muted' }, 'Anything changed since is lost.' + (words.after ? ' ' + words.after : ''))),
+      { title: words.title, confirmLabel: words.confirmLabel, danger: true });
+    return ok ? { files: files } : null;
+  };
+
+  /**
+   * A rollback asked for outside the restore points list (a move's Undo,
+   * Roll back on a stopped move, Roll back and discard): fetches the
+   * preview with btn spinning, then asks with D.rollbackConfirm. Resolves
+   * { files } or null (also while btn is already busy).
+   */
+  D.askRollback = async function (api, id, home, btn, words) {
+    var busy = true;
+    var pv = await D.busy(btn, function () {
+      busy = false;
+      return api.post('restore-points/preview', { import_id: id }).catch(function (e) {
+        if (e && e.status === 404 && e.data && e.data.code === 'no_rollback') throw e;
+        return null; // an older Disembark: the plain question
+      });
+    });
+    if (busy) return null;
+    return D.rollbackConfirm(api, Object.assign({ id: id, home: home }, words || {}), null, pv || null);
+  };
+  /** What a rollback refused because later restore points exist (later_points_exist) says to do instead. */
+  D.laterPointsText = function (e) {
+    return e && e.data && e.data.code === 'later_points_exist'
+      ? 'A move made after this one has its own restore point, so this one can’t go back on its own. Roll back from Backups → Restore points, which undoes the later moves first.' : '';
   };
 
   /**
@@ -1444,91 +1625,11 @@
       } }, 'Show all ' + points.length)) : null;
       D.mount(body, list, more);
     }
-    function hasFiles(p) { return !!(p.files || p.deployed); }
-    /** The restore points made after p that rolling back to it undoes first, newest first (matches Import::later_points()). */
-    function laterThan(p, files) {
-      return points.filter(function (q) {
-        return q.id !== p.id && q.created_at > p.created_at && ((!q.rolled_back_at && !q.rolled_back_legacy) || (files && hasFiles(q) && !q.files_spent));
-      }).sort(function (a, b) { return b.created_at - a.created_at; });
-    }
-    /** The steps a rollback to p runs that still hold their files: the choice of Database only matters for any of them. */
-    function unspentFiles(p) { return [p].concat(laterThan(p, true)).some(function (q) { return hasFiles(q) && !q.files_spent && !(q.id === p.id && p.creates_site); }); }
     async function rollback(p, btn) {
       if (running) return;
-      var choice = unspentFiles(p), files = true;
-      var laterBox = h('div'), sumBox = h('div'), preview = null;
-      // What it changes, from the site (read only): files each move placed
-      // that a rollback removes, the ones it puts back, and the totals.
-      D.api.post('restore-points/preview', { import_id: p.id }).then(function (r) { preview = r; showLater(); }).catch(function () { preview = false; showLater(); });
-      function size(b) { return (preview && preview.partial ? 'at least ' : '') + D.fmt.size(b || 0); }
-      function stepOf(q) { return preview && (preview.steps || []).find(function (st) { return st.id === q.id; }); }
-      function stepText(q) {
-        var st = stepOf(q);
-        if (!st) return '';
-        // A subsite or tenant a move created goes whole, files and all, with Database only too.
-        if (st.creates_site && !st.spent) return 'removes the subsite or tenant it created, files and all';
-        if (!files || !st.files) return files && st.spent && (st.removes || st.puts_back || hasFiles(q)) ? 'database only (its files were put back before)' : 'database only';
-        var parts = [];
-        if (st.removes) parts.push('removes ' + D.fmt.plural(st.removes, 'file') + ' (' + size(st.removes_bytes) + ')');
-        if (st.puts_back) parts.push('puts back ' + D.fmt.plural(st.puts_back, 'file'));
-        return parts.length ? parts.join(', ') : 'database only';
-      }
-      function summary() {
-        if (preview === null) return D.note('', [h('span', { class: 'dsk-spin' }), ' Working out what changes…']);
-        if (!preview) return null;
-        var db = preview.database || {}, lines = [];
-        var steps = preview.steps || [], moves = steps.filter(function (st) { return st.files && (st.removes || st.puts_back); }).length > 1 ? 'the moves' : 'the move';
-        var created = steps.filter(function (st) { return st.creates_site && !st.spent; }).length;
-        lines.push(h('div', null, h('strong', null, 'Database: '), db.partial ? 'the ' + D.fmt.plural(db.tables, 'table') + ' the change touched ' + (db.tables === 1 ? 'goes' : 'go') + ' back.' : 'back to ' + D.fmt.date(db.created_at) + ' (' + D.fmt.plural(db.tables, 'table') + ').'));
-        if (files) {
-          if (preview.removes) lines.push(h('div', null, h('strong', null, 'Removes: '), D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') ' + moves + ' placed' + (preview.uploads ? ', ' + D.fmt.num(preview.uploads) + ' of them in uploads (' + size(preview.uploads_bytes) + ')' : '') + '.'));
-          if (preview.puts_back) lines.push(h('div', null, h('strong', null, 'Puts back: '), D.fmt.plural(preview.puts_back, 'file') + ' ' + moves + ' replaced or removed.'));
-          if (!preview.removes && !preview.puts_back) lines.push(h('div', null, h('strong', null, 'Files: '), 'none to change.'));
-        } else {
-          // The files a created site's step placed go with that site; only
-          // the other steps' placed files stay.
-          var staying = created ? steps.some(function (st) { return st.removes && !(st.creates_site && !st.spent); }) : !!preview.removes;
-          lines.push(h('div', null, h('strong', null, 'Files: '), 'stay as they are' + (created ? ', except the ' + (created > 1 ? created + ' subsites or tenants' : 'subsite or tenant') + ' below' + (staying ? ', including files ' + moves + ' placed' : '')
-            : staying ? ', including the ' + D.fmt.plural(preview.removes, 'file') + ' (' + size(preview.removes_bytes) + ') ' + moves + ' placed' : '') + '.'));
-          if (created) lines.push(h('div', null, h('strong', null, 'Removes: '), (created > 1 ? 'the ' + created + ' subsites or tenants these moves created, each' : 'the subsite or tenant a move created,') + ' with its tables, folders and files. A site a move created always goes whole.'));
-        }
-        (preview.notes || []).forEach(function (n) { lines.push(h('div', null, h('strong', null, 'Users: '), n)); });
-        if (preview.maintenance) lines.push(h('div', null, h('strong', null, 'While it runs: '), 'visitors see WordPress\u2019s \u201cBriefly unavailable for scheduled maintenance\u201d page, so nothing loads the site half put back.'));
-        return D.note('', lines);
-      }
-      function showLater() {
-        var later = laterThan(p, files);
-        D.mount(sumBox, summary());
-        D.mount(laterBox, later.length ? h('div', { class: 'dsk-stack', style: { gap: '4px' } },
-          h('p', null, 'First it undoes ', h('strong', null, D.fmt.plural(later.length, 'later move')), ', newest first:'),
-          h('ul', { style: { margin: '0 0 0 18px', padding: 0 } }, later.slice(0, 8).map(function (q) {
-            var t = stepText(q);
-            return h('li', { style: { marginBottom: '4px' } }, (q.label || 'Restore point') + ' ', h('span', { class: 'muted' }, '(' + D.fmt.date(q.created_at) + ')'),
-              t ? h('small', { class: 'muted', style: { display: 'block' } }, t) : null);
-          }), later.length > 8 ? h('li', { class: 'muted' }, 'and ' + D.fmt.plural(later.length - 8, 'more')) : null)) : null);
-      }
-      var opt = function (value, title, text) {
-        var input = h('input', { type: 'radio', name: 'dsk-rb-files', value: value, style: { marginTop: '3px' } });
-        input.checked = (value === 'all') === files;
-        input.addEventListener('change', function () { files = value === 'all'; showLater(); });
-        return h('label', { style: { display: 'flex', gap: '10px', alignItems: 'flex-start', padding: '9px 0', borderTop: '1px solid var(--line)', cursor: 'pointer' } }, input,
-          h('span', null, h('strong', null, title), h('small', { class: 'muted', style: { display: 'block', marginTop: '2px' } }, text)));
-      };
-      showLater();
-      var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
-        h('p', null, 'Put this site back to how it was on ', h('strong', null, D.fmt.date(p.created_at)), '?'),
-        choice && p.creates_site ? h('p', { class: 'muted' }, 'The subsite or tenant this move created goes completely either way: its tables, folders and files.') : null,
-        choice ? h('div', null,
-          opt('all', 'Database and files', 'The database goes back to the snapshot, the files the move replaced come back and the ones it added go.'),
-          opt('db', 'Database only', 'The files stay as they are now, and the restore point keeps its saved files for a later rollback. An older database with newer plugin files usually works, though a plugin may ask to update its database.'))
-          : h('p', { class: 'muted' }, p.creates_site ? 'The subsite or tenant this move created goes completely: its tables, folders and files.'
-            : hasFiles(p) && p.files_spent ? 'Only the database goes back: an earlier rollback already put this point’s files back (a rollback moves them into place, so it can only happen once).'
-            : 'The database is replaced with the snapshot.'),
-        sumBox,
-        laterBox,
-        h('p', { class: 'muted' }, 'Anything changed since is lost.')),
-        { title: 'Roll back?', confirmLabel: 'Roll back', danger: true });
-      if (!ok || running) return;
+      var pick = await D.rollbackConfirm(D.api, p, points);
+      if (!pick || running) return;
+      var files = pick.files;
       var label = btn.lastChild, was = label && label.nodeType === 3 ? label.textContent : null;
       lock(true);
       await D.busy(btn, async function () {

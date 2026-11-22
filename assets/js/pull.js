@@ -43,6 +43,12 @@
     var list = [];
     try { list = await D.api.get('import/unfinished'); } catch (e) { /* older Disembark */ }
     if (!Array.isArray(list) || !list.length) { D.mount(box); return; }
+    // A move still running (a CLI pull, another tab, a push driven from the
+    // source) can't be resumed or discarded under it: its buttons wait, and
+    // the list looks again in half a minute.
+    if (list.some(function (m) { return m.active; })) {
+      setTimeout(function () { if (box.isConnected) unfinished(box, onResume); }, 30000);
+    }
     D.mount(box, h('div', { class: 'dsk-unfinished' }, list.map(function (m) {
       var where = m.rollback_point
         ? 'It stopped after the rollback point was saved, so this site may be partly changed.'
@@ -55,10 +61,11 @@
         (m.started ? 'Started ' + D.fmt.ago(m.started) + ', last active ' : 'Last active ') + D.fmt.ago(m.touched) + '. ' + where,
         m.rollback_point && m.idle_days >= 7 ? ' It has waited ' + D.fmt.plural(m.idle_days, 'day') + ': it stays until you resume it, discard it or roll it back.' : '',
         m.rollback_point && m.left_alone ? ' ' + (D.OLD_POINT_NOTE || '') : '',
+        m.active ? h('div', { style: { marginTop: '8px' } }, h('strong', null, 'Still running: '), 'it was active ' + D.fmt.ago(m.touched) + '. Resume and Discard wait until it stops.') : null,
         h('div', { class: 'dsk-row', style: { marginTop: '10px' } },
           cli ? h('code', null, 'wp disembark pull --resume=' + m.id)
-            : h('button', { class: 'dsk-btn primary sm', type: 'button', onclick: function (e) { resume(m, e.currentTarget); } }, D.icon('play'), 'Resume'),
-          h('button', { class: 'dsk-btn ghost sm', type: 'button', onclick: function (e) { discard(m, e.currentTarget); } }, D.icon('trash'), m.rollback_point ? 'Roll back and discard' : 'Discard'))
+            : h('button', { class: 'dsk-btn primary sm', type: 'button', disabled: !!m.active, onclick: function (e) { resume(m, e.currentTarget); } }, D.icon('play'), 'Resume'),
+          h('button', { class: 'dsk-btn ghost sm', type: 'button', disabled: !!m.active, onclick: function (e) { discard(m, e.currentTarget); } }, D.icon('trash'), m.rollback_point ? 'Roll back and discard' : 'Discard'))
       ], 'history');
     })));
 
@@ -73,23 +80,34 @@
     }
 
     async function discard(m, btn) {
-      var ok = await D.confirm(m.rollback_point
-        ? 'Roll ' + D.host(D.config.homeUrl) + ' back to how it was before this move, then delete what it copied and its rollback point?'
-        : 'Delete what this move copied so far? Nothing on this site has changed.',
-        { title: m.rollback_point ? 'Roll back and discard?' : 'Discard this move?', confirmLabel: m.rollback_point ? 'Roll back and discard' : 'Discard', danger: true });
-      if (!ok) return;
+      // With a restore point: the same question and rollback as Backups →
+      // Restore points, so a move made since is undone first.
+      var pick = null;
+      if (m.rollback_point) {
+        try { pick = await D.askRollback(D.api, m.id, D.config.homeUrl, btn, { title: 'Roll back and discard?', confirmLabel: 'Roll back and discard', after: 'Then what this move copied and its restore point are deleted.' }); }
+        catch (e) { D.toast(D.errorText(e), 'error'); unfinished(box, onResume); return; }
+        if (!pick) return;
+      } else {
+        var ok = await D.confirm('Delete what this move copied so far? Nothing on this site has changed.', { title: 'Discard this move?', confirmLabel: 'Discard', danger: true });
+        if (!ok) return;
+      }
       await D.busy(btn, async function () {
         try {
-          var rolledBack = false;
+          var rolledBack = false, r = null;
           if (m.rollback_point) {
-            var r = await D.paced(D.api, 'import/rollback', { import_id: m.id });
+            r = await D.paced(D.api, 'import/rollback', { import_id: m.id, files: pick.files, later: true });
+            if (r.quiet_mode_lifted && D.quietOff) D.quietOff();
             if (r.errors && r.errors.length) throw new Error('The rollback reported ' + D.fmt.plural(r.errors.length, 'error') + '. The rollback point is kept: try again from Backups → Restore points.');
             rolledBack = true;
           }
           await D.api.post('import/cancel', { import_id: m.id, action: 'cleanup', delete_restore_point: rolledBack });
           D.toast(m.rollback_point ? 'Rolled back and cleaned up.' : 'Discarded.');
-          if (m.rollback_point) setTimeout(function () { location.href = D.config.loginUrl; }, 1200);
-        } catch (e) { D.toast(D.errorText(e), 'error'); }
+          // User accounts went back with a whole-site move's database: log in again.
+          if (r && !r.logins_kept) { setTimeout(function () { location.href = D.config.loginUrl; }, 1200); return; }
+        } catch (e) {
+          if (D.quietLifted(e)) D.quietOff();
+          D.toast(D.laterPointsText(e) || D.errorText(e), 'error');
+        }
         unfinished(box, onResume);
       });
     }
