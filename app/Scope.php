@@ -74,6 +74,16 @@ class Scope {
         } elseif ( is_array( $request ) ) {
             $value = (string) ( $request['site'] ?? '' );
         }
+        // A request that reached one site of an install by its own address
+        // (a subsite's /alpha/wp-json/, a WP Freighter tenant's cookie or
+        // STACKED_SITE_ID) and named no site exports that site, not the
+        // whole install (the Disembark CLI pointed at a subsite's address).
+        if ( trim( $value ) === '' ) {
+            $install = self::install();
+            if ( $install && (string) $install['current'] !== (string) $install['main'] ) {
+                $value = 'current';
+            }
+        }
         $scope = self::resolve( $value );
         // super_admins=0: the pulling site chose to leave out the network's
         // super admins who have no role on this site (see super_admins_added()).

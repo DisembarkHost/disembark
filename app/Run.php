@@ -719,16 +719,15 @@ class Run {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
-        // One site of a shared install (a pull that chose one): its tables,
+        // One site of a shared install (a pull that chose one, or a request
+        // that reached a subsite or tenant by its own address): its tables,
         // by the names it exports them under.
-        if ( (string) $request->get_param( 'site' ) !== '' ) {
-            $scope = Scope::from_request( $request );
-            if ( is_wp_error( $scope ) ) {
-                return $scope;
-            }
-            if ( $scope ) {
-                return $scope->table_info();
-            }
+        $scope = Scope::from_request( $request );
+        if ( is_wp_error( $scope ) ) {
+            return $scope;
+        }
+        if ( $scope ) {
+            return $scope->table_info();
         }
         global $wpdb;
         $sql = $wpdb->prepare( "SELECT table_name AS \"table\", data_length + index_length AS \"size\" FROM information_schema.TABLES WHERE table_schema = %s ORDER BY (data_length + index_length) DESC;", DB_NAME );
