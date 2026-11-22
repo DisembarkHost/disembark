@@ -6398,6 +6398,26 @@ class Import {
         return $out;
     }
 
+    /**
+     * A restore point's DROP TABLE / DROP VIEW IF EXISTS, aimed at what the
+     * name is now: the move may have put a table where the restore point had
+     * a view (or the reverse), and the wrong kind of DROP leaves it standing,
+     * so the CREATE after it fails with "already exists".
+     */
+    private static function kind_aware_drop( $sql ) {
+        global $wpdb;
+        if ( ! preg_match( '/^DROP\s+(TABLE|VIEW)\s+IF\s+EXISTS\s+`((?:[^`]|``)+)`\s*;?\s*$/i', trim( (string) $sql ), $m ) ) {
+            return $sql;
+        }
+        $name  = str_replace( '``', '`', $m[2] );
+        $found = (array) $wpdb->get_row( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( $name ) ), ARRAY_N );
+        if ( strcasecmp( (string) ( $found[0] ?? '' ), $name ) !== 0 ) {
+            return $sql;
+        }
+        $kind = strtoupper( (string) ( $found[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
+        return strtoupper( $m[1] ) === $kind ? $sql : "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $name ) . '`';
+    }
+
     /** The table or view a restore point's statement creates, fills or drops, or null. */
     private static function dump_statement_table( $statement ) {
         $statement = self::strip_leading_comments( (string) $statement );
@@ -7281,7 +7301,7 @@ class Import {
         $fi      = (int) $st['f'];
         $exec    = function ( $sql ) use ( &$run, &$tolerant ) {
             $before = count( $run['errors'] );
-            $more   = $this->run_statement( $sql, $run );
+            $more   = $this->run_statement( self::kind_aware_drop( $sql ), $run );
             if ( $tolerant && count( $run['errors'] ) > $before && preg_match( '/Duplicate entry|already exists/i', (string) $run['errors'][ $before ] ) ) {
                 array_splice( $run['errors'], $before );
             }
