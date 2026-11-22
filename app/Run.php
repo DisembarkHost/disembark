@@ -53,7 +53,7 @@ class Run {
     }
 
     /** The storage format this build writes (see upgrade_storage()). */
-    const STORAGE_VERSION = 4;
+    const STORAGE_VERSION = 5;
 
     /**
      * After an upgrade, the first load moves what older versions kept as
@@ -68,7 +68,7 @@ class Run {
             return;
         }
         $base = Storage::base_dir();
-        if ( is_multisite() ) {
+        if ( is_multisite() || Storage::legacy_base_dir() !== '' ) {
             Storage::ensure_dir( $base );
         }
         if ( is_dir( $base ) ) {
@@ -82,7 +82,10 @@ class Run {
             }
             // A network's sites kept their own folders before 3.0: their
             // restore points move into the main site's (version 4).
-            $done = ! is_multisite() || Import::adopt_subsite_storage( microtime( true ) + 5 );
+            // Folders kept under a custom upload_path move to the
+            // constant-based folder first (version 5, see Storage::base_dir()).
+            $done = Storage::adopt_legacy( microtime( true ) + 5 );
+            $done = $done && ( ! is_multisite() || Import::adopt_subsite_storage( microtime( true ) + 5 ) );
             $done = $done && Import::protect_legacy_storage( microtime( true ) + 5 );
             flock( $lock, LOCK_UN );
             fclose( $lock );
@@ -1144,6 +1147,7 @@ class Run {
         $chunk_size_mb    = 150;
         $default_excludes = [
             Storage::relative_base_dir(),
+            Storage::relative_legacy_base_dir(),
             "wp-content/uploads/disembark",
             "wp-content/updraft",
             "wp-content/ai1wm-backups",

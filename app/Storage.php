@@ -12,55 +12,189 @@ namespace Disembark;
  */
 class Storage {
 
+    /**
+     * The folder everything Disembark keeps lives in: the main site's uploads
+     * folder plus /disembark, worked out from WordPress's constants alone
+     * (UPLOADS, WP_CONTENT_DIR, which is how WP Freighter gives each tenant
+     * its own folder), never from the upload_path option. A move replaces
+     * the options table with the source's, so a source with its own
+     * upload_path used to move this folder halfway through: the next
+     * request looked for the move's state, its token guard and every
+     * restore point in a folder that didn't hold them, and the rollback was
+     * gone. Fixed per request; folders an earlier version kept under a
+     * custom upload_path move here once (Run::upgrade_storage()).
+     */
     public static function base_dir() {
-        $switched = is_multisite() && get_current_blog_id() !== get_main_site_id();
-        if ( $switched ) {
-            switch_to_blog( get_main_site_id() );
+        static $dir = null;
+        if ( $dir === null ) {
+            $dir = self::uploads()['basedir'];
         }
-        try {
-            return wp_upload_dir()['basedir'] . '/disembark';
-        } finally {
-            if ( $switched ) {
-                restore_current_blog();
-            }
-        }
+        return $dir . '/disembark';
     }
 
     /**
-     * The base folder's URL. Usually uploads' baseurl, but WordPress builds
-     * that from WP_CONTENT_URL when upload_path is an absolute path, so a
-     * site whose uploads were moved to another folder under the web root
-     * (with no upload_url_path) gets a baseurl that doesn't serve basedir,
-     * and every file a pull fetched from it answered 404. When basedir sits
-     * under the web root and baseurl doesn't end in that same path, the URL
-     * is built from the site address instead.
+     * The main site's uploads folder and address as WordPress works them out
+     * with no upload_path or upload_url_path set. The folder is cached for
+     * the request; the address is worked out each time (it follows siteurl,
+     * which a move changes).
      */
-    public static function base_url() {
+    private static function uploads() {
+        static $dir = null;
+        $switched = is_multisite() && get_current_blog_id() !== get_main_site_id();
+        if ( $switched ) {
+            switch_to_blog( get_main_site_id() );
+        }
+        $blank = function () {
+            return '';
+        };
+        add_filter( 'pre_option_upload_path', $blank, PHP_INT_MAX );
+        add_filter( 'pre_option_upload_url_path', $blank, PHP_INT_MAX );
+        try {
+            $uploads = function_exists( '_wp_upload_dir' ) ? _wp_upload_dir() : wp_upload_dir( null, false, true );
+        } finally {
+            remove_filter( 'pre_option_upload_path', $blank, PHP_INT_MAX );
+            remove_filter( 'pre_option_upload_url_path', $blank, PHP_INT_MAX );
+            if ( $switched ) {
+                restore_current_blog();
+            }
+        }
+        if ( $dir === null ) {
+            $dir = untrailingslashit( (string) $uploads['basedir'] );
+        }
+        return [ 'basedir' => $dir, 'baseurl' => untrailingslashit( (string) $uploads['baseurl'] ) ];
+    }
+
+    /**
+     * Where an earlier version kept this folder when it differs from
+     * base_dir(): under the upload_path option (or an upload_dir filter).
+     * '' when it's the same folder.
+     */
+    public static function legacy_base_dir() {
         $switched = is_multisite() && get_current_blog_id() !== get_main_site_id();
         if ( $switched ) {
             switch_to_blog( get_main_site_id() );
         }
         try {
-            $uploads = wp_upload_dir();
-            $url     = untrailingslashit( (string) $uploads['baseurl'] );
-            if ( get_option( 'upload_url_path' ) ) {
-                return $url . '/disembark';
-            }
-            $root = rtrim( str_replace( '\\', '/', ABSPATH ), '/' );
-            $dir  = rtrim( str_replace( '\\', '/', (string) $uploads['basedir'] ), '/' );
-            if ( strpos( $dir, $root . '/' ) === 0 ) {
-                $rel  = '/' . substr( $dir, strlen( $root ) + 1 );
-                $path = rtrim( (string) wp_parse_url( $url, PHP_URL_PATH ), '/' );
-                if ( substr( $path, -strlen( $rel ) ) !== $rel ) {
-                    $url = untrailingslashit( site_url( $rel ) );
-                }
-            }
-            return $url . '/disembark';
+            $legacy = untrailingslashit( (string) wp_upload_dir( null, false )['basedir'] ) . '/disembark';
         } finally {
             if ( $switched ) {
                 restore_current_blog();
             }
         }
+        $norm = function ( $p ) {
+            $p = rtrim( wp_normalize_path( $p ), '/' );
+            $r = @realpath( $p );
+            return $r ? rtrim( wp_normalize_path( $r ), '/' ) : $p;
+        };
+        return $norm( $legacy ) === $norm( self::base_dir() ) ? '' : $legacy;
+    }
+
+    /**
+     * The base folder's URL: the uploads address with no upload_url_path.
+     * WordPress builds that from siteurl (UPLOADS set) or WP_CONTENT_URL, so
+     * when basedir sits under the web root and the address doesn't end in
+     * that same path, the URL is built from the site address instead.
+     */
+    public static function base_url() {
+        $uploads = self::uploads();
+        $url     = $uploads['baseurl'];
+        $root    = rtrim( str_replace( '\\', '/', ABSPATH ), '/' );
+        $dir     = rtrim( str_replace( '\\', '/', $uploads['basedir'] ), '/' );
+        if ( strpos( $dir, $root . '/' ) === 0 ) {
+            $rel  = '/' . substr( $dir, strlen( $root ) + 1 );
+            $path = rtrim( (string) wp_parse_url( $url, PHP_URL_PATH ), '/' );
+            if ( substr( $path, -strlen( $rel ) ) !== $rel ) {
+                $switched = is_multisite() && get_current_blog_id() !== get_main_site_id();
+                if ( $switched ) {
+                    switch_to_blog( get_main_site_id() );
+                }
+                $url = untrailingslashit( site_url( $rel ) );
+                if ( $switched ) {
+                    restore_current_blog();
+                }
+            }
+        }
+        return $url . '/disembark';
+    }
+
+    /**
+     * Moves what an earlier version kept under a custom upload_path into
+     * base_dir(), a few seconds at a time. Renamed where it can be; across
+     * disks, copied file by file and each original deleted once copied, so
+     * a later call carries on. True when nothing is left to move. An entry
+     * whose name is already taken here is left where it is.
+     */
+    public static function adopt_legacy( $deadline ) {
+        $legacy = self::legacy_base_dir();
+        if ( $legacy === '' || ! is_dir( $legacy ) || is_link( $legacy ) ) {
+            return true;
+        }
+        $base = self::base_dir();
+        self::ensure_dir( $base );
+        $done = true;
+        foreach ( (array) scandir( $legacy ) as $name ) {
+            if ( $name === '.' || $name === '..' || $name === 'index.php' || $name === 'index.html' || $name === 'upgrade.lock' ) {
+                continue;
+            }
+            if ( microtime( true ) >= $deadline ) {
+                return false;
+            }
+            $from = "{$legacy}/{$name}";
+            $to   = "{$base}/{$name}";
+            if ( is_link( $from ) ) {
+                continue;
+            }
+            if ( file_exists( $to ) && ! is_dir( $to ) ) {
+                continue;
+            }
+            if ( ! file_exists( $to ) && @rename( $from, $to ) ) {
+                continue;
+            }
+            if ( is_dir( $from ) && is_dir( $to ) && ! self::copy_tree( $from, $to, $deadline ) ) {
+                $done = false;
+            } elseif ( is_file( $from ) && ! file_exists( $to ) ) {
+                if ( @copy( $from, $to ) ) {
+                    @unlink( $from );
+                } else {
+                    $done = false;
+                }
+            }
+        }
+        if ( $done && count( (array) scandir( $legacy ) ) <= 4 ) {
+            foreach ( [ 'index.php', 'index.html', 'upgrade.lock' ] as $name ) {
+                @unlink( "{$legacy}/{$name}" );
+            }
+            @rmdir( $legacy );
+        }
+        return $done;
+    }
+
+    /** Copies $from into $to (creating it), deleting each original once copied. True when $from is gone. */
+    private static function copy_tree( $from, $to, $deadline ) {
+        if ( ! is_dir( $to ) && ! wp_mkdir_p( $to ) ) {
+            return false;
+        }
+        $done = true;
+        foreach ( (array) scandir( $from ) as $name ) {
+            if ( $name === '.' || $name === '..' ) {
+                continue;
+            }
+            if ( microtime( true ) >= $deadline ) {
+                return false;
+            }
+            $a = "{$from}/{$name}";
+            $b = "{$to}/{$name}";
+            if ( is_link( $a ) ) {
+                @unlink( $a );
+            } elseif ( is_dir( $a ) ) {
+                $done = self::copy_tree( $a, $b, $deadline ) && $done;
+            } elseif ( ( file_exists( $b ) && filesize( $b ) === filesize( $a ) ) || @copy( $a, $b ) ) {
+                @unlink( $a );
+            } else {
+                $done = false;
+            }
+        }
+        return $done && @rmdir( $from );
     }
 
     /**
@@ -107,6 +241,21 @@ class Storage {
      */
     public static function sanitize_session( $session ) {
         return preg_replace( '/[^a-z0-9-]/', '', strtolower( (string) $session ) );
+    }
+
+    /**
+     * Where an earlier version kept the base folder (a custom upload_path),
+     * relative to the web root, so a scan leaves out anything not yet moved.
+     * The base folder's own path when there is no such folder.
+     */
+    public static function relative_legacy_base_dir() {
+        $legacy = self::legacy_base_dir();
+        if ( $legacy === '' ) {
+            return self::relative_base_dir();
+        }
+        $web_root = rtrim( str_replace( '\\', '/', dirname( WP_CONTENT_DIR ) ), '/' );
+        $legacy   = str_replace( '\\', '/', $legacy );
+        return strpos( $legacy, $web_root . '/' ) === 0 ? substr( $legacy, strlen( $web_root ) + 1 ) : self::relative_base_dir();
     }
 
     /**
