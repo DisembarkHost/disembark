@@ -310,7 +310,10 @@ class Scope {
         // own options table, or when it's below the next site ID and at
         // least two tables share it, so a plugin's lone table that merely
         // starts with a number (wp_404_to_301) doesn't.
-        $next   = (int) $wpdb->get_var( $wpdb->prepare( 'SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s', $wpdb->blogs ) );
+        // (SQLite's driver has no AUTO_INCREMENT there: the highest ID does.)
+        $quiet  = $wpdb->suppress_errors( true );
+        $next   = Import::on_sqlite() ? 0 : (int) $wpdb->get_var( $wpdb->prepare( 'SELECT AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s', $wpdb->blogs ) );
+        $wpdb->suppress_errors( $quiet );
         $next   = max( $next, (int) $wpdb->get_var( "SELECT MAX(blog_id) FROM {$wpdb->blogs}" ) + 1 );
         $groups = [];
         foreach ( (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $this->base ) . '%' ) ) as $t ) {

@@ -215,9 +215,28 @@ class Import {
         return [ 'ok' => true, 'target' => $t ? $t->info() : null ];
     }
 
-    /** Why this move can't go on here (see here_refusal(), whole_install_refusal()), or null. */
+    /** Why this move can't go on here (see sqlite_refusal(), here_refusal(), whole_install_refusal()), or null. */
     public function refused() {
-        return self::here_refusal( $this->target() ) ?: $this->whole_install_refusal();
+        return self::sqlite_refusal() ?: self::here_refusal( $this->target() ) ?: $this->whole_install_refusal();
+    }
+
+    /** Whether this site's database is SQLite (the SQLite Database Integration plugin: WordPress Playground, Studio). */
+    public static function on_sqlite() {
+        global $wpdb;
+        return ( defined( 'DB_ENGINE' ) && strtolower( (string) DB_ENGINE ) === 'sqlite' ) || ( is_object( $wpdb ) && stripos( get_class( $wpdb ), 'sqlite' ) !== false );
+    }
+
+    /**
+     * A move into a site whose database is SQLite, refused before anything
+     * changes (--skip-checks can't override it). Its driver can't rename
+     * tables, which the import needs to swap the incoming tables in safely.
+     * The other way works: a site on SQLite moves to MySQL or MariaDB.
+     */
+    public static function sqlite_refusal() {
+        if ( ! self::on_sqlite() ) {
+            return null;
+        }
+        return new \WP_Error( 'sqlite_destination', 'This site\'s database is SQLite (the SQLite Database Integration plugin, as in WordPress Playground and Studio). Disembark can\'t move a site into SQLite yet: its driver can\'t rename tables, which the import needs to swap the incoming tables in safely. Moving a site off SQLite works: pull or restore it into a site on MySQL or MariaDB. Nothing here was changed.', [ 'status' => 409 ] );
     }
 
     /**
@@ -7045,6 +7064,12 @@ class Import {
             'plugins_turned_off' => [],
             'login_url'          => null,
         ];
+        // A site that ran on SQLite (Playground, Studio) brings the plugin
+        // that made it work; here the database is MySQL or MariaDB, and its
+        // db.php drop-in stayed behind (a host file), so it has nothing to do.
+        if ( ! self::on_sqlite() ) {
+            $out['plugins_turned_off'] = array_merge( $out['plugins_turned_off'], self::turn_off_plugins( [ 'sqlite-database-integration' => 'SQLite Database Integration' ], 'this site\'s database is MySQL or MariaDB, not SQLite' ) );
+        }
         if ( $moved && strtolower( (string) wp_parse_url( $here, PHP_URL_SCHEME ) ) === 'http' ) {
             $out['plugins_turned_off'] = array_merge( $out['plugins_turned_off'], self::turn_off_plugins( self::FORCE_SSL_PLUGINS, 'it would redirect this http:// copy to https://' ) );
             if ( get_option( 'woocommerce_force_ssl_checkout' ) === 'yes' ) {
