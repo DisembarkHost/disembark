@@ -6216,8 +6216,11 @@ class Import {
     public function rollback( $budget = null, $opts = [] ) {
         $r = $this->rollback_run( $budget, $opts );
         // The maintenance page stays while the rollback carries on, and goes
-        // once it's done or stopped (see maintenance_on()).
-        if ( is_wp_error( $r ) || ! ( isset( $r['done'] ) && $r['done'] === false ) ) {
+        // once it's done or stopped (see maintenance_on()). A step of a
+        // chain that worked keeps it up for the next step: the site is half
+        // undone until the whole chain is (see rollback_through()).
+        $held = ! empty( $opts['hold_maintenance'] ) && ! is_wp_error( $r ) && empty( $r['errors'] );
+        if ( ! $held && ( is_wp_error( $r ) || ! ( isset( $r['done'] ) && $r['done'] === false ) ) ) {
             self::maintenance_off();
         }
         return $r;
@@ -6571,14 +6574,20 @@ class Import {
         while ( $ch['i'] < $total ) {
             $step = $ch['steps'][ $ch['i'] ];
             $one  = ( new self( (string) $step['id'] ) )->set_request_token( $this->request_token );
-            $r    = $one->rollback( $paced ? max( 2, (int) floor( Pace::left( $deadline ) ) ) : null, [ 'files' => $files ] );
+            $r    = $one->rollback( $paced ? max( 2, (int) floor( Pace::left( $deadline ) ) ) : null, [ 'files' => $files, 'hold_maintenance' => $ch['i'] < $total - 1 ] );
             $where = $total > 1 ? [ 'step' => $ch['i'] + 1, 'steps' => $total, 'label' => $step['label'] ] : [];
             if ( is_wp_error( $r ) ) {
                 @unlink( $chain_file );
-                if ( $ch['i'] < $total - 1 ) {
-                    return new \WP_Error( $r->get_error_code(), 'Undoing the later "' . $step['label'] . '" first: ' . $r->get_error_message() . ( $ch['undone'] ? ' ' . self::undone_words( $ch['undone'] ) : '' ), $r->get_error_data() );
+                self::maintenance_off();
+                // An earlier step may have lifted quiet mode already.
+                $data = (array) $r->get_error_data();
+                if ( ! empty( $ch['quiet'] ) ) {
+                    $data['quiet_mode_lifted'] = true;
                 }
-                return $r;
+                if ( $ch['i'] < $total - 1 ) {
+                    return new \WP_Error( $r->get_error_code(), 'Undoing the later "' . $step['label'] . '" first: ' . $r->get_error_message() . ( $ch['undone'] ? ' ' . self::undone_words( $ch['undone'] ) : '' ), $data );
+                }
+                return new \WP_Error( $r->get_error_code(), $r->get_error_message(), $data );
             }
             if ( isset( $r['done'] ) && $r['done'] === false ) {
                 $save();
@@ -6588,6 +6597,8 @@ class Import {
             $ch['quiet']       = ! empty( $ch['quiet'] ) || ! empty( $r['quiet_mode_lifted'] );
             if ( ! empty( $r['errors'] ) ) {
                 @unlink( $chain_file );
+                self::maintenance_off();
+                $r['quiet_mode_lifted'] = ! empty( $ch['quiet'] );
                 if ( $ch['i'] < $total - 1 ) {
                     array_unshift( $r['errors'], 'Stopped while undoing the later "' . $step['label'] . '"; ' . ( $ch['undone'] ? self::undone_words( $ch['undone'] ) : 'nothing before it was undone.' ) );
                 }
