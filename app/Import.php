@@ -7009,13 +7009,33 @@ class Import {
         if ( is_file( $file ) && strpos( (string) @file_get_contents( $file ), self::MAINTENANCE_MARK ) === false ) {
             return false;
         }
-        // Let in only Disembark's import routes: in the address's path under
-        // the REST prefix, or as ?rest_route= (plain permalinks), never a
-        // query string that merely mentions them.
+        // Let in only Disembark's import routes: the site's address path
+        // (on a subdirectory network, any of its sites' paths), then the
+        // REST prefix, or ?rest_route= (plain permalinks); never
+        // a query string, or a path elsewhere, that merely mentions them.
+        // The address the rollback started at stays let in when a step puts
+        // back an older one (it's kept in the file between steps).
         $prefix = function_exists( 'rest_get_url_prefix' ) ? trim( (string) rest_get_url_prefix(), '/' ) : 'wp-json';
-        $route  = var_export( '#/' . preg_quote( $prefix, '#' ) . '/disembark/v1/import/#', true );
+        $paths  = [];
+        if ( is_file( $file ) && preg_match( '#^// paths: (\[.*\])$#m', (string) @file_get_contents( $file ), $pm ) ) {
+            $paths = array_filter( (array) json_decode( $pm[1], true ), 'is_string' );
+        }
+        $home    = is_multisite() ? network_home_url( '/' ) : home_url( '/' );
+        $paths[] = '/' . ltrim( trailingslashit( (string) wp_parse_url( $home, PHP_URL_PATH ) ), '/' );
+        // A subdirectory network's subsites answer at their own paths.
+        if ( is_multisite() && ! is_subdomain_install() ) {
+            foreach ( get_sites( [ 'number' => 2000, 'network_id' => get_current_network_id(), 'fields' => 'ids' ] ) as $blog_id ) {
+                $site = get_site( $blog_id );
+                if ( $site ) {
+                    $paths[] = (string) $site->path;
+                }
+            }
+        }
+        $paths   = array_values( array_unique( array_map( function ( $p ) { return '/' . trim( $p, '/' ) . ( trim( $p, '/' ) === '' ? '' : '/' ); }, $paths ) ) );
+        $route   = var_export( '#^(?:' . implode( '|', array_map( function ( $p ) { return preg_quote( $p, '#' ); }, $paths ) ) . ')' . preg_quote( $prefix, '#' ) . '/disembark/v1/import/#', true );
         $code = "<?php\n"
             . '// ' . self::MAINTENANCE_MARK . ' ' . preg_replace( '/[^a-f0-9]/', '', (string) $this->import_id ) . ": Disembark is putting this site back to a restore point. Delete this file if it's still here after the rollback.\n"
+            . '// paths: ' . wp_json_encode( $paths, JSON_UNESCAPED_SLASHES ) . "\n"
             . "\$disembark_path  = explode( '?', rawurldecode( (string) ( \$_SERVER['REQUEST_URI'] ?? '' ) ), 2 )[0];\n"
             . "\$disembark_route = isset( \$_GET['rest_route'] ) && is_string( \$_GET['rest_route'] ) ? '/' . ltrim( \$_GET['rest_route'], '/' ) : '';\n"
             . "\$upgrading = ( ( defined( 'WP_CLI' ) && WP_CLI ) || preg_match( {$route}, \$disembark_path ) || strpos( \$disembark_route, '/disembark/v1/import/' ) === 0 ) ? 0 : " . time() . ";\n";
