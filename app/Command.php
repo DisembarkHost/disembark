@@ -1229,6 +1229,18 @@ class Command {
         $meta       = (array) Import::rollback_meta( Storage::base_dir() . "/_import_{$point['id']}/rollback" );
         $later      = $through ? Import::later_points( $meta, $files ) : [];
         $what       = $files ? 'database and files' : 'database only (files stay as they are)';
+        // A subsite or tenant a move made goes whole, files and all, even
+        // database only (see Import::rollback_run()).
+        $makes = [];
+        foreach ( array_merge( $later, [ [ 'id' => $point['id'], 'label' => $point['label'] ] ] ) as $step ) {
+            $m = $step['id'] === $point['id'] ? $meta : (array) Import::rollback_meta( Storage::base_dir() . "/_import_{$step['id']}/rollback" );
+            if ( ! empty( $m['target']['created'] ) ) {
+                $makes[] = $step['label'];
+            }
+        }
+        if ( ! $files && $makes ) {
+            $what = 'database only (files stay as they are, except that ' . ( count( $makes ) === 1 ? 'the subsite or tenant the move "' . $makes[0] . '" made goes whole, its files included' : 'the subsites or tenants the moves ' . implode( ', ', array_map( function ( $l ) { return '"' . $l . '"'; }, $makes ) ) . ' made go whole, their files included' ) . ')';
+        }
         if ( $files && ! empty( $point['files_spent'] ) ) {
             $what = 'database only: an earlier rollback already put this point\'s files back';
         }
@@ -1248,7 +1260,7 @@ class Command {
         $this->say( 'Rolling back…' );
         $import = new Import( $point['id'] );
         $opts   = [ 'files' => $files ];
-        $r      = $this->check( $this->budgeted( function ( $x ) { return ( isset( $x['step'] ) ? '[' . (int) $x['step'] . '/' . (int) $x['steps'] . '] ' . $x['label'] . ': ' : '' ) . ( ( $x['phase'] ?? '' ) === 'files' ? 'Putting files back: ' . (int) $x['files_done'] . ' of ' . (int) $x['files_total'] : ( ( $x['phase'] ?? '' ) === 'next' ? 'Done' : 'Putting the database back' ) ); }, function ( $budget ) use ( $import, $opts, $through ) { return $through ? $import->rollback_through( $budget, $opts ) : $import->rollback( $budget, $opts ); } ), 'rollback' );
+        $r      = $this->check( $this->budgeted( function ( $x ) { return ( isset( $x['step'] ) ? '[' . (int) $x['step'] . '/' . (int) $x['steps'] . '] ' . $x['label'] . ': ' : '' ) . ( ( $x['phase'] ?? '' ) === 'files' ? 'Putting files back: ' . (int) $x['files_done'] . ' of ' . (int) $x['files_total'] : ( ( $x['phase'] ?? '' ) === 'next' ? 'Starting' : 'Putting the database back' ) ); }, function ( $budget ) use ( $import, $opts, $through ) { return $through ? $import->rollback_through( $budget, $opts ) : $import->rollback( $budget, $opts ); } ), 'rollback' );
         unset( $r['done'] );
         $has_errors = ! empty( $r['errors'] );
         if ( $this->json ) {
