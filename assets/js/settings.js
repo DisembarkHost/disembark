@@ -235,7 +235,9 @@
           loadPoints();
           // The site leaves a move it saw active alone (skipped_active: a list, or how many).
           var sk = r && r.skipped_active, n = Array.isArray(sk) ? sk.length : (+sk || 0);
-          D.toast('Working files cleaned up.' + (n ? ' ' + D.fmt.plural(n, 'move') + ' still running ' + (n === 1 ? 'was' : 'were') + ' left alone.' : ''));
+          // The site can't tell a move still running from one that just
+          // finished, so it keeps any touched in the last couple of minutes.
+          D.toast('Working files cleaned up.' + (n ? ' ' + D.fmt.plural(n, 'move') + ' from the last couple of minutes ' + (n === 1 ? 'was' : 'were') + ' left alone, in case ' + (n === 1 ? 'it’s' : 'they’re') + ' still running.' : ''));
         } catch (err) { D.toast('Cleanup failed: ' + D.errorText(err), 'error'); }
       });
     }
