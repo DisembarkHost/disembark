@@ -7,7 +7,13 @@
   'use strict';
   var D = window.Disembark, h = D.h, S = D.store.state;
 
-  D.section({ id: 'backups', title: 'Backups', icon: 'history', tab: 2, mount: mount });
+  // Back on the tab, the restore points list again: a move or a rollback
+  // elsewhere in the dashboard may have changed it.
+  var reloadPoints = null, shownOnce = false;
+  D.section({ id: 'backups', title: 'Backups', icon: 'history', tab: 2, mount: mount, onShow: function () {
+    if (!shownOnce) { shownOnce = true; return; } // mount just loaded it
+    if (reloadPoints) reloadPoints();
+  } });
 
   /** "Today, 2:31 PM", "Yesterday, 9:02 AM", "Nov 17, 11:44 AM", "Feb 16, 2025, 7:59 PM". */
   function when(ts) {
@@ -37,6 +43,7 @@
   function mount(root) {
     var view = h('div'), picker = h('div'), scans = h('div');
     var points = D.restorePoints();
+    reloadPoints = points.reload;
     D.mount(root,
       D.pageHead({ caps: 'Backups', icon: 'history', title: ['Every move, ', 'anchored.'],
         text: 'A restore point is saved before every pull, restore and search and replace. Download a full backup zip whenever you like.' }),

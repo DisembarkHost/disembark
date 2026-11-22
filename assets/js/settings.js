@@ -6,9 +6,11 @@
 (function () {
   'use strict';
   var D = window.Disembark, h = D.h, S = D.store.state;
-  var syncTheme = null;
+  var syncTheme = null, refresh = null;
 
-  D.section({ id: 'settings', title: 'Settings', icon: 'settings', tab: 4, mount: mount, onShow: function () { D.loadStatus(); if (syncTheme) syncTheme(); } });
+  // Back on the tab: quiet mode and the restore points may have changed
+  // since (a rollback lifts quiet mode, a move adds a point).
+  D.section({ id: 'settings', title: 'Settings', icon: 'settings', tab: 4, mount: mount, onShow: function () { D.loadStatus(); if (syncTheme) syncTheme(); if (refresh) refresh(); } });
 
   function mount(root) {
     var home = D.config.homeUrl, shown = false;
@@ -92,7 +94,11 @@
         h('div', { class: 'ctl' }, ctl));
     }
 
-    var quiet = quietRow();
+    var quiet = quietRow(), shownOnce = false;
+    refresh = function () {
+      if (!shownOnce) { shownOnce = true; return; } // mount just loaded both
+      quiet.load(); loadPoints();
+    };
     D.mount(root,
       D.pageHead({ caps: 'Settings', icon: 'settings', title: ['Keys, tools ', '& tidying.'], text: 'Connect the CLI, hand a move to an AI agent, and clean up working files.' }),
       h('div', { class: 'dsk-set' },
