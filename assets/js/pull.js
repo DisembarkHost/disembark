@@ -20,9 +20,16 @@
     /** The last pull from site, or null. */
     lastPullFor: function (site) {
       var a = D.address(site);
+      if (!a) return null;
       // A site pulled out of a network or WP Freighter install is remembered
       // by its own address and by the install's connect line it came through.
-      return a ? lastPulls.find(function (p) { return D.address(p.source) === a; }) || lastPulls.find(function (p) { return p.via && D.address(p.via) === a; }) || null : null;
+      var mine = lastPulls.filter(function (p) { return D.address(p.source) === a; })
+        .concat(lastPulls.filter(function (p) { return p.via && D.address(p.via) === a && D.address(p.source) !== a; }));
+      // Only this site's newest pull (current) can catch up: a pull since
+      // replaced the older ones' files, so the server brings everything
+      // for them anyway. An older Disembark doesn't say: the first match.
+      if (lastPulls.some(function (p) { return 'current' in p; })) return mine.filter(function (p) { return p.current; })[0] || null;
+      return mine[0] || null;
     },
     unfinished: unfinished,
     run: run
