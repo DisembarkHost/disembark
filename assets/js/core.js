@@ -491,13 +491,19 @@
 
   D.seg = function (options, value, onChange) {
     var el = h('div', { class: 'dsk-seg', role: 'group' });
-    function render() {
-      mount(el, options.map(function (o) {
-        return h('button', { type: 'button', 'aria-pressed': String(o.value === value), disabled: el.disabled, onclick: function () { if (o.value !== value) { value = o.value; render(); onChange(value); } } }, o.icon ? D.icon(o.icon) : null, o.label);
-      }));
+    // The buttons are made once and only their state changes, so the one
+    // clicked (or reached with the keyboard) keeps focus.
+    var btns = options.map(function (o) {
+      return h('button', { type: 'button', onclick: function () { if (o.value !== value) { value = o.value; sync(); onChange(value); } } }, o.icon ? D.icon(o.icon) : null, o.label);
+    });
+    function sync() {
+      btns.forEach(function (b, i) { b.setAttribute('aria-pressed', String(options[i].value === value)); b.disabled = !!el.disabled; });
     }
-    el.setDisabled = function (d) { el.disabled = d; render(); };
-    render();
+    el.setDisabled = function (d) { el.disabled = d; sync(); };
+    /** Shows v as chosen without calling onChange. */
+    el.set = function (v) { value = v; sync(); };
+    mount(el, btns);
+    sync();
     return el;
   };
 

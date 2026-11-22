@@ -44,7 +44,14 @@
       else if (e.key === 'Home' || e.key === 'End') { e.preventDefault(); items[e.key === 'Home' ? 0 : items.length - 1].focus(); }
       else if (e.key === 'Escape' || e.key === 'Tab') { if (e.key === 'Escape') e.preventDefault(); themeMenuOpen(false); if (e.key === 'Escape') root.querySelector('#dsk-theme').focus(); }
     });
-    document.addEventListener('click', function (e) { if (!themeMenu.hidden && !themeMenu.contains(e.target)) themeMenuOpen(false); });
+    // Closes on a click or right-click anywhere else, and on Escape wherever focus is.
+    function outside(e) { if (!themeMenu.hidden && !themeMenu.contains(e.target) && !e.target.closest('#dsk-theme')) themeMenuOpen(false); }
+    document.addEventListener('click', outside);
+    document.addEventListener('contextmenu', outside);
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape' || themeMenu.hidden || themeMenu.contains(document.activeElement)) return;
+      themeMenuOpen(false);
+    });
     return themeMenu;
   }
   D.setTheme = function (pref) {

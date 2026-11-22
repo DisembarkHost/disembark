@@ -78,11 +78,10 @@
     var withPoints = D.toggle('Also delete restore points', false, function () {});
 
     /* Appearance */
-    var themeBox = h('div');
-    syncTheme = function () {
-      D.mount(themeBox, D.seg([{ value: 'system', label: 'System' }, { value: 'light', label: 'Light', icon: 'sun' }, { value: 'dark', label: 'Dark', icon: 'moon' }], D.themePref(), function (v) { D.setTheme(v); }));
-    };
-    syncTheme();
+    // Made once; syncing only moves the pressed state, so focus stays put.
+    var themeSeg = D.seg([{ value: 'system', label: 'System' }, { value: 'light', label: 'Light', icon: 'sun' }, { value: 'dark', label: 'Dark', icon: 'moon' }], D.themePref(), function (v) { D.setTheme(v); });
+    var themeBox = h('div', null, themeSeg);
+    syncTheme = function () { themeSeg.set(D.themePref()); };
     // The header's sun/moon button changes the theme too: keep the switch in step.
     var appRoot = document.getElementById('disembark-app');
     if (appRoot && window.MutationObserver) new MutationObserver(function () { syncTheme(); }).observe(appRoot, { attributes: true, attributeFilter: ['data-theme'] });
