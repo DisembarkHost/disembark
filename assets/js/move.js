@@ -383,7 +383,7 @@
     var what = S.file.name;
     var ok3 = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
       h('p', null, S.to === 'new' ? (S.into === 'new' ? 'Restore ' : 'Replace ' + intoLabel() + ' with ') : 'Replace ' + here + ' with ', h('strong', null, what), S.to === 'new' && S.into === 'new' ? ' as a new ' + one + '?' : '?'),
-      h('p', { class: 'muted' }, 'A restore point is saved first.' + (S.to === 'this' ? ' You’ll need to log in again afterwards.' : ''))), { title: 'Restore ' + (S.to === 'this' ? 'this site' : 'the backup') + '?', confirmLabel: 'Restore', danger: !(S.to === 'new' && S.into === 'new') });
+      h('p', { class: 'muted' }, 'A restore point is saved first.' + (S.to === 'this' && !(isMain && net) ? ' You’ll need to log in again afterwards.' : S.to === 'this' ? ' The network keeps its users, so you stay logged in.' : ''))), { title: 'Restore ' + (S.to === 'this' ? 'this site' : 'the backup') + '?', confirmLabel: 'Restore', danger: !(S.to === 'new' && S.into === 'new') });
     if (!ok3) return;
     var file = S.file, sourceUrl = S.sourceUrl, quiet = S.to === 'this' && S.quiet;
     start(function (view, back, onFinish) {
