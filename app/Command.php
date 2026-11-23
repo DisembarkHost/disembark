@@ -1294,9 +1294,12 @@ class Command {
         foreach ( ( new Import( $point['id'] ) )->rollback_notes( $steps ) as $note ) {
             \WP_CLI::warning( $note );
         }
-        $this->check_overlap( '', false );
+        if ( Pull::is_locked( $point['id'] ) ) {
+            $this->fail( 'That restore point is currently in use by another running process. Let it finish, then try again.', 'rollback' );
+        }
+        $this->check_overlap( $point['id'], false );
         $this->confirm( $assoc_args, 'Roll ' . home_url() . " back to \"{$point['label']}\"" . ( $later ? ', undoing ' . self::plural( count( $later ), 'later move' ) . ' first' : '' ) . '? Anything changed since is lost.' );
-        $this->check_overlap( '', false );
+        $this->check_overlap( $point['id'], false );
         if ( ! Pull::lock_run( $point['id'] ) ) {
             $this->fail( 'That restore point is currently in use by another running process. Let it finish, then try again.', 'rollback' );
         }
