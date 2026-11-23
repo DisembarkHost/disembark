@@ -1381,13 +1381,48 @@ class Pull {
                 }
             }
             $busy = ! empty( $active[ $id ]['active'] ) || self::is_locked( $id );
-            if ( ! $busy && ! is_array( $state ) && ( is_dir( $dir . '/staging' ) || is_file( $dir . '/rollback-state.php' ) ) ) {
-                $touched = max( (int) @filemtime( $dir ), (int) @filemtime( $dir . '/staging' ), (int) @filemtime( $dir . '/staging/public' ) );
-                foreach ( (array) glob( $dir . '/*', GLOB_NOSORT ) as $f ) {
-                    $touched = max( $touched, (int) @filemtime( $f ) );
+            if ( ! $busy && ! is_array( $state ) ) {
+                // Ignore bare preflight probe folders (empty staging/public/
+                // with only index files); only treat a non-pull import as busy
+                // once it has uploaded/extracted files or active pace state.
+                $work_files = [
+                    $dir . '/rollback-state.php',
+                    $dir . '/sql-state.php',
+                    $dir . '/deploy-list.php',
+                    $dir . '/replace-state.php',
+                    $dir . '/extract-state.php',
+                    $dir . '/users-merge-job.php',
+                    $dir . '/rollback/snapshot-state.php',
+                    $dir . '/rollback/snapshot-add-state.php',
+                ];
+                $has_work = false;
+                foreach ( $work_files as $wf ) {
+                    if ( is_file( $wf ) ) {
+                        $has_work = true;
+                        break;
+                    }
                 }
-                if ( time() - $touched < 120 ) {
-                    $busy = true;
+                if ( ! $has_work && is_dir( $dir . '/staging' ) ) {
+                    foreach ( [ $dir . '/staging', $dir . '/staging/public' ] as $sd ) {
+                        if ( is_dir( $sd ) && array_diff( (array) @scandir( $sd ), [ '.', '..', 'index.php', 'index.html', 'public' ] ) !== [] ) {
+                            $has_work = true;
+                            break;
+                        }
+                    }
+                }
+                if ( $has_work ) {
+                    $touched = max( (int) @filemtime( $dir ), (int) @filemtime( $dir . '/staging' ), (int) @filemtime( $dir . '/staging/public' ) );
+                    foreach ( $work_files as $wf ) {
+                        if ( is_file( $wf ) ) {
+                            $touched = max( $touched, (int) @filemtime( $wf ) );
+                        }
+                    }
+                    foreach ( (array) glob( $dir . '/*', GLOB_NOSORT ) as $f ) {
+                        $touched = max( $touched, (int) @filemtime( $f ) );
+                    }
+                    if ( time() - $touched < 120 ) {
+                        $busy = true;
+                    }
                 }
             }
             if ( ! $busy ) {
