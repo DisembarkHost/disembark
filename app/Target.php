@@ -97,11 +97,23 @@ class Target {
      * when it was made after that try began. True when adopted.
      */
     private function adopt_pending() {
+        global $wpdb;
         $p  = (array) $this->pending;
         $at = (int) ( $p['at'] ?? 0 );
+        if ( $at <= 0 ) {
+            return false;
+        }
         if ( $this->kind === 'multisite' && ! empty( $p['domain'] ) && isset( $p['path'] ) ) {
             $site = get_site_by_path( (string) $p['domain'], (string) $p['path'] );
-            if ( ! $site || (string) $site->domain !== (string) $p['domain'] || (string) $site->path !== (string) $p['path'] || strtotime( (string) $site->registered . ' UTC' ) < $at - 5 ) {
+            if ( ! $site || (string) $site->domain !== (string) $p['domain'] || (string) $site->path !== (string) $p['path'] ) {
+                return false;
+            }
+            $created = strtotime( (string) $site->registered . ' UTC' );
+            if ( $created === false || $created < $at - 5 || $created > $at + 60 ) {
+                return false;
+            }
+            $prefix = $wpdb->get_blog_prefix( (int) $site->blog_id );
+            if ( $prefix === '' || ! empty( $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $prefix ) . '%' ) ) ) ) {
                 return false;
             }
             $this->slug    = (string) ( $p['slug'] ?? $this->slug );
@@ -114,8 +126,16 @@ class Target {
         }
         if ( $this->kind === 'freighter' && ! empty( $p['id'] ) ) {
             $primary = Scope::freighter_primary();
+            if ( $primary === '' ) {
+                return false;
+            }
             foreach ( (array) Scope::freighter_option( $primary, 'stacked_sites' ) as $site ) {
-                if ( (string) ( $site['stacked_site_id'] ?? '' ) === (string) $p['id'] && (int) ( $site['created_at'] ?? 0 ) >= $at - 5 ) {
+                $created = (int) ( $site['created_at'] ?? 0 );
+                if ( (string) ( $site['stacked_site_id'] ?? '' ) === (string) $p['id'] && $created >= $at - 5 && $created <= $at + 60 ) {
+                    $prefix = 'stacked_' . (int) $p['id'] . '_';
+                    if ( (int) $p['id'] < 1 || ! empty( $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $prefix ) . '%' ) ) ) ) {
+                        return false;
+                    }
                     $this->domain  = (string) ( $site['domain'] ?? '' );
                     $this->created = true;
                     $this->locate( (string) $p['id'] );
@@ -316,14 +336,19 @@ class Target {
             $slug = $path !== '' ? basename( $path ) : preg_replace( '/^www\./', '', (string) strtok( (string) wp_parse_url( $from, PHP_URL_HOST ), '.' ) );
             $slug = sanitize_title( $slug ) ?: 'site';
         }
-        $base = $slug;
-        for ( $n = 2; $n < 100; $n++ ) {
+        $base  = $slug;
+        $found = false;
+        for ( $n = 2; $n <= 100; $n++ ) {
             $domain = is_subdomain_install() ? $slug . '.' . preg_replace( '/^www\./', '', $network->domain ) : $network->domain;
             $path   = is_subdomain_install() ? $network->path : $network->path . $slug . '/';
             if ( ! domain_exists( $domain, $path, $network->id ) && ( is_subdomain_install() || ! in_array( $slug, get_subdirectory_reserved_names(), true ) ) ) {
+                $found = true;
                 break;
             }
             $slug = $base . '-' . $n;
+        }
+        if ( ! $found ) {
+            return new \WP_Error( 'slug_taken', 'All site slugs for "' . $base . '" are already taken. Choose a different --slug.', [ 'status' => 409 ] );
         }
         // The import brings every table, so WordPress (and plugins hooked to
         // a new site) mustn't install the default ones first.
@@ -331,10 +356,13 @@ class Target {
         $this->save_pending( [ 'domain' => $domain, 'path' => $path, 'slug' => $slug, 'at' => time() ] );
         $saved = $wp_filter['wp_initialize_site'] ?? null;
         unset( $wp_filter['wp_initialize_site'] );
-        $id = wp_insert_site( [ 'domain' => $domain, 'path' => $path, 'network_id' => $network->id ] );
-        Scope::forget();
-        if ( $saved ) {
-            $wp_filter['wp_initialize_site'] = $saved;
+        try {
+            $id = wp_insert_site( [ 'domain' => $domain, 'path' => $path, 'network_id' => $network->id ] );
+            Scope::forget();
+        } finally {
+            if ( $saved !== null ) {
+                $wp_filter['wp_initialize_site'] = $saved;
+            }
         }
         if ( is_wp_error( $id ) ) {
             $this->save_pending( [] );
@@ -352,48 +380,67 @@ class Target {
 
     private function create_tenant( $from, $name ) {
         global $wpdb;
-        $primary = Scope::freighter_primary();
-        $sites   = (array) Scope::freighter_option( $primary, 'stacked_sites' );
-        $config  = (array) Scope::freighter_option( $primary, 'stacked_configurations' );
-        $ids     = array_map( 'intval', array_column( $sites, 'stacked_site_id' ) );
-        $id      = $ids ? max( $ids ) + 1 : 1;
-        $tables  = (array) $wpdb->get_col( 'SHOW TABLES' );
-        while ( true ) {
-            $prefix = "stacked_{$id}_";
-            $taken  = $prefix === $primary;
-            foreach ( $tables as $t ) {
-                if ( strpos( (string) $t, $prefix ) === 0 ) {
-                    $taken = true;
+        Storage::ensure_dir( Storage::base_dir() );
+        $lock = @fopen( Storage::base_dir() . '/create-site.lock', 'c+' );
+        if ( ! $lock || ! @flock( $lock, LOCK_EX ) ) {
+            if ( $lock ) {
+                fclose( $lock );
+            }
+            return new \WP_Error( 'tenant_lock_failed', 'Could not lock tenant creation; please try again.', [ 'status' => 500 ] );
+        }
+        try {
+            $primary = Scope::freighter_primary();
+            $raw     = Scope::freighter_option( $primary, 'stacked_sites' );
+            $sites   = is_array( $raw ) ? $raw : [];
+            $config  = (array) Scope::freighter_option( $primary, 'stacked_configurations' );
+            $ids     = array_map( 'intval', array_column( $sites, 'stacked_site_id' ) );
+            $id      = $ids ? max( $ids ) + 1 : 1;
+            $tables  = (array) $wpdb->get_col( 'SHOW TABLES' );
+            while ( true ) {
+                $prefix = "stacked_{$id}_";
+                $taken  = $prefix === $primary;
+                foreach ( $tables as $t ) {
+                    if ( strpos( (string) $t, $prefix ) === 0 ) {
+                        $taken = true;
+                        break;
+                    }
+                }
+                if ( ! $taken ) {
                     break;
                 }
+                $id++;
             }
-            if ( ! $taken ) {
-                break;
+            $mapping = ( $config['domain_mapping'] ?? 'off' ) === 'on';
+            $domain  = $this->domain;
+            if ( $mapping && $domain === '' ) {
+                // The source's own domain, unless it is already the main site's
+                // or another tenant's here (a copy within the same install):
+                // mapped twice, it would take that site's address over.
+                $domain = strtolower( (string) wp_parse_url( $from, PHP_URL_HOST ) );
+                if ( $domain !== '' && self::domain_taken( $domain ) ) {
+                    $domain = '';
+                }
             }
-            $id++;
-        }
-        $mapping = ( $config['domain_mapping'] ?? 'off' ) === 'on';
-        $domain  = $this->domain;
-        if ( $mapping && $domain === '' ) {
-            // The source's own domain, unless it is already the main site's
-            // or another tenant's here (a copy within the same install):
-            // mapped twice, it would take that site's address over.
-            $domain = strtolower( (string) wp_parse_url( $from, PHP_URL_HOST ) );
-            if ( $domain !== '' && self::domain_taken( $domain ) ) {
-                $domain = '';
+            $now = time();
+            $this->save_pending( [ 'id' => $id, 'at' => $now ] );
+            $sites[] = [ 'stacked_site_id' => $id, 'created_at' => $now, 'name' => sanitize_text_field( $name ), 'domain' => $mapping ? $domain : '' ];
+            // The install's first tenant: there is no registry row to update yet.
+            if ( $raw === null ) {
+                $ok = $wpdb->insert( $primary . 'options', [ 'option_name' => 'stacked_sites', 'option_value' => serialize( array_values( $sites ) ), 'autoload' => 'yes' ] );
+            } else {
+                $ok = $wpdb->update( $primary . 'options', [ 'option_value' => serialize( array_values( $sites ) ) ], [ 'option_name' => 'stacked_sites' ] );
             }
+            if ( $ok === false ) {
+                $this->save_pending( [] );
+                return new \WP_Error( 'tenant_create_failed', 'Could not register the new tenant in stacked_sites: ' . (string) $wpdb->last_error, [ 'status' => 500 ] );
+            }
+            wp_cache_delete( 'alloptions', 'options' );
+            wp_cache_delete( 'stacked_sites', 'options' );
+            Scope::forget();
+        } finally {
+            @flock( $lock, LOCK_UN );
+            fclose( $lock );
         }
-        $this->save_pending( [ 'id' => $id, 'at' => time() ] );
-        $sites[] = [ 'stacked_site_id' => $id, 'created_at' => time(), 'name' => sanitize_text_field( $name ), 'domain' => $mapping ? $domain : '' ];
-        // The install's first tenant: there is no registry row to update yet.
-        if ( Scope::freighter_option( $primary, 'stacked_sites' ) === null ) {
-            $wpdb->insert( $primary . 'options', [ 'option_name' => 'stacked_sites', 'option_value' => serialize( array_values( $sites ) ), 'autoload' => 'yes' ] );
-        } else {
-            $wpdb->update( $primary . 'options', [ 'option_value' => serialize( array_values( $sites ) ) ], [ 'option_name' => 'stacked_sites' ] );
-        }
-        wp_cache_delete( 'alloptions', 'options' );
-        wp_cache_delete( 'stacked_sites', 'options' );
-        Scope::forget();
         $this->pending = [];
         $this->domain  = $mapping ? $domain : '';
         $this->created = true;
@@ -498,7 +545,7 @@ class Target {
         }
         if ( $this->content !== '' ) {
             if ( in_array( $top, [ 'plugins', 'themes', 'languages' ], true ) ) {
-                return [ $this->content . '/' . $sub, true ];
+                return [ $this->content . '/' . $top . substr( $sub, strlen( $top ) ), true ];
             }
             if ( $top === 'mu-plugins' ) {
                 $entry = (string) strtok( substr( $sub, strlen( 'mu-plugins/' ) ), '/' );
@@ -510,7 +557,7 @@ class Target {
                         return null;
                     }
                 }
-                return [ $this->content . '/' . $sub, true ];
+                return [ $this->content . '/' . $top . substr( $sub, strlen( $top ) ), true ];
             }
             // A dedicated tenant has a whole wp-content of its own, so its
             // other folders come too (a gallery's, a font or cache plugin's).
@@ -518,7 +565,7 @@ class Target {
         }
         $shared = self::rel( WP_CONTENT_DIR );
         if ( in_array( $top, [ 'plugins', 'themes', 'languages' ], true ) ) {
-            return [ $shared . '/' . $sub, false ];
+            return [ $shared . '/' . $top . substr( $sub, strlen( $top ) ), false ];
         }
         return null;
     }
@@ -531,7 +578,7 @@ class Target {
         $shared = self::rel( WP_CONTENT_DIR );
         foreach ( [ 'plugins', 'themes' ] as $pool ) {
             $dir = $shared . '/' . $pool . '/';
-            if ( strpos( $dest, $dir ) === 0 ) {
+            if ( stripos( $dest, $dir ) === 0 ) {
                 $rest = substr( $dest, strlen( $dir ) );
                 return strpos( $rest, '/' ) === false ? '' : $dir . strtok( $rest, '/' );
             }
@@ -549,13 +596,28 @@ class Target {
         if ( $this->prefix === '' ) {
             return [];
         }
+        $prefix = strtolower( (string) $this->prefix );
+        $rows   = array_map( 'strval', (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $this->prefix ) . '%' ) ) );
+        $all    = array_flip( array_map( 'strtolower', $rows ) );
+        $other  = [];
+        foreach ( array_keys( $all ) as $n ) {
+            if ( substr( $n, -7 ) === 'options' && ( $p = substr( $n, 0, -7 ) ) !== $prefix && strpos( $p, $prefix ) === 0 && isset( $all[ $p . 'posts' ] ) ) {
+                $other[] = $p;
+            }
+        }
         $out = [];
-        foreach ( (array) $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $this->prefix ) . '%' ) ) as $t ) {
+        foreach ( $rows as $t ) {
             // On a network, wp_1_ doesn't exist and wp_10_ starts with wp_1.
-            if ( $this->kind === 'multisite' && preg_match( '/^' . preg_quote( $this->prefix, '/' ) . '\d+_/', (string) $t ) ) {
+            if ( $this->kind === 'multisite' && preg_match( '/^' . preg_quote( $this->prefix, '/' ) . '\d+_/i', $t ) ) {
                 continue;
             }
-            $out[] = (string) $t;
+            $lower = strtolower( $t );
+            foreach ( $other as $p ) {
+                if ( strpos( $lower, $p ) === 0 ) {
+                    continue 2;
+                }
+            }
+            $out[] = $t;
         }
         return $out;
     }
@@ -595,7 +657,7 @@ class Target {
             if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $in_users ) ) ) !== $in_users ) {
                 return $blank;
             }
-            $cur = [ 'phase' => 'old', 'last_user' => 0, 'last_meta' => 0, 'map' => [], 'created' => [], 'report' => $blank, 'done_tables' => [], 'subtracting' => '', 'total' => (int) $wpdb->get_var( "SELECT COUNT(*) FROM `{$in_users}`" ) ];
+            $cur = [ 'phase' => 'old', 'last_user' => 0, 'last_meta' => 0, 'last_primary_blog' => 0, 'map' => [], 'created' => [], 'report' => $blank, 'done_tables' => [], 'subtracting' => '', 'total' => (int) $wpdb->get_var( "SELECT COUNT(*) FROM `{$in_users}`" ) ];
         }
         $map     = [];
         foreach ( (array) $cur['map'] as $o => $n ) {
@@ -608,18 +670,28 @@ class Target {
         // out again (see undo_merge()): "u" a user it created (with "o",
         // their old ID), "m" a usermeta row it added, "d" a usermeta row it
         // removed.
+        $journaled_meta = [];
         if ( $resumed && $journal_file !== '' ) {
-            // Users a killed call created after its last checkpoint.
+            // Users a killed call created after its last checkpoint, plus any
+            // usermeta IDs already recorded so resume doesn't double-journal them.
             foreach ( Pace::journal_read( $journal_file ) as $r ) {
                 if ( isset( $r['u'], $r['o'] ) && ! isset( $map[ (int) $r['o'] ] ) ) {
                     $map[ (int) $r['o'] ]     = (int) $r['u'];
                     $created[ (int) $r['o'] ] = true;
                     $report['created']++;
+                } elseif ( isset( $r['m'] ) ) {
+                    $journaled_meta[ (int) $r['m'] ] = true;
                 }
             }
         }
         $journal = $journal_file !== '' ? Pace::journal_open( $journal_file ) : null;
-        $save    = function () use ( &$cur, &$map, &$created, &$report, $cursor_file ) {
+        if ( $journal && function_exists( 'stream_set_write_buffer' ) ) {
+            @stream_set_write_buffer( $journal, 0 );
+        }
+        $save    = function () use ( &$cur, &$map, &$created, &$report, $cursor_file, $journal ) {
+            if ( $journal ) {
+                fflush( $journal );
+            }
             if ( $cursor_file === '' ) {
                 return;
             }
@@ -651,6 +723,9 @@ class Target {
                         Pace::journal_add( $journal, [ 'd' => $r ] );
                     }
                 } while ( count( $old_rows ) === 1000 );
+                if ( $journal ) {
+                    fflush( $journal );
+                }
                 $wpdb->query( "DELETE FROM `{$meta}` WHERE " . $where );
             }
             $cur['phase'] = 'users';
@@ -715,12 +790,22 @@ class Target {
                     if ( ! isset( $created[ $old ] ) && ! $remapped ) {
                         continue;
                     }
-                    if ( $check && $since < 1000 && $wpdb->get_var( $wpdb->prepare( "SELECT umeta_id FROM `{$meta}` WHERE user_id = %d AND meta_key = %s AND meta_value = %s LIMIT 1", $map[ $old ], $key, $r['meta_value'] ) ) ) {
-                        $since++;
-                        continue;
+                    if ( $check && $since < 1000 ) {
+                        $existing_umeta_id = $wpdb->get_var( $wpdb->prepare( "SELECT umeta_id FROM `{$meta}` WHERE user_id = %d AND meta_key = %s AND meta_value = %s LIMIT 1", $map[ $old ], $key, $r['meta_value'] ) );
+                        if ( $existing_umeta_id ) {
+                            $existing_umeta_id = (int) $existing_umeta_id;
+                            if ( ! isset( $created[ $old ] ) && ! isset( $journaled_meta[ $existing_umeta_id ] ) ) {
+                                Pace::journal_add( $journal, [ 'm' => $existing_umeta_id ] );
+                                $journaled_meta[ $existing_umeta_id ] = true;
+                            }
+                            $since++;
+                            continue;
+                        }
                     }
                     if ( $wpdb->insert( $meta, [ 'user_id' => $map[ $old ], 'meta_key' => $key, 'meta_value' => $r['meta_value'] ] ) && ! isset( $created[ $old ] ) ) {
-                        Pace::journal_add( $journal, [ 'm' => (int) $wpdb->insert_id ] );
+                        $mid = (int) $wpdb->insert_id;
+                        Pace::journal_add( $journal, [ 'm' => $mid ] );
+                        $journaled_meta[ $mid ] = true;
                     }
                     if ( ++$since % 1000 === 0 ) {
                         $check = false; // past where a killed call could have got to
@@ -731,8 +816,30 @@ class Target {
                     }
                 }
             } while ( count( $rows ) === 500 );
-            foreach ( array_keys( $created ) as $old ) {
-                update_user_meta( $map[ $old ], 'primary_blog', (int) $this->id );
+            $cur['phase']             = 'primary_blog';
+            $cur['last_primary_blog'] = 0;
+            $save();
+        }
+
+        if ( $cur['phase'] === 'primary_blog' ) {
+            $created_olds = array_keys( $created );
+            sort( $created_olds, SORT_NUMERIC );
+            $last_pb = (int) ( $cur['last_primary_blog'] ?? 0 );
+            $n       = 0;
+            foreach ( $created_olds as $old ) {
+                if ( $old <= $last_pb ) {
+                    continue;
+                }
+                if ( ! empty( $map[ $old ] ) ) {
+                    update_user_meta( $map[ $old ], 'primary_blog', (int) $this->id );
+                }
+                $cur['last_primary_blog'] = $old;
+                if ( ++$n % 200 === 0 ) {
+                    $save();
+                }
+                if ( $r2 = $stop() ) {
+                    return $r2;
+                }
             }
             $cur['phase'] = 'renumber';
             $save();
@@ -758,9 +865,16 @@ class Target {
             $unattributed = [];
             $moved        = [];
             $same         = [];
+            $max_id       = 0;
             foreach ( $map as $old => $new ) {
                 $old = (int) $old;
                 $new = (int) $new;
+                if ( $old > $max_id ) {
+                    $max_id = $old;
+                }
+                if ( $new > $max_id ) {
+                    $max_id = $new;
+                }
                 if ( $new === 0 ) {
                     $unattributed[ $old ] = 0;
                 } elseif ( $new !== $old ) {
@@ -778,11 +892,33 @@ class Target {
                 if ( isset( $done_tables[ $id ] ) ) {
                     continue;
                 }
+                if ( $r = $stop() ) {
+                    return $r;
+                }
                 if ( strpos( $table, $p ) !== 0 || ! preg_match( '/^[A-Za-z0-9_]+$/', $col ) || $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) !== $table ) {
                     continue;
                 }
                 $col_info = $wpdb->get_row( $wpdb->prepare( "SHOW COLUMNS FROM `{$table}` LIKE %s", $wpdb->esc_like( $col ) ), ARRAY_A );
                 if ( ! is_array( $col_info ) ) {
+                    continue;
+                }
+                $col_type   = strtolower( (string) ( $col_info['Type'] ?? '' ) );
+                $col_offset = $offset;
+                if ( preg_match( '/^int\b/', $col_type ) ) {
+                    if ( $max_id < 1000000000 ) {
+                        $col_offset = 1000000000;
+                    } elseif ( strpos( $col_type, 'unsigned' ) !== false && $max_id < 2000000000 ) {
+                        $col_offset = 2000000000;
+                    } else {
+                        $col_offset = 0;
+                    }
+                } elseif ( preg_match( '/^(?:mediumint|smallint|tinyint)\b/', $col_type ) ) {
+                    $col_offset = 0;
+                }
+                if ( $col_offset === 0 ) {
+                    $cur['done_tables'][] = $id;
+                    $done_tables[ $id ]   = true;
+                    $save();
                     continue;
                 }
                 $nullable  = isset( $col_info['Null'] ) && strtoupper( (string) $col_info['Null'] ) === 'YES';
@@ -793,31 +929,63 @@ class Target {
                 if ( (string) $cur['subtracting'] !== $id ) {
                     // Unattributed users ($new === 0) go straight to NULL (for nullable
                     // columns such as wc_customer_lookup.user_id, avoiding UNIQUE index
-                    // collisions) or 0 without passing through $offset.
+                    // collisions) or 0 without passing through $col_offset.
                     foreach ( array_chunk( array_keys( $unattributed ), 500 ) as $chunk ) {
-                        $in = implode( ',', array_map( 'intval', $chunk ) );
-                        $report['renumbered'] += (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` IN ({$in}){$extra}" );
+                        $in  = implode( ',', array_map( 'intval', $chunk ) );
+                        $res = $wpdb->query( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` IN ({$in}){$extra}" );
+                        if ( $res !== false ) {
+                            $report['renumbered'] += (int) $res;
+                        }
                     }
                     // Through a high offset, so 2→5 and 5→9 can't chain; the ones
                     // that keep their ID too, so they aren't taken for orphans.
+                    $failed_rows = false;
                     foreach ( [ $moved, $same ] as $i => $set ) {
                         foreach ( array_chunk( $set, 500, true ) as $chunk ) {
                             $case = '';
                             foreach ( $chunk as $old => $new ) {
-                                $case .= ' WHEN ' . (int) $old . ' THEN ' . ( (int) $new + $offset );
+                                $case .= ' WHEN ' . (int) $old . ' THEN ' . ( (int) $new + $col_offset );
                             }
-                            $in      = implode( ',', array_map( 'intval', array_keys( $chunk ) ) );
-                            $changed = (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = CASE `{$col}`{$case} END WHERE `{$col}` IN ({$in}){$extra}" );
-                            if ( $i === 0 ) {
-                                $report['renumbered'] += $changed;
+                            $in       = implode( ',', array_map( 'intval', array_keys( $chunk ) ) );
+                            $suppress = $wpdb->suppress_errors( true );
+                            $res      = $wpdb->query( "UPDATE `{$table}` SET `{$col}` = CASE `{$col}`{$case} END WHERE `{$col}` IN ({$in}){$extra}" );
+                            $wpdb->suppress_errors( $suppress );
+                            if ( $res === false ) {
+                                // A UNIQUE index collision (e.g. duplicate incoming emails in
+                                // wc_customer_lookup.user_id) failed the chunk. Apply each
+                                // mapping individually so only colliding duplicates become
+                                // NULL/0 rather than wiping the whole chunk as orphans.
+                                foreach ( $chunk as $old => $new ) {
+                                    $target_val = (int) $new + $col_offset;
+                                    $suppress   = $wpdb->suppress_errors( true );
+                                    $one        = $wpdb->query( $wpdb->prepare( "UPDATE `{$table}` SET `{$col}` = {$target_val} WHERE `{$col}` = %d{$extra}", (int) $old ) );
+                                    $wpdb->suppress_errors( $suppress );
+                                    if ( $one === false ) {
+                                        $dup = $wpdb->get_var( "SELECT 1 FROM `{$table}` WHERE `{$col}` = {$target_val}{$extra} LIMIT 1" );
+                                        if ( $dup !== null ) {
+                                            $wpdb->query( $wpdb->prepare( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` = %d{$extra}", (int) $old ) );
+                                        } else {
+                                            $failed_rows = true;
+                                        }
+                                    } elseif ( $i === 0 ) {
+                                        $report['renumbered'] += (int) $one;
+                                    }
+                                }
+                            } elseif ( $i === 0 ) {
+                                $report['renumbered'] += (int) $res;
                             }
                         }
                     }
-                    $report['orphaned'] += (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` > 0 AND `{$col}` < {$offset}{$extra}" );
+                    if ( ! $failed_rows ) {
+                        $report['orphaned'] += (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` > 0 AND `{$col}` < {$col_offset}{$extra}" );
+                    }
                     $cur['subtracting'] = $id;
                     $save();
+                    if ( $r = $stop() ) {
+                        return $r;
+                    }
                 }
-                $wpdb->query( "UPDATE `{$table}` SET `{$col}` = `{$col}` - {$offset} WHERE `{$col}` >= {$offset}{$extra}" );
+                $wpdb->query( "UPDATE `{$table}` SET `{$col}` = `{$col}` - {$col_offset} WHERE `{$col}` >= {$col_offset}{$extra}" );
                 $cur['done_tables'][] = $id;
                 $cur['subtracting']   = '';
                 $done_tables[ $id ]   = true;
@@ -870,7 +1038,7 @@ class Target {
         foreach ( [ 'user_login' => 60, 'user_nicename' => 50 ] as $col => $max ) {
             $base = (string) $u[ $col ];
             for ( $n = 2; $wpdb->get_var( $wpdb->prepare( "SELECT ID FROM `{$users}` WHERE `{$col}` = %s", $u[ $col ] ) ); $n++ ) {
-                $u[ $col ] = substr( $base, 0, $max - 4 ) . '-' . $n;
+                $u[ $col ] = substr( $base, 0, $max - 1 - strlen( (string) $n ) ) . '-' . $n;
             }
         }
         $error = '';

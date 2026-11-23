@@ -144,23 +144,28 @@ class Storage {
             if ( is_link( $from ) ) {
                 continue;
             }
-            if ( file_exists( $to ) && ! is_dir( $to ) ) {
+            if ( is_link( $to ) || ( file_exists( $to ) && ! is_dir( $to ) ) ) {
                 continue;
             }
             if ( ! file_exists( $to ) && @rename( $from, $to ) ) {
                 continue;
             }
-            if ( is_dir( $from ) && is_dir( $to ) && ! self::copy_tree( $from, $to, $deadline ) ) {
-                $done = false;
+            if ( is_dir( $from ) && ( ! file_exists( $to ) || is_dir( $to ) ) ) {
+                if ( ! self::copy_tree( $from, $to, $deadline ) ) {
+                    $done = false;
+                }
             } elseif ( is_file( $from ) && ! file_exists( $to ) ) {
-                if ( @copy( $from, $to ) ) {
+                $tmp = $base . '/.' . $name . '.tmp.' . getmypid();
+                if ( @copy( $from, $tmp ) && @rename( $tmp, $to ) ) {
                     @unlink( $from );
                 } else {
+                    @unlink( $tmp );
                     $done = false;
                 }
             }
         }
-        if ( $done && count( (array) scandir( $legacy ) ) <= 4 ) {
+        $entries = @scandir( $legacy );
+        if ( $done && is_array( $entries ) && array_diff( $entries, [ '.', '..', 'index.php', 'index.html', 'upgrade.lock' ] ) === [] ) {
             foreach ( [ 'index.php', 'index.html', 'upgrade.lock' ] as $name ) {
                 @unlink( "{$legacy}/{$name}" );
             }
@@ -169,8 +174,11 @@ class Storage {
         return $done;
     }
 
-    /** Copies $from into $to (creating it), deleting each original once copied. True when $from is gone. */
+    /** Copies $from into $to (creating it), deleting each original once copied. Entries already in $to are never overwritten. */
     private static function copy_tree( $from, $to, $deadline ) {
+        if ( is_link( $to ) || ( file_exists( $to ) && ! is_dir( $to ) ) ) {
+            return true;
+        }
         if ( ! is_dir( $to ) && ! wp_mkdir_p( $to ) ) {
             return false;
         }
@@ -187,14 +195,27 @@ class Storage {
             if ( is_link( $a ) ) {
                 @unlink( $a );
             } elseif ( is_dir( $a ) ) {
-                $done = self::copy_tree( $a, $b, $deadline ) && $done;
-            } elseif ( ( file_exists( $b ) && filesize( $b ) === filesize( $a ) ) || @copy( $a, $b ) ) {
-                @unlink( $a );
+                if ( ! is_link( $b ) && ( ! file_exists( $b ) || is_dir( $b ) ) ) {
+                    $done = self::copy_tree( $a, $b, $deadline ) && $done;
+                }
+            } elseif ( file_exists( $b ) || is_link( $b ) ) {
+                if ( is_file( $b ) && ! is_link( $b ) && @filesize( $a ) === @filesize( $b ) ) {
+                    @unlink( $a );
+                }
             } else {
-                $done = false;
+                $tmp = $to . '/.' . $name . '.tmp.' . getmypid();
+                if ( @copy( $a, $tmp ) && @rename( $tmp, $b ) ) {
+                    @unlink( $a );
+                } else {
+                    @unlink( $tmp );
+                    $done = false;
+                }
             }
         }
-        return $done && @rmdir( $from );
+        if ( $done ) {
+            @rmdir( $from );
+        }
+        return $done;
     }
 
     /**
@@ -253,9 +274,8 @@ class Storage {
         if ( $legacy === '' ) {
             return self::relative_base_dir();
         }
-        $web_root = rtrim( str_replace( '\\', '/', dirname( WP_CONTENT_DIR ) ), '/' );
-        $legacy   = str_replace( '\\', '/', $legacy );
-        return strpos( $legacy, $web_root . '/' ) === 0 ? substr( $legacy, strlen( $web_root ) + 1 ) : self::relative_base_dir();
+        $rel = self::rel_to_web_root( $legacy );
+        return $rel !== null ? $rel : self::relative_base_dir();
     }
 
     /**
@@ -263,11 +283,34 @@ class Storage {
      * default excludes (custom UPLOADS / Bedrock layouts move it).
      */
     public static function relative_base_dir() {
-        $web_root = rtrim( str_replace( '\\', '/', dirname( WP_CONTENT_DIR ) ), '/' );
-        $base     = str_replace( '\\', '/', self::base_dir() );
-        if ( strpos( $base, $web_root . '/' ) === 0 ) {
-            return substr( $base, strlen( $web_root ) + 1 );
+        $rel = self::rel_to_web_root( self::base_dir() );
+        return $rel !== null ? $rel : 'wp-content/uploads/disembark';
+    }
+
+    /**
+     * Makes $path relative to the web root: checks ABSPATH first when
+     * WP_CONTENT_DIR sits inside ABSPATH (so Freighter dedicated tenants at
+     * ABSPATH . 'content/8' return 'content/8/uploads/disembark', not
+     * '8/uploads/disembark'), falling back to dirname(WP_CONTENT_DIR) for
+     * Bedrock-style layouts where WP_CONTENT_DIR sits outside ABSPATH.
+     */
+    private static function rel_to_web_root( $path ) {
+        $path    = str_replace( '\\', '/', (string) $path );
+        $abspath = rtrim( str_replace( '\\', '/', ABSPATH ), '/' );
+        $content = rtrim( str_replace( '\\', '/', WP_CONTENT_DIR ), '/' );
+        $roots   = [];
+        if ( $abspath !== '' && strpos( $content, $abspath . '/' ) === 0 ) {
+            $roots[] = $abspath;
         }
-        return 'wp-content/uploads/disembark';
+        $parent = rtrim( str_replace( '\\', '/', dirname( WP_CONTENT_DIR ) ), '/' );
+        if ( $parent !== '' && ! in_array( $parent, $roots, true ) ) {
+            $roots[] = $parent;
+        }
+        foreach ( $roots as $web_root ) {
+            if ( strpos( $path, $web_root . '/' ) === 0 ) {
+                return substr( $path, strlen( $web_root ) + 1 );
+            }
+        }
+        return null;
     }
 }
