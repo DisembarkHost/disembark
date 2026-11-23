@@ -218,6 +218,9 @@ class Command {
             if ( ( $move['move']['client'] ?? '' ) !== 'cli' ) {
                 $this->fail( 'That move was started in the dashboard. Resume it from Tools → Disembark → Pull, or discard it with: wp disembark discard ' . $move['id'] );
             }
+            if ( Pull::is_locked( $move['id'] ) ) {
+                $this->fail( 'That move is still running in another process (an earlier run that was interrupted may still be waiting on the source). Let it finish or stop that process, then resume.', 'preflight' );
+            }
             if ( ! empty( $move['active'] ) ) {
                 $this->fail( 'That move was working ' . (int) $move['active_ago'] . ' seconds ago, so something may still be running it. If it has stopped, try again in two minutes.' );
             }
@@ -227,7 +230,6 @@ class Command {
             $now        = array_intersect_key( $assoc_args, array_flip( [ 'skip-checks', 'skip-verify', 'notify' ] ) );
             $assoc_args = array_merge( (array) ( $move['move']['args'] ?? [] ), $now, [ 'yes' => true, 'format' => $assoc_args['format'] ?? 'text' ] );
             $source     = [ 'url' => $move['source'], 'token' => '' ];
-            @unlink( Storage::base_dir() . "/_import_{$import_id}/cancel" );
         } else {
             $source = self::parse_connect( $args );
             if ( ! $source ) {
@@ -235,20 +237,20 @@ class Command {
             }
             $import_id = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
         }
-        $import  = new Import( $import_id );
-        $pull    = new Pull( $import_id );
+        $import    = new Import( $import_id );
+        $pull      = new Pull( $import_id );
+        $notify_to = ! empty( $assoc_args['notify'] ) ? (string) $assoc_args['notify'] : '';
+        if ( $notify_to !== '' ) {
+            $parsed = Notify::parse( $notify_to );
+            if ( is_wp_error( $parsed ) ) {
+                $this->fail( $parsed->get_error_message() );
+            }
+        }
         if ( $resuming && ( $kept = Pace::recall( $import_id ) ) ) {
             $this->pace = array_merge( $this->pace, array_intersect_key( $kept, $this->pace ) );
         }
         $summary = [ 'ok' => false, 'source' => $source['url'], 'import_id' => $import_id ];
         $started = time();
-        if ( ! empty( $assoc_args['notify'] ) ) {
-            $set = Notify::set( $import_id, (string) $assoc_args['notify'] );
-            if ( is_wp_error( $set ) ) {
-                $this->fail( $set->get_error_message() );
-            }
-        }
-        $this->notify = [ 'import' => $import_id, 'kind' => 'pull', 'source' => $source['url'], 'destination' => home_url(), 'started' => $started ];
 
         $this->say( '[1/9] Checking this site' );
         // In a subsite's or tenant's context, the pull would replace the
@@ -256,15 +258,28 @@ class Command {
         if ( $refused = Import::sqlite_refusal() ?: Import::here_refusal() ) {
             $this->fail( $refused->get_error_message(), 'preflight' );
         }
-        $this->refuse_overlap( $import_id, ! empty( $assoc_args['into'] ), $resuming );
+        $into      = (string) ( $assoc_args['into'] ?? '' );
+        $into_lock = $into !== '' ? $into : false;
+        $this->check_overlap( $import_id, $into_lock, $resuming );
         if ( ! $resuming ) {
             $pre = $import->preflight();
-            $this->confirm( $assoc_args, ! empty( $assoc_args['into'] )
-                ? "Bring {$source['url']} into " . ( $assoc_args['into'] === 'new' ? 'a new subsite or tenant' : 'subsite or tenant ' . $assoc_args['into'] . ' (replacing it)' ) . ' here? A rollback point is saved first.'
+            $this->confirm( $assoc_args, $into !== ''
+                ? "Bring {$source['url']} into " . ( $into === 'new' ? 'a new subsite or tenant' : 'subsite or tenant ' . $into . ' (replacing it)' ) . ' here? A rollback point is saved first.'
                 : 'Replace ' . untrailingslashit( (string) $pre['home_url'] ) . " with {$source['url']}? A rollback point is saved first, and " . ( is_multisite() ? 'the network keeps its users (the incoming site\'s users join them).' : "afterwards you log in with the source site's credentials." ) );
         } else {
             $this->say( "      Resuming {$import_id} (a pull from {$source['url']}): finished steps are replayed." );
         }
+        $this->refuse_overlap( $import_id, $into_lock, $resuming );
+        if ( $resuming ) {
+            @unlink( Storage::base_dir() . "/_import_{$import_id}/cancel" );
+        }
+        if ( $notify_to !== '' ) {
+            $set = Notify::set( $import_id, $notify_to );
+            if ( is_wp_error( $set ) ) {
+                $this->fail( $set->get_error_message() );
+            }
+        }
+        $this->notify = [ 'import' => $import_id, 'kind' => 'pull', 'source' => $source['url'], 'destination' => home_url(), 'started' => $started ];
         // From here every step is recorded. A pull that stops can be resumed
         // once it has connected (that's when it's listed as unfinished).
         $this->steps_import = $import_id;
@@ -276,7 +291,6 @@ class Command {
         $dest_prefix = (string) ( $pre['db_prefix'] ?? '' );
         $dest_home   = untrailingslashit( (string) ( $pre['home_url'] ?? home_url() ) );
         $summary['destination'] = $dest_home;
-        $into = (string) ( $assoc_args['into'] ?? '' );
         if ( $into !== '' ) {
             if ( ! empty( $assoc_args['catch-up'] ) ) {
                 $this->fail( '--catch-up works on this site\'s own files, so it can\'t be combined with --into.' );
@@ -466,7 +480,7 @@ class Command {
                 $summary['super_admins'] = $brought;
                 $this->say( '      Brought ' . self::plural( count( $brought ), 'super admin' ) . ' as administrators: ' . implode( ', ', $brought ) . '.' );
             }
-            if ( isset( $sq['users'] ) && ( $sq['users']['created'] || $sq['users']['matched'] ) ) {
+            if ( isset( $sq['users'] ) && ( $sq['users']['created'] || $sq['users']['matched'] || ! empty( $sq['users']['unattributed'] ) || ! empty( $sq['users']['orphaned'] ) ) ) {
                 $summary['users'] = $sq['users'];
                 foreach ( (array) ( $sq['users']['renamed'] ?? [] ) as $r ) {
                     $this->say( "      The login {$r['from']} ({$r['email']}) " . ( $r['why'] ?? 'was taken' ) . " on this network, so that user logs in as {$r['to']}." );
@@ -712,21 +726,23 @@ class Command {
         if ( ! empty( $assoc_args['files-only'] ) && isset( $assoc_args['database'] ) ) {
             $this->fail( '--database and --files-only don\'t go together: pick one.' );
         }
+        $notify_to = ! empty( $assoc_args['notify'] ) ? (string) $assoc_args['notify'] : '';
+        if ( $notify_to !== '' ) {
+            $parsed = Notify::parse( $notify_to );
+            if ( is_wp_error( $parsed ) ) {
+                $this->fail( $parsed->get_error_message() );
+            }
+        }
         if ( $refused = Import::sqlite_refusal() ?: Import::here_refusal() ) {
             $this->fail( $refused->get_error_message(), 'preflight' );
         }
         $import_id = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
-        $this->refuse_overlap( $import_id, ! empty( $assoc_args['into'] ), false );
+        $into      = (string) ( $assoc_args['into'] ?? '' );
+        $into_lock = $into !== '' ? $into : false;
+        $this->check_overlap( $import_id, $into_lock, false );
         $import    = new Import( $import_id );
         $summary   = [ 'ok' => false, 'source' => $zip, 'import_id' => $import_id ];
         $started   = time();
-        if ( ! empty( $assoc_args['notify'] ) ) {
-            $set = Notify::set( $import_id, (string) $assoc_args['notify'] );
-            if ( is_wp_error( $set ) ) {
-                $this->fail( $set->get_error_message() );
-            }
-        }
-        $this->notify = [ 'import' => $import_id, 'kind' => 'restore', 'source' => basename( $zip ), 'destination' => home_url(), 'started' => $started ];
         // Before anything is saved, a stop leaves nothing behind.
         $stop = function ( $message, $step ) use ( $import ) {
             if ( $this->notify ) {
@@ -749,10 +765,17 @@ class Command {
         $dest_prefix = (string) ( $pre['db_prefix'] ?? '' );
         $dest_home   = untrailingslashit( (string) ( $pre['home_url'] ?? home_url() ) );
         $summary['destination'] = $dest_home;
-        $into = (string) ( $assoc_args['into'] ?? '' );
         $this->confirm( $assoc_args, $into !== ''
             ? 'Bring the backup in ' . basename( $zip ) . ' into ' . ( $into === 'new' ? 'a new subsite or tenant' : 'subsite or tenant ' . $into . ' (replacing it)' ) . ' here? A rollback point is saved first.'
             : 'Replace ' . $dest_home . ' with the backup in ' . basename( $zip ) . '? A rollback point is saved first, and ' . ( is_multisite() ? 'the network keeps its users (the incoming site\'s users join them).' : 'afterwards you log in with the backup\'s credentials.' ) );
+        $this->refuse_overlap( $import_id, $into_lock, false );
+        if ( $notify_to !== '' ) {
+            $set = Notify::set( $import_id, $notify_to );
+            if ( is_wp_error( $set ) ) {
+                $this->fail( $set->get_error_message() );
+            }
+        }
+        $this->notify = [ 'import' => $import_id, 'kind' => 'restore', 'source' => basename( $zip ), 'destination' => $dest_home, 'started' => $started ];
         if ( $into !== '' ) {
             $t = $import->set_target( $into, [ 'slug' => (string) ( $assoc_args['slug'] ?? '' ), 'domain' => (string) ( $assoc_args['domain'] ?? '' ) ] );
             if ( is_wp_error( $t ) ) {
@@ -926,7 +949,7 @@ class Command {
                 $summary['sql_left_out'] = $sq['left_out'] ?? [];
                 $this->say( '      ! ' . $sq['left_out_words'] );
             }
-            if ( isset( $sq['users'] ) && ( $sq['users']['created'] || $sq['users']['matched'] ) ) {
+            if ( isset( $sq['users'] ) && ( $sq['users']['created'] || $sq['users']['matched'] || ! empty( $sq['users']['unattributed'] ) || ! empty( $sq['users']['orphaned'] ) ) ) {
                 $summary['users'] = $sq['users'];
                 foreach ( (array) ( $sq['users']['renamed'] ?? [] ) as $r ) {
                     $this->say( "      The login {$r['from']} ({$r['email']}) " . ( $r['why'] ?? 'was taken' ) . " on this network, so that user logs in as {$r['to']}." );
@@ -1271,7 +1294,12 @@ class Command {
         foreach ( ( new Import( $point['id'] ) )->rollback_notes( $steps ) as $note ) {
             \WP_CLI::warning( $note );
         }
+        $this->check_overlap( '', false );
         $this->confirm( $assoc_args, 'Roll ' . home_url() . " back to \"{$point['label']}\"" . ( $later ? ', undoing ' . self::plural( count( $later ), 'later move' ) . ' first' : '' ) . '? Anything changed since is lost.' );
+        $this->check_overlap( '', false );
+        if ( ! Pull::lock_run( $point['id'] ) ) {
+            $this->fail( 'That restore point is currently in use by another running process. Let it finish, then try again.', 'rollback' );
+        }
         @set_time_limit( 0 );
         $this->say( 'Rolling back…' );
         $import = new Import( $point['id'] );
@@ -1386,19 +1414,26 @@ class Command {
         @set_time_limit( 0 );
         $out = [];
         if ( ! $dry ) {
+            $this->check_overlap( '', false );
             $this->confirm( $assoc_args, "Replace \"{$from}\" with \"{$to}\" across " . ( $named ? implode( ', ', $tables ) : ( ! empty( $assoc_args['all-tables'] ) ? 'every table in the database' : 'this site\'s tables' ) ) . '? A rollback point is saved first.' );
+            $id = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
+            $this->refuse_overlap( $id, false, false );
+            $this->unconnected = $id;
             // The restore point holds the tables that would change, and the
             // replace runs on those (both a piece at a time, see Pace).
             $preview = $this->check( ( new Import() )->search_replace( $from, $to, $tables, true ), 'search-replace' );
             $tables  = array_keys( (array) ( $preview['by_table'] ?? [] ) );
-            $id      = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
             if ( $tables ) {
                 $this->say( 'Saving a rollback point…' );
                 $this->check( $this->budgeted( function () { return 'Saving the rollback point'; }, function ( $budget ) use ( $id, $from, $to, $tables ) {
                     return ( new Import( $id ) )->snapshot( "Before search & replace: {$from} → " . ( $to === '' ? '(nothing)' : $to ), $budget, $tables );
                 } ), 'snapshot' );
+                $this->unconnected  = '';
                 $out['rollback_id'] = $id;
                 $out['undo']        = "wp disembark rollback {$id}";
+            } else {
+                $this->unconnected = '';
+                ( new Import( $id ) )->cancel( 'cleanup' );
             }
         }
         if ( ! $dry && ! $tables ) {
@@ -2093,6 +2128,22 @@ class Command {
     }
 
     /**
+     * Read-only overlap check run before confirmation so declining a prompt or
+     * hitting an overlap never creates an import folder or run.lock file.
+     * $into: false for a whole-site move, or the target subsite/tenant string
+     * ("new" or an ID) passed through to Pull::running().
+     */
+    private function check_overlap( $import_id, $into = false, $resuming = false ) {
+        if ( $resuming && Pull::is_locked( $import_id ) ) {
+            $this->fail( 'That move is still running in another process (an earlier run that was interrupted may still be waiting on the source). Let it finish or stop that process, then resume.', 'preflight' );
+        }
+        $other = Pull::running( $import_id, $into );
+        if ( $other ) {
+            $this->fail( 'Another move into this site is running now (' . $other['id'] . ( $other['source'] !== '' ? ' from ' . $other['source'] : '' ) . '). Two at once would replace the same tables and files. Let it finish, or stop it and discard it (wp disembark discard ' . $other['id'] . '), then try again.', 'preflight' );
+        }
+    }
+
+    /**
      * Stops a move that would run over another: the same move still
      * running in another process (an interrupted run can wait on the source
      * for minutes without a sign of life), or another move into this site
@@ -2100,7 +2151,7 @@ class Command {
      * the same tables and files, and could clear each other's state. Then
      * takes this move's run lock for as long as this command runs.
      */
-    private function refuse_overlap( $import_id, $into, $resuming ) {
+    private function refuse_overlap( $import_id, $into = false, $resuming = false ) {
         if ( $resuming && ! Pull::lock_run( $import_id ) ) {
             $this->fail( 'That move is still running in another process (an earlier run that was interrupted may still be waiting on the source). Let it finish or stop that process, then resume.', 'preflight' );
         }
@@ -2108,8 +2159,8 @@ class Command {
         if ( $other ) {
             $this->fail( 'Another move into this site is running now (' . $other['id'] . ( $other['source'] !== '' ? ' from ' . $other['source'] : '' ) . '). Two at once would replace the same tables and files. Let it finish, or stop it and discard it (wp disembark discard ' . $other['id'] . '), then try again.', 'preflight' );
         }
-        if ( ! $resuming ) {
-            Pull::lock_run( $import_id );
+        if ( ! $resuming && ! Pull::lock_run( $import_id ) ) {
+            $this->fail( 'That move is still running in another process. Let it finish or stop that process, then try again.', 'preflight' );
         }
     }
 
@@ -2200,6 +2251,9 @@ class Command {
     public function discard( $args, $assoc_args ) {
         $this->retry_limits( $assoc_args );
         $move = $this->find_unfinished( (string) ( $args[0] ?? '' ) );
+        if ( Pull::is_locked( $move['id'] ) ) {
+            $this->fail( 'That move is still running in another process. Let it finish or stop that process, then discard it.' );
+        }
         if ( ! empty( $move['active'] ) ) {
             \WP_CLI::warning( 'This move was working ' . (int) $move['active_ago'] . ' seconds ago: something may still be running it (another terminal, the dashboard, or a push from the source).' );
         }
@@ -2210,6 +2264,9 @@ class Command {
             $later = Import::later_points( (array) Import::rollback_meta( Storage::base_dir() . "/_import_{$move['id']}/rollback" ) );
         }
         $this->confirm( $assoc_args, $move['rollback_point'] ? 'Roll this site back to before the move' . ( $later ? ' (undoing ' . self::plural( count( $later ), 'later restore point' ) . ' first: ' . implode( ', ', array_map( function ( $l ) { return '"' . $l['label'] . '"'; }, $later ) ) . ')' : '' ) . ', then delete what it copied and its rollback point?' : 'Delete what this move copied so far? Nothing on this site has changed.' );
+        if ( Pull::is_locked( $move['id'] ) ) {
+            $this->fail( 'That move is still running in another process. Let it finish or stop that process, then discard it.' );
+        }
         $import      = new Import( $move['id'] );
         $rolled_back = false;
         if ( $move['rollback_point'] ) {
