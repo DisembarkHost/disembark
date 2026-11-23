@@ -106,7 +106,7 @@ class Target {
             }
             $this->slug    = (string) ( $p['slug'] ?? $this->slug );
             $this->created = true;
-            $this->locate( (string) $site->blog_id );
+            $this->locate( (string) $site->blog_id, true );
             $scheme        = (string) wp_parse_url( get_home_url( get_main_site_id() ), PHP_URL_SCHEME );
             $this->home    = untrailingslashit( ( $scheme !== '' ? $scheme : 'https' ) . '://' . $p['domain'] . $p['path'] );
             $this->make_dir( $this->uploads );
@@ -181,13 +181,19 @@ class Target {
         return $t;
     }
 
-    /** Fills in an existing site's prefix, address and folders. */
-    private function locate( $id ) {
+    /**
+     * Fills in an existing site's prefix, address and folders. $fresh: a
+     * subsite just created without its tables (see create_subsite()), whose
+     * address the caller sets: asking WordPress for it would switch to the
+     * site and query its missing options table (the address, then the
+     * roles), printing a database error for each.
+     */
+    private function locate( $id, $fresh = false ) {
         global $wpdb;
         $this->id = (string) $id;
         if ( $this->kind === 'multisite' ) {
             $this->prefix  = $wpdb->get_blog_prefix( (int) $id );
-            $this->home    = untrailingslashit( get_home_url( (int) $id ) );
+            $this->home    = $fresh ? '' : untrailingslashit( get_home_url( (int) $id ) );
             $this->uploads = self::rel( self::multisite_uploads( (int) $id ) );
             return;
         }
@@ -337,7 +343,7 @@ class Target {
         $this->pending = [];
         $this->slug    = $slug;
         $this->created = true;
-        $this->locate( (string) $id );
+        $this->locate( (string) $id, true );
         $scheme        = (string) wp_parse_url( get_home_url( get_main_site_id() ), PHP_URL_SCHEME );
         $this->home    = untrailingslashit( ( $scheme !== '' ? $scheme : 'https' ) . '://' . $domain . $path );
         $this->make_dir( $this->uploads );
