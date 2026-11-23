@@ -1126,7 +1126,7 @@ class Import {
             if ( @rename( $from, $to ) ) {
                 return true;
             }
-            if ( copy( $from, $to ) ) {
+            if ( @copy( $from, $to ) ) {
                 @unlink( $from );
                 return true;
             }
@@ -1215,12 +1215,22 @@ class Import {
         if ( preg_match( '#^database-.*\.sql$#i', $base ) ) {
             return true;
         }
-        // This site's own SQLite database: never replaced by a file, even
-        // when host files aren't kept (see host_file()).
-        $sqlite = self::sqlite_host_dirs( ABSPATH )['database'] ?? '';
-        if ( $sqlite !== '' && strpos( $rel . '/', $sqlite . '/' ) === 0 ) {
-            return true;
+        // This site's own SQLite database, driver plugin and db.php drop-in:
+        // never replaced by a file, even when host files aren't kept (see
+        // host_file()).
+        $sqlite_dirs = self::sqlite_host_dirs( dirname( WP_CONTENT_DIR ) );
+        foreach ( $sqlite_dirs as $dir ) {
+            if ( $dir !== '' && stripos( $rel . '/', $dir . '/' ) === 0 ) {
+                return true;
+            }
         }
+        if ( self::on_sqlite() ) {
+            $content_dir = trim( basename( rtrim( str_replace( '\\', '/', WP_CONTENT_DIR ), '/' ) ), '/' );
+            if ( $content_dir !== '' && strcasecmp( $rel, $content_dir . '/db.php' ) === 0 ) {
+                return true;
+            }
+        }
+        $sqlite = $sqlite_dirs['database'] ?? '';
         // A SQLite source's database file, on a site that isn't SQLite: the
         // database came across as SQL, and the file (the whole old database,
         // behind only an .htaccess rule nginx ignores) would sit unused in
@@ -1354,6 +1364,9 @@ class Import {
         }
         if ( ! self::is_safe_relative_path( $sql_file ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid SQL file path.', [ 'status' => 400 ] );
+        }
+        if ( ( (string) $old_prefix !== '' && ! preg_match( '/^[A-Za-z0-9_]+$/', (string) $old_prefix ) ) || ( (string) $new_prefix !== '' && ! preg_match( '/^[A-Za-z0-9_]+$/', (string) $new_prefix ) ) ) {
+            return new \WP_Error( 'bad_prefix', 'Table prefix must contain only letters, numbers, and underscores.', [ 'status' => 400 ] );
         }
         // Under its staged name (database-x.sql.php, behind the exit line)
         // or, staged by an older build, its own.
@@ -1712,17 +1725,19 @@ class Import {
         $sqlite_left = [];
         if ( empty( $run['errors'] ) ) {
             $swapped = self::swap_finish( $swap, $run );
-            foreach ( $swap['deferred'] as $statement ) {
-                // SQLite's driver can't make views, triggers or stored
-                // routines: they're left out and said, not failed on after
-                // the tables went in.
-                if ( ( $what = self::sqlite_left_out( $statement ) ) !== '' ) {
-                    if ( $what !== 'drop' ) {
-                        $sqlite_left[ $what ] = ( $sqlite_left[ $what ] ?? 0 ) + 1;
+            if ( empty( $run['errors'] ) ) {
+                foreach ( $swap['deferred'] as $statement ) {
+                    // SQLite's driver can't make views, triggers or stored
+                    // routines: they're left out and said, not failed on after
+                    // the tables went in.
+                    if ( ( $what = self::sqlite_left_out( $statement ) ) !== '' ) {
+                        if ( $what !== 'drop' ) {
+                            $sqlite_left[ $what ] = ( $sqlite_left[ $what ] ?? 0 ) + 1;
+                        }
+                        continue;
                     }
-                    continue;
+                    $this->run_statement( self::compat_statement( $statement, $compat ), $run );
                 }
-                $this->run_statement( self::compat_statement( $statement, $compat ), $run );
             }
         } else {
             self::swap_abandon( $swap );
@@ -2019,7 +2034,7 @@ class Import {
     private static function rename_foreign_keys( $statement, $tag ) {
         $keys = [];
         $statement = preg_replace_callback(
-            '/\bCONSTRAINT\s+`((?:[^`]|``)+)`\s+(FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+(?:`(?:[^`]|``)+`\.)?`(?:[^`]|``)+`\s*\([^)]*\)(?:\s+ON\s+(?:DELETE|UPDATE)\s+(?:RESTRICT|CASCADE|SET\s+NULL|NO\s+ACTION|SET\s+DEFAULT))*)/i',
+            '/\bCONSTRAINT\s+`((?:[^`]|``)+)`\s+(FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+(?:`(?:[^`]|``)+`\.)?`(?:[^`]|``)+`\s*\([^)]*\)(?:\s+MATCH\s+(?:FULL|PARTIAL|SIMPLE))?(?:\s+ON\s+(?:DELETE|UPDATE)\s+(?:RESTRICT|CASCADE|SET\s+NULL|NO\s+ACTION|SET\s+DEFAULT))*)/i',
             function ( $m ) use ( &$keys, $tag ) {
                 $name          = str_replace( '``', '`', $m[1] );
                 $tmp           = self::shadow_constraint( $name, $tag );
@@ -2075,8 +2090,10 @@ class Import {
                         unset( $swap['map'][ $view ], $swap['keys'][ $view ] );
                     }
                     $swap['views'][ $view ] = true;
-                    $swap['deferred'][]     = 'DROP TABLE IF EXISTS `' . str_replace( '`', '``', $view ) . '`';
-                    $swap['deferred'][]     = 'DROP VIEW IF EXISTS `' . str_replace( '`', '``', $view ) . '`';
+                    if ( ! self::on_sqlite() ) {
+                        $swap['deferred'][] = 'DROP TABLE IF EXISTS `' . str_replace( '`', '``', $view ) . '`';
+                        $swap['deferred'][] = 'DROP VIEW IF EXISTS `' . str_replace( '`', '``', $view ) . '`';
+                    }
                     $swap['deferred'][]     = $statement;
                 }
                 continue;
@@ -2147,8 +2164,10 @@ class Import {
             return self::swap_finish_sqlite( $swap, $run );
         }
         global $wpdb;
-        $done = 0;
+        $done      = 0;
+        $remaining = array_change_key_case( $swap['map'], CASE_LOWER );
         foreach ( $swap['map'] as $table => $shadow ) {
+            unset( $remaining[ strtolower( $table ) ] );
             $live   = '`' . str_replace( '`', '``', $table ) . '`';
             $found  = (array) $wpdb->get_row( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( $table ) ), ARRAY_N );
             $exists = strcasecmp( (string) ( $found[0] ?? '' ), $table ) === 0;
@@ -2170,7 +2189,7 @@ class Import {
             }
             if ( $exists ) {
                 if ( $kind === 'TABLE' ) {
-                    self::repoint_foreign_keys( $old, $table, $run );
+                    self::repoint_foreign_keys( $old, $table, $run, $remaining );
                 }
                 $wpdb->query( "DROP {$kind} IF EXISTS `{$old}`" );
             }
@@ -2347,12 +2366,15 @@ class Import {
      * copy, about to be dropped. Those keys are pointed at the table now
      * live under the name, as they were before the swap.
      */
-    private static function repoint_foreign_keys( $old, $table, &$run ) {
+    private static function repoint_foreign_keys( $old, $table, &$run, $skip = [] ) {
         global $wpdb;
         $quiet = $wpdb->suppress_errors( true );
         $refs  = (array) $wpdb->get_results( $wpdb->prepare( 'SELECT TABLE_NAME, CONSTRAINT_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME = %s', $old ), ARRAY_N );
         foreach ( $refs as $ref ) {
             list( $child, $name ) = [ (string) $ref[0], (string) $ref[1] ];
+            if ( strcasecmp( $child, $old ) === 0 || isset( $skip[ strtolower( $child ) ] ) ) {
+                continue;
+            }
             $create = (string) ( $wpdb->get_row( 'SHOW CREATE TABLE `' . str_replace( '`', '``', $child ) . '`', ARRAY_N )[1] ?? '' );
             $quoted = '`' . str_replace( '`', '``', $name ) . '`';
             if ( ! preg_match( '/CONSTRAINT\s+' . preg_quote( $quoted, '/' ) . '\s+(FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+)`' . preg_quote( str_replace( '`', '``', $old ), '/' ) . '`(\s*\([^)]*\)[^,\n]*)/i', $create, $m ) ) {
@@ -2361,7 +2383,7 @@ class Import {
             }
             $t   = '`' . str_replace( '`', '``', $child ) . '`';
             $def = $m[1] . '`' . str_replace( '`', '``', $table ) . '`' . rtrim( $m[2] );
-            if ( $wpdb->query( "ALTER TABLE {$t} DROP FOREIGN KEY {$quoted}" ) === false || $wpdb->query( "ALTER TABLE {$t} ADD CONSTRAINT {$quoted} {$def}" ) === false ) {
+            if ( $wpdb->query( "ALTER TABLE {$t} DROP FOREIGN KEY {$quoted}, ADD CONSTRAINT {$quoted} {$def}" ) === false ) {
                 $run['warnings'][] = "The foreign key {$name} on {$child} couldn't be pointed back at {$table}: " . substr( (string) $wpdb->last_error, 0, 160 );
             }
         }
@@ -3768,9 +3790,10 @@ class Import {
      *   db.php), which point at the source host's services.
      */
     private static function host_file( $relative_path, $web_root ) {
-        $rel = ltrim( str_replace( '\\', '/', (string) $relative_path ), '/' );
+        $rel         = ltrim( str_replace( '\\', '/', (string) $relative_path ), '/' );
+        $content_dir = trim( basename( rtrim( str_replace( '\\', '/', WP_CONTENT_DIR ), '/' ) ), '/' );
         foreach ( [ 'object-cache.php', 'advanced-cache.php', 'db.php' ] as $dropin ) {
-            if ( $rel === 'wp-content/' . $dropin ) {
+            if ( strcasecmp( $rel, 'wp-content/' . $dropin ) === 0 || ( $content_dir !== '' && strcasecmp( $rel, $content_dir . '/' . $dropin ) === 0 ) ) {
                 return $rel;
             }
         }
@@ -3786,7 +3809,7 @@ class Import {
         // db-path.php would point this site at the other database file), and
         // a different copy of the driver could misread the one it has.
         foreach ( self::sqlite_host_dirs( $web_root ) as $dir ) {
-            if ( strpos( $rel . '/', $dir . '/' ) === 0 ) {
+            if ( stripos( $rel . '/', $dir . '/' ) === 0 ) {
                 return $dir;
             }
         }
@@ -3840,8 +3863,9 @@ class Import {
             return $cache[ $web_root ];
         }
         global $wpdb;
-        $root = rtrim( str_replace( '\\', '/', (string) ( realpath( $web_root ) ?: $web_root ) ), '/' ) . '/';
-        $dirs = [ 'database' => defined( 'FQDBDIR' ) ? (string) FQDBDIR : WP_CONTENT_DIR . '/database' ];
+        $logical_root = rtrim( wp_normalize_path( (string) $web_root ), '/' ) . '/';
+        $real_root    = rtrim( str_replace( '\\', '/', (string) ( realpath( $web_root ) ?: $web_root ) ), '/' ) . '/';
+        $dirs         = [ 'database' => defined( 'FQDBDIR' ) ? (string) FQDBDIR : WP_CONTENT_DIR . '/database' ];
         if ( defined( 'SQLITE_MAIN_FILE' ) ) {
             $dirs['plugin'] = dirname( (string) SQLITE_MAIN_FILE );
         } elseif ( is_object( $wpdb->dbh ?? null ) ) {
@@ -3853,9 +3877,31 @@ class Import {
         }
         $out = [];
         foreach ( $dirs as $key => $dir ) {
-            $dir = rtrim( str_replace( '\\', '/', (string) ( realpath( $dir ) ?: $dir ) ), '/' );
-            if ( $dir !== '' && strpos( $dir . '/', $root ) === 0 && strlen( $dir ) + 1 > strlen( $root ) ) {
-                $out[ $key ] = substr( $dir, strlen( $root ) );
+            $logical = rtrim( wp_normalize_path( (string) $dir ), '/' );
+            if ( $logical !== '' && strpos( $logical . '/', $logical_root ) === 0 && strlen( $logical ) + 1 > strlen( $logical_root ) ) {
+                $out[ $key ] = substr( $logical, strlen( $logical_root ) );
+                continue;
+            }
+            $real = rtrim( str_replace( '\\', '/', (string) ( realpath( $dir ) ?: $dir ) ), '/' );
+            if ( $real !== '' && strpos( $real . '/', $real_root ) === 0 && strlen( $real ) + 1 > strlen( $real_root ) ) {
+                $out[ $key ] = substr( $real, strlen( $real_root ) );
+                continue;
+            }
+            // A symlinked SQLite plugin where __FILE__ resolved outside $web_root:
+            // match it back to its logical folder under WP_PLUGIN_DIR.
+            if ( $key === 'plugin' && $real !== '' && defined( 'WP_PLUGIN_DIR' ) ) {
+                $candidate = rtrim( wp_normalize_path( (string) WP_PLUGIN_DIR ), '/' ) . '/' . basename( $real );
+                $cand_real = realpath( $candidate );
+                if ( $cand_real !== false && rtrim( str_replace( '\\', '/', $cand_real ), '/' ) === $real ) {
+                    if ( strpos( $candidate . '/', $logical_root ) === 0 && strlen( $candidate ) + 1 > strlen( $logical_root ) ) {
+                        $out[ $key ] = substr( $candidate, strlen( $logical_root ) );
+                    } elseif ( ( $pdir = realpath( WP_PLUGIN_DIR ) ) !== false ) {
+                        $p_cand = rtrim( str_replace( '\\', '/', $pdir ), '/' ) . '/' . basename( $real );
+                        if ( strpos( $p_cand . '/', $real_root ) === 0 && strlen( $p_cand ) + 1 > strlen( $real_root ) ) {
+                            $out[ $key ] = substr( $p_cand, strlen( $real_root ) );
+                        }
+                    }
+                }
             }
         }
         return $cache[ $web_root ] = $out;
@@ -4115,7 +4161,7 @@ class Import {
                 // backticks; mysqldump splits the head into versioned comments.
                 $flat = ltrim( (string) preg_replace( '/\s+/', ' ', (string) preg_replace( '/\/\*M?!\d*|\*\//', ' ', substr( $statement, 0, 600 ) ) ) );
                 if ( preg_match( '/^CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW\b/i', $flat ) ) {
-                    $statement = str_replace( '`' . $old_prefix, '`' . $new_prefix, $statement );
+                    $statement = self::rewrite_view_prefix( $statement, $old_prefix, $new_prefix );
                 }
                 // Foreign keys name their parent table too (backticked or unbackticked).
                 if ( preg_match( '/^(?:\/\*M?!\d*\s*)?(?:CREATE|ALTER)\s+TABLE/i', $statement ) ) {
@@ -4130,6 +4176,347 @@ class Import {
                 $out[] = 'DROP TABLE IF EXISTS `' . $m[1] . '`';
             }
             $out[] = $statement;
+        }
+        return $out;
+    }
+
+    /**
+     * Rewrites table and view names carrying $old_prefix in a CREATE VIEW
+     * statement, leaving column names, aliases, schema qualifiers, string
+     * literals and comments untouched. Handles backticked and unbackticked
+     * identifiers and mysqldump's executable-comment wrappers.
+     */
+    private static function rewrite_view_prefix( $statement, $old_prefix, $new_prefix ) {
+        if ( $old_prefix === '' || $new_prefix === '' || $old_prefix === $new_prefix ) {
+            return $statement;
+        }
+        $tokens  = [];
+        $sig     = [];
+        $len     = strlen( $statement );
+        $i       = 0;
+        $in_exec = 0;
+        while ( $i < $len ) {
+            $c = $statement[ $i ];
+            // Executable comments (/*!50001 ... */ or /*M!100000 ... */): treat
+            // markers as trivia so the SQL inside is tokenized normally.
+            if ( $c === '/' && ( substr( $statement, $i, 3 ) === '/*!' || substr( $statement, $i, 4 ) === '/*M!' ) ) {
+                $m_len = 0;
+                if ( preg_match( '/^\/\*M?!\d*/', substr( $statement, $i, 16 ), $em ) ) {
+                    $m_len = strlen( $em[0] );
+                }
+                $tokens[] = [ 'type' => 'exec', 'text' => substr( $statement, $i, $m_len ) ];
+                $i       += $m_len;
+                $in_exec++;
+                continue;
+            }
+            if ( $in_exec > 0 && $c === '*' && $i + 1 < $len && $statement[ $i + 1 ] === '/' ) {
+                $tokens[] = [ 'type' => 'exec', 'text' => '*/' ];
+                $i       += 2;
+                $in_exec--;
+                continue;
+            }
+            // Regular block comments.
+            if ( $c === '/' && $i + 1 < $len && $statement[ $i + 1 ] === '*' ) {
+                $end      = strpos( $statement, '*/', $i + 2 );
+                $end      = $end === false ? $len : $end + 2;
+                $tokens[] = [ 'type' => 'comment', 'text' => substr( $statement, $i, $end - $i ) ];
+                $i        = $end;
+                continue;
+            }
+            // Line comments (-- ... or # ...).
+            if ( $c === '#' || ( $c === '-' && $i + 1 < $len && $statement[ $i + 1 ] === '-' && ( $i + 2 >= $len || strpos( " \t\r\n", $statement[ $i + 2 ] ) !== false ) ) ) {
+                $nl       = strpos( $statement, "\n", $i );
+                $end      = $nl === false ? $len : $nl;
+                $tokens[] = [ 'type' => 'comment', 'text' => substr( $statement, $i, $end - $i ) ];
+                $i        = $end;
+                continue;
+            }
+            // Single- or double-quoted string literals.
+            if ( $c === "'" || $c === '"' ) {
+                $q = $c;
+                $j = $i + 1;
+                while ( $j < $len ) {
+                    if ( $statement[ $j ] === '\\' ) {
+                        $j += 2;
+                        continue;
+                    }
+                    if ( $statement[ $j ] === $q ) {
+                        if ( $j + 1 < $len && $statement[ $j + 1 ] === $q ) {
+                            $j += 2;
+                            continue;
+                        }
+                        $j++;
+                        break;
+                    }
+                    $j++;
+                }
+                $idx      = count( $tokens );
+                $tokens[] = [ 'type' => 'string', 'text' => substr( $statement, $i, $j - $i ) ];
+                $sig[]    = $idx;
+                $i        = $j;
+                continue;
+            }
+            // Backtick-quoted identifiers.
+            if ( $c === '`' ) {
+                $j = $i + 1;
+                while ( $j < $len ) {
+                    if ( $statement[ $j ] === '`' ) {
+                        if ( $j + 1 < $len && $statement[ $j + 1 ] === '`' ) {
+                            $j += 2;
+                            continue;
+                        }
+                        $j++;
+                        break;
+                    }
+                    $j++;
+                }
+                $idx      = count( $tokens );
+                $tokens[] = [ 'type' => 'bident', 'text' => substr( $statement, $i, $j - $i ) ];
+                $sig[]    = $idx;
+                $i        = $j;
+                continue;
+            }
+            // Whitespace.
+            if ( $c === ' ' || $c === "\t" || $c === "\n" || $c === "\r" ) {
+                $j = $i + 1;
+                while ( $j < $len && ( $statement[ $j ] === ' ' || $statement[ $j ] === "\t" || $statement[ $j ] === "\n" || $statement[ $j ] === "\r" ) ) {
+                    $j++;
+                }
+                $tokens[] = [ 'type' => 'ws', 'text' => substr( $statement, $i, $j - $i ) ];
+                $i        = $j;
+                continue;
+            }
+            // Unquoted word (keyword or identifier).
+            if ( preg_match( '/^[A-Za-z0-9_$]+/', substr( $statement, $i, 128 ), $wm ) ) {
+                $j = $i + strlen( $wm[0] );
+                while ( $j < $len && preg_match( '/^[A-Za-z0-9_$]/', $statement[ $j ] ) ) {
+                    $j++;
+                }
+                $idx      = count( $tokens );
+                $tokens[] = [ 'type' => 'word', 'text' => substr( $statement, $i, $j - $i ) ];
+                $sig[]    = $idx;
+                $i        = $j;
+                continue;
+            }
+            // Single punctuation character.
+            $idx      = count( $tokens );
+            $tokens[] = [ 'type' => 'punct', 'text' => $c ];
+            $sig[]    = $idx;
+            $i++;
+        }
+
+        $is_ident = function ( $tok ) {
+            return $tok !== null && ( $tok['type'] === 'bident' || $tok['type'] === 'word' );
+        };
+        $is_word = function ( $tok, $word ) {
+            return $tok !== null && $tok['type'] === 'word' && strcasecmp( $tok['text'], $word ) === 0;
+        };
+        $is_punct = function ( $tok, $ch ) {
+            return $tok !== null && $tok['type'] === 'punct' && $tok['text'] === $ch;
+        };
+        $ident_name = function ( $tok ) {
+            if ( $tok['type'] === 'bident' ) {
+                return str_replace( '``', '`', substr( $tok['text'], 1, -1 ) );
+            }
+            return $tok['text'];
+        };
+        $rewrite_at = function ( $sig_pos ) use ( &$tokens, $sig, $old_prefix, $new_prefix ) {
+            $idx = $sig[ $sig_pos ];
+            $tok = $tokens[ $idx ];
+            if ( $tok['type'] === 'bident' ) {
+                $inner = str_replace( '``', '`', substr( $tok['text'], 1, -1 ) );
+                if ( stripos( $inner, $old_prefix ) === 0 ) {
+                    $replaced                = $new_prefix . substr( $inner, strlen( $old_prefix ) );
+                    $tokens[ $idx ]['text'] = '`' . str_replace( '`', '``', $replaced ) . '`';
+                }
+            } elseif ( $tok['type'] === 'word' ) {
+                if ( stripos( $tok['text'], $old_prefix ) === 0 && ! ctype_digit( $tok['text'] ) ) {
+                    $tokens[ $idx ]['text'] = $new_prefix . substr( $tok['text'], strlen( $old_prefix ) );
+                }
+            }
+        };
+
+        $n = count( $sig );
+        // 1. Locate VIEW and rewrite the view's own name (or db.view's view part).
+        $k = 0;
+        while ( $k < $n && ! $is_word( $tokens[ $sig[ $k ] ], 'VIEW' ) ) {
+            $k++;
+        }
+        if ( $k >= $n ) {
+            return $statement;
+        }
+        $k++; // step past VIEW
+        if ( $k + 2 < $n && $is_word( $tokens[ $sig[ $k ] ], 'IF' ) && $is_word( $tokens[ $sig[ $k + 1 ] ], 'NOT' ) && $is_word( $tokens[ $sig[ $k + 2 ] ], 'EXISTS' ) ) {
+            $k += 3;
+        }
+        if ( $k < $n && $is_ident( $tokens[ $sig[ $k ] ] ) ) {
+            if ( $k + 2 < $n && $is_punct( $tokens[ $sig[ $k + 1 ] ], '.' ) && $is_ident( $tokens[ $sig[ $k + 2 ] ] ) ) {
+                $rewrite_at( $k + 2 );
+                $k += 3;
+            } else {
+                $rewrite_at( $k );
+                $k++;
+            }
+        }
+        // Advance to AS at paren depth 0 (skipping any optional column list).
+        $depth = 0;
+        while ( $k < $n ) {
+            $tok = $tokens[ $sig[ $k ] ];
+            if ( $is_punct( $tok, '(' ) ) {
+                $depth++;
+            } elseif ( $is_punct( $tok, ')' ) && $depth > 0 ) {
+                $depth--;
+            } elseif ( $depth === 0 && $is_word( $tok, 'AS' ) ) {
+                $k++;
+                break;
+            }
+            $k++;
+        }
+
+        // 2. Walk the view body (after AS) and rewrite identifiers only in table positions.
+        $end_from = [
+            'WHERE' => true, 'GROUP' => true, 'HAVING' => true, 'WINDOW' => true,
+            'ORDER' => true, 'LIMIT' => true, 'OFFSET' => true, 'FETCH' => true,
+            'FOR' => true, 'LOCK' => true, 'INTO' => true, 'UNION' => true,
+            'INTERSECT' => true, 'EXCEPT' => true, 'SELECT' => true, 'SET' => true,
+            'PROCEDURE' => true, 'WITH' => true,
+        ];
+        $alias_stop = $end_from + [
+            'AS' => true, 'ON' => true, 'USING' => true, 'JOIN' => true,
+            'INNER' => true, 'LEFT' => true, 'RIGHT' => true, 'OUTER' => true,
+            'CROSS' => true, 'NATURAL' => true, 'STRAIGHT_JOIN' => true,
+            'USE' => true, 'FORCE' => true, 'IGNORE' => true, 'PARTITION' => true,
+        ];
+        $stack      = [ [ 'mode' => 'other', 'is_query' => true ] ];
+        $aliases    = [];
+        $qualifiers = [];
+
+        for ( ; $k < $n; $k++ ) {
+            $tok = $tokens[ $sig[ $k ] ];
+            $top = count( $stack ) - 1;
+
+            if ( $is_punct( $tok, '(' ) ) {
+                $p = $k + 1;
+                while ( $p < $n && $is_punct( $tokens[ $sig[ $p ] ], '(' ) ) {
+                    $p++;
+                }
+                $next_tok  = $p < $n ? $tokens[ $sig[ $p ] ] : null;
+                $is_subq   = $is_word( $next_tok, 'SELECT' ) || $is_word( $next_tok, 'WITH' ) || $is_word( $next_tok, 'VALUES' ) || $is_word( $next_tok, 'TABLE' );
+                $imm_tok   = $k + 1 < $n ? $tokens[ $sig[ $k + 1 ] ] : null;
+                $imm_query = $is_word( $imm_tok, 'SELECT' ) || $is_word( $imm_tok, 'WITH' );
+
+                if ( $stack[ $top ]['mode'] === 'from_expect' ) {
+                    $stack[ $top ]['mode'] = 'from_after';
+                    if ( $is_subq ) {
+                        $stack[] = [ 'mode' => 'other', 'is_query' => $imm_query ];
+                    } else {
+                        $stack[] = [ 'mode' => 'from_expect', 'is_query' => false ];
+                    }
+                } else {
+                    $stack[] = [ 'mode' => 'other', 'is_query' => $imm_query ];
+                }
+                continue;
+            }
+
+            if ( $is_punct( $tok, ')' ) ) {
+                if ( count( $stack ) > 1 ) {
+                    array_pop( $stack );
+                }
+                continue;
+            }
+
+            if ( $is_punct( $tok, ',' ) ) {
+                if ( $stack[ $top ]['mode'] === 'from_after' || $stack[ $top ]['mode'] === 'from_after_alias' || $stack[ $top ]['mode'] === 'from_on' ) {
+                    $stack[ $top ]['mode'] = 'from_expect';
+                }
+                continue;
+            }
+
+            if ( $is_punct( $tok, ';' ) ) {
+                $stack[ $top ]['mode'] = 'other';
+                continue;
+            }
+
+            // Keywords controlling FROM / JOIN table positions.
+            if ( $tok['type'] === 'word' ) {
+                $upper = strtoupper( $tok['text'] );
+                if ( $upper === 'FROM' && $stack[ $top ]['is_query'] ) {
+                    $stack[ $top ]['mode'] = 'from_expect';
+                    continue;
+                }
+                if ( $upper === 'JOIN' || $upper === 'STRAIGHT_JOIN' ) {
+                    $stack[ $top ]['mode'] = 'from_expect';
+                    continue;
+                }
+                if ( $upper === 'ON' && ( $stack[ $top ]['mode'] === 'from_after' || $stack[ $top ]['mode'] === 'from_after_alias' ) ) {
+                    $stack[ $top ]['mode'] = 'from_on';
+                    continue;
+                }
+                if ( $upper === 'LATERAL' && $stack[ $top ]['mode'] === 'from_expect' ) {
+                    continue;
+                }
+                if ( isset( $end_from[ $upper ] ) ) {
+                    $stack[ $top ]['mode'] = 'other';
+                    continue;
+                }
+            }
+
+            // Table position 1: directly after FROM, JOIN, or a FROM comma.
+            if ( $stack[ $top ]['mode'] === 'from_expect' && $is_ident( $tok ) ) {
+                $next1 = $k + 1 < $n ? $tokens[ $sig[ $k + 1 ] ] : null;
+                $next2 = $k + 2 < $n ? $tokens[ $sig[ $k + 2 ] ] : null;
+                if ( $is_punct( $next1, '.' ) && $is_ident( $next2 ) ) {
+                    $rewrite_at( $k + 2 );
+                    $k += 2;
+                } else {
+                    $rewrite_at( $k );
+                }
+                $stack[ $top ]['mode'] = 'from_after';
+                continue;
+            }
+
+            // Explicit or implicit table alias right after a FROM/JOIN table.
+            if ( $stack[ $top ]['mode'] === 'from_after' ) {
+                if ( $is_word( $tok, 'AS' ) && $k + 1 < $n && $is_ident( $tokens[ $sig[ $k + 1 ] ] ) ) {
+                    $aliases[ strtolower( $ident_name( $tokens[ $sig[ $k + 1 ] ] ) ) ] = true;
+                    $k++;
+                    $stack[ $top ]['mode'] = 'from_after_alias';
+                    continue;
+                }
+                if ( $is_ident( $tok ) && ( $tok['type'] === 'bident' || ! isset( $alias_stop[ strtoupper( $tok['text'] ) ] ) ) ) {
+                    $aliases[ strtolower( $ident_name( $tok ) ) ] = true;
+                    $stack[ $top ]['mode']                        = 'from_after_alias';
+                    continue;
+                }
+            }
+
+            // Table position 2: table qualifier before '.' (table.col or db.table.col).
+            if ( $is_ident( $tok ) ) {
+                $prev1 = $k - 1 >= 0 ? $tokens[ $sig[ $k - 1 ] ] : null;
+                $next1 = $k + 1 < $n ? $tokens[ $sig[ $k + 1 ] ] : null;
+                $next2 = $k + 2 < $n ? $tokens[ $sig[ $k + 2 ] ] : null;
+                $next3 = $k + 3 < $n ? $tokens[ $sig[ $k + 3 ] ] : null;
+                if (
+                    $is_punct( $next1, '.' )
+                    && ( $is_ident( $next2 ) || $is_punct( $next2, '*' ) )
+                    && ! $is_punct( $next3, '.' )
+                    && ! $is_punct( $next3, '(' )
+                ) {
+                    $qualifiers[] = [ $k, $is_punct( $prev1, '.' ) ];
+                }
+            }
+        }
+
+        foreach ( $qualifiers as $q ) {
+            list( $qk, $has_prev_dot ) = $q;
+            if ( $has_prev_dot || ! isset( $aliases[ strtolower( $ident_name( $tokens[ $sig[ $qk ] ] ) ) ] ) ) {
+                $rewrite_at( $qk );
+            }
+        }
+
+        $out = '';
+        foreach ( $tokens as $tok ) {
+            $out .= $tok['text'];
         }
         return $out;
     }
@@ -4836,15 +5223,26 @@ class Import {
      * Executes a list of individual SQL statements on the destination database.
      */
     private function execute_statements( $statements ) {
-        $run    = $this->begin_statements();
-        $compat = self::db_compat();
+        $run         = $this->begin_statements();
+        $compat      = self::db_compat();
+        $sqlite_left = [];
         foreach ( $statements as $statement ) {
+            if ( ( $what = self::sqlite_left_out( $statement ) ) !== '' ) {
+                if ( $what !== 'drop' ) {
+                    $sqlite_left[ $what ] = ( $sqlite_left[ $what ] ?? 0 ) + 1;
+                }
+                continue;
+            }
             if ( ! $this->run_statement( self::compat_statement( $statement, $compat ), $run ) ) {
                 break;
             }
         }
         $result              = $this->end_statements( $run );
         $result['converted'] = $compat['converted'];
+        if ( $sqlite_left ) {
+            $result['left_out']       = $sqlite_left;
+            $result['left_out_words'] = self::sqlite_left_out_words( $sqlite_left );
+        }
         return $result;
     }
 
@@ -5767,6 +6165,9 @@ class Import {
             return null;
         }
         $meta = (array) $meta;
+        if ( ! empty( $meta['target'] ) ) {
+            return $primary;
+        }
         if ( isset( $meta['site_prefix'] ) && is_string( $meta['site_prefix'] ) && $meta['site_prefix'] !== '' ) {
             return $meta['site_prefix'];
         }
@@ -6553,7 +6954,7 @@ class Import {
             // The source's roles win over a leftover row under this site's
             // prefix that came along (option_name is unique, so the rename
             // would otherwise fail and leave the leftover in charge).
-            if ( $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM `{$options}` WHERE option_name = %s", $old_prefix . 'user_roles' ) ) ) {
+            if ( strcasecmp( $old_prefix, $new_prefix ) !== 0 && $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM `{$options}` WHERE option_name = %s", $old_prefix . 'user_roles' ) ) ) {
                 $wpdb->delete( $options, [ 'option_name' => $new_prefix . 'user_roles' ] );
             }
             $res = $wpdb->update(
@@ -6821,12 +7222,17 @@ class Import {
             }
         }
         $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
+        $fk = self::sqlite_foreign_keys( false );
         foreach ( (array) $wpdb->get_results( 'SHOW FULL TABLES', ARRAY_N ) as $row ) {
             if ( ! isset( $owned[ $row[0] ] ) || isset( $kept[ $row[0] ] ) ) {
                 continue;
             }
             $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
             $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $row[0] ) . '`' );
+        }
+        self::sqlite_forget_dropped_keys();
+        if ( $fk ) {
+            self::sqlite_foreign_keys( true );
         }
         $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
     }
@@ -6893,12 +7299,12 @@ class Import {
      * alone, knowingly). A rollback already under way, or one asked again
      * right after it finished, carries on. null when there's nothing to say.
      */
-    public function later_refusal( $files = true ) {
+    public function later_refusal( $files = true, $paced = true ) {
         if ( is_file( $this->import_path . '/rollback-state.php' ) ) {
             return null;
         }
         $done = json_decode( (string) self::read_protected( $this->import_path . '/rollback-done.php' ), true );
-        if ( is_array( $done ) && (int) ( $done['at'] ?? 0 ) > time() - 600 ) {
+        if ( $paced && is_array( $done ) && (int) ( $done['at'] ?? 0 ) > time() - 600 && (bool) ( $done['files_asked'] ?? true ) === (bool) $files && empty( $done['result']['errors'] ) ) {
             return null;
         }
         $meta = self::rollback_meta( $this->rollback_path );
@@ -7584,13 +7990,15 @@ class Import {
             }
         }
         $paths   = array_values( array_unique( array_map( function ( $p ) { return '/' . trim( $p, '/' ) . ( trim( $p, '/' ) === '' ? '' : '/' ); }, $paths ) ) );
-        $route   = var_export( '#^(?:' . implode( '|', array_map( function ( $p ) { return preg_quote( $p, '#' ); }, $paths ) ) . ')' . preg_quote( $prefix, '#' ) . '/disembark/v1/import/#', true );
+        $bases   = implode( '|', array_map( function ( $p ) { return preg_quote( $p, '#' ); }, $paths ) );
+        $route   = var_export( '#^(?:' . $bases . ')(?:index\.php/)?' . preg_quote( $prefix, '#' ) . '/disembark/v1/import/#', true );
+        $entry   = var_export( '#^(?:' . $bases . ')(?:index\.php)?$#', true );
         $code = "<?php\n"
             . '// ' . self::MAINTENANCE_MARK . ' ' . preg_replace( '/[^a-f0-9]/', '', (string) $this->import_id ) . ": Disembark is putting this site back to a restore point. Delete this file if it's still here after the rollback.\n"
             . '// paths: ' . wp_json_encode( $paths, JSON_UNESCAPED_SLASHES ) . "\n"
             . "\$disembark_path  = explode( '?', rawurldecode( (string) ( \$_SERVER['REQUEST_URI'] ?? '' ) ), 2 )[0];\n"
             . "\$disembark_route = isset( \$_GET['rest_route'] ) && is_string( \$_GET['rest_route'] ) ? '/' . ltrim( \$_GET['rest_route'], '/' ) : '';\n"
-            . "\$upgrading = ( ( defined( 'WP_CLI' ) && WP_CLI ) || preg_match( {$route}, \$disembark_path ) || strpos( \$disembark_route, '/disembark/v1/import/' ) === 0 ) ? 0 : " . time() . ";\n";
+            . "\$upgrading = ( ( defined( 'WP_CLI' ) && WP_CLI ) || preg_match( {$route}, \$disembark_path ) || ( preg_match( {$entry}, \$disembark_path ) && strpos( \$disembark_route, '/disembark/v1/import/' ) === 0 ) ) ? 0 : " . time() . ";\n";
         // Written whole and then moved into place, so a request never reads
         // half a file, and dropped from OPcache so the new time counts.
         $tmp = $file . '.' . substr( md5( uniqid( '', true ) ), 0, 8 ) . '.tmp';
@@ -7931,15 +8339,33 @@ class Import {
             return [];
         }
         $own     = array_flip( $target->tables() );
+        $prefix  = strtolower( (string) $target->prefix );
+        $rows    = (array) $wpdb->get_results( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( $target->prefix ) . '%' ), ARRAY_N );
+        $names   = array_map( function ( $r ) { return strtolower( (string) $r[0] ); }, $rows );
+        $all     = array_flip( $names );
+        $other   = [];
+        foreach ( $names as $n ) {
+            if ( substr( $n, -7 ) === 'options' && ( $p = substr( $n, 0, -7 ) ) !== $prefix && strpos( $p, $prefix ) === 0 && isset( $all[ $p . 'posts' ] ) ) {
+                $other[] = $p;
+            }
+        }
         $dropped = [];
-        foreach ( (array) $wpdb->get_results( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( $target->prefix ) . '%' ), ARRAY_N ) as $row ) {
+        $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
+        $fk = self::sqlite_foreign_keys( false );
+        foreach ( $rows as $row ) {
             $table = (string) $row[0];
+            $lower = strtolower( $table );
             $kind  = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
             // A subsite or tenant never takes the source's views (see
             // note_left_out()), so a view here is the old site's, even
             // under a name the source also has.
-            if ( ! isset( $own[ $table ] ) || ! isset( $saved[ $table ] ) || ( $kind === 'TABLE' && isset( $incoming[ strtolower( $table ) ] ) ) ) {
+            if ( ! isset( $own[ $table ] ) || ! isset( $saved[ $table ] ) || ( $kind === 'TABLE' && isset( $incoming[ $lower ] ) ) ) {
                 continue;
+            }
+            foreach ( $other as $p ) {
+                if ( strpos( $lower, $p ) === 0 ) {
+                    continue 2;
+                }
             }
             // The host's own tables (its firewall's) stay, as on a whole-site move.
             foreach ( self::HOST_TABLES as $host ) {
@@ -7951,6 +8377,11 @@ class Import {
                 $dropped[] = $table;
             }
         }
+        self::sqlite_forget_dropped_keys();
+        if ( $fk ) {
+            self::sqlite_foreign_keys( true );
+        }
+        $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
         return $dropped;
     }
 
@@ -7979,6 +8410,8 @@ class Import {
             }
         }
         $dropped = [];
+        $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
+        $fk = self::sqlite_foreign_keys( false );
         foreach ( $rows as $row ) {
             $table = (string) $row[0];
             $lower = strtolower( $table );
@@ -8008,6 +8441,11 @@ class Import {
                 $dropped[] = $table;
             }
         }
+        self::sqlite_forget_dropped_keys();
+        if ( $fk ) {
+            self::sqlite_foreign_keys( true );
+        }
+        $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
         return $dropped;
     }
 
