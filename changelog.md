@@ -1,5 +1,37 @@
 # Changelog
 
+## **v3.0.3** - November 23, 2026
+
+### Security
+* **Core tables stay protected server-side:** `Pull::select()` now refuses to skip rows of WordPress's core tables (`options`, `users`, `usermeta`, `site`, `sitemeta`, `blogs`) even if requested directly over REST.
+* **Tighter path and session checks:** `/backup/archive` and `/database` enforce the session's site scope, `wp-config.php` is checked case-insensitively after `realpath()`, `/stream-file` verifies a regular file before streaming, and the updater regex anchors package URLs strictly at the end of the string.
+* **SQLite files stay protected:** SQLite drop-ins and database files are protected case-insensitively, through symlinks, and under custom `WP_CONTENT_DIR` layouts.
+
+### Fixed
+* **Hosts with `ABSPATH=/wordpress/` (Flywheel) keep every core path intact:** file scanning now strips the root prefix from the start of a path only instead of using unanchored `str_replace()`, which previously stripped `/wordpress` out of the middle of core paths like `wp-admin/images/wordpress-logo.svg` and `tinymce/plugins/wordpress/`.
+* **Move locks and rollbacks don't fight each other:**
+  * `Pull::running()` ignores bare preflight probe folders (so Dashboard Push no longer blocks its own snapshot) and ignores already-rolled-back points.
+  * `Import::rollback_run()` cleans up staged files and pace state once a rollback finishes, so a failed move that was rolled back no longer locks out new moves for two minutes.
+  * `wp disembark rollback` passes the restore point's own ID to its overlap check so a just-failed move can be rolled back immediately.
+  * REST discard, rollback, and delete-restore-point endpoints now refuse with 409 when a WP-CLI process holds the move's lock, and two simultaneous moves into the same `--into` subsite or tenant are refused.
+* **Safer imports, views, and foreign keys:**
+  * Deferred DDL (views, triggers, routines) no longer runs if the table swap failed.
+  * View prefix rewriting tokenizes strings and comments so matching text inside SQL literals or aliases isn't altered.
+  * Foreign-key repointing handles `MATCH` clauses, checks MariaDB-compatible two-statement `ALTER TABLE`, drops replaced tables safely around foreign-key constraints, and validates incoming table prefixes before targeted imports.
+* **Network user merges and new site creation:**
+  * Paced user-merge journals flush cleanly, `primary_blog` and renumbering work in paced steps, `UNIQUE` collisions fall back row-by-row instead of wiping a whole chunk as orphans, narrow integer columns (`int`/`mediumint`/`smallint`/`tinyint`) are renumbered safely or reported with a warning, and failed renumber updates are never marked done.
+  * Resuming creation of a new subsite or WP Freighter tenant matches an explicit registration timestamp or creation marker (with locked tenant registration), so plugins adding tables during `wp_insert_site` don't cause duplicate subsites.
+* **Legacy storage migration:** cross-filesystem (`EXDEV`) moves copy atomically via temp files, finish any half-copied files from earlier interrupted runs, preserve newer pull memory, and never stop prematurely on large folders.
+* **WP-CLI notifications and locks:** `--notify` delivers failure notices even for pre-confirmation refusals without creating an import folder on disk; move locks are held only after confirmation, and `discard`, `rollback`, and `search-replace` lock cleanly.
+* **Dashboard polish:**
+  * Rolling back and discarding an unfinished move keeps the restore point only when saved files actually remain, and shows paced user-merge progress (`Merging users… N of M`).
+  * Rollback previews fall back to a plain confirmation on timeouts or older sites, while still refusing missing or wrong-site points.
+  * Search & replace binds the replace action to the exact previewed terms and invalidates stale previews if inputs change while loading.
+  * Plain-permalink post-rollback login checks, cancel dialog races, and poll timer deduplication are fixed.
+
+### Improved
+* **Faster media zips:** `Backup::zip_file_list()` stores already-compressed media and archives (`jpg`, `png`, `webp`, `mp4`, `pdf`, `zip`, `woff2`, etc.) with `ZipArchive::CM_STORE` instead of re-deflating them.
+
 ## **v3.0.2** - November 23, 2026
 
 ### Added
