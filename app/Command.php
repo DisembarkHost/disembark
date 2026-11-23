@@ -501,7 +501,7 @@ class Command {
                     'cells_changed'   => (int) ( $sr['cells_changed'] ?? 0 ),
                     'files_rewritten' => (int) ( $sr['files_rewritten'] ?? 0 ),
                 ];
-                $this->say( '      ' . ( $from !== $dest_home ? "{$src_home} → {$dest_home} (every http, https and www spelling): " : 'Same address: ' ) . number_format( (int) ( $sr['cells_changed'] ?? 0 ) ) . ' cells, ' . (int) ( $sr['files_rewritten'] ?? 0 ) . ' files under uploads.' );
+                $this->say( '      ' . ( $from !== $dest_home ? "{$src_home} → {$dest_home} (every http, https and www spelling): " : 'Same address: ' ) . number_format( (int) ( $sr['cells_changed'] ?? 0 ) ) . ' cells, ' . ( ! empty( $sr['users_rewritten'] ) ? self::plural( (int) $sr['users_rewritten'], 'user website' ) . ' (accounts it added to the network), ' : '' ) . (int) ( $sr['files_rewritten'] ?? 0 ) . ' files under uploads.' );
                 if ( ! empty( $sr['files_too_big_total'] ) ) {
                     $summary['urls']['files_too_big'] = (array) ( $sr['files_too_big'] ?? [] );
                     $this->say( '      ! ' . self::plural( (int) $sr['files_too_big_total'], 'file' ) . ' under uploads ' . ( (int) $sr['files_too_big_total'] === 1 ? 'mentions' : 'mention' ) . " {$src_home} but " . ( (int) $sr['files_too_big_total'] === 1 ? 'is' : 'are' ) . ' over 5 MB, so left as is: ' . implode( ', ', array_slice( (array) ( $sr['files_too_big'] ?? [] ), 0, 8 ) ) . ( (int) $sr['files_too_big_total'] > 8 ? ', …' : '' ) );
@@ -956,7 +956,7 @@ class Command {
                     return $import->move_search_replace( $from, $dest_home, $budget );
                 } ), 'urls', $import_id );
                 $summary['urls'] = [ 'from' => $src_home, 'to' => $dest_home, 'cells_changed' => (int) ( $sr['cells_changed'] ?? 0 ), 'files_rewritten' => (int) ( $sr['files_rewritten'] ?? 0 ) ];
-                $this->say( '      ' . ( $from !== $dest_home ? "{$src_home} → {$dest_home} (every http, https and www spelling): " : 'Same address: ' ) . number_format( (int) ( $sr['cells_changed'] ?? 0 ) ) . ' cells, ' . (int) ( $sr['files_rewritten'] ?? 0 ) . ' files under uploads.' );
+                $this->say( '      ' . ( $from !== $dest_home ? "{$src_home} → {$dest_home} (every http, https and www spelling): " : 'Same address: ' ) . number_format( (int) ( $sr['cells_changed'] ?? 0 ) ) . ' cells, ' . ( ! empty( $sr['users_rewritten'] ) ? self::plural( (int) $sr['users_rewritten'], 'user website' ) . ' (accounts it added to the network), ' : '' ) . (int) ( $sr['files_rewritten'] ?? 0 ) . ' files under uploads.' );
                 if ( ! empty( $sr['files_too_big_total'] ) ) {
                     $summary['urls']['files_too_big'] = (array) ( $sr['files_too_big'] ?? [] );
                     $this->say( '      ! ' . self::plural( (int) $sr['files_too_big_total'], 'file' ) . ' under uploads ' . ( (int) $sr['files_too_big_total'] === 1 ? 'mentions' : 'mention' ) . " {$src_home} but " . ( (int) $sr['files_too_big_total'] === 1 ? 'is' : 'are' ) . ' over 5 MB, so left as is: ' . implode( ', ', array_slice( (array) ( $sr['files_too_big'] ?? [] ), 0, 8 ) ) . ( (int) $sr['files_too_big_total'] > 8 ? ', …' : '' ) );

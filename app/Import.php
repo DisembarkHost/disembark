@@ -2943,7 +2943,51 @@ class Import {
         foreach ( $moved as $f => $t ) {
             $file_pairs += self::replacement_pairs( $f, $t );
         }
+        $result['users_rewritten'] = $this->rewrite_added_users( $file_pairs );
         return array_merge( $result, $this->rewrite_files( $file_pairs, $target ) );
+    }
+
+    /**
+     * The network accounts this move added (merging a site's users into a
+     * network's, see Target::merge_users()), as their IDs, from the merge's
+     * journal in the move's folder $import_dir.
+     */
+    public static function added_users( $import_dir ) {
+        $ids = [];
+        foreach ( Pace::journal_read( $import_dir . '/rollback/users-merge.php' ) as $r ) {
+            if ( isset( $r['u'] ) && (int) $r['u'] > 0 ) {
+                $ids[ (int) $r['u'] ] = true;
+            }
+        }
+        return array_keys( $ids );
+    }
+
+    /**
+     * The address rewrite for the accounts a move added to a network's
+     * users table: a site's own rewrite covers only its tables, and the
+     * network's are shared, so a user's website (user_url) kept the old
+     * address. Only these accounts' user_url changes; accounts that were
+     * already here keep theirs. Returns how many changed.
+     */
+    private function rewrite_added_users( $pairs ) {
+        global $wpdb;
+        $ids = $pairs ? self::added_users( $this->import_path ) : [];
+        if ( ! $ids ) {
+            return 0;
+        }
+        $users   = $wpdb->base_prefix . 'users';
+        $changed = 0;
+        foreach ( array_chunk( $ids, 500 ) as $chunk ) {
+            $rows = (array) $wpdb->get_results( 'SELECT ID, user_url FROM `' . $users . '` WHERE ID IN (' . implode( ',', array_map( 'intval', $chunk ) ) . ") AND user_url <> ''", ARRAY_A );
+            foreach ( $rows as $row ) {
+                $url = strtr( (string) $row['user_url'], $pairs );
+                if ( $url !== (string) $row['user_url'] && $wpdb->update( $users, [ 'user_url' => $url ], [ 'ID' => (int) $row['ID'] ] ) ) {
+                    clean_user_cache( (int) $row['ID'] );
+                    $changed++;
+                }
+            }
+        }
+        return $changed;
     }
 
     /**

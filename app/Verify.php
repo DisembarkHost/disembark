@@ -68,7 +68,7 @@ class Verify {
         if ( array_filter( (array) $pages['list'], function ( $p ) { return ! empty( $p['fatal'] ); } ) ) {
             $pages['culprits'] = self::fatal_culprits( $since - 2 );
         }
-        $leftovers = $moved ? self::leftovers( $old ) : null;
+        $leftovers = $moved ? self::leftovers( $old, Import::added_users( $dir ) ) : null;
 
         $problems = 0;
         $problems += is_array( $rows ) ? count( (array) ( $rows['mismatched'] ?? [] ) ) : 0;
@@ -305,8 +305,11 @@ class Verify {
      * Rows that still mention the old address, per table, with a sample.
      * The search runs in the database (LIKE), so it's quick even on large
      * sites. Disembark's own records (held emails and the like) don't count.
+     * $users: accounts the move added to a network's shared users table,
+     * whose website (user_url) is looked at too, since the table is
+     * otherwise another site's.
      */
-    private static function leftovers( $old_home ) {
+    private static function leftovers( $old_home, $users = [] ) {
         global $wpdb;
         $needles = self::needles( $old_home );
         $out     = [ 'rows' => 0, 'tables' => [], 'samples' => [] ];
@@ -370,6 +373,26 @@ class Verify {
                             break 2;
                         }
                     }
+                }
+            }
+        }
+        // The network's users table is shared, so only the accounts this
+        // move added: their website came across with the old address.
+        $users_table = $wpdb->base_prefix . 'users';
+        if ( $users && ! isset( $out['tables'][ $users_table ] ) ) {
+            $where = [];
+            foreach ( $needles as $needle ) {
+                $where[] = $wpdb->prepare( 'user_url LIKE %s', '%' . $wpdb->esc_like( $needle ) . '%' );
+            }
+            $ids   = implode( ',', array_map( 'intval', array_slice( $users, 0, 50000 ) ) );
+            $cond  = "ID IN ({$ids}) AND (" . implode( ' OR ', $where ) . ')';
+            $count = (int) $wpdb->get_var( "SELECT COUNT(*) FROM `{$users_table}` WHERE {$cond}" );
+            if ( $count ) {
+                $out['rows'] += $count;
+                $out['tables'][ $users_table ] = [ 'rows' => $count, 'no_primary_key' => false ];
+                $row = $wpdb->get_row( "SELECT ID, user_url FROM `{$users_table}` WHERE {$cond} LIMIT 1", ARRAY_A );
+                if ( $row && count( $out['samples'] ) < 8 ) {
+                    $out['samples'][] = [ 'table' => $users_table, 'column' => 'user_url', 'key' => 'ID=' . $row['ID'], 'excerpt' => substr( (string) $row['user_url'], 0, 120 ) ];
                 }
             }
         }
