@@ -1364,6 +1364,7 @@ class Pull {
             }
             $state       = is_file( $dir . '/pull.json' ) ? json_decode( (string) file_get_contents( $dir . '/pull.json' ), true ) : null;
             $target_data = is_file( $dir . '/target.json' ) ? json_decode( (string) file_get_contents( $dir . '/target.json' ), true ) : null;
+            $meta        = null;
             if ( is_array( $state ) && isset( $state['owner'] ) ) {
                 if ( (string) $state['owner'] !== self::owner() ) {
                     continue; // another site's of the install
@@ -1383,9 +1384,10 @@ class Pull {
             $busy = ! empty( $active[ $id ]['active'] ) || self::is_locked( $id );
             if ( ! $busy && ! is_array( $state ) ) {
                 // Ignore bare preflight probe folders (empty staging/public/
-                // with only index files); only treat a non-pull import as busy
-                // once it has uploaded/extracted files or active pace state.
-                $work_files = [
+                // with only index files) and already-rolled-back points unless
+                // a rollback step is actively running right now.
+                $rolled_back = is_array( $meta ) && ! empty( $meta['rolled_back_at'] );
+                $work_files  = $rolled_back ? [ $dir . '/rollback-state.php' ] : [
                     $dir . '/rollback-state.php',
                     $dir . '/sql-state.php',
                     $dir . '/deploy-list.php',
@@ -1402,7 +1404,7 @@ class Pull {
                         break;
                     }
                 }
-                if ( ! $has_work && is_dir( $dir . '/staging' ) ) {
+                if ( ! $has_work && ! $rolled_back && is_dir( $dir . '/staging' ) ) {
                     foreach ( [ $dir . '/staging', $dir . '/staging/public' ] as $sd ) {
                         if ( is_dir( $sd ) && array_diff( (array) @scandir( $sd ), [ '.', '..', 'index.php', 'index.html', 'public' ] ) !== [] ) {
                             $has_work = true;

@@ -7549,6 +7549,15 @@ class Import {
         @unlink( $this->import_path . '/token-guard.json' );
         @unlink( $this->import_path . '/pull.json' );
         @unlink( $this->import_path . '/pull-secret.php' );
+        if ( empty( $errors ) ) {
+            $this->remove_pace_files();
+            if ( is_dir( $this->staging_path ) ) {
+                self::delete_directory_recursive( $this->staging_path );
+            }
+            foreach ( [ 'skip-rows.json', 'unchanged.json', 'delete-list.json', 'cancel' ] as $name ) {
+                @unlink( $this->import_path . '/' . $name );
+            }
+        }
 
         // Quiet mode turned on by this restore goes with it.
         $quiet_lifted = empty( $errors ) && Quiet::lift_for_rollback( (string) $this->import_id );
