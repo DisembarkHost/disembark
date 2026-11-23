@@ -590,7 +590,10 @@ class Backup {
         // that keeps writing during the export (a store taking orders) can't
         // leave an order in one table and its items missing from another.
         // Reads only; nothing is held locked.
-        $wpdb->query( 'SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ' );
+        // SQLite reads one snapshot in a transaction already, and its driver refuses this.
+        if ( ! Import::on_sqlite() ) {
+            $wpdb->query( 'SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ' );
+        }
         $wpdb->query( 'START TRANSACTION WITH CONSISTENT SNAPSHOT' );
         $fail = function ( $message ) use ( $fail, $wpdb ) {
             $wpdb->query( 'COMMIT' );
@@ -782,7 +785,10 @@ class Backup {
             return $data === '' || fwrite( $handle, $data ) === strlen( $data );
         };
         $disk_full = new \WP_Error( 'export_failed', 'Could not write the database export (disk full?).', [ 'status' => 500 ] );
-        $wpdb->query( 'SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ' );
+        // SQLite reads one snapshot in a transaction already, and its driver refuses this.
+        if ( ! Import::on_sqlite() ) {
+            $wpdb->query( 'SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ' );
+        }
         $wpdb->query( 'START TRANSACTION WITH CONSISTENT SNAPSHOT' );
         $tables = array_values( $tables );
         while ( $cur['t'] < count( $tables ) ) {

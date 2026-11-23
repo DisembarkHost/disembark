@@ -52,7 +52,10 @@ class Fingerprint {
         $cur    += [ 't' => 0, 'key' => null, 'rows' => 0, 's1' => '0', 's2' => '0', 'struct' => '', 'slice' => self::SLICE, 'tries' => 0 ];
         $results = [];
         $worked  = false;
-        $wpdb->query( 'SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ' );
+        // SQLite reads one snapshot in a transaction already, and its driver refuses this.
+        if ( ! Import::on_sqlite() ) {
+            $wpdb->query( 'SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ' );
+        }
         $wpdb->query( 'START TRANSACTION WITH CONSISTENT SNAPSHOT' );
         while ( $cur['t'] < count( $tables ) ) {
             if ( $worked && microtime( true ) >= $deadline ) {
