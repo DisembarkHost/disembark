@@ -22,8 +22,8 @@
   var one = inst && !net ? 'tenant' : 'subsite';
   var here = D.host(D.config.homeUrl);
   var others = isMain ? inst.sites.filter(function (s) { return s.id !== inst.main; }) : [];
-  // A site on SQLite can't take a move in (Import::sqlite_refusal()), only
-  // send one out; D.config.sqlite says why.
+  // A site on an older SQLite driver can't take a move in
+  // (Import::sqlite_refusal()), only send one out; D.config.sqlite says why.
   var sqliteNo = String(D.config.sqlite || '');
 
   var DEFAULTS = { from: subHere ? 'this' : 'other', to: subHere ? 'other' : 'this', connect: null, file: null, sourceUrl: '', into: 'new', quiet: true, catchUp: true };
@@ -272,13 +272,13 @@
           h('strong', null, 'This ' + one + ' can’t be replaced from here.'),
           String(D.config.refused || 'Run the move from the main site’s Disembark and pick “Replace” there.').replace(/ Nothing here was changed\.$/, '')))));
     }
-    // Nothing moves into a site on SQLite: say so before anything is asked.
+    // Nothing moves into a site on an older SQLite driver: say so before anything is asked.
     if (sqliteNo && k !== 'push') {
       return h('section', { class: 'dsk-card dsk-panel' },
         h('div', { class: 'dsk-panel-body' }, h('div', { class: 'dsk-warn1' }, D.icon('alert'), h('div', null,
           h('strong', null, 'A move can’t come into this site.'),
           sqliteNo.replace(/ Nothing here was changed\.$/, ''),
-          ' Pushing it out to another site works: pick ', h('strong', null, 'This site'), ' under From.'))));
+          ' Pushing it out to another site works: pick ', h('b', null, 'This site'), ' under From.'))));
     }
     if (k === 'pull' || k === 'push') { body.push(connectField()); ready = !!S.connect; why = 'Paste a connect line first'; }
     else { body.push(zipField()); ready = !!S.file; why = 'Choose a backup zip first'; }

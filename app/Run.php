@@ -319,7 +319,7 @@ class Run {
         if ( $refused ) {
             $config['refused'] = $refused->get_error_message();
         }
-        // On SQLite nothing can move in (see Import::sqlite_refusal()): Move
+        // On an older SQLite driver nothing can move in (see Import::sqlite_refusal()): Move
         // says so up front.
         $sqlite = Import::sqlite_refusal();
         if ( $sqlite ) {
@@ -1580,7 +1580,7 @@ class Run {
         // A subsite or tenant reached directly can't take a whole-site move
         // (see Import::here_refusal()): the dashboard stops before asking
         // anything, with the move that does it.
-        // Nor can a site on SQLite take any move (see Import::sqlite_refusal()).
+        // Nor can a site on an older SQLite driver take any move (see Import::sqlite_refusal()).
         $refused = Import::sqlite_refusal() ?: Import::here_refusal( $import->target() );
         if ( $refused ) {
             $pre['refused'] = $refused->get_error_message();

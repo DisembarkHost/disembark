@@ -227,16 +227,19 @@ class Import {
     }
 
     /**
-     * A move into a site whose database is SQLite, refused before anything
-     * changes (--skip-checks can't override it). Its driver can't rename
-     * tables, which the import needs to swap the incoming tables in safely.
-     * The other way works: a site on SQLite moves to MySQL or MariaDB.
+     * A move into a site on SQLite whose driver predates the MySQL-on-SQLite
+     * one (the SQLite Database Integration plugin before 3.0), refused before
+     * anything changes (--skip-checks can't override it): the import has
+     * only been proven on the newer driver, which swap_finish_sqlite() puts
+     * the tables in place through. On 3.0 and later a move comes in as it
+     * does on MySQL.
      */
     public static function sqlite_refusal() {
-        if ( ! self::on_sqlite() ) {
+        global $wpdb;
+        if ( ! self::on_sqlite() || ( is_object( $wpdb->dbh ?? null ) && $wpdb->dbh instanceof \WP_MySQL_On_SQLite ) ) {
             return null;
         }
-        return new \WP_Error( 'sqlite_destination', 'This site\'s database is SQLite (the SQLite Database Integration plugin, as in WordPress Playground and Studio). Disembark can\'t move a site into SQLite yet: its driver can\'t rename tables, which the import needs to swap the incoming tables in safely. Moving a site off SQLite works: pull or restore it into a site on MySQL or MariaDB. Nothing here was changed.', [ 'status' => 409 ] );
+        return new \WP_Error( 'sqlite_destination', 'This site\'s database is SQLite, through an older SQLite Database Integration plugin than Disembark can move a site into. Update that plugin to 3.0 or later and try again, or move into a site on MySQL or MariaDB. Nothing here was changed.', [ 'status' => 409 ] );
     }
 
     /**
@@ -1212,6 +1215,12 @@ class Import {
         if ( preg_match( '#^database-.*\.sql$#i', $base ) ) {
             return true;
         }
+        // This site's own SQLite database: never replaced by a file, even
+        // when host files aren't kept (see host_file()).
+        $sqlite = self::sqlite_host_dirs( ABSPATH )['database'] ?? '';
+        if ( $sqlite !== '' && strpos( $rel . '/', $sqlite . '/' ) === 0 ) {
+            return true;
+        }
         // Database exports (Database tab, backups) and anything in a
         // Disembark folder: restore points, staged moves, token guards.
         // Brought along, a source could plant its own token guard here.
@@ -1905,6 +1914,7 @@ class Import {
             $kind = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
             $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $name ) . '`' );
         }
+        self::sqlite_forget_dropped_keys();
         return [ 'map' => [], 'direct' => [], 'views' => [], 'deferred' => [], 'keys' => [], 'tag' => $tag ];
     }
 
@@ -2111,6 +2121,9 @@ class Import {
     private static function swap_finish( $swap, &$run ) {
         // The install's sites may be the source's now (see Scope::install()).
         Scope::forget();
+        if ( self::on_sqlite() ) {
+            return self::swap_finish_sqlite( $swap, $run );
+        }
         global $wpdb;
         $done = 0;
         foreach ( $swap['map'] as $table => $shadow ) {
@@ -2163,6 +2176,149 @@ class Import {
     }
 
     /**
+     * swap_finish() on SQLite, whose driver can't rename a table (RENAME
+     * TABLE is refused, and ALTER TABLE ... RENAME TO reports success and
+     * changes nothing). Each copy is put in place by value instead: the live
+     * table is dropped, created again from the copy's definition and filled
+     * from the copy. SQLite rolls DDL back with everything else, so all the
+     * tables go in inside one transaction: if any step fails, every live
+     * table is exactly as it was and the copies go. Foreign keys are off
+     * while it runs (the driver keeps them on and has no FOREIGN_KEY_CHECKS),
+     * or dropping a table others point at would delete their rows with it.
+     */
+    private static function swap_finish_sqlite( $swap, &$run ) {
+        global $wpdb;
+        $q    = function ( $name ) {
+            return '`' . str_replace( '`', '``', (string) $name ) . '`';
+        };
+        $plan = [];
+        foreach ( $swap['map'] as $table => $shadow ) {
+            $create = (string) ( $wpdb->get_row( 'SHOW CREATE TABLE ' . $q( $shadow ), ARRAY_N )[1] ?? '' );
+            $head   = 'CREATE TABLE ' . $q( $shadow );
+            if ( strpos( $create, $head ) !== 0 ) {
+                $run['errors'][] = "Could not put the imported {$table} in place: its copy's definition couldn't be read. " . substr( self::plain_db_error( (string) $wpdb->last_error ), 0, 200 );
+                self::swap_abandon( $swap );
+                return 0;
+            }
+            $create = 'CREATE TABLE ' . $q( $table ) . substr( $create, strlen( $head ) );
+            // The copy's foreign keys get their own names back: the live
+            // table holding them is dropped first, in the same transaction.
+            foreach ( (array) ( $swap['keys'][ $table ] ?? [] ) as $tmp => $key ) {
+                $create = str_replace( 'CONSTRAINT ' . $q( $tmp ), 'CONSTRAINT ' . $q( $key[0] ), $create );
+            }
+            $found  = (array) $wpdb->get_row( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( $table ) ), ARRAY_N );
+            $kind   = strcasecmp( (string) ( $found[0] ?? '' ), $table ) !== 0 ? '' : ( strtoupper( (string) ( $found[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE' );
+            $plan[] = [ $table, $shadow, $create, $kind ];
+        }
+        $fk     = self::sqlite_foreign_keys( false );
+        $failed = '';
+        self::sqlite_forget_dropped_keys();
+        if ( $wpdb->query( 'START TRANSACTION' ) === false ) {
+            $failed = 'the transaction could not start: ' . substr( self::plain_db_error( (string) $wpdb->last_error ), 0, 200 );
+        }
+        foreach ( $failed === '' ? $plan : [] as list( $table, $shadow, $create, $kind ) ) {
+            $steps = $kind !== '' ? [ "DROP {$kind} IF EXISTS " . $q( $table ) ] : [];
+            $steps[] = $create;
+            $steps[] = 'INSERT INTO ' . $q( $table ) . ' SELECT * FROM ' . $q( $shadow );
+            $steps[] = 'DROP TABLE ' . $q( $shadow );
+            foreach ( $steps as $sql ) {
+                if ( $wpdb->query( $sql ) === false ) {
+                    $failed = "{$table}: " . substr( self::plain_db_error( (string) $wpdb->last_error ), 0, 200 );
+                    break 2;
+                }
+                // The dropped table's foreign keys leave the driver's
+                // records, or the table made again can't reuse their names.
+                if ( strpos( $sql, 'DROP ' ) === 0 ) {
+                    self::sqlite_forget_dropped_keys();
+                }
+            }
+        }
+        if ( $failed === '' && $wpdb->query( 'COMMIT' ) === false ) {
+            $failed = 'the transaction could not be committed: ' . substr( self::plain_db_error( (string) $wpdb->last_error ), 0, 200 );
+        }
+        if ( $failed !== '' ) {
+            $wpdb->query( 'ROLLBACK' );
+        }
+        if ( $fk ) {
+            self::sqlite_foreign_keys( true );
+        }
+        if ( $failed !== '' ) {
+            $run['errors'][] = 'Could not put the imported tables in place, so none of them went in (' . $failed . ').';
+            self::swap_abandon( $swap );
+            self::sqlite_forget_dropped_keys();
+            return 0;
+        }
+        wp_cache_flush();
+        return count( $plan );
+    }
+
+    /**
+     * Turns SQLite's foreign key enforcement off or on for this connection.
+     * Its driver keeps it on and ignores SET FOREIGN_KEY_CHECKS, so a dump
+     * that adds a child table's rows before its parent's (as mysqldump and
+     * Disembark both may, with the checks off) would be refused, and
+     * dropping a parent table would delete the rows pointing at it. Returns
+     * whether it was on; false when this isn't SQLite.
+     */
+    private static function sqlite_foreign_keys( $on ) {
+        global $wpdb;
+        if ( ! self::on_sqlite() || ! is_object( $wpdb->dbh ?? null ) || ! method_exists( $wpdb->dbh, 'execute_sqlite_query' ) ) {
+            return false;
+        }
+        try {
+            $was = (bool) $wpdb->dbh->execute_sqlite_query( 'PRAGMA foreign_keys' )->fetchColumn();
+            $wpdb->dbh->execute_sqlite_query( 'PRAGMA foreign_keys = ' . ( $on ? 'ON' : 'OFF' ) );
+            return $was;
+        } catch ( \Throwable $e ) {
+            return false;
+        }
+    }
+
+    /**
+     * Works around the SQLite driver (3.1) keeping a dropped table's foreign
+     * keys in its emulated information_schema: DROP TABLE leaves their rows
+     * in referential_constraints and key_column_usage (ALTER TABLE ... DROP
+     * FOREIGN KEY removes them), and a constraint name must be unique, so
+     * the table made again under the same name can't have its keys back.
+     * Rows for tables that no longer exist are removed. Runs on the
+     * driver's own connection, so inside a transaction it rolls back with
+     * the rest. Does nothing when this isn't SQLite or the driver keeps its
+     * records elsewhere.
+     */
+    private static function sqlite_forget_dropped_keys() {
+        global $wpdb;
+        if ( ! self::on_sqlite() || ! is_object( $wpdb->dbh ?? null ) || ! method_exists( $wpdb->dbh, 'execute_sqlite_query' ) ) {
+            return;
+        }
+        foreach ( [ '_wp_sqlite_mysql_information_schema_referential_constraints', '_wp_sqlite_mysql_information_schema_key_column_usage' ] as $records ) {
+            try {
+                $has = $wpdb->dbh->execute_sqlite_query( "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", [ $records ] )->fetchColumn();
+                if ( $has ) {
+                    $wpdb->dbh->execute_sqlite_query( "DELETE FROM \"{$records}\" WHERE TABLE_NAME NOT IN ( SELECT name FROM sqlite_master WHERE type = 'table' )" );
+                }
+            } catch ( \Throwable $e ) {
+                // Left as the driver had it.
+            }
+        }
+    }
+
+    /**
+     * The SQLite driver's error as a line of text: wpdb's SQLite class wraps
+     * it in HTML with the query log (the MySQL query, each SQLite query it
+     * ran, a backtrace). The cause is kept; MySQL's errors pass unchanged.
+     */
+    private static function plain_db_error( $error ) {
+        if ( strpos( $error, '<' ) === false ) {
+            return $error;
+        }
+        $text = html_entity_decode( wp_strip_all_tags( $error ), ENT_QUOTES );
+        if ( preg_match( '/(MySQL query not supported[^\n]*|SQLSTATE\[[^\n]*)/', $text, $m ) ) {
+            return trim( $m[1] );
+        }
+        return trim( preg_replace( '/\s+/', ' ', $text ) );
+    }
+
+    /**
      * InnoDB moves a foreign key with the table it points at: renaming the
      * live table aside left every other table's key to it (a plugin table
      * the import didn't bring, one a catch-up skipped) pointing at the old
@@ -2210,6 +2366,12 @@ class Import {
     private static function db_compat() {
         global $wpdb;
         $compat = [ 'collations' => [], 'charsets' => [], 'engines' => [], 'converted' => [], 'definers_removed' => 0, 'map' => [] ];
+        // SQLite's driver takes any collation and engine name and keeps
+        // them only as labels, so nothing needs rewriting (and it can't
+        // answer SHOW CHARACTER SET).
+        if ( self::on_sqlite() ) {
+            return $compat;
+        }
         // MariaDB 11 lists some collations without a character set.
         foreach ( (array) $wpdb->get_results( 'SHOW COLLATION', ARRAY_A ) as $row ) {
             $compat['collations'][ strtolower( (string) $row['Collation'] ) ] = strtolower( (string) $row['Charset'] );
@@ -3553,6 +3715,15 @@ class Import {
         if ( strtolower( $rel ) === 'wordfence-waf.php' && is_file( $web_root . '/wordfence-waf.php' ) ) {
             return $rel;
         }
+        // On SQLite, this site's database file and the plugin whose driver
+        // reads it: a backup of another SQLite site brings its own (its
+        // db-path.php would point this site at the other database file), and
+        // a different copy of the driver could misread the one it has.
+        foreach ( self::sqlite_host_dirs( $web_root ) as $dir ) {
+            if ( strpos( $rel . '/', $dir . '/' ) === 0 ) {
+                return $dir;
+            }
+        }
         $mu = 'wp-content/mu-plugins/';
         if ( strpos( $rel, $mu ) !== 0 ) {
             return '';
@@ -3570,6 +3741,58 @@ class Import {
             }
         }
         return '';
+    }
+
+    /**
+     * On SQLite, the SQLite Database Integration plugin's basename
+     * (sqlite-database-integration/load.php), when it's in the plugins
+     * folder; '' otherwise (Studio and Playground can load it from
+     * elsewhere).
+     */
+    public static function sqlite_plugin() {
+        if ( ! self::on_sqlite() || ! defined( 'SQLITE_MAIN_FILE' ) ) {
+            return '';
+        }
+        $file = str_replace( '\\', '/', (string) ( realpath( SQLITE_MAIN_FILE ) ?: SQLITE_MAIN_FILE ) );
+        $dir  = rtrim( str_replace( '\\', '/', (string) ( realpath( WP_PLUGIN_DIR ) ?: WP_PLUGIN_DIR ) ), '/' ) . '/';
+        return strpos( $file, $dir ) === 0 ? substr( $file, strlen( $dir ) ) : '';
+    }
+
+    /**
+     * On a site on SQLite, the folders that hold its database (FQDBDIR,
+     * wp-content/database/ by default) and the SQLite Database Integration
+     * plugin running it, relative to $web_root, as [ 'database' => …,
+     * 'plugin' => … ] (either missing when outside it). Empty on MySQL or
+     * MariaDB.
+     */
+    private static function sqlite_host_dirs( $web_root ) {
+        static $cache = [];
+        if ( ! self::on_sqlite() ) {
+            return [];
+        }
+        if ( isset( $cache[ $web_root ] ) ) {
+            return $cache[ $web_root ];
+        }
+        global $wpdb;
+        $root = rtrim( str_replace( '\\', '/', (string) ( realpath( $web_root ) ?: $web_root ) ), '/' ) . '/';
+        $dirs = [ 'database' => defined( 'FQDBDIR' ) ? (string) FQDBDIR : WP_CONTENT_DIR . '/database' ];
+        if ( defined( 'SQLITE_MAIN_FILE' ) ) {
+            $dirs['plugin'] = dirname( (string) SQLITE_MAIN_FILE );
+        } elseif ( is_object( $wpdb->dbh ?? null ) ) {
+            // wp-includes/database/sqlite/<driver>.php inside the plugin.
+            $file = ( new \ReflectionClass( $wpdb->dbh ) )->getFileName();
+            if ( $file && preg_match( '#^(.*)/wp-includes/database/sqlite/[^/]+$#', str_replace( '\\', '/', $file ), $m ) ) {
+                $dirs['plugin'] = $m[1];
+            }
+        }
+        $out = [];
+        foreach ( $dirs as $key => $dir ) {
+            $dir = rtrim( str_replace( '\\', '/', (string) ( realpath( $dir ) ?: $dir ) ), '/' );
+            if ( $dir !== '' && strpos( $dir . '/', $root ) === 0 && strlen( $dir ) + 1 > strlen( $root ) ) {
+                $out[ $key ] = substr( $dir, strlen( $root ) );
+            }
+        }
+        return $cache[ $web_root ] = $out;
     }
 
     /**
@@ -4557,6 +4780,7 @@ class Import {
         $this->keep_install_rows();
 
         $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 0' );
+        self::sqlite_foreign_keys( false );
         $wpdb->query( 'SET UNIQUE_CHECKS = 0' );
         $wpdb->query( "SET sql_mode='NO_AUTO_VALUE_ON_ZERO'" );
 
@@ -4588,6 +4812,9 @@ class Import {
         }
 
         $result = $wpdb->query( $statement );
+        if ( $result === false ) {
+            $wpdb->last_error = self::plain_db_error( (string) $wpdb->last_error );
+        }
         // The site stays live while this runs: between the DROP just before a
         // CREATE and the CREATE itself, a request that loads a plugin can make
         // the plugin's missing table again (Search & Filter does). Drop it and
@@ -4621,6 +4848,11 @@ class Import {
                 return false;
             }
             return true;
+        }
+        // A table dropped on SQLite leaves its foreign keys' records (see
+        // sqlite_forget_dropped_keys()), which the CREATE after it needs gone.
+        if ( preg_match( '/^DROP\s+TABLE\b/i', $statement ) ) {
+            self::sqlite_forget_dropped_keys();
         }
         $run['statements_executed']++;
         return true;
@@ -4674,6 +4906,7 @@ class Import {
         global $wpdb;
 
         $wpdb->query( 'SET FOREIGN_KEY_CHECKS = 1' );
+        self::sqlite_foreign_keys( true );
         $wpdb->query( 'SET UNIQUE_CHECKS = 1' );
 
         // Restore the preserved Disembark token (Token::set() clears the
@@ -4747,6 +4980,17 @@ class Import {
             $active = maybe_unserialize( (string) $wpdb->get_var( "SELECT option_value FROM `{$wpdb->options}` WHERE option_name = 'active_plugins'" ) );
             if ( is_array( $active ) && ! in_array( 'wp-freighter/wp-freighter.php', $active, true ) ) {
                 $active[] = 'wp-freighter/wp-freighter.php';
+                $wpdb->update( $wpdb->options, [ 'option_value' => serialize( array_values( $active ) ) ], [ 'option_name' => 'active_plugins' ] );
+            }
+        }
+        // On SQLite, the plugin running the database stays on: its db.php
+        // drop-in works without it, but a source on MySQL never had it on,
+        // and the site's own screens for the database are in it.
+        $sqlite = self::sqlite_plugin();
+        if ( $sqlite !== '' ) {
+            $active = maybe_unserialize( (string) $wpdb->get_var( "SELECT option_value FROM `{$wpdb->options}` WHERE option_name = 'active_plugins'" ) );
+            if ( is_array( $active ) && ! in_array( $sqlite, $active, true ) ) {
+                $active[] = $sqlite;
                 $wpdb->update( $wpdb->options, [ 'option_value' => serialize( array_values( $active ) ) ], [ 'option_name' => 'active_plugins' ] );
             }
         }

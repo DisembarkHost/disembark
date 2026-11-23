@@ -180,13 +180,23 @@ class Checks {
 
     /* -------------------------------------------------------- Database */
 
-    /** The import creates, renames and drops tables: try exactly that. */
+    /**
+     * The import creates, renames and drops tables: try exactly that. On
+     * SQLite, whose driver can't rename a table, the import copies each one
+     * into place instead (see Import::swap_finish_sqlite()): that's tried.
+     */
     private static function database_user( $add ) {
         global $wpdb;
         $a = '_dsk_check_' . substr( md5( uniqid( '', true ) ), 0, 8 );
         $b = $a . '_b';
         $suppress = $wpdb->suppress_errors( true );
-        $steps    = [
+        $sqlite   = Import::on_sqlite();
+        $steps    = $sqlite ? [
+            'create' => "CREATE TABLE `{$a}` (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB",
+            'copy'   => "CREATE TABLE `{$b}` (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB",
+            'fill'   => "INSERT INTO `{$b}` SELECT * FROM `{$a}`",
+            'drop'   => "DROP TABLE `{$a}`",
+        ] : [
             'create' => "CREATE TABLE `{$a}` (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB",
             'rename' => "RENAME TABLE `{$a}` TO `{$b}`",
             'drop'   => "DROP TABLE `{$b}`",
@@ -202,7 +212,7 @@ class Checks {
         $wpdb->query( "DROP TABLE IF EXISTS `{$b}`" );
         $wpdb->suppress_errors( $suppress );
         if ( $failed !== '' ) {
-            $add( 'block', 'database_user', 'The database user can\'t create, rename or drop tables', 'The import needs all three. The server said: ' . $failed );
+            $add( 'block', 'database_user', $sqlite ? 'This site\'s SQLite database can\'t create, copy or drop tables' : 'The database user can\'t create, rename or drop tables', 'The import needs all three. The server said: ' . $failed );
         }
     }
 
@@ -315,9 +325,11 @@ class Checks {
         $older  = [];
         $idle   = [];
         foreach ( $ours as $file => $data ) {
-            // Disembark itself, and WP Freighter on an install's main site:
-            // both stay on whatever the source runs (see Import::keep_install_rows()).
-            if ( $file === $own || ( $file === 'wp-freighter/wp-freighter.php' && Scope::freighter_primary() !== '' ) ) {
+            // Disembark itself, WP Freighter on an install's main site, and
+            // on SQLite the plugin running the database: each stays on (and
+            // keeps this site's copy) whatever the source runs (see
+            // Import::keep_install_rows() and Import::host_file()).
+            if ( $file === $own || ( $file === 'wp-freighter/wp-freighter.php' && Scope::freighter_primary() !== '' ) || ( $file !== '' && $file === Import::sqlite_plugin() ) ) {
                 continue;
             }
             if ( isset( $theirs[ $file ] ) ) {
