@@ -1701,9 +1701,19 @@ class Import {
 
         // Only a clean import replaces this site's tables. Otherwise the copies
         // go and the live tables stay exactly as they were.
+        $sqlite_left = [];
         if ( empty( $run['errors'] ) ) {
             $swapped = self::swap_finish( $swap, $run );
             foreach ( $swap['deferred'] as $statement ) {
+                // SQLite's driver can't make views, triggers or stored
+                // routines: they're left out and said, not failed on after
+                // the tables went in.
+                if ( ( $what = self::sqlite_left_out( $statement ) ) !== '' ) {
+                    if ( $what !== 'drop' ) {
+                        $sqlite_left[ $what ] = ( $sqlite_left[ $what ] ?? 0 ) + 1;
+                    }
+                    continue;
+                }
                 $this->run_statement( self::compat_statement( $statement, $compat ), $run );
             }
         } else {
@@ -1735,6 +1745,10 @@ class Import {
         $result['database_unchanged'] = ! empty( $result['errors'] ) && empty( $swap['direct'] ) && ! $swapped;
         $result['converted']          = $compat['converted'];
         $result['definers_removed']   = $compat['definers_removed'];
+        if ( $sqlite_left ) {
+            $result['left_out']       = $sqlite_left;
+            $result['left_out_words'] = self::sqlite_left_out_words( $sqlite_left );
+        }
         // This site's own tables were just swapped for the source's, whose
         // roles and logins sit under the source's prefix (stacked_1_user_roles
         // when the source was a WP Freighter tenant). Until they're renamed,
@@ -3904,6 +3918,41 @@ class Import {
         $list = count( $parts ) > 1 ? implode( ', ', array_slice( $parts, 0, -1 ) ) . ' and ' . end( $parts ) : $parts[0];
         $one  = $kind === 'multisite' ? 'subsite' : 'tenant';
         return "Left out {$list} from the incoming database: a {$one} takes only the site's own tables and rows, so nothing reaches the rest of this install.";
+    }
+
+    /**
+     * On SQLite, what a deferred statement makes that the driver can't
+     * (view, trigger, routine: a stored procedure, function or event), or
+     * "drop" for dropping one of the last three; '' when it can run, and
+     * always '' on MySQL or MariaDB.
+     */
+    private static function sqlite_left_out( $statement ) {
+        if ( ! self::on_sqlite() ) {
+            return '';
+        }
+        $flat = trim( (string) preg_replace( '/\s+/', ' ', (string) preg_replace( '/\/\*M?!\d*|\*\//', ' ', substr( self::strip_leading_comments( (string) $statement ), 0, 600 ) ) ) );
+        if ( preg_match( '/^DROP\s+(?:TRIGGER|PROCEDURE|FUNCTION|EVENT)\b/i', $flat ) ) {
+            return 'drop';
+        }
+        if ( ! preg_match( '/^CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?(?:AGGREGATE\s+)?(VIEW|TRIGGER|PROCEDURE|FUNCTION|EVENT)\b/i', $flat, $m ) ) {
+            return '';
+        }
+        $kind = strtoupper( $m[1] );
+        return $kind === 'VIEW' ? 'view' : ( $kind === 'TRIGGER' ? 'trigger' : 'routine' );
+    }
+
+    /** What sqlite_left_out() left out, as a sentence for the report. */
+    private static function sqlite_left_out_words( $left ) {
+        $names = [ 'view' => [ 'view', 'views' ], 'trigger' => [ 'trigger', 'triggers' ], 'routine' => [ 'stored routine or event', 'stored routines or events' ] ];
+        $parts = [];
+        foreach ( $names as $k => $n ) {
+            $c = (int) ( $left[ $k ] ?? 0 );
+            if ( $c > 0 ) {
+                $parts[] = $c . ' ' . ( $c === 1 ? $n[0] : $n[1] );
+            }
+        }
+        $list = count( $parts ) > 1 ? implode( ', ', array_slice( $parts, 0, -1 ) ) . ' and ' . end( $parts ) : (string) ( $parts[0] ?? '' );
+        return "Left out {$list} from the incoming database: SQLite can't hold views, triggers or stored routines. The tables they use came across.";
     }
 
     /** The table or view a DML/DDL statement names, or null. */
