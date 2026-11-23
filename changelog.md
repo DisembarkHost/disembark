@@ -1,5 +1,25 @@
 # Changelog
 
+## **v3.0.2** - November 23, 2026
+
+### Added
+* **Moves come into a site on SQLite:** a backup zip, a pull or a push can now replace a site whose database is SQLite (the SQLite Database Integration plugin 3.0 or later, as in WordPress Playground and Studio). The driver can't rename a table, so the incoming tables are copied into place inside one transaction: if anything fails, every table is exactly as it was. The site keeps its own database folder, `db.php` and SQLite plugin (left on), and SQLite's views, triggers and stored routines, which it can't hold, are left out and named in the report. A site on an older SQLite plugin is still refused, with a note to update it.
+
+### Fixed
+* **No database errors creating a subsite:** a pull into a new subsite printed "Table 'wp_3_options' doesn't exist" errors before the import brought the subsite's tables (#12).
+* **Accounts added to a network get the new address:** accounts a move adds to a network's shared users table kept the old address in their website (`user_url`), and the checks after the move didn't look there (#12).
+* **Pretty links work right after a WP-CLI move:** a network's main site (permalinks starting with `/blog/`) pulled out as a single site 404'd until permalinks were saved, because the flush used the permalink settings WordPress read when the command started (#12).
+* **Two moves can't run into one site at once:** a WP-CLI move holds a lock while it runs, resuming a move another process still runs is refused even when it looks idle, and a new whole-site move waits for a running one (moves into different subsites or tenants still run side by side). A pull's saved state is written atomically, so a run can no longer find it empty ("Run the scan step first") (#12).
+* **A subsite's views come out with it:** a view's name and the tables it reads take the prefix of where it lands. Pulling or restoring a subsite with a view into a single site failed after its tables were swapped in.
+* **No SQLite database file left on a MySQL site:** a backup or pull of a SQLite site into a site on MySQL or MariaDB left the old database file and `db-path.php` in `wp-content/database/`, unused. The database comes across as SQL, as before.
+* **Smaller fixes:**
+  * Errors from SQLite's driver read as text, not its HTML query log.
+  * Restore points on SQLite no longer log a database error for a transaction setting the driver refuses.
+
+### Changed
+* **Replacing a subsite or tenant matches the source:** a pull into an existing subsite or tenant removes that site's own tables and views the source doesn't have, as a whole-site move does. They stay in the restore point, and a rollback brings them back.
+* **Ready for a move to anchorhost:** the updater also accepts releases from `github.com/anchorhost/disembark`, so sites on this version keep updating if the repository moves there.
+
 ## **v3.0.1** - November 22, 2026
 
 ### Security

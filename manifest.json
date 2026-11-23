@@ -4,13 +4,13 @@
     "author": "<a href=\"https://austinginder.com\">Austin Ginder</a>",
     "author_profile": "https://profiles.wordpress.org/austinginder",
     "donate_link": "https://github.com/sponsors/austinginder",
-    "version": "3.0.1",
-    "download_url": "https://github.com/DisembarkHost/disembark/releases/download/v3.0.1/disembark.zip",
+    "version": "3.0.2",
+    "download_url": "https://github.com/DisembarkHost/disembark/releases/download/v3.0.2/disembark.zip",
     "requires": "5.6",
     "tested": "7.1",
     "requires_php": "7.0",
     "added": "2024-06-05 16:00:00",
-    "last_updated": "2026-11-22 13:28:07",
+    "last_updated": "2026-11-23 11:14:47",
     "homepage": "https://disembark.host",
     "sections": {
         "description": "Back up, restore, or migrate your files and database in the dashboard or CLI."
