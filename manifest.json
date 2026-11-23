@@ -16,7 +16,7 @@
         "description": "Back up, restore, or migrate your files and database in the dashboard or CLI."
     },
     "banners": {
-        "low": "https://disembark.host/images/disembark-772x250.webp",
-        "high": "https://disembark.host/images/disembark-1544x500.webp"
+        "low": "https://disembark.host/content/8/themes/disembark-harbor/assets/brand/disembark-banner-772x250.webp",
+        "high": "https://disembark.host/content/8/themes/disembark-harbor/assets/brand/disembark-banner-1544x500.webp"
     }
 }
