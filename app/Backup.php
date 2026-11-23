@@ -162,7 +162,7 @@ class Backup {
             $scope     = Scope::active();
             // Determine the home_path for the *current* directory
             $home_path = $web_root;
-            if ( !empty($state['current_directory_path']) && $web_root !== $core_root && str_starts_with( $state['current_directory_path'], $core_root ) ) {
+            if ( !empty($state['current_directory_path']) && $web_root !== $core_root && ( $state['current_directory_path'] === $core_root || str_starts_with( $state['current_directory_path'], $core_root . '/' ) ) ) {
                 $home_path = $core_root;
             }
 
@@ -184,7 +184,10 @@ class Backup {
                 }
 
                 $full_path = $state['current_directory_path'] . '/' . $item;
-                $relative_path = ltrim( str_replace( $home_path, '', $full_path ), '/' );
+                // Strip $home_path from the start only: unanchored str_replace() corrupts
+                // paths on hosts like Flywheel where ABSPATH is /wordpress/ (stripping
+                // /wordpress from wp-admin/images/wordpress-logo.svg and tinymce/plugins/wordpress/).
+                $relative_path = ltrim( strpos( $full_path, $home_path . '/' ) === 0 ? substr( $full_path, strlen( $home_path ) ) : ( $full_path === $home_path ? '' : $full_path ), '/' );
                 if ( isset( $state['seen_files'][$relative_path] ) ) {
                     continue; // Already processed
                 }
@@ -371,8 +374,8 @@ class Backup {
             $url = "{$this->backup_url}/{$file_name}";
 
             // Keep relative path just in case
-            $relative_path = str_replace( rtrim( ABSPATH, '/' ), '', $chunk_file );
-            $relative_path = ltrim( $relative_path, '/' );
+            $abs_prefix = rtrim( ABSPATH, '/' );
+            $relative_path = ltrim( strpos( $chunk_file, $abs_prefix . '/' ) === 0 ? substr( $chunk_file, strlen( $abs_prefix ) ) : $chunk_file, '/' );
 
             $response[] = (object) [
                 "name"  => $file_name,
