@@ -87,6 +87,7 @@ class Pace {
     public static function journal_add( $h, $record ) {
         if ( $h ) {
             fwrite( $h, wp_json_encode( $record ) . "\n" );
+            fflush( $h );
         }
     }
 

@@ -621,6 +621,7 @@ class Pull {
         if ( ! preg_match( '#^https?://#', $source_url ) ) {
             $source_url = 'https://' . $source_url;
         }
+        $existed = is_file( $this->state_file );
         // A resume passes no token: the one this move connected with, kept
         // in pull-secret.php, when it's the same source.
         if ( (string) $source_token === '' ) {
@@ -633,8 +634,10 @@ class Pull {
         // A connect that failed after it saved the connection (the source's
         // preflight, the site it named, a busy source) leaves nothing
         // behind: no move listed as unfinished that can't be resumed, and
-        // not the source's token on disk for a week.
-        if ( is_wp_error( $r ) && is_file( $this->state_file ) && ! Import::has_restore_point( dirname( $this->state_file ) ) ) {
+        // not the source's token on disk for a week. Never remove a move
+        // that already existed before this call (a transient error during
+        // resume must not wipe its staging directory).
+        if ( is_wp_error( $r ) && ! $existed && is_file( $this->state_file ) && ! Import::has_restore_point( dirname( $this->state_file ) ) ) {
             $this->import->cancel( 'cleanup' );
         }
         return $r;
@@ -1180,10 +1183,12 @@ class Pull {
         if ( ! is_array( $memory ) || ! array_key_exists( 'previous', $memory ) ) {
             return;
         }
-        $file   = (string) ( $memory['file'] ?? '' );
-        if ( $file === '' || strpos( wp_normalize_path( $file ), wp_normalize_path( self::pulls_dir() ) . '/' ) !== 0 ) {
+        $file = (string) ( $memory['file'] ?? '' );
+        $name = basename( $file );
+        if ( $file === '' || ! preg_match( '/^[a-f0-9]{32}\.php$/', $name ) ) {
             return;
         }
+        $file = self::pulls_dir() . '/' . $name;
         if ( ! $with_files ) {
             $raw  = (string) @file_get_contents( $file );
             $nl   = strpos( $raw, "\n" );
@@ -1202,6 +1207,7 @@ class Pull {
         if ( $memory['previous'] === null ) {
             @unlink( $file );
         } else {
+            Storage::ensure_dir( self::pulls_dir() );
             file_put_contents( $file, (string) $memory['previous'] );
         }
         @unlink( $saved );
@@ -1256,15 +1262,41 @@ class Pull {
                 // Past its restore point, it's kept until it's resumed,
                 // discarded or rolled back, however long that takes.
                 'idle_days'      => (int) floor( $ago / DAY_IN_SECONDS ),
-                // Worked on in the last two minutes: something (another tab,
-                // a terminal, a push from the source) may still be running
-                // it, so Resume, Discard and Roll back wait or ask.
-                'active'         => $ago < 120,
+                // Worked on in the last two minutes, or locked by a running
+                // WP-CLI process: something (another tab, a terminal, a push
+                // from the source) may still be running it, so Resume, Discard
+                // and Roll back wait or ask.
+                'active'         => $ago < 120 || self::is_locked( $id ),
                 'active_ago'     => $ago,
             ];
         }
         usort( $out, function ( $a, $b ) { return $b['touched'] - $a['touched']; } );
         return $out;
+    }
+
+    /**
+     * Whether another process currently holds move $import_id's run lock
+     * (see lock_run()).
+     */
+    public static function is_locked( $import_id ) {
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) );
+        if ( $import_id === '' ) {
+            return false;
+        }
+        $lock = Storage::base_dir() . '/_import_' . $import_id . '/run.lock';
+        if ( ! is_file( $lock ) ) {
+            return false;
+        }
+        $h = @fopen( $lock, 'c' );
+        if ( ! $h ) {
+            return false;
+        }
+        $locked = ! flock( $h, LOCK_EX | LOCK_NB );
+        if ( ! $locked ) {
+            flock( $h, LOCK_UN );
+        }
+        fclose( $h );
+        return $locked;
     }
 
     /**
@@ -1298,41 +1330,85 @@ class Pull {
     /**
      * Another move into this site that's running now, or null: one whose
      * run lock a WP-CLI process holds (see lock_run()), or an unfinished
-     * one worked on in the last two minutes (a dashboard move, whose steps
-     * are separate requests). $into: the new move goes into a subsite or
-     * tenant; two such moves don't share tables or folders, so they may
-     * run side by side. A whole-site move waits for anything, and anything
-     * waits for it.
+     * pull or backup-zip restore worked on in the last two minutes (a
+     * dashboard move, whose steps are separate requests). $into: bool or
+     * target identifier ("new", "5", etc.) when the new move goes into a
+     * subsite or tenant; two targeted moves into different sites don't
+     * share tables or folders, so they may run side by side, while two
+     * targeting the same existing site ID conflict. A whole-site move waits
+     * for anything, and anything waits for it.
      */
     public static function running( $except = '', $into = false ) {
         $except = (string) $except;
+        if ( is_string( $into ) ) {
+            $into_id = strtolower( trim( $into ) );
+            if ( $into_id === '' || $into_id === 'site' ) {
+                $is_into = false;
+                $into_id = '';
+            } else {
+                $is_into = true;
+            }
+        } else {
+            $is_into = (bool) $into;
+            $into_id = '';
+        }
         $active = [];
         foreach ( self::unfinished() as $m ) {
             $active[ $m['id'] ] = $m;
         }
+        $ids = Scope::ids();
         foreach ( (array) glob( Storage::base_dir() . '/_import_*', GLOB_ONLYDIR ) as $dir ) {
             $id = substr( basename( $dir ), strlen( '_import_' ) );
             if ( $id === $except || is_link( $dir ) ) {
                 continue;
             }
-            $state = is_file( $dir . '/pull.json' ) ? json_decode( (string) file_get_contents( $dir . '/pull.json' ), true ) : null;
-            if ( is_array( $state ) && isset( $state['owner'] ) && (string) $state['owner'] !== self::owner() ) {
-                continue; // another site's of the install
-            }
-            $busy = ! empty( $active[ $id ]['active'] );
-            if ( ! $busy && is_file( $dir . '/run.lock' ) && ( $h = @fopen( $dir . '/run.lock', 'c' ) ) ) {
-                $busy = ! flock( $h, LOCK_EX | LOCK_NB );
-                if ( ! $busy ) {
-                    flock( $h, LOCK_UN );
+            $state       = is_file( $dir . '/pull.json' ) ? json_decode( (string) file_get_contents( $dir . '/pull.json' ), true ) : null;
+            $target_data = is_file( $dir . '/target.json' ) ? json_decode( (string) file_get_contents( $dir . '/target.json' ), true ) : null;
+            if ( is_array( $state ) && isset( $state['owner'] ) ) {
+                if ( (string) $state['owner'] !== self::owner() ) {
+                    continue; // another site's of the install
                 }
-                fclose( $h );
+            } else {
+                $meta = Import::rollback_meta( $dir . '/rollback' );
+                if ( is_array( $meta ) && ! Import::point_is_here( $meta ) ) {
+                    continue; // another site's restore point
+                }
+                if ( is_array( $target_data ) && $ids && (string) $ids['current'] !== (string) $ids['main'] ) {
+                    $t_id = strtolower( trim( (string) ( $target_data['id'] ?? '' ) ?: (string) ( $target_data['into'] ?? '' ) ) );
+                    if ( $t_id !== (string) $ids['current'] ) {
+                        continue; // main site's targeted move into a different site
+                    }
+                }
+            }
+            $busy = ! empty( $active[ $id ]['active'] ) || self::is_locked( $id );
+            if ( ! $busy && ! is_array( $state ) && ( is_dir( $dir . '/staging' ) || is_file( $dir . '/rollback-state.php' ) ) ) {
+                $touched = max( (int) @filemtime( $dir ), (int) @filemtime( $dir . '/staging' ), (int) @filemtime( $dir . '/staging/public' ) );
+                foreach ( (array) glob( $dir . '/*', GLOB_NOSORT ) as $f ) {
+                    $touched = max( $touched, (int) @filemtime( $f ) );
+                }
+                if ( time() - $touched < 120 ) {
+                    $busy = true;
+                }
             }
             if ( ! $busy ) {
                 continue;
             }
-            $other_into = is_file( $dir . '/target.json' ) || ! empty( $state['move']['args']['into'] );
-            if ( $into && $other_into ) {
-                continue;
+            $other_into_id = '';
+            if ( is_array( $target_data ) ) {
+                $other_into_id = strtolower( trim( (string) ( $target_data['id'] ?? '' ) ?: (string) ( $target_data['into'] ?? '' ) ) );
+            }
+            if ( $other_into_id === '' && ! empty( $state['move']['args']['into'] ) ) {
+                $other_into_id = strtolower( trim( (string) $state['move']['args']['into'] ) );
+                if ( $other_into_id === 'site' ) {
+                    $other_into_id = '';
+                }
+            }
+            $other_is_into = $other_into_id !== '' || is_file( $dir . '/target.json' );
+            if ( $is_into && $other_is_into ) {
+                $same_site = $into_id !== '' && $into_id !== 'new' && $other_into_id !== '' && $other_into_id !== 'new' && $into_id === $other_into_id;
+                if ( ! $same_site ) {
+                    continue;
+                }
             }
             return [
                 'id'     => $id,
@@ -2485,6 +2561,13 @@ class Pull {
         $state  = $this->state();
         $known  = array_column( (array) ( $state['tables'] ?? [] ), 'name' );
         $rows   = array_values( array_intersect( array_map( 'strval', (array) $skip_rows ), $known ) );
+        $prefix = (string) ( $state['source_prefix'] ?? '' );
+        if ( $prefix !== '' && $rows ) {
+            $required = '/^' . preg_quote( $prefix, '/' ) . '(?:(?:\d+_)?options|users|usermeta|site|sitemeta|blogs)$/i';
+            $rows     = array_values( array_filter( $rows, function ( $table ) use ( $required ) {
+                return ! preg_match( $required, $table );
+            } ) );
+        }
         list( $kept, $left_files, $left_bytes ) = Skips::filter_files( $files, $skip_paths, $skip_names );
 
         file_put_contents( $state['file_list'], wp_json_encode( $kept ) );

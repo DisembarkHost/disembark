@@ -130,7 +130,7 @@ class Updater {
         // trusted ahead of a move, so sites on this version keep updating
         // whichever address the manifest names.
         return is_string( $url ) && strpos( $url, '..' ) === false
-            && (bool) preg_match( '#^https://github\.com/(?:DisembarkHost|anchorhost)/disembark/releases/download/v?[0-9][0-9A-Za-z.+-]*/disembark\.zip$#', $url );
+            && (bool) preg_match( '#^https://github\.com/(?:DisembarkHost|anchorhost)/disembark/releases/download/v?[0-9][0-9A-Za-z.+-]*/disembark\.zip\z#', $url );
     }
 
     function info( $response, $action, $args ) {

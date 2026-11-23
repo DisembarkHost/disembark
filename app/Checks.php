@@ -156,6 +156,12 @@ class Checks {
             }
         }
         $here = (int) $wpdb->get_var( $wpdb->prepare( 'SELECT SUM(data_length + index_length) FROM information_schema.TABLES WHERE table_schema = %s', DB_NAME ) );
+        if ( $here === 0 && Import::on_sqlite() ) {
+            $sqlite_db = defined( 'FQDB' ) ? (string) FQDB : ( ( defined( 'FQDBDIR' ) ? rtrim( (string) FQDBDIR, '/' ) : WP_CONTENT_DIR . '/database' ) . '/' . ( defined( 'DB_FILE' ) ? (string) DB_FILE : '.ht.sqlite' ) );
+            if ( is_file( $sqlite_db ) ) {
+                $here = (int) @filesize( $sqlite_db );
+            }
+        }
         $need = $download + $db_dump + $replaced + $here + $db_in;
         $free = function_exists( 'disk_free_space' ) ? @disk_free_space( Storage::base_dir() ) : false;
 
@@ -238,7 +244,7 @@ class Checks {
                 . ', ' . implode( ', ', array_slice( $too_long, 0, 5 ) ) . ' would be over the 64 characters MySQL allows.';
             $add( 'block', 'table_names', 'Table names would be too long', $detail );
         }
-        $lower = (string) $wpdb->get_var( "SELECT @@lower_case_table_names" );
+        $lower = Import::on_sqlite() ? '' : (string) $wpdb->get_var( "SELECT @@lower_case_table_names" );
         if ( $lower !== '' && $lower !== '0' ) {
             $groups = [];
             foreach ( $names as $name ) {

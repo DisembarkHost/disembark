@@ -350,7 +350,8 @@ class Verify {
                 continue;
             }
             $cond = '(' . implode( ' OR ', $where ) . ')';
-            if ( $table === $wpdb->options ) {
+            $options_table = self::$target ? (string) self::$target['prefix'] . 'options' : $wpdb->options;
+            if ( $table === $options_table ) {
                 $cond .= " AND option_name NOT LIKE 'disembark\\_%' AND option_name NOT LIKE '\\_transient%' AND option_name NOT LIKE '\\_site\\_transient%'";
             }
             $count = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$q} WHERE {$cond}" );
@@ -384,15 +385,28 @@ class Verify {
             foreach ( $needles as $needle ) {
                 $where[] = $wpdb->prepare( 'user_url LIKE %s', '%' . $wpdb->esc_like( $needle ) . '%' );
             }
-            $ids   = implode( ',', array_map( 'intval', array_slice( $users, 0, 50000 ) ) );
-            $cond  = "ID IN ({$ids}) AND (" . implode( ' OR ', $where ) . ')';
-            $count = (int) $wpdb->get_var( "SELECT COUNT(*) FROM `{$users_table}` WHERE {$cond}" );
+            $match      = '(' . implode( ' OR ', $where ) . ')';
+            $count      = 0;
+            $sample_row = null;
+            foreach ( array_chunk( array_slice( $users, 0, 50000 ), 500 ) as $chunk ) {
+                $ids = implode( ',', array_map( 'intval', $chunk ) );
+                if ( $ids === '' ) {
+                    continue;
+                }
+                $cond = "ID IN ({$ids}) AND {$match}";
+                $n    = (int) $wpdb->get_var( "SELECT COUNT(*) FROM `{$users_table}` WHERE {$cond}" );
+                if ( $n ) {
+                    $count += $n;
+                    if ( $sample_row === null && count( $out['samples'] ) < 8 ) {
+                        $sample_row = $wpdb->get_row( "SELECT ID, user_url FROM `{$users_table}` WHERE {$cond} LIMIT 1", ARRAY_A );
+                    }
+                }
+            }
             if ( $count ) {
                 $out['rows'] += $count;
                 $out['tables'][ $users_table ] = [ 'rows' => $count, 'no_primary_key' => false ];
-                $row = $wpdb->get_row( "SELECT ID, user_url FROM `{$users_table}` WHERE {$cond} LIMIT 1", ARRAY_A );
-                if ( $row && count( $out['samples'] ) < 8 ) {
-                    $out['samples'][] = [ 'table' => $users_table, 'column' => 'user_url', 'key' => 'ID=' . $row['ID'], 'excerpt' => substr( (string) $row['user_url'], 0, 120 ) ];
+                if ( $sample_row && count( $out['samples'] ) < 8 ) {
+                    $out['samples'][] = [ 'table' => $users_table, 'column' => 'user_url', 'key' => 'ID=' . $sample_row['ID'], 'excerpt' => substr( (string) $sample_row['user_url'], 0, 120 ) ];
                 }
             }
         }

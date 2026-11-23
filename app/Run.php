@@ -84,7 +84,21 @@ class Run {
             // restore points move into the main site's (version 4).
             // Folders kept under a custom upload_path move to the
             // constant-based folder first (version 5, see Storage::base_dir()).
-            $done = Storage::adopt_legacy( microtime( true ) + 5 );
+            $legacy_tries = (int) get_site_option( 'disembark_storage_legacy_tries', 0 );
+            if ( $legacy_tries >= 5 ) {
+                $legacy_done = true;
+            } else {
+                $legacy_done = Storage::adopt_legacy( microtime( true ) + 5 );
+                if ( ! $legacy_done ) {
+                    $legacy_tries++;
+                    update_site_option( 'disembark_storage_legacy_tries', $legacy_tries );
+                    if ( $legacy_tries >= 5 ) {
+                        error_log( 'Disembark: could not move all legacy storage files from ' . Storage::legacy_base_dir() . ' into ' . $base . ' after ' . $legacy_tries . ' attempts; continuing.' );
+                        $legacy_done = true;
+                    }
+                }
+            }
+            $done = $legacy_done;
             $done = $done && ( ! is_multisite() || Import::adopt_subsite_storage( microtime( true ) + 5 ) );
             $done = $done && Import::protect_legacy_storage( microtime( true ) + 5 );
             flock( $lock, LOCK_UN );
@@ -94,6 +108,7 @@ class Run {
             }
             @unlink( $base . '/upgrade.lock' );
         }
+        delete_site_option( 'disembark_storage_legacy_tries' );
         update_site_option( 'disembark_storage_version', self::STORAGE_VERSION );
     }
 
@@ -742,7 +757,9 @@ class Run {
         // One site of a shared install (a pull that chose one, or a request
         // that reached a subsite or tenant by its own address): its tables,
         // by the names it exports them under.
-        $scope = Scope::from_request( $request );
+        $scope = Storage::sanitize_session( (string) ( $request->get_param( 'backup_token' ) ?? '' ) ) !== ''
+            ? self::session_scope( $request )
+            : Scope::from_request( $request );
         if ( is_wp_error( $scope ) ) {
             return $scope;
         }
@@ -1046,7 +1063,9 @@ class Run {
         $token = Storage::sanitize_session( (string) ( $get( 'backup_token' ) ?? '' ) );
         $meta  = $token !== '' ? Backup::session_meta( $token ) : null;
         $known = is_array( $meta ) && array_key_exists( 'site', $meta );
-        if ( $known && trim( (string) ( $get( 'site' ) ?? '' ) ) === '' && (string) $meta['site'] !== '' ) {
+        $ids   = Scope::ids();
+        $main  = ! $ids || (string) $ids['current'] === (string) $ids['main'];
+        if ( $known && $main && trim( (string) ( $get( 'site' ) ?? '' ) ) === '' && (string) $meta['site'] !== '' ) {
             if ( is_array( $params ) ) {
                 $params['site'] = (string) $meta['site'];
             } else {
@@ -1112,7 +1131,7 @@ class Run {
 
         // wp-config.php holds credentials and is deliberately never deployed
         // by a restore — keep the file editor consistent with that rule.
-        if ( basename( $full_path ) === 'wp-config.php' ) {
+        if ( strtolower( basename( $full_path ) ) === 'wp-config.php' ) {
             return new \WP_Error( 'protected_file', 'wp-config.php cannot be modified through Disembark.', [ 'status' => 400 ] );
         }
 
@@ -1160,11 +1179,6 @@ class Run {
             return $old_path_relative;
         }
 
-        // Same wp-config.php protection as save_file, in both directions.
-        if ( basename( $old_path_relative ) === 'wp-config.php' || $new_name === 'wp-config.php' ) {
-            return new \WP_Error( 'protected_file', 'wp-config.php cannot be renamed through Disembark.', [ 'status' => 400 ] );
-        }
-
         // Resolve Paths
         $base_dir = realpath( dirname( WP_CONTENT_DIR ) );
         $core_dir = realpath( ABSPATH );
@@ -1182,6 +1196,11 @@ class Run {
         };
         if ( ! $old_full_path || ( ! $inside( $base_dir ) && ! $inside( $core_dir ) ) ) {
             return new \WP_Error( 'invalid_path', 'Invalid source file.', [ 'status' => 400 ] );
+        }
+
+        // Same wp-config.php protection as save_file, in both directions.
+        if ( strtolower( basename( $old_full_path ) ) === 'wp-config.php' || strtolower( $new_name ) === 'wp-config.php' ) {
+            return new \WP_Error( 'protected_file', 'wp-config.php cannot be renamed through Disembark.', [ 'status' => 400 ] );
         }
 
         // Calculate new full path
@@ -1435,7 +1454,7 @@ class Run {
             header("HTTP/1.1 400 Bad Request");
             die('400 Bad Request: Invalid file path.');
         }
-        if ( !file_exists($full_path) || !is_readable($full_path) ) {
+        if ( !is_file($full_path) || !is_readable($full_path) ) {
             header("HTTP/1.1 404 Not Found");
             die('404 Not Found: File does not exist or is not readable.');
         }
@@ -1611,7 +1630,9 @@ class Run {
         $tables = isset( $params['tables'] ) && is_array( $params['tables'] ) ? array_values( array_filter( $params['tables'], 'is_string' ) ) : null;
         // The restore point is a move's first change: never while another
         // move into this site is running (see Pull::running()).
-        if ( $tables === null && ( $other = Pull::running( preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) ), (bool) $import->target() ) ) ) {
+        $target = $import->target();
+        $into   = $target ? ( (string) $target->into ?: (string) $target->id ?: true ) : false;
+        if ( $tables === null && ( $other = Pull::running( preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) ), $into ) ) ) {
             return new \WP_Error( 'move_running', 'Another move into this site is running now' . ( $other['source'] !== '' ? ' (from ' . $other['source'] . ')' : '' ) . '. Two at once would replace the same tables and files. Let it finish, or stop it, then try again. Nothing here was changed.', [ 'status' => 409 ] );
         }
         return $import->snapshot( (string) ( $params['label'] ?? '' ), self::paced( $params ), $tables );
@@ -1634,7 +1655,7 @@ class Run {
         if ( ! User::allowed( $request ) ) {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
-        $scope = Scope::from_request( $request );
+        $scope = self::session_scope( $request );
         if ( is_wp_error( $scope ) ) {
             return $scope;
         }
@@ -2207,10 +2228,11 @@ class Run {
         if ( ! empty( $params['later'] ) ) {
             return $import->rollback_through( self::paced( $params ), $opts );
         }
-        if ( empty( $params['only'] ) && ( $refused = $import->later_refusal( $opts['files'] ) ) ) {
+        $budget = self::paced( $params );
+        if ( empty( $params['only'] ) && ( $refused = $import->later_refusal( $opts['files'], $budget !== null ) ) ) {
             return $refused;
         }
-        return $import->rollback( self::paced( $params ), $opts );
+        return $import->rollback( $budget, $opts );
     }
 
     function import_finalize( $request ) {
@@ -2248,6 +2270,9 @@ class Run {
         }
         $base    = Storage::base_dir();
         $session = Storage::sanitize_session( $request['backup_token'] ?? '' );
+        if ( $session === 'pulls' ) {
+            return new \WP_Error( 'invalid_session', 'The pulls folder cannot be removed as a backup session.', [ 'status' => 400 ] );
+        }
         $targets = [];
         $active  = [];
         $others  = 0;
@@ -2279,7 +2304,7 @@ class Run {
                     foreach ( (array) glob( $dir . '/*', GLOB_NOSORT ) as $f ) {
                         $touched = max( $touched, (int) @filemtime( $f ) );
                     }
-                    if ( is_array( $state ) || is_file( $dir . '/rollback-state.php' ) || is_dir( $dir . '/staging' ) || $touched > time() - 2 * MINUTE_IN_SECONDS ) {
+                    if ( is_array( $state ) || is_file( $dir . '/rollback-state.php' ) || is_dir( $dir . '/staging' ) || $touched > time() - 2 * MINUTE_IN_SECONDS || Pull::is_locked( $id ) ) {
                         $active[] = $id;
                         continue;
                     }
