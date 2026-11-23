@@ -459,11 +459,12 @@ class Backup {
                 fclose( $file_handle );
                 return $backup_url;
             }
+            $insert_sql .= "SET FOREIGN_KEY_CHECKS = 0;\n";
+            $insert_sql .= "SET UNIQUE_CHECKS = 0;\n";
+            $insert_sql .= 'DROP TABLE IF EXISTS ' . self::ident( $table ) . ";\n";
             $insert_sql .= str_replace( "\n", '', $scope ? $scope->create( $create_table_array[1], $table, $real ) : $create_table_array[1] ) . ";\n";
             unset( $create_table_array );
             $insert_sql .= "/*!40000 ALTER TABLE " . self::ident( $table ) . " DISABLE KEYS */;\n";
-            $insert_sql .= "SET FOREIGN_KEY_CHECKS = 0;\n";
-            $insert_sql .= "SET UNIQUE_CHECKS = 0;\n";
         }
 
         $query_count = 0;
@@ -621,7 +622,7 @@ class Backup {
                 }
                 continue;
             }
-            if ( ! $write( str_replace( "\n", '', $create_table[0][1] ) . ";\n/*!40000 ALTER TABLE " . self::ident( $table ) . " DISABLE KEYS */;\n" ) ) {
+            if ( ! $write( 'DROP TABLE IF EXISTS ' . self::ident( $table ) . ";\n" . str_replace( "\n", '', $create_table[0][1] ) . ";\n/*!40000 ALTER TABLE " . self::ident( $table ) . " DISABLE KEYS */;\n" ) ) {
                 return $fail( 'Could not write the database export (disk full?).' );
             }
 
@@ -812,7 +813,7 @@ class Backup {
                     $cur = [ 't' => $cur['t'] + 1, 'started' => false, 'key' => null, 'offset' => 0, 'rows' => 0 ];
                     continue;
                 }
-                if ( ! $write( str_replace( "\n", '', $sql ) . ";\n/*!40000 ALTER TABLE " . self::ident( $table ) . " DISABLE KEYS */;\n" ) ) {
+                if ( ! $write( 'DROP TABLE IF EXISTS ' . self::ident( $table ) . ";\n" . str_replace( "\n", '', $sql ) . ";\n/*!40000 ALTER TABLE " . self::ident( $table ) . " DISABLE KEYS */;\n" ) ) {
                     $wpdb->query( 'COMMIT' );
                     return $disk_full;
                 }
