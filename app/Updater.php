@@ -125,9 +125,12 @@ class Updater {
      */
     public static function trusted_package( $url ) {
         // Only this plugin's own release assets: no other repository, no dot
-        // segments that a client would normalise into another path.
+        // segments that a client would normalise into another path. Under
+        // DisembarkHost, where it lives, or anchorhost, where it may move:
+        // trusted ahead of a move, so sites on this version keep updating
+        // whichever address the manifest names.
         return is_string( $url ) && strpos( $url, '..' ) === false
-            && (bool) preg_match( '#^https://github\.com/DisembarkHost/disembark/releases/download/v?[0-9][0-9A-Za-z.+-]*/disembark\.zip$#', $url );
+            && (bool) preg_match( '#^https://github\.com/(?:DisembarkHost|anchorhost)/disembark/releases/download/v?[0-9][0-9A-Za-z.+-]*/disembark\.zip$#', $url );
     }
 
     function info( $response, $action, $args ) {
