@@ -4099,6 +4099,16 @@ class Import {
                     },
                     $statement
                 );
+                // A view names its own tables, and itself, in its body: a
+                // subsite's view (CREATE VIEW `wp_2_x` AS select from
+                // `wp_2_y`) pulled out as a single site goes in as `wp_x`
+                // reading `wp_y`, or it fails once the tables are swapped in.
+                // MySQL writes every identifier of a view's definition in
+                // backticks; mysqldump splits the head into versioned comments.
+                $flat = ltrim( (string) preg_replace( '/\s+/', ' ', (string) preg_replace( '/\/\*M?!\d*|\*\//', ' ', substr( $statement, 0, 600 ) ) ) );
+                if ( preg_match( '/^CREATE\s+(?:OR\s+REPLACE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?VIEW\b/i', $flat ) ) {
+                    $statement = str_replace( '`' . $old_prefix, '`' . $new_prefix, $statement );
+                }
                 // Foreign keys name their parent table too (backticked or unbackticked).
                 if ( preg_match( '/^(?:\/\*M?!\d*\s*)?(?:CREATE|ALTER)\s+TABLE/i', $statement ) ) {
                     $statement = preg_replace(
