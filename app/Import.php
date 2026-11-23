@@ -1221,6 +1221,14 @@ class Import {
         if ( $sqlite !== '' && strpos( $rel . '/', $sqlite . '/' ) === 0 ) {
             return true;
         }
+        // A SQLite source's database file, on a site that isn't SQLite: the
+        // database came across as SQL, and the file (the whole old database,
+        // behind only an .htaccess rule nginx ignores) would sit unused in
+        // the web root. What the SQLite plugin writes there is left out:
+        // .ht.sqlite, its hashed .ht.* folder and db-path.php.
+        if ( $sqlite === '' && ! self::on_sqlite() && preg_match( '#^wp-content/database/(?:\.ht\.|db-path\.php$)#i', $rel ) ) {
+            return true;
+        }
         // Database exports (Database tab, backups) and anything in a
         // Disembark folder: restore points, staged moves, token guards.
         // Brought along, a source could plant its own token guard here.
