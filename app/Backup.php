@@ -1270,6 +1270,8 @@ class Backup {
 
         if ( $this->archiver_type === 'ZipArchive' ) {
             // ZipArchive::CREATE opens existing files for appending, which is what we want.
+            $store_exts = [ 'jpg' => 1, 'jpeg' => 1, 'png' => 1, 'gif' => 1, 'webp' => 1, 'avif' => 1, 'mp4' => 1, 'mov' => 1, 'm4v' => 1, 'webm' => 1, 'mp3' => 1, 'm4a' => 1, 'ogg' => 1, 'pdf' => 1, 'zip' => 1, 'gz' => 1, 'tgz' => 1, 'bz2' => 1, 'xz' => 1, '7z' => 1, 'rar' => 1, 'woff' => 1, 'woff2' => 1 ];
+            $can_store  = defined( 'ZipArchive::CM_STORE' ) && method_exists( $this->zip_object, 'setCompressionName' );
             if ( $this->zip_object->open( $zip_name, \ZipArchive::CREATE ) === TRUE ) {
                 foreach( $files as $file_obj ) {
                     if ( !is_array($file_obj) || empty($file_obj['name']) ) continue;
@@ -1287,6 +1289,12 @@ class Backup {
 
                     if ( file_exists( $full_file_path ) && is_readable( $full_file_path ) ) {
                         if ( $this->zip_object->addFile( $full_file_path, $file_relative_path ) ) {
+                            if ( $can_store ) {
+                                $ext = strtolower( pathinfo( $file_relative_path, PATHINFO_EXTENSION ) );
+                                if ( isset( $store_exts[ $ext ] ) ) {
+                                    $this->zip_object->setCompressionName( $file_relative_path, \ZipArchive::CM_STORE );
+                                }
+                            }
                             $files_added++;
                         }
                     }
