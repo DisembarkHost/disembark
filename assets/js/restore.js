@@ -1439,7 +1439,10 @@
   /** The steps a rollback to p runs that still hold their files: the choice of Database only matters for any of them. */
   function unspentFiles(points, p) { return [p].concat(laterThan(points, p, true)).some(function (q) { return hasFiles(q) && !q.files_spent && !q.creates_site; }); }
 
-  function missingPreview(e) { return !!(e && e.status === 404 && !(e.data && e.data.code === 'no_rollback')); }
+  function fatalPreview(e) {
+    var code = e && e.data && e.data.code;
+    return !!(e && ((e.status === 404 && code === 'no_rollback') || code === 'other_site_point'));
+  }
   function pointsFromPreview(pv, list) {
     var listed = {};
     (Array.isArray(list) ? list : []).forEach(function (q) { if (q && q.id) listed[q.id] = q; });
@@ -1465,7 +1468,7 @@
     if (!points) {
       var pv = null;
       try { pv = await pending; } catch (e) {
-        if (!missingPreview(e)) throw e;
+        if (fatalPreview(e)) throw e;
       }
       if (!pv || !Array.isArray(pv.steps)) {
         // An older Disembark without the preview: the plain question.
@@ -1579,8 +1582,8 @@
       var r = null;
       try { r = await api.post('restore-points/preview', { import_id: id }); }
       catch (e) {
-        if (missingPreview(e)) return null; // an older Disembark: the plain question
-        throw e;
+        if (fatalPreview(e)) throw e;
+        return null; // an older Disembark or slow preview timeout: fall back to plain confirmation
       }
       if (r && Array.isArray(r.steps)) {
         var list = [];

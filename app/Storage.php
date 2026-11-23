@@ -144,24 +144,23 @@ class Storage {
             if ( is_link( $from ) ) {
                 continue;
             }
-            if ( is_link( $to ) || ( file_exists( $to ) && ! is_dir( $to ) ) ) {
+            if ( is_link( $to ) ) {
+                $done = false;
                 continue;
             }
             if ( ! file_exists( $to ) && @rename( $from, $to ) ) {
                 continue;
             }
             if ( is_dir( $from ) && ( ! file_exists( $to ) || is_dir( $to ) ) ) {
-                if ( ! self::copy_tree( $from, $to, $deadline ) ) {
+                if ( ! self::copy_tree( $from, $to, $deadline, $name === 'pulls' ) ) {
                     $done = false;
                 }
-            } elseif ( is_file( $from ) && ! file_exists( $to ) ) {
-                $tmp = $base . '/.' . $name . '.tmp.' . getmypid();
-                if ( @copy( $from, $tmp ) && @rename( $tmp, $to ) ) {
-                    @unlink( $from );
-                } else {
-                    @unlink( $tmp );
+            } elseif ( is_file( $from ) && ( ! file_exists( $to ) || is_file( $to ) ) ) {
+                if ( ! self::move_legacy_file( $from, $to, false ) ) {
                     $done = false;
                 }
+            } else {
+                $done = false;
             }
         }
         $entries = @scandir( $legacy );
@@ -174,10 +173,41 @@ class Storage {
         return $done;
     }
 
-    /** Copies $from into $to (creating it), deleting each original once copied. Entries already in $to are never overwritten. */
-    private static function copy_tree( $from, $to, $deadline ) {
+    /**
+     * Moves one legacy file $a to $b via an atomic temp file, then removes $a.
+     * For mutable pull memory ($keep_newer = true), a newer non-empty file in
+     * $b wins; for immutable restore-point files, a size mismatch means $b is
+     * a half-copied file from an interrupted run and is replaced atomically.
+     */
+    private static function move_legacy_file( $a, $b, $keep_newer ) {
+        $name = basename( $a );
+        if ( $name === 'index.php' || $name === 'index.html' ) {
+            return @unlink( $a ) || ! file_exists( $a );
+        }
+        if ( is_file( $b ) && ! is_link( $b ) ) {
+            $sa = @filesize( $a );
+            $sb = @filesize( $b );
+            if ( $sa !== false && $sb !== false && $sa === $sb ) {
+                return @unlink( $a ) || ! file_exists( $a );
+            }
+            if ( $keep_newer && $sb !== false && $sb > 0 && (int) @filemtime( $b ) > (int) @filemtime( $a ) ) {
+                return @unlink( $a ) || ! file_exists( $a );
+            }
+        } elseif ( file_exists( $b ) || is_link( $b ) ) {
+            return false;
+        }
+        $tmp = dirname( $b ) . '/.' . $name . '.tmp.' . getmypid();
+        if ( @copy( $a, $tmp ) && @rename( $tmp, $b ) ) {
+            return @unlink( $a ) || ! file_exists( $a );
+        }
+        @unlink( $tmp );
+        return false;
+    }
+
+    /** Copies $from into $to (creating it), deleting each original once copied. */
+    private static function copy_tree( $from, $to, $deadline, $keep_newer = false ) {
         if ( is_link( $to ) || ( file_exists( $to ) && ! is_dir( $to ) ) ) {
-            return true;
+            return false;
         }
         if ( ! is_dir( $to ) && ! wp_mkdir_p( $to ) ) {
             return false;
@@ -193,21 +223,17 @@ class Storage {
             $a = "{$from}/{$name}";
             $b = "{$to}/{$name}";
             if ( is_link( $a ) ) {
-                @unlink( $a );
+                if ( ! @unlink( $a ) ) {
+                    $done = false;
+                }
             } elseif ( is_dir( $a ) ) {
                 if ( ! is_link( $b ) && ( ! file_exists( $b ) || is_dir( $b ) ) ) {
-                    $done = self::copy_tree( $a, $b, $deadline ) && $done;
-                }
-            } elseif ( file_exists( $b ) || is_link( $b ) ) {
-                if ( is_file( $b ) && ! is_link( $b ) && @filesize( $a ) === @filesize( $b ) ) {
-                    @unlink( $a );
+                    $done = self::copy_tree( $a, $b, $deadline, $keep_newer ) && $done;
+                } else {
+                    $done = false;
                 }
             } else {
-                $tmp = $to . '/.' . $name . '.tmp.' . getmypid();
-                if ( @copy( $a, $tmp ) && @rename( $tmp, $b ) ) {
-                    @unlink( $a );
-                } else {
-                    @unlink( $tmp );
+                if ( ! self::move_legacy_file( $a, $b, $keep_newer ) ) {
                     $done = false;
                 }
             }

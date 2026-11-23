@@ -97,7 +97,6 @@ class Target {
      * when it was made after that try began. True when adopted.
      */
     private function adopt_pending() {
-        global $wpdb;
         $p  = (array) $this->pending;
         $at = (int) ( $p['at'] ?? 0 );
         if ( $at <= 0 ) {
@@ -108,13 +107,15 @@ class Target {
             if ( ! $site || (string) $site->domain !== (string) $p['domain'] || (string) $site->path !== (string) $p['path'] ) {
                 return false;
             }
-            $created = strtotime( (string) $site->registered . ' UTC' );
-            if ( $created === false || $created < $at - 5 || $created > $at + 60 ) {
-                return false;
-            }
-            $prefix = $wpdb->get_blog_prefix( (int) $site->blog_id );
-            if ( $prefix === '' || ! empty( $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $prefix ) . '%' ) ) ) ) {
-                return false;
+            if ( ! empty( $p['registered'] ) ) {
+                if ( (string) $site->registered !== (string) $p['registered'] ) {
+                    return false;
+                }
+            } else {
+                $created = strtotime( (string) $site->registered . ' UTC' );
+                if ( $created === false || $created < $at - 5 || $created > $at + 60 ) {
+                    return false;
+                }
             }
             $this->slug    = (string) ( $p['slug'] ?? $this->slug );
             $this->created = true;
@@ -130,25 +131,31 @@ class Target {
                 return false;
             }
             foreach ( (array) Scope::freighter_option( $primary, 'stacked_sites' ) as $site ) {
-                $created = (int) ( $site['created_at'] ?? 0 );
-                if ( (string) ( $site['stacked_site_id'] ?? '' ) === (string) $p['id'] && $created >= $at - 5 && $created <= $at + 60 ) {
-                    $prefix = 'stacked_' . (int) $p['id'] . '_';
-                    if ( (int) $p['id'] < 1 || ! empty( $wpdb->get_col( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $prefix ) . '%' ) ) ) ) {
-                        return false;
-                    }
-                    $this->domain  = (string) ( $site['domain'] ?? '' );
-                    $this->created = true;
-                    $this->locate( (string) $p['id'] );
-                    if ( $this->content !== '' ) {
-                        $this->make_dir( $this->content );
-                        foreach ( [ 'plugins', 'themes', 'uploads' ] as $sub ) {
-                            $this->make_dir( $this->content . '/' . $sub );
-                        }
-                    } elseif ( $this->files === 'hybrid' ) {
-                        $this->make_dir( $this->uploads );
-                    }
-                    return true;
+                if ( (string) ( $site['stacked_site_id'] ?? '' ) !== (string) $p['id'] ) {
+                    continue;
                 }
+                if ( ! empty( $p['marker'] ) ) {
+                    if ( (string) ( $site['disembark_marker'] ?? '' ) !== (string) $p['marker'] ) {
+                        continue;
+                    }
+                } else {
+                    $created = (int) ( $site['created_at'] ?? 0 );
+                    if ( $created < $at - 5 || $created > $at + 60 ) {
+                        continue;
+                    }
+                }
+                $this->domain  = (string) ( $site['domain'] ?? '' );
+                $this->created = true;
+                $this->locate( (string) $p['id'] );
+                if ( $this->content !== '' ) {
+                    $this->make_dir( $this->content );
+                    foreach ( [ 'plugins', 'themes', 'uploads' ] as $sub ) {
+                        $this->make_dir( $this->content . '/' . $sub );
+                    }
+                } elseif ( $this->files === 'hybrid' ) {
+                    $this->make_dir( $this->uploads );
+                }
+                return true;
             }
         }
         return false;
@@ -353,11 +360,13 @@ class Target {
         // The import brings every table, so WordPress (and plugins hooked to
         // a new site) mustn't install the default ones first.
         global $wp_filter;
-        $this->save_pending( [ 'domain' => $domain, 'path' => $path, 'slug' => $slug, 'at' => time() ] );
+        $now        = time();
+        $registered = gmdate( 'Y-m-d H:i:s', $now );
+        $this->save_pending( [ 'domain' => $domain, 'path' => $path, 'slug' => $slug, 'registered' => $registered, 'at' => $now ] );
         $saved = $wp_filter['wp_initialize_site'] ?? null;
         unset( $wp_filter['wp_initialize_site'] );
         try {
-            $id = wp_insert_site( [ 'domain' => $domain, 'path' => $path, 'network_id' => $network->id ] );
+            $id = wp_insert_site( [ 'domain' => $domain, 'path' => $path, 'network_id' => $network->id, 'registered' => $registered ] );
             Scope::forget();
         } finally {
             if ( $saved !== null ) {
@@ -421,9 +430,10 @@ class Target {
                     $domain = '';
                 }
             }
-            $now = time();
-            $this->save_pending( [ 'id' => $id, 'at' => $now ] );
-            $sites[] = [ 'stacked_site_id' => $id, 'created_at' => $now, 'name' => sanitize_text_field( $name ), 'domain' => $mapping ? $domain : '' ];
+            $now    = time();
+            $marker = bin2hex( random_bytes( 8 ) );
+            $this->save_pending( [ 'id' => $id, 'at' => $now, 'marker' => $marker ] );
+            $sites[] = [ 'stacked_site_id' => $id, 'created_at' => $now, 'name' => sanitize_text_field( $name ), 'domain' => $mapping ? $domain : '', 'disembark_marker' => $marker ];
             // The install's first tenant: there is no registry row to update yet.
             if ( $raw === null ) {
                 $ok = $wpdb->insert( $primary . 'options', [ 'option_name' => 'stacked_sites', 'option_value' => serialize( array_values( $sites ) ), 'autoload' => 'yes' ] );
@@ -643,7 +653,7 @@ class Target {
         // renamed: users whose login was taken here and who log in under a
         // new one; unattributed: users who couldn't be added, whose content
         // now has no author rather than someone else's.
-        $blank = [ 'created' => 0, 'matched' => 0, 'renumbered' => 0, 'renamed' => [], 'unattributed' => [], 'orphaned' => 0 ];
+        $blank = [ 'created' => 0, 'matched' => 0, 'renumbered' => 0, 'renamed' => [], 'unattributed' => [], 'orphaned' => 0, 'warnings' => [] ];
         if ( $this->kind !== 'multisite' ) {
             return $blank;
         }
@@ -657,7 +667,7 @@ class Target {
             if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $in_users ) ) ) !== $in_users ) {
                 return $blank;
             }
-            $cur = [ 'phase' => 'old', 'last_user' => 0, 'last_meta' => 0, 'last_primary_blog' => 0, 'map' => [], 'created' => [], 'report' => $blank, 'done_tables' => [], 'subtracting' => '', 'total' => (int) $wpdb->get_var( "SELECT COUNT(*) FROM `{$in_users}`" ) ];
+            $cur = [ 'phase' => 'old', 'last_user' => 0, 'last_meta' => 0, 'last_primary_blog' => 0, 'map' => [], 'created' => [], 'report' => $blank, 'done_tables' => [], 'subtracting' => '', 'offsets' => [], 'total' => (int) $wpdb->get_var( "SELECT COUNT(*) FROM `{$in_users}`" ) ];
         }
         $map     = [];
         foreach ( (array) $cur['map'] as $o => $n ) {
@@ -866,6 +876,7 @@ class Target {
             $moved        = [];
             $same         = [];
             $max_id       = 0;
+            $max_new      = 0;
             foreach ( $map as $old => $new ) {
                 $old = (int) $old;
                 $new = (int) $new;
@@ -875,6 +886,9 @@ class Target {
                 if ( $new > $max_id ) {
                     $max_id = $new;
                 }
+                if ( $new > $max_new ) {
+                    $max_new = $new;
+                }
                 if ( $new === 0 ) {
                     $unattributed[ $old ] = 0;
                 } elseif ( $new !== $old ) {
@@ -882,6 +896,9 @@ class Target {
                 } else {
                     $same[ $old ] = $new;
                 }
+            }
+            if ( ! isset( $cur['offsets'] ) || ! is_array( $cur['offsets'] ) ) {
+                $cur['offsets'] = [];
             }
             $done_tables = array_flip( (array) $cur['done_tables'] );
             foreach ( $columns as $c ) {
@@ -902,44 +919,106 @@ class Target {
                 if ( ! is_array( $col_info ) ) {
                     continue;
                 }
-                $col_type   = strtolower( (string) ( $col_info['Type'] ?? '' ) );
+                $nullable  = isset( $col_info['Null'] ) && strtoupper( (string) $col_info['Null'] ) === 'YES';
+                $empty_val = $nullable ? 'NULL' : '0';
+                $extra     = (string) $where !== '' ? " AND ({$where})" : '';
+                $col_type  = strtolower( (string) ( $col_info['Type'] ?? '' ) );
+                $col_max   = null;
+                $unsigned  = strpos( $col_type, 'unsigned' ) !== false;
+                if ( preg_match( '/^tinyint\b/', $col_type ) ) {
+                    $col_max = $unsigned ? 255 : 127;
+                } elseif ( preg_match( '/^smallint\b/', $col_type ) ) {
+                    $col_max = $unsigned ? 65535 : 32767;
+                } elseif ( preg_match( '/^mediumint\b/', $col_type ) ) {
+                    $col_max = $unsigned ? 16777215 : 8388607;
+                } elseif ( preg_match( '/^int\b/', $col_type ) ) {
+                    $col_max = $unsigned ? 4294967295 : 2147483647;
+                }
                 $col_offset = $offset;
-                if ( preg_match( '/^int\b/', $col_type ) ) {
-                    if ( $max_id < 1000000000 ) {
-                        $col_offset = 1000000000;
-                    } elseif ( strpos( $col_type, 'unsigned' ) !== false && $max_id < 2000000000 ) {
-                        $col_offset = 2000000000;
-                    } else {
-                        $col_offset = 0;
+                if ( $col_max !== null ) {
+                    if ( $max_new > $col_max ) {
+                        $report['warnings'][] = "Column {$table}.{$col} ({$col_type}) is too narrow for network user IDs up to {$max_new}; its user IDs were not renumbered.";
+                        $cur['done_tables'][] = $id;
+                        $done_tables[ $id ]   = true;
+                        $save();
+                        continue;
                     }
-                } elseif ( preg_match( '/^(?:mediumint|smallint|tinyint)\b/', $col_type ) ) {
-                    $col_offset = 0;
+                    if ( isset( $cur['offsets'][ $id ] ) ) {
+                        $col_offset = (int) $cur['offsets'][ $id ];
+                    } else {
+                        $table_max = max( $max_id, (int) $wpdb->get_var( "SELECT MAX(`{$col}`) FROM `{$table}`" . ( (string) $where !== '' ? " WHERE {$where}" : '' ) ) );
+                        if ( $table_max + 1 + $max_new <= $col_max ) {
+                            $col_offset = $table_max + 1;
+                        } elseif ( count( $moved ) + count( $same ) <= 500 ) {
+                            $col_offset = -1; // Single-statement atomic CASE without an offset.
+                        } else {
+                            $col_offset = 0;
+                        }
+                        $cur['offsets'][ $id ] = $col_offset;
+                        $save();
+                    }
                 }
                 if ( $col_offset === 0 ) {
+                    $report['warnings'][] = "Column {$table}.{$col} ({$col_type}) has no headroom to renumber " . ( count( $moved ) + count( $same ) ) . " users without ID collisions; check its user IDs by hand.";
                     $cur['done_tables'][] = $id;
                     $done_tables[ $id ]   = true;
                     $save();
                     continue;
                 }
-                $nullable  = isset( $col_info['Null'] ) && strtoupper( (string) $col_info['Null'] ) === 'YES';
-                $empty_val = $nullable ? 'NULL' : '0';
-                $extra     = (string) $where !== '' ? " AND ({$where})" : '';
+                if ( $col_offset === -1 ) {
+                    // Narrow integer column that fits every new ID without headroom
+                    // for a temporary offset: one atomic CASE updates every row
+                    // against its pre-update value without chaining.
+                    $all = $moved + $same;
+                    if ( $all ) {
+                        $case = '';
+                        foreach ( $all as $old => $new ) {
+                            $case .= ' WHEN ' . (int) $old . ' THEN ' . (int) $new;
+                        }
+                        $sql = "UPDATE `{$table}` SET `{$col}` = CASE `{$col}`{$case} ELSE {$empty_val} END WHERE `{$col}` > 0{$extra}";
+                    } else {
+                        $sql = "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` > 0{$extra}";
+                    }
+                    $suppress = $wpdb->suppress_errors( true );
+                    $res      = $wpdb->query( $sql );
+                    $err      = (string) $wpdb->last_error;
+                    $wpdb->suppress_errors( $suppress );
+                    if ( $res === false ) {
+                        $save();
+                        if ( $journal ) {
+                            fclose( $journal );
+                        }
+                        return new \WP_Error( 'renumber_failed', "Could not renumber user IDs in {$table}.{$col}: " . substr( $err, 0, 160 ), [ 'status' => 500 ] );
+                    }
+                    $report['renumbered'] += (int) $res;
+                    unset( $cur['offsets'][ $id ] );
+                    $cur['done_tables'][] = $id;
+                    $done_tables[ $id ]   = true;
+                    $save();
+                    continue;
+                }
                 // Its last step started before a call was killed: only that
                 // step again (it can run twice), never the renumbering.
                 if ( (string) $cur['subtracting'] !== $id ) {
+                    $failed_rows = false;
+                    $last_err    = '';
                     // Unattributed users ($new === 0) go straight to NULL (for nullable
                     // columns such as wc_customer_lookup.user_id, avoiding UNIQUE index
                     // collisions) or 0 without passing through $col_offset.
                     foreach ( array_chunk( array_keys( $unattributed ), 500 ) as $chunk ) {
-                        $in  = implode( ',', array_map( 'intval', $chunk ) );
-                        $res = $wpdb->query( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` IN ({$in}){$extra}" );
-                        if ( $res !== false ) {
+                        $in       = implode( ',', array_map( 'intval', $chunk ) );
+                        $suppress = $wpdb->suppress_errors( true );
+                        $res      = $wpdb->query( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` IN ({$in}){$extra}" );
+                        if ( $res === false ) {
+                            $failed_rows = true;
+                            $last_err    = (string) $wpdb->last_error;
+                        } else {
                             $report['renumbered'] += (int) $res;
                         }
+                        $wpdb->suppress_errors( $suppress );
                     }
                     // Through a high offset, so 2→5 and 5→9 can't chain; the ones
                     // that keep their ID too, so they aren't taken for orphans.
-                    $failed_rows = false;
                     foreach ( [ $moved, $same ] as $i => $set ) {
                         foreach ( array_chunk( $set, 500, true ) as $chunk ) {
                             $case = '';
@@ -959,13 +1038,21 @@ class Target {
                                     $target_val = (int) $new + $col_offset;
                                     $suppress   = $wpdb->suppress_errors( true );
                                     $one        = $wpdb->query( $wpdb->prepare( "UPDATE `{$table}` SET `{$col}` = {$target_val} WHERE `{$col}` = %d{$extra}", (int) $old ) );
+                                    $one_err    = (string) $wpdb->last_error;
                                     $wpdb->suppress_errors( $suppress );
                                     if ( $one === false ) {
                                         $dup = $wpdb->get_var( "SELECT 1 FROM `{$table}` WHERE `{$col}` = {$target_val}{$extra} LIMIT 1" );
                                         if ( $dup !== null ) {
-                                            $wpdb->query( $wpdb->prepare( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` = %d{$extra}", (int) $old ) );
+                                            $suppress = $wpdb->suppress_errors( true );
+                                            $cleared  = $wpdb->query( $wpdb->prepare( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` = %d{$extra}", (int) $old ) );
+                                            if ( $cleared === false ) {
+                                                $failed_rows = true;
+                                                $last_err    = (string) $wpdb->last_error;
+                                            }
+                                            $wpdb->suppress_errors( $suppress );
                                         } else {
                                             $failed_rows = true;
+                                            $last_err    = $one_err;
                                         }
                                     } elseif ( $i === 0 ) {
                                         $report['renumbered'] += (int) $one;
@@ -976,16 +1063,45 @@ class Target {
                             }
                         }
                     }
-                    if ( ! $failed_rows ) {
-                        $report['orphaned'] += (int) $wpdb->query( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` > 0 AND `{$col}` < {$col_offset}{$extra}" );
+                    if ( $failed_rows ) {
+                        // Keep already-offset rows parked above $col_offset and do NOT
+                        // mark this column done so a retry finishes the failed rows.
+                        $save();
+                        if ( $journal ) {
+                            fclose( $journal );
+                        }
+                        return new \WP_Error( 'renumber_failed', "Could not finish renumbering user IDs in {$table}.{$col}: " . substr( $last_err, 0, 160 ), [ 'status' => 500 ] );
                     }
-                    $cur['subtracting'] = $id;
+                    $suppress = $wpdb->suppress_errors( true );
+                    $orph     = $wpdb->query( "UPDATE `{$table}` SET `{$col}` = {$empty_val} WHERE `{$col}` > 0 AND `{$col}` < {$col_offset}{$extra}" );
+                    $orph_err = (string) $wpdb->last_error;
+                    $wpdb->suppress_errors( $suppress );
+                    if ( $orph === false ) {
+                        $save();
+                        if ( $journal ) {
+                            fclose( $journal );
+                        }
+                        return new \WP_Error( 'renumber_failed', "Could not clear orphaned user IDs in {$table}.{$col}: " . substr( $orph_err, 0, 160 ), [ 'status' => 500 ] );
+                    }
+                    $report['orphaned'] += (int) $orph;
+                    $cur['subtracting']  = $id;
                     $save();
                     if ( $r = $stop() ) {
                         return $r;
                     }
                 }
-                $wpdb->query( "UPDATE `{$table}` SET `{$col}` = `{$col}` - {$col_offset} WHERE `{$col}` >= {$col_offset}{$extra}" );
+                $suppress = $wpdb->suppress_errors( true );
+                $sub      = $wpdb->query( "UPDATE `{$table}` SET `{$col}` = `{$col}` - {$col_offset} WHERE `{$col}` >= {$col_offset}{$extra}" );
+                $sub_err  = (string) $wpdb->last_error;
+                $wpdb->suppress_errors( $suppress );
+                if ( $sub === false ) {
+                    $save();
+                    if ( $journal ) {
+                        fclose( $journal );
+                    }
+                    return new \WP_Error( 'renumber_failed', "Could not finalize renumbered user IDs in {$table}.{$col}: " . substr( $sub_err, 0, 160 ), [ 'status' => 500 ] );
+                }
+                unset( $cur['offsets'][ $id ] );
                 $cur['done_tables'][] = $id;
                 $cur['subtracting']   = '';
                 $done_tables[ $id ]   = true;

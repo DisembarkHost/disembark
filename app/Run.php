@@ -84,21 +84,7 @@ class Run {
             // restore points move into the main site's (version 4).
             // Folders kept under a custom upload_path move to the
             // constant-based folder first (version 5, see Storage::base_dir()).
-            $legacy_tries = (int) get_site_option( 'disembark_storage_legacy_tries', 0 );
-            if ( $legacy_tries >= 5 ) {
-                $legacy_done = true;
-            } else {
-                $legacy_done = Storage::adopt_legacy( microtime( true ) + 5 );
-                if ( ! $legacy_done ) {
-                    $legacy_tries++;
-                    update_site_option( 'disembark_storage_legacy_tries', $legacy_tries );
-                    if ( $legacy_tries >= 5 ) {
-                        error_log( 'Disembark: could not move all legacy storage files from ' . Storage::legacy_base_dir() . ' into ' . $base . ' after ' . $legacy_tries . ' attempts; continuing.' );
-                        $legacy_done = true;
-                    }
-                }
-            }
-            $done = $legacy_done;
+            $done = Storage::adopt_legacy( microtime( true ) + 5 );
             $done = $done && ( ! is_multisite() || Import::adopt_subsite_storage( microtime( true ) + 5 ) );
             $done = $done && Import::protect_legacy_storage( microtime( true ) + 5 );
             flock( $lock, LOCK_UN );
@@ -108,7 +94,6 @@ class Run {
             }
             @unlink( $base . '/upgrade.lock' );
         }
-        delete_site_option( 'disembark_storage_legacy_tries' );
         update_site_option( 'disembark_storage_version', self::STORAGE_VERSION );
     }
 
@@ -1705,6 +1690,9 @@ class Run {
         if ( $import_id === '' ) {
             return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
         }
+        if ( Pull::is_locked( $import_id ) ) {
+            return new \WP_Error( 'move_running', 'This move is still running in another process. Stop it first, then delete its restore point.', [ 'status' => 409 ] );
+        }
         return ( new Import( $import_id ) )->delete_restore_point();
     }
 
@@ -2059,6 +2047,9 @@ class Run {
             return new \WP_Error( 'missing_import_id', 'import_id is required.', [ 'status' => 400 ] );
         }
         $action = (string) ( $request['action'] ?? 'stop' ) === 'cleanup' ? 'cleanup' : 'stop';
+        if ( $action === 'cleanup' && Pull::is_locked( $import_id ) ) {
+            return new \WP_Error( 'move_running', 'This move is still running in another process. Stop it first, then discard it.', [ 'status' => 409 ] );
+        }
         return ( new Import( $import_id ) )->cancel( $action, ! empty( $request['delete_restore_point'] ) );
     }
 
@@ -2211,10 +2202,17 @@ class Run {
             return new \WP_Error( 'rest_forbidden', 'Sorry, you are not allowed to do that.', [ 'status' => 403 ] );
         }
         $params    = $request->get_json_params();
-        $import_id = $params['import_id'] ?? '';
+        $import_id = preg_replace( '/[^a-f0-9]/', '', strtolower( (string) ( $params['import_id'] ?? '' ) ) );
 
-        if ( empty( $import_id ) ) {
+        if ( $import_id === '' ) {
             return new \WP_Error( 'missing_import_id', 'import_id (rollback_id) is required.', [ 'status' => 400 ] );
+        }
+        if ( Pull::is_locked( $import_id ) ) {
+            return new \WP_Error( 'move_running', 'This move is still running in another process. Stop it before rolling it back.', [ 'status' => 409 ] );
+        }
+        $other = Pull::running( $import_id );
+        if ( is_array( $other ) && Pull::is_locked( (string) ( $other['id'] ?? '' ) ) ) {
+            return new \WP_Error( 'move_running', 'Another move into this site is running now (' . $other['id'] . '). Wait for it to finish or stop it before rolling back.', [ 'status' => 409 ] );
         }
 
         $import = new Import( $import_id );

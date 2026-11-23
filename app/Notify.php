@@ -138,6 +138,27 @@ class Notify {
         return [ 'sent' => true, 'results' => $results ];
     }
 
+    /**
+     * Sends a notice directly to $to without creating an import folder on disk
+     * (for refusals that happen before a move starts or is confirmed).
+     */
+    public static function send_to( $to, $event, $details = [] ) {
+        $targets = self::parse( $to );
+        if ( is_wp_error( $targets ) || ( ! $targets['emails'] && ! $targets['webhooks'] ) ) {
+            return [ 'sent' => false, 'reason' => 'no one to notify' ];
+        }
+        $event = in_array( $event, [ 'finished', 'failed', 'cancelled' ], true ) ? $event : 'finished';
+        list( $subject, $text ) = self::message( $event, (array) $details );
+        $results = [];
+        foreach ( $targets['emails'] as $email ) {
+            $results[ $email ] = self::email( $email, $subject, $text );
+        }
+        foreach ( $targets['webhooks'] as $url ) {
+            $results[ $url ] = self::webhook( $url, $event, $text, (array) $details );
+        }
+        return [ 'sent' => true, 'results' => $results ];
+    }
+
     private static function message( $event, $d ) {
         $kind  = ucfirst( (string) ( $d['kind'] ?? 'move' ) );
         $from  = (string) ( $d['source'] ?? '' );

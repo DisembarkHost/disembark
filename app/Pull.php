@@ -621,7 +621,6 @@ class Pull {
         if ( ! preg_match( '#^https?://#', $source_url ) ) {
             $source_url = 'https://' . $source_url;
         }
-        $existed = is_file( $this->state_file );
         // A resume passes no token: the one this move connected with, kept
         // in pull-secret.php, when it's the same source.
         if ( (string) $source_token === '' ) {
@@ -634,10 +633,8 @@ class Pull {
         // A connect that failed after it saved the connection (the source's
         // preflight, the site it named, a busy source) leaves nothing
         // behind: no move listed as unfinished that can't be resumed, and
-        // not the source's token on disk for a week. Never remove a move
-        // that already existed before this call (a transient error during
-        // resume must not wipe its staging directory).
-        if ( is_wp_error( $r ) && ! $existed && is_file( $this->state_file ) && ! Import::has_restore_point( dirname( $this->state_file ) ) ) {
+        // not the source's token on disk for a week.
+        if ( is_wp_error( $r ) && is_file( $this->state_file ) && ! Import::has_restore_point( dirname( $this->state_file ) ) ) {
             $this->import->cancel( 'cleanup' );
         }
         return $r;

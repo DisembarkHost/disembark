@@ -115,14 +115,16 @@
     function searchReplace(selected) {
       var from = h('input', { class: 'dsk-input mono', placeholder: 'https://old-address.com', spellcheck: 'false' });
       var to = h('input', { class: 'dsk-input mono', placeholder: 'https://new-address.com', spellcheck: 'false' });
-      var onlySelected = selected.length ? D.toggle('Only the ' + D.fmt.plural(selected.length, 'selected table'), false, function () { result.replaceChildren(); }) : null;
+      var previewSeq = 0;
+      function clearPreview() { previewSeq++; result.replaceChildren(); }
+      var onlySelected = selected.length ? D.toggle('Only the ' + D.fmt.plural(selected.length, 'selected table'), false, clearPreview) : null;
       // This site's own tables by default: on a network or WP Freighter
       // install, the other sites' tables (and another WordPress sharing the
       // database) only when asked for.
-      var everyTable = D.toggle('Every table in the database, not just this site’s', false, function () { result.replaceChildren(); });
+      var everyTable = D.toggle('Every table in the database, not just this site’s', false, clearPreview);
       var result = h('div');
       var previewBtn = h('button', { class: 'dsk-btn primary', onclick: preview }, D.icon('search'), 'Preview changes');
-      [from, to].forEach(function (i) { i.addEventListener('input', function () { result.replaceChildren(); }); i.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); preview(); } }); });
+      [from, to].forEach(function (i) { i.addEventListener('input', clearPreview); i.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); preview(); } }); });
       function scope() { return onlySelected && onlySelected.input.checked ? selected : []; }
       function allTables() { return !scope().length && everyTable.input.checked ? 1 : 0; }
       // While a replace (or its undo) runs, the dialog stays open: closing it
@@ -146,32 +148,33 @@
       });
       async function preview() {
         if (!from.value) { from.focus(); return; }
+        var seq = ++previewSeq, f = from.value, t = to.value, sc = scope(), all = allTables();
         await D.busy(previewBtn, async function () {
           try {
-            var r = await D.api.post('search-replace', { from: from.value, to: to.value, tables: scope(), all_tables: allTables(), dry_run: true });
-            showPreview(r);
-          } catch (e) { result.replaceChildren(D.note('error', D.errorText(e))); }
+            var r = await D.api.post('search-replace', { from: f, to: t, tables: sc, all_tables: all, dry_run: true });
+            if (seq !== previewSeq) return;
+            showPreview(r, f, t, sc, all);
+          } catch (e) { if (seq === previewSeq) result.replaceChildren(D.note('error', D.errorText(e))); }
         });
       }
-      function showPreview(r) {
-        if (!r.cells_changed) { result.replaceChildren(D.note('', 'Nothing matches \u201c' + from.value + '\u201d' + (scope().length ? ' in the selected tables.' : allTables() ? ' anywhere in the database.' : ' in this site\u2019s tables.'))); return; }
-        var go = h('button', { class: 'dsk-btn danger solid', onclick: function () { replace(r, go); } }, 'Replace ' + D.fmt.plural(r.cells_changed, 'cell'));
+      function showPreview(r, f, t, sc, all) {
+        if (!r.cells_changed) { result.replaceChildren(D.note('', 'Nothing matches \u201c' + f + '\u201d' + (sc.length ? ' in the selected tables.' : all ? ' anywhere in the database.' : ' in this site\u2019s tables.'))); return; }
+        var go = h('button', { class: 'dsk-btn danger solid', onclick: function () { replace(r, f, t, go); } }, 'Replace ' + D.fmt.plural(r.cells_changed, 'cell'));
         result.replaceChildren(h('div', { class: 'dsk-stack', style: { gap: '12px' } },
           D.note('warn', [h('strong', null, D.fmt.plural(r.cells_changed, 'cell')), ' in ', D.fmt.plural(r.rows_changed, 'row'), ' across ', D.fmt.plural(Object.keys(r.by_table).length, 'table'), ' would change.']),
-          h('div', { class: 'dsk-row', style: { gap: '6px' } }, Object.keys(r.by_table).slice(0, 12).map(function (t) { return h('span', { class: 'dsk-badge' }, t + ' · ' + D.fmt.num(r.by_table[t])); })),
+          h('div', { class: 'dsk-row', style: { gap: '6px' } }, Object.keys(r.by_table).slice(0, 12).map(function (tbl) { return h('span', { class: 'dsk-badge' }, tbl + ' · ' + D.fmt.num(r.by_table[tbl])); })),
           h('div', { class: 'dsk-table-wrap', style: { maxHeight: '260px', border: '1px solid var(--line)', borderRadius: '10px' } }, h('table', { class: 'dsk-table static' },
             h('thead', null, h('tr', null, h('th', null, 'Where'), h('th', null, 'Before'), h('th', null, 'After'))),
             h('tbody', null, (r.samples || []).map(function (x) {
               return h('tr', null,
                 h('td', { style: { whiteSpace: 'normal', maxWidth: '180px' } }, x.table + '.' + x.column, h('div', { class: 'muted' }, x.key)),
-                h('td', { style: { whiteSpace: 'normal', wordBreak: 'break-all', maxWidth: '300px' } }, mark(x.before, from.value)),
-                h('td', { style: { whiteSpace: 'normal', wordBreak: 'break-all', maxWidth: '300px' } }, mark(x.after, to.value)));
+                h('td', { style: { whiteSpace: 'normal', wordBreak: 'break-all', maxWidth: '300px' } }, mark(x.before, f)),
+                h('td', { style: { whiteSpace: 'normal', wordBreak: 'break-all', maxWidth: '300px' } }, mark(x.after, t)));
             })))),
           (r.samples || []).length < r.cells_changed ? h('p', { class: 'muted' }, 'Showing the first ' + r.samples.length + ' changes.') : null,
           h('div', null, go)));
       }
-      async function replace(r, btn) {
-        var f = from.value, t = to.value;
+      async function replace(r, f, t, btn) {
         var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
           h('p', null, 'Replace ', h('strong', null, f), ' with ', h('strong', null, t || '(nothing)'), ' in ', D.fmt.plural(r.cells_changed, 'cell'), '?'),
           h('p', { class: 'muted' }, 'A restore point is saved first, so this can be undone.')), { title: 'Replace now?', confirmLabel: 'Replace', danger: true });

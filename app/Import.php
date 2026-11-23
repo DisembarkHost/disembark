@@ -1850,6 +1850,9 @@ class Import {
             return $result;
         }
         $report = $target->merge_users( (string) ( $job['old_prefix'] ?? '' ), $job['incoming'] ?: null, $this->rollback_path . '/users-merge.php', $deadline, $this->import_path . '/users-merge-cursor.php' );
+        if ( is_wp_error( $report ) ) {
+            return $report;
+        }
         if ( isset( $report['done'] ) && $report['done'] === false ) {
             return [
                 'done'                => false,
@@ -1863,6 +1866,9 @@ class Import {
             ];
         }
         @unlink( $this->import_path . '/users-merge-job.php' );
+        if ( ! empty( $report['warnings'] ) ) {
+            $result['warnings'] = array_merge( (array) ( $result['warnings'] ?? [] ), (array) $report['warnings'] );
+        }
         $result['users'] = $report;
         return $result;
     }
@@ -2383,7 +2389,9 @@ class Import {
             }
             $t   = '`' . str_replace( '`', '``', $child ) . '`';
             $def = $m[1] . '`' . str_replace( '`', '``', $table ) . '`' . rtrim( $m[2] );
-            if ( $wpdb->query( "ALTER TABLE {$t} DROP FOREIGN KEY {$quoted}, ADD CONSTRAINT {$quoted} {$def}" ) === false ) {
+            // Two separate ALTER TABLE statements: MariaDB (including 13) refuses
+            // DROP FOREIGN KEY + ADD CONSTRAINT with the same name in one statement (error 1826).
+            if ( $wpdb->query( "ALTER TABLE {$t} DROP FOREIGN KEY {$quoted}" ) === false || $wpdb->query( "ALTER TABLE {$t} ADD CONSTRAINT {$quoted} {$def}" ) === false ) {
                 $run['warnings'][] = "The foreign key {$name} on {$child} couldn't be pointed back at {$table}: " . substr( (string) $wpdb->last_error, 0, 160 );
             }
         }
@@ -7607,6 +7615,7 @@ class Import {
                 ! empty( $st['not_back'] ) ? [ count( $st['not_back'] ) . ' saved ' . ( count( $st['not_back'] ) === 1 ? 'file' : 'files' ) . ' couldn\'t be put back, and stay in the restore point\'s folder (' . $this->rollback_path . '/files): ' . implode( ', ', array_slice( (array) $st['not_back'], 0, 10 ) ) . ( count( $st['not_back'] ) > 10 ? ', …' : '' ) ] : []
             ),
             'files'            => $with_files,
+            'files_remaining'  => self::point_has_files( $meta ) && ! self::files_spent( $saved ?: $meta ),
             'errors'           => $errors,
         ];
         @unlink( $state_file );

@@ -251,6 +251,9 @@ class Command {
         }
         $summary = [ 'ok' => false, 'source' => $source['url'], 'import_id' => $import_id ];
         $started = time();
+        if ( $notify_to !== '' ) {
+            $this->notify = [ 'import' => $import_id, 'to' => $notify_to, 'saved' => false, 'kind' => 'pull', 'source' => $source['url'], 'destination' => home_url(), 'started' => $started ];
+        }
 
         $this->say( '[1/9] Checking this site' );
         // In a subsite's or tenant's context, the pull would replace the
@@ -278,8 +281,10 @@ class Command {
             if ( is_wp_error( $set ) ) {
                 $this->fail( $set->get_error_message() );
             }
+            $this->notify = [ 'import' => $import_id, 'to' => $notify_to, 'saved' => true, 'kind' => 'pull', 'source' => $source['url'], 'destination' => home_url(), 'started' => $started ];
+        } elseif ( $resuming ) {
+            $this->notify = [ 'import' => $import_id, 'to' => '', 'saved' => true, 'kind' => 'pull', 'source' => $source['url'], 'destination' => home_url(), 'started' => $started ];
         }
-        $this->notify = [ 'import' => $import_id, 'kind' => 'pull', 'source' => $source['url'], 'destination' => home_url(), 'started' => $started ];
         // From here every step is recorded. A pull that stops can be resumed
         // once it has connected (that's when it's listed as unfinished).
         $this->steps_import = $import_id;
@@ -733,27 +738,35 @@ class Command {
                 $this->fail( $parsed->get_error_message() );
             }
         }
+        $import_id = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
+        $started   = time();
+        if ( $notify_to !== '' ) {
+            $this->notify = [ 'import' => $import_id, 'to' => $notify_to, 'saved' => false, 'kind' => 'restore', 'source' => basename( $zip ), 'destination' => home_url(), 'started' => $started ];
+        }
         if ( $refused = Import::sqlite_refusal() ?: Import::here_refusal() ) {
             $this->fail( $refused->get_error_message(), 'preflight' );
         }
-        $import_id = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
         $into      = (string) ( $assoc_args['into'] ?? '' );
         $into_lock = $into !== '' ? $into : false;
         $this->check_overlap( $import_id, $into_lock, false );
         $import    = new Import( $import_id );
         $summary   = [ 'ok' => false, 'source' => $zip, 'import_id' => $import_id ];
-        $started   = time();
         // Before anything is saved, a stop leaves nothing behind.
         $stop = function ( $message, $step ) use ( $import ) {
             if ( $this->notify ) {
-                Notify::send( $this->notify['import'], 'failed', [
+                $details = [
                     'kind'        => $this->notify['kind'],
                     'source'      => $this->notify['source'],
                     'destination' => $this->notify['destination'],
                     'step'        => $step,
                     'error'       => $message . ' Nothing on this site was changed.',
                     'seconds'     => time() - (int) $this->notify['started'],
-                ] );
+                ];
+                if ( ! empty( $this->notify['saved'] ) ) {
+                    Notify::send( $this->notify['import'], 'failed', $details );
+                } elseif ( ! empty( $this->notify['to'] ) ) {
+                    Notify::send_to( $this->notify['to'], 'failed', $details );
+                }
                 $this->notify = [];
             }
             $import->cancel( 'cleanup' );
@@ -765,6 +778,9 @@ class Command {
         $dest_prefix = (string) ( $pre['db_prefix'] ?? '' );
         $dest_home   = untrailingslashit( (string) ( $pre['home_url'] ?? home_url() ) );
         $summary['destination'] = $dest_home;
+        if ( $this->notify ) {
+            $this->notify['destination'] = $dest_home;
+        }
         $this->confirm( $assoc_args, $into !== ''
             ? 'Bring the backup in ' . basename( $zip ) . ' into ' . ( $into === 'new' ? 'a new subsite or tenant' : 'subsite or tenant ' . $into . ' (replacing it)' ) . ' here? A rollback point is saved first.'
             : 'Replace ' . $dest_home . ' with the backup in ' . basename( $zip ) . '? A rollback point is saved first, and ' . ( is_multisite() ? 'the network keeps its users (the incoming site\'s users join them).' : 'afterwards you log in with the backup\'s credentials.' ) );
@@ -774,8 +790,8 @@ class Command {
             if ( is_wp_error( $set ) ) {
                 $this->fail( $set->get_error_message() );
             }
+            $this->notify = [ 'import' => $import_id, 'to' => $notify_to, 'saved' => true, 'kind' => 'restore', 'source' => basename( $zip ), 'destination' => $dest_home, 'started' => $started ];
         }
-        $this->notify = [ 'import' => $import_id, 'kind' => 'restore', 'source' => basename( $zip ), 'destination' => $dest_home, 'started' => $started ];
         if ( $into !== '' ) {
             $t = $import->set_target( $into, [ 'slug' => (string) ( $assoc_args['slug'] ?? '' ), 'domain' => (string) ( $assoc_args['domain'] ?? '' ) ] );
             if ( is_wp_error( $t ) ) {
@@ -2296,7 +2312,8 @@ class Command {
             $this->unconnected = '';
         }
         if ( $this->notify ) {
-            Notify::send( $this->notify['import'], $message === 'Cancelled.' ? 'cancelled' : 'failed', [
+            $event   = $message === 'Cancelled.' ? 'cancelled' : 'failed';
+            $details = [
                 'kind'        => $this->notify['kind'],
                 'source'      => $this->notify['source'],
                 'destination' => $this->notify['destination'],
@@ -2305,7 +2322,12 @@ class Command {
                 'rollback_id' => $rollback_id,
                 'resume'      => $this->resume_hint !== '' ? "wp disembark pull --resume={$this->resume_hint}" : '',
                 'seconds'     => time() - (int) $this->notify['started'],
-            ] );
+            ];
+            if ( ! empty( $this->notify['saved'] ) ) {
+                Notify::send( $this->notify['import'], $event, $details );
+            } elseif ( ! empty( $this->notify['to'] ) ) {
+                Notify::send_to( $this->notify['to'], $event, $details );
+            }
             $this->notify = [];
         }
         if ( $rollback_id !== '' ) {

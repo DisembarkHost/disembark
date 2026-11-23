@@ -102,7 +102,7 @@
             if (r.errors && r.errors.length) throw new Error('The rollback reported ' + D.fmt.plural(r.errors.length, 'error') + '. The rollback point is kept: try again from Backups → Restore points.');
             rolledBack = true;
           }
-          var delPoint = rolledBack && (!r || r.files !== false) && pick.files !== false;
+          var delPoint = rolledBack && (r && typeof r.files_remaining === 'boolean' ? !r.files_remaining : ((!r || r.files !== false) && pick.files !== false));
           await D.api.post('import/cancel', { import_id: m.id, action: 'cleanup', delete_restore_point: delPoint });
           D.toast(m.rollback_point ? (delPoint ? 'Rolled back and cleaned up.' : 'Database rolled back; restore point kept for its saved files.') : 'Discarded.');
           // Log in again only when the rollback took this login's accounts
