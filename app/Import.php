@@ -7811,7 +7811,7 @@ class Import {
         if ( $target ) {
             // A subsite or tenant: its own settings, and the page caches.
             $target->finish();
-            $tidy = [ 'opcache_reset' => self::reset_opcache(), 'caches_cleared' => self::clear_page_caches(), 'plugins_turned_off' => [], 'login_url' => null, 'target' => $target->info() ];
+            $tidy = [ 'opcache_reset' => self::reset_opcache(), 'caches_cleared' => self::clear_page_caches(), 'plugins_turned_off' => [], 'login_url' => null, 'target' => $target->info(), 'tables_removed' => $this->drop_replaced_tables( $target ) ];
         } else {
             $tidy = $this->tidy( $source );
             $tidy['tables_removed'] = $this->drop_extra_tables();
@@ -7902,6 +7902,50 @@ class Import {
      * starts with this one's (wp_ and wp_staging_). In doubt, a table stays.
      * Returns the names dropped.
      */
+    /**
+     * drop_extra_tables() for a subsite or tenant this pull replaced: its
+     * own tables and views the source doesn't have (an old plugin's, a view
+     * reading tables the move replaced) go, as they do on a whole-site
+     * move, so the site matches the source. Only ones its restore point
+     * holds, so a rollback brings them back, and only after a pull, which
+     * knows every table the source has (a catch-up copies only some; a
+     * backup zip may not list them).
+     */
+    private function drop_replaced_tables( $target ) {
+        global $wpdb;
+        if ( ! $target || ! empty( $target->created ) || $target->prefix === '' ) {
+            return [];
+        }
+        $incoming = ( new Pull( $this->import_id ) )->incoming_tables( $target->prefix );
+        $meta     = self::rollback_meta( $this->rollback_path );
+        $saved    = $meta === null ? [] : array_flip( (array) ( $meta['saved_tables'] ?? $meta['tables'] ?? [] ) );
+        if ( ! $incoming || ! $saved ) {
+            return [];
+        }
+        $own     = array_flip( $target->tables() );
+        $dropped = [];
+        foreach ( (array) $wpdb->get_results( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( $target->prefix ) . '%' ), ARRAY_N ) as $row ) {
+            $table = (string) $row[0];
+            $kind  = strtoupper( (string) ( $row[1] ?? '' ) ) === 'VIEW' ? 'VIEW' : 'TABLE';
+            // A subsite or tenant never takes the source's views (see
+            // note_left_out()), so a view here is the old site's, even
+            // under a name the source also has.
+            if ( ! isset( $own[ $table ] ) || ! isset( $saved[ $table ] ) || ( $kind === 'TABLE' && isset( $incoming[ strtolower( $table ) ] ) ) ) {
+                continue;
+            }
+            // The host's own tables (its firewall's) stay, as on a whole-site move.
+            foreach ( self::HOST_TABLES as $host ) {
+                if ( strpos( strtolower( substr( $table, strlen( $target->prefix ) ) ), $host ) === 0 ) {
+                    continue 2;
+                }
+            }
+            if ( $wpdb->query( "DROP {$kind} IF EXISTS `" . str_replace( '`', '``', $table ) . '`' ) !== false ) {
+                $dropped[] = $table;
+            }
+        }
+        return $dropped;
+    }
+
     private function drop_extra_tables() {
         global $wpdb;
         $incoming = ( new Pull( $this->import_id ) )->incoming_tables();

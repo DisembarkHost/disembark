@@ -1925,22 +1925,22 @@ class Pull {
      * keys): every table the source has, copied this time or not (a catch-up
      * leaves unchanged ones alone). Empty when there's no pull to go by.
      */
-    public function incoming_tables() {
+    public function incoming_tables( $prefix = null ) {
         $out = [];
         foreach ( (array) ( $this->state()['tables'] ?? [] ) as $t ) {
             $name = (string) ( $t['name'] ?? '' );
             if ( $name !== '' ) {
-                $out[ strtolower( $this->dest_name( $name ) ) ] = true;
+                $out[ strtolower( $this->dest_name( $name, $prefix ) ) ] = true;
             }
         }
         return $out;
     }
 
-    /** The name a source table gets here (the import swaps the prefix). */
-    private function dest_name( $table ) {
+    /** The name a source table gets here, under $prefix (default this site's): the import swaps the prefix. */
+    private function dest_name( $table, $prefix = null ) {
         global $wpdb;
         $old = (string) ( $this->state()['source_prefix'] ?? '' );
-        $new = (string) $wpdb->prefix;
+        $new = $prefix !== null ? (string) $prefix : (string) $wpdb->prefix;
         return $old !== '' && $new !== '' && $old !== $new && strpos( $table, $old ) === 0 ? $new . substr( $table, strlen( $old ) ) : $table;
     }
 
