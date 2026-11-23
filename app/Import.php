@@ -7779,9 +7779,42 @@ class Import {
         @unlink( $this->import_path . '/unchanged.json' );
         $this->remove_pace_files();
 
-        // Flush rewrite rules (a subsite or tenant had its own cleared)
+        // Flush rewrite rules (a subsite or tenant had its own cleared).
+        // WP-CLI runs a whole move in one process, and WordPress read this
+        // site's permalink settings when it started: flushed as they are,
+        // the rules would be the old site's (a network's main site, whose
+        // permalinks start with /blog/, pulled out as a single site 404'd
+        // every pretty link). So the settings are read again first (and
+        // the links built from them set up again), and the saved rules
+        // then go: the next request builds them with the
+        // plugins and post types the site now has. The flush still writes
+        // .htaccess.
         if ( ! $target ) {
+            global $wp_rewrite;
+            wp_cache_delete( 'alloptions', 'options' );
+            wp_cache_delete( 'notoptions', 'options' );
+            foreach ( [ 'permalink_structure', 'category_base', 'tag_base', 'rewrite_rules' ] as $name ) {
+                wp_cache_delete( $name, 'options' );
+            }
+            if ( $wp_rewrite instanceof \WP_Rewrite ) {
+                $wp_rewrite->init();
+                // Category, tag, post type and taxonomy links were set up
+                // with the old prefix too (the checks after the move build
+                // links in this process): set up again with the new one.
+                create_initial_taxonomies();
+                foreach ( get_taxonomies( [ '_builtin' => false ], 'objects' ) as $tax ) {
+                    if ( ! empty( $tax->rewrite ) && method_exists( $tax, 'add_rewrite_rules' ) ) {
+                        $tax->add_rewrite_rules();
+                    }
+                }
+                foreach ( get_post_types( [ '_builtin' => false ], 'objects' ) as $type ) {
+                    if ( ! empty( $type->rewrite ) && method_exists( $type, 'add_rewrite_rules' ) ) {
+                        $type->add_rewrite_rules();
+                    }
+                }
+            }
             flush_rewrite_rules();
+            delete_option( 'rewrite_rules' );
         }
 
         // Flush object cache
