@@ -40,14 +40,16 @@
    * onResume(o) is called with the run options to carry one on.
    */
   async function unfinished(box, onResume) {
+    if (box._pollTimer) { clearTimeout(box._pollTimer); box._pollTimer = 0; }
     var list = [];
     try { list = await D.api.get('import/unfinished'); } catch (e) { /* older Disembark */ }
     if (!Array.isArray(list) || !list.length) { D.mount(box); return; }
     // A move still running (a CLI pull, another tab, a push driven from the
     // source) can't be resumed or discarded under it: its buttons wait, and
     // the list looks again in half a minute.
+    if (box._pollTimer) { clearTimeout(box._pollTimer); box._pollTimer = 0; }
     if (list.some(function (m) { return m.active; })) {
-      setTimeout(function () { if (box.isConnected) unfinished(box, onResume); }, 30000);
+      box._pollTimer = setTimeout(function () { box._pollTimer = 0; if (box.isConnected) unfinished(box, onResume); }, 30000);
     }
     D.mount(box, h('div', { class: 'dsk-unfinished' }, list.map(function (m) {
       var where = m.rollback_point
@@ -84,7 +86,7 @@
       // Restore points, so a move made since is undone first.
       var pick = null;
       if (m.rollback_point) {
-        try { pick = await D.askRollback(D.api, m.id, D.config.homeUrl, btn, { title: 'Roll back and discard?', confirmLabel: 'Roll back and discard', after: 'Then what this move copied and its restore point are deleted.' }); }
+        try { pick = await D.askRollback(D.api, m.id, D.config.homeUrl, btn, { title: 'Roll back and discard?', confirmLabel: 'Roll back and discard', after: 'Then what this move copied is deleted (and its restore point too when its files go back).' }); }
         catch (e) { D.toast(D.errorText(e), 'error'); unfinished(box, onResume); return; }
         if (!pick) return;
       } else {
@@ -100,11 +102,12 @@
             if (r.errors && r.errors.length) throw new Error('The rollback reported ' + D.fmt.plural(r.errors.length, 'error') + '. The rollback point is kept: try again from Backups → Restore points.');
             rolledBack = true;
           }
-          await D.api.post('import/cancel', { import_id: m.id, action: 'cleanup', delete_restore_point: rolledBack });
-          D.toast(m.rollback_point ? 'Rolled back and cleaned up.' : 'Discarded.');
+          var delPoint = rolledBack && (!r || r.files !== false) && pick.files !== false;
+          await D.api.post('import/cancel', { import_id: m.id, action: 'cleanup', delete_restore_point: delPoint });
+          D.toast(m.rollback_point ? (delPoint ? 'Rolled back and cleaned up.' : 'Database rolled back; restore point kept for its saved files.') : 'Discarded.');
           // Log in again only when the rollback took this login's accounts
           // away (D.rollbackNeedsLogin: the same test as the restore points list).
-          if (await D.rollbackNeedsLogin(r, [{ id: m.id, label: (m.move && m.move.label) || 'Before pull from ' + D.host(m.source) }])) { setTimeout(function () { location.href = D.config.loginUrl; }, 1200); return; }
+          if (await D.rollbackNeedsLogin(r, [{ id: m.id, label: (m.move && m.move.label) || 'Before pull from ' + D.host(m.source), deployed: m.rollback_point ? 1 : 0 }])) { setTimeout(function () { location.href = D.config.loginUrl; }, 1200); return; }
         } catch (e) {
           if (D.quietLifted(e)) D.quietOff();
           D.toast(D.laterPointsText(e) || D.errorText(e), 'error');

@@ -266,12 +266,13 @@
       function render() { renderStart(); renderSugg(); renderSuper(); renderTree(); renderTables(); renderSummary(); }
 
       async function saveTemplate(e) {
+        var btn = e.currentTarget;
         var current = start.indexOf('tpl:') === 0 ? start.slice(4) : '';
         var name = await D.prompt({ title: 'Save as a template', label: 'Name', value: current || (o.quiet ? 'Staging copy' : ''), confirmLabel: 'Save' });
         if (!name || !String(name).trim()) return;
         var strip = function (t) { var l = t.toLowerCase(); return prefix && l.indexOf(prefix) === 0 ? t.slice(prefix.length) : t; };
         try {
-          templates = await D.busy(e.currentTarget, function () {
+          templates = await D.busy(btn, function () {
             return D.api.post('templates', { action: 'save', name: String(name).trim(), suggestions: Array.from(on), paths: Array.from(paths), rows: Array.from(rows).map(strip) });
           }) || templates;
           start = 'tpl:' + String(name).trim();
@@ -282,10 +283,11 @@
         } catch (err) { D.toast(D.errorText(err), 'error'); }
       }
       async function deleteTemplate(e) {
+        var btn = e.currentTarget;
         var name = start.slice(4);
         if (!(await D.confirm('Delete the template “' + name + '”?', { title: 'Delete template', confirmLabel: 'Delete', danger: true }))) return;
         try {
-          templates = await D.busy(e.currentTarget, function () { return D.api.post('templates', { action: 'delete', name: name }); }) || [];
+          templates = await D.busy(btn, function () { return D.api.post('templates', { action: 'delete', name: name }); }) || [];
           apply('suggested'); render();
         } catch (err) { D.toast(D.errorText(err), 'error'); }
       }

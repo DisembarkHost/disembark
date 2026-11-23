@@ -130,7 +130,9 @@
       var working = 0, dlgEl = null;
       function hold(on) {
         working += on ? 1 : -1;
-        if (dlgEl) Array.prototype.forEach.call(dlgEl.querySelectorAll('header .dsk-btn, footer .dsk-btn'), function (b) { b.disabled = working > 0; });
+        var busy = working > 0;
+        [from, to, previewBtn, onlySelected && onlySelected.input, everyTable.input].forEach(function (el) { if (el) el.disabled = busy; });
+        if (dlgEl) Array.prototype.forEach.call(dlgEl.querySelectorAll('header .dsk-btn, footer .dsk-btn'), function (b) { b.disabled = busy; });
       }
       D.modal({
         title: 'Search and replace', wide: true, busy: function () { return working > 0; }, onOpen: function (dlg) { dlgEl = dlg; },
@@ -169,8 +171,9 @@
           h('div', null, go)));
       }
       async function replace(r, btn) {
+        var f = from.value, t = to.value;
         var ok = await D.confirm(h('div', { class: 'dsk-stack', style: { gap: '10px' } },
-          h('p', null, 'Replace ', h('strong', null, from.value), ' with ', h('strong', null, to.value || '(nothing)'), ' in ', D.fmt.plural(r.cells_changed, 'cell'), '?'),
+          h('p', null, 'Replace ', h('strong', null, f), ' with ', h('strong', null, t || '(nothing)'), ' in ', D.fmt.plural(r.cells_changed, 'cell'), '?'),
           h('p', { class: 'muted' }, 'A restore point is saved first, so this can be undone.')), { title: 'Replace now?', confirmLabel: 'Replace', danger: true });
         if (!ok) return;
         await D.busy(btn, async function () {
@@ -180,9 +183,9 @@
             // The tables the preview found, and only those: their restore
             // point, then the replace, each a piece at a time.
             var tables = Object.keys(r.by_table);
-            await D.paced(D.api, 'import/snapshot', { import_id: id, label: 'Before search and replace: ' + from.value + ' → ' + (to.value || '(nothing)'), tables: tables });
+            await D.paced(D.api, 'import/snapshot', { import_id: id, label: 'Before search and replace: ' + f + ' → ' + (t || '(nothing)'), tables: tables });
             saved = true;
-            var done = await D.paced(D.api, 'search-replace', { import_id: id, from: from.value, to: to.value, tables: tables });
+            var done = await D.paced(D.api, 'search-replace', { import_id: id, from: f, to: t, tables: tables });
             var undo = h('button', { class: 'dsk-btn', onclick: async function () {
               await D.busy(undo, async function () {
                 hold(true);

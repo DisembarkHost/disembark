@@ -243,9 +243,8 @@
   // ?rest_route= form always does, so requests switch to it.
   var apiRoot = cfg.apiRoot;
   function plainRoot() { return String(cfg.homeUrl).replace(/\/+$/, '') + '/?rest_route=/disembark/v1/'; }
-  function apiUrl(path, query) {
-    var root = apiRoot;
-    var url = root + String(path).replace(/^\//, '');
+  function apiUrl(path, query, root) {
+    var url = (root || apiRoot) + String(path).replace(/^\//, '');
     if (query) {
       var qs = Object.keys(query).filter(function (k) { return query[k] !== undefined && query[k] !== null; })
         .map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(query[k]); }).join('&');
@@ -288,7 +287,7 @@
       timer = setTimeout(function () { ctl.abort(); }, opts.timeout);
     }
     try {
-      res = await fetch(opts.url || apiUrl(path, query), init);
+      res = await fetch(opts.url || apiUrl(path, query, opts.root), init);
     } catch (e) {
       var err = new ApiError(init.signal && init.signal.aborted ? 'No answer from the site in time.' : 'Could not reach the site (' + e.message + ').', 0);
       err.timeout = !!(init.signal && init.signal.aborted);
@@ -311,10 +310,10 @@
     // WordPress's maintenance page (503), not a missing route: it stays.
     var html = /text\/html/i.test(res.headers.get('content-type') || '');
     if (!opts.url && !opts.retried && html && res.status < 500 && apiRoot.indexOf('rest_route=') === -1) {
-      var was = apiRoot;
-      apiRoot = plainRoot();
-      try { return await request(method, path, Object.assign({}, opts, { retried: true })); }
-      catch (e) { if (e.page) apiRoot = was; throw e; }
+      var alt = plainRoot();
+      var out = await request(method, path, Object.assign({}, opts, { root: alt, retried: true }));
+      apiRoot = alt;
+      return out;
     }
     if (opts.retried && html) {
       var page = new ApiError('The site answered with a page instead of the Disembark API (HTTP ' + res.status + ').', res.status);

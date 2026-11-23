@@ -178,7 +178,7 @@
   D.movesRunning = 0;
   D.runMove = function (view, opts) {
     D.movesRunning++;
-    var importId = opts.resume ? opts.resume.id : D.randomHex(24), rollbackId = '', snapSent = false, codeMentions = null, quietOn = false, quietSource = '';
+    var importId = opts.resume ? opts.resume.id : D.randomHex(24), rollbackId = '', snapLabel = String(opts.label || ''), snapSent = false, codeMentions = null, quietOn = false, quietSource = '';
     // Request ids follow the import id and the step's place in the move, so
     // the same move asks for the same ids. Resuming replays the steps the
     // server already finished (opts.resume.steps) and carries on from the
@@ -316,10 +316,10 @@
     // Disembark stops early). Before the rollback point nothing here has
     // changed, so the copied files are just deleted; after it, the site is
     // rolled back first.
-    var cancelled = false;
+    var cancelled = false, settled = false;
     function Cancelled() { var e = new Error('Cancelled.'); e.cancelled = true; return e; }
     async function askCancel() {
-      if (cancelled) return;
+      if (cancelled || settled) return;
       // Once the restore point is asked for, the site may change (a new
       // subsite is made with it). If that happens while the question is
       // open, it's asked again in the right words.
@@ -330,7 +330,7 @@
           ? h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, D.host(opts.targetHome) + (rollbackId ? ' is partly changed by now.' : ' may be changing already: its restore point is being saved.')), h('p', { class: 'muted' }, 'Cancelling stops the move and rolls it back to the restore point, then deletes the copied files and the restore point.'))
           : h('div', { class: 'dsk-stack', style: { gap: '10px' } }, h('p', null, 'Nothing on ' + D.host(opts.targetHome) + ' has changed yet.'), h('p', { class: 'muted' }, 'Cancelling stops the move and deletes what was copied so far.')),
           { title: after ? 'Cancel and roll back?' : 'Cancel this move?', confirmLabel: after ? 'Cancel and roll back' : 'Cancel the move', cancelLabel: 'Keep going', danger: true });
-        if (!ok || cancelled) return;
+        if (!ok || cancelled || settled) return;
         if (after === (!!rollbackId || snapSent)) break;
       }
       cancelled = true;
@@ -685,7 +685,7 @@
     function backoffMs(n, e) {
       var ms = Math.min(30000, 1000 * Math.pow(2, n - 1));
       ms = ms * (0.7 + Math.random() * 0.6);
-      if (e && e.retryAfter) ms = Math.max(ms, Math.min(300, e.retryAfter) * 1000);
+      if (e && e.retryAfter) ms = Math.max(ms, Math.min(30, e.retryAfter) * 1000);
       return Math.round(ms);
     }
     async function wait(ms) {
@@ -1071,6 +1071,7 @@
     // cards under the voyage (what to do next, and the checks).
     var doneBox = h('div', { class: 'dsk-card' }), checks = h('div', { class: 'dsk-card' });
     function arrive(verify) {
+      settled = true;
       cancelAnimationFrame(boat.raf);
       stopEls.forEach(function (se, i) { setStop(i, 'done'); });
       strip.style.setProperty('--p', 1);
@@ -1174,7 +1175,8 @@
 
         step('snap');
         // Named for the site that came over (see srcLabel above).
-        var snapLabel = String(opts.label || ''), siteHost = kind === 'pull' && opts.site ? D.host(opts.site) : '';
+        snapLabel = String(opts.label || '');
+        var siteHost = kind === 'pull' && opts.site ? D.host(opts.site) : '';
         if (siteHost && siteHost !== srcLabel) snapLabel = snapLabel.replace(siteHost, srcLabel);
         snapSent = true;
         var snap = pacing ? await budgeted('import/snapshot', t({ label: snapLabel }), function (r) { paced('Saving a rollback point\u2026 ' + D.fmt.num(r.tables_done || 0) + ' of ' + D.fmt.plural(r.tables_total || 0, 'table')); })
@@ -1224,7 +1226,11 @@
           step('db');
           progress('This can take a while on large databases…');
           var sqBody = t({ sql_file: info.sql_file, old_prefix: srcPrefix, new_prefix: destPrefix });
-          var sq = pacing ? await budgeted('import/import-staged-sql', sqBody, function (r) { paced('Importing the database\u2026 ' + Math.floor(100 * (r.bytes_done || 0) / Math.max(1, r.bytes_total || 1)) + '%'); })
+          var sq = pacing ? await budgeted('import/import-staged-sql', sqBody, function (r) {
+            paced(r.phase === 'users'
+              ? 'Merging users\u2026 ' + (r.users_total ? D.fmt.num(r.users_done || 0) + ' of ' + D.fmt.num(r.users_total) : '')
+              : 'Importing the database\u2026 ' + Math.floor(100 * (r.bytes_done || 0) / Math.max(1, r.bytes_total || 1)) + '%');
+          })
             : await api.post('import/import-staged-sql', sqBody);
           progress('');
           rlog(D.fmt.num(sq.statements_executed || 0) + ' statements executed.');
@@ -1304,7 +1310,7 @@
         if (gone.length) rlog('Removed ' + D.fmt.plural(gone.length, 'table') + ' the incoming site doesn\u2019t have (kept in the restore point): ' + gone.slice(0, 8).join(', ') + (gone.length > 8 ? ', \u2026' : '') + '.');
         var caches = Object.keys(tidy.caches_cleared || {});
         if (caches.length) rlog('Cleared page caches so nothing serves the old site: ' + caches.join(', ') + '.', 'dim');
-        (tidy.plugins_turned_off || []).forEach(function (p) { rlog('Turned off ' + p.name + ': ' + p.why + (p.plugin === 'redirection' ? '.' : '. Turn it back on once this site has its own keys or certificate.'), 'dim'); });
+        (tidy.plugins_turned_off || []).forEach(function (p) { rlog('Turned off ' + p.name + ': ' + p.why + (p.plugin === 'redirection' || String(p.plugin || '').indexOf('sqlite-database-integration/') === 0 ? '.' : '. Turn it back on once this site has its own keys or certificate.'), 'dim'); });
         if (tidy.login_url) { ctx.loginUrl = tidy.login_url.url; rlog('The login page is moved by ' + tidy.login_url.plugin + ': log in at ' + tidy.login_url.url, 'ok'); }
 
         step('check');
@@ -1334,7 +1340,8 @@
         }
       } catch (e) {
         notifyBtn.hidden = true;
-        if (e.cancelled || cancelled) { sendNotice('cancelled'); await cleanUp(); return; }
+        if (e.cancelled || cancelled) { settled = true; sendNotice('cancelled'); await cleanUp(); return; }
+        settled = true;
         cancelBtn.hidden = true;
         var msg = D.errorText(e);
         sendNotice('failed', { error: msg, step: current ? (STEPS.filter(function (s) { return s.key === current; })[0] || {}).label : '' });
@@ -1396,9 +1403,13 @@
           boat.t = null; boat.cargo = 0; boat.dock = 'left'; boat.arrived = false; drawScene();
           stopEls.forEach(function (se, i) { setStop(i, 'todo'); se.small.textContent = '\u00a0'; });
           strip.style.setProperty('--p', 0);
+          var needLogin = opts.local && await D.rollbackNeedsLogin(r, [{ id: rollbackId, label: snapLabel, deployed: 1 }]);
           D.mount(outcome, h('div', { class: 'dsk-stack', style: { marginTop: '16px' } },
             D.note('ok', [h('strong', null, 'Rolled back. '), dbOnly ? 'The database of ' + D.host(opts.targetHome) + ' is back to how it was before; its files stay as they are.' : D.host(opts.targetHome) + ' is back to how it was before.']),
-            h('div', null, h('button', { class: 'dsk-btn', type: 'button', onclick: opts.back }, D.icon(opts.icon || 'ship'), opts.againLabel || 'Start another move'))));
+            needLogin ? D.note('warn', [h('strong', null, 'Log in again. '), 'User accounts went back with the database, so your current login no longer applies here.'], 'key') : null,
+            h('div', { class: 'dsk-row' },
+              needLogin ? h('a', { class: 'dsk-btn primary', href: D.config.loginUrl }, 'Log in again') : null,
+              needLogin ? null : h('button', { class: 'dsk-btn', type: 'button', onclick: opts.back }, D.icon(opts.icon || 'ship'), opts.againLabel || 'Start another move'))));
         } catch (e) {
           progress('');
           live.className = prevLive;
@@ -1426,7 +1437,17 @@
     }).sort(function (a, b) { return b.created_at - a.created_at; });
   }
   /** The steps a rollback to p runs that still hold their files: the choice of Database only matters for any of them. */
-  function unspentFiles(points, p) { return [p].concat(laterThan(points, p, true)).some(function (q) { return hasFiles(q) && !q.files_spent && !(q.id === p.id && p.creates_site); }); }
+  function unspentFiles(points, p) { return [p].concat(laterThan(points, p, true)).some(function (q) { return hasFiles(q) && !q.files_spent && !q.creates_site; }); }
+
+  function missingPreview(e) { return !!(e && e.status === 404 && !(e.data && e.data.code === 'no_rollback')); }
+  function pointsFromPreview(pv, list) {
+    var listed = {};
+    (Array.isArray(list) ? list : []).forEach(function (q) { if (q && q.id) listed[q.id] = q; });
+    return pv.steps.map(function (st) {
+      var q = listed[st.id] || {};
+      return { id: st.id, label: st.label, created_at: st.created_at, files: (st.spent || st.removes || st.puts_back) ? 1 : 0, files_spent: !!st.spent, creates_site: !!st.creates_site, rolled_back_at: q.rolled_back_at || 0, rolled_back_legacy: !!q.rolled_back_legacy };
+    });
+  }
 
   /**
    * Asks before a rollback to restore point p, saying what it changes: the
@@ -1444,7 +1465,7 @@
     if (!points) {
       var pv = null;
       try { pv = await pending; } catch (e) {
-        if (e && e.status === 404 && e.data && e.data.code === 'no_rollback') throw e;
+        if (!missingPreview(e)) throw e;
       }
       if (!pv || !Array.isArray(pv.steps)) {
         // An older Disembark without the preview: the plain question.
@@ -1458,13 +1479,10 @@
       // later moves whose database was already rolled back (their files are
       // still out). With Database only those steps don't run, so take each
       // step's rolled-back state from the restore points list when it loads.
-      var listed = {};
+      var list = [];
       // (A push's destination answers POST only: there, the preview alone.)
-      if (typeof api.get === 'function') try { (await api.get('restore-points') || []).forEach(function (q) { if (q && q.id) listed[q.id] = q; }); } catch (e) { /* an older site: the preview alone */ }
-      points = pv.steps.map(function (st) {
-        var q = listed[st.id] || {};
-        return { id: st.id, label: st.label, created_at: st.created_at, files: (st.spent || st.removes || st.puts_back) ? 1 : 0, files_spent: !!st.spent, creates_site: !!st.creates_site, rolled_back_at: q.rolled_back_at || 0, rolled_back_legacy: !!q.rolled_back_legacy };
-      });
+      if (typeof api.get === 'function') try { list = await api.get('restore-points') || []; } catch (e) { /* an older site: the preview alone */ }
+      points = pointsFromPreview(pv, list);
       p = points.filter(function (q) { return q.id === p.id; })[0] || p;
       pending = Promise.resolve(pv);
     }
@@ -1555,16 +1573,27 @@
    * { files } or null (also while btn is already busy).
    */
   D.askRollback = async function (api, id, home, btn, words) {
-    var busy = true;
-    var pv = await D.busy(btn, function () {
+    var busy = true, points = null;
+    var pv = await D.busy(btn, async function () {
       busy = false;
-      return api.post('restore-points/preview', { import_id: id }).catch(function (e) {
-        if (e && e.status === 404 && e.data && e.data.code === 'no_rollback') throw e;
-        return null; // an older Disembark: the plain question
-      });
+      var r = null;
+      try { r = await api.post('restore-points/preview', { import_id: id }); }
+      catch (e) {
+        if (missingPreview(e)) return null; // an older Disembark: the plain question
+        throw e;
+      }
+      if (r && Array.isArray(r.steps)) {
+        var list = [];
+        // (A push's destination answers POST only: there, the preview alone.)
+        if (typeof api.get === 'function') try { list = await api.get('restore-points') || []; } catch (e) { /* an older site: the preview alone */ }
+        points = pointsFromPreview(r, list);
+      }
+      return r;
     });
     if (busy) return null;
-    return D.rollbackConfirm(api, Object.assign({ id: id, home: home }, words || {}), null, pv || null);
+    var p = Object.assign({ id: id, home: home }, words || {});
+    if (points) p = Object.assign({}, points.filter(function (q) { return q.id === id; })[0] || {}, p);
+    return D.rollbackConfirm(api, p, points, pv || null);
   };
   /**
    * Whether this browser has to log in again after rollback r, which undid
@@ -1586,8 +1615,8 @@
     });
     if (!moves) return false;
     try {
-      var url = String(D.config.apiRoot || '').replace('disembark/v1/', 'wp/v2/users/me');
-      var res = await fetch(url + (url.indexOf('?') === -1 ? '?' : '&') + '_fields=id', { headers: { 'X-WP-Nonce': D.config.nonce }, credentials: 'same-origin', cache: 'no-store' });
+      var url = String(D.config.homeUrl || '').replace(/\/+$/, '') + '/?rest_route=/wp/v2/users/me&_fields=id';
+      var res = await fetch(url, { headers: { 'X-WP-Nonce': D.config.nonce }, credentials: 'same-origin', cache: 'no-store' });
       var me = res.ok && /json/i.test(res.headers.get('content-type') || '') ? await res.json() : null;
       return !(me && me.id);
     } catch (e) { return true; }
