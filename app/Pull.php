@@ -68,6 +68,15 @@ class Pull {
         }
         $encoded = wp_json_encode( array_diff_key( (array) $state, $secret ) );
         if ( is_string( $encoded ) ) {
+            // Written beside it and renamed into place: another request
+            // reading it mid-write (file batches run side by side) would
+            // otherwise find it empty, a move with no source and no file
+            // list ("Run the scan step first").
+            $tmp = $this->state_file . '.' . bin2hex( random_bytes( 6 ) ) . '.tmp';
+            if ( file_put_contents( $tmp, $encoded ) === strlen( $encoded ) && @rename( $tmp, $this->state_file ) ) {
+                return;
+            }
+            @unlink( $tmp );
             file_put_contents( $this->state_file, $encoded );
         }
     }
@@ -1256,6 +1265,81 @@ class Pull {
         }
         usort( $out, function ( $a, $b ) { return $b['touched'] - $a['touched']; } );
         return $out;
+    }
+
+    /**
+     * Takes move $import_id's run lock for as long as this PHP process runs
+     * (a WP-CLI pull or restore), released when it ends, however it ends.
+     * False when another process holds it: the same move is already
+     * running, perhaps a run that was interrupted but is still waiting on
+     * the source (which touches no files, so it can look idle). True also
+     * when the lock can't be made, as before there was one.
+     */
+    public static function lock_run( $import_id ) {
+        static $held = [];
+        $import_id = preg_replace( '/[^a-f0-9]/', '', (string) $import_id );
+        if ( $import_id === '' || isset( $held[ $import_id ] ) ) {
+            return true;
+        }
+        $dir = Storage::base_dir() . '/_import_' . $import_id;
+        Storage::ensure_dir( $dir );
+        $h = @fopen( $dir . '/run.lock', 'c' );
+        if ( ! $h ) {
+            return true;
+        }
+        if ( ! flock( $h, LOCK_EX | LOCK_NB ) ) {
+            fclose( $h );
+            return false;
+        }
+        $held[ $import_id ] = $h;
+        return true;
+    }
+
+    /**
+     * Another move into this site that's running now, or null: one whose
+     * run lock a WP-CLI process holds (see lock_run()), or an unfinished
+     * one worked on in the last two minutes (a dashboard move, whose steps
+     * are separate requests). $into: the new move goes into a subsite or
+     * tenant; two such moves don't share tables or folders, so they may
+     * run side by side. A whole-site move waits for anything, and anything
+     * waits for it.
+     */
+    public static function running( $except = '', $into = false ) {
+        $except = (string) $except;
+        $active = [];
+        foreach ( self::unfinished() as $m ) {
+            $active[ $m['id'] ] = $m;
+        }
+        foreach ( (array) glob( Storage::base_dir() . '/_import_*', GLOB_ONLYDIR ) as $dir ) {
+            $id = substr( basename( $dir ), strlen( '_import_' ) );
+            if ( $id === $except || is_link( $dir ) ) {
+                continue;
+            }
+            $state = is_file( $dir . '/pull.json' ) ? json_decode( (string) file_get_contents( $dir . '/pull.json' ), true ) : null;
+            if ( is_array( $state ) && isset( $state['owner'] ) && (string) $state['owner'] !== self::owner() ) {
+                continue; // another site's of the install
+            }
+            $busy = ! empty( $active[ $id ]['active'] );
+            if ( ! $busy && is_file( $dir . '/run.lock' ) && ( $h = @fopen( $dir . '/run.lock', 'c' ) ) ) {
+                $busy = ! flock( $h, LOCK_EX | LOCK_NB );
+                if ( ! $busy ) {
+                    flock( $h, LOCK_UN );
+                }
+                fclose( $h );
+            }
+            if ( ! $busy ) {
+                continue;
+            }
+            $other_into = is_file( $dir . '/target.json' ) || ! empty( $state['move']['args']['into'] );
+            if ( $into && $other_into ) {
+                continue;
+            }
+            return [
+                'id'     => $id,
+                'source' => (string) ( $active[ $id ]['source'] ?? '' ) ?: (string) ( $state['source_home'] ?? $state['source_url'] ?? '' ),
+            ];
+        }
+        return null;
     }
 
     /** This site within its install, for telling moves apart in a shared folder: "blog:<id>" on a network, the table prefix elsewhere. */

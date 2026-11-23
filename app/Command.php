@@ -256,6 +256,7 @@ class Command {
         if ( $refused = Import::sqlite_refusal() ?: Import::here_refusal() ) {
             $this->fail( $refused->get_error_message(), 'preflight' );
         }
+        $this->refuse_overlap( $import_id, ! empty( $assoc_args['into'] ), $resuming );
         if ( ! $resuming ) {
             $pre = $import->preflight();
             $this->confirm( $assoc_args, ! empty( $assoc_args['into'] )
@@ -715,6 +716,7 @@ class Command {
             $this->fail( $refused->get_error_message(), 'preflight' );
         }
         $import_id = substr( bin2hex( random_bytes( 12 ) ), 0, 24 );
+        $this->refuse_overlap( $import_id, ! empty( $assoc_args['into'] ), false );
         $import    = new Import( $import_id );
         $summary   = [ 'ok' => false, 'source' => $zip, 'import_id' => $import_id ];
         $started   = time();
@@ -2088,6 +2090,27 @@ class Command {
 
     private static function plural( $n, $word ) {
         return number_format( $n ) . ' ' . $word . ( $n === 1 ? '' : 's' );
+    }
+
+    /**
+     * Stops a move that would run over another: the same move still
+     * running in another process (an interrupted run can wait on the source
+     * for minutes without a sign of life), or another move into this site
+     * running now (see Pull::running()). Two moves at once would replace
+     * the same tables and files, and could clear each other's state. Then
+     * takes this move's run lock for as long as this command runs.
+     */
+    private function refuse_overlap( $import_id, $into, $resuming ) {
+        if ( $resuming && ! Pull::lock_run( $import_id ) ) {
+            $this->fail( 'That move is still running in another process (an earlier run that was interrupted may still be waiting on the source). Let it finish or stop that process, then resume.', 'preflight' );
+        }
+        $other = Pull::running( $import_id, $into );
+        if ( $other ) {
+            $this->fail( 'Another move into this site is running now (' . $other['id'] . ( $other['source'] !== '' ? ' from ' . $other['source'] : '' ) . '). Two at once would replace the same tables and files. Let it finish, or stop it and discard it (wp disembark discard ' . $other['id'] . '), then try again.', 'preflight' );
+        }
+        if ( ! $resuming ) {
+            Pull::lock_run( $import_id );
+        }
     }
 
     private function find_unfinished( $id ) {

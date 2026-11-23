@@ -1609,6 +1609,11 @@ class Run {
         $import = new Import( $import_id );
         // tables: a restore point of just those (Browse's search and replace).
         $tables = isset( $params['tables'] ) && is_array( $params['tables'] ) ? array_values( array_filter( $params['tables'], 'is_string' ) ) : null;
+        // The restore point is a move's first change: never while another
+        // move into this site is running (see Pull::running()).
+        if ( $tables === null && ( $other = Pull::running( preg_replace( '/[^a-f0-9]/', '', strtolower( (string) $import_id ) ), (bool) $import->target() ) ) ) {
+            return new \WP_Error( 'move_running', 'Another move into this site is running now' . ( $other['source'] !== '' ? ' (from ' . $other['source'] . ')' : '' ) . '. Two at once would replace the same tables and files. Let it finish, or stop it, then try again. Nothing here was changed.', [ 'status' => 409 ] );
+        }
         return $import->snapshot( (string) ( $params['label'] ?? '' ), self::paced( $params ), $tables );
     }
 
